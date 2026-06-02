@@ -67,7 +67,7 @@ app/
 ├── core/
 │   ├── config.py       # env-based settings
 │   ├── database.py     # async engine, session, connection check
-│   └── security.py     # (auth — later)
+│   └── security.py     # Supabase JWT verification
 ├── models/             # SQLAlchemy ORM models
 ├── schemas/            # Pydantic request/response models
 ├── services/           # business logic

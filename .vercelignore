@@ -1,0 +1,16 @@
+# Files not needed in the Vercel deployment bundle.
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+tests/
+*.log
+.env
+.env.*
+!.env.example
+
+# Large docs / source artifacts not needed at runtime.
+database/*.pdf
+NEXT_STEPS.md
+README.md
+.claude/

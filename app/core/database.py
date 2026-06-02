@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 
@@ -29,11 +30,27 @@ engine: AsyncEngine | None = None
 SessionLocal: async_sessionmaker[AsyncSession] | None = None
 
 if settings.async_database_url:
-    engine = create_async_engine(
-        settings.async_database_url,
-        echo=settings.debug,
-        pool_pre_ping=True,
-    )
+    _url = settings.async_database_url
+    # Supabase pooler ports: 5432 = session pooler, 6543 = transaction pooler.
+    # The transaction pooler (pgbouncer) is what serverless platforms like
+    # Vercel should use. In that mode we must disable asyncpg's prepared-
+    # statement cache and not hold a connection pool across invocations.
+    _is_transaction_pooler = ":6543" in _url
+
+    if _is_transaction_pooler:
+        engine = create_async_engine(
+            _url,
+            echo=settings.debug,
+            poolclass=NullPool,
+            connect_args={"statement_cache_size": 0},
+        )
+    else:
+        engine = create_async_engine(
+            _url,
+            echo=settings.debug,
+            pool_pre_ping=True,
+        )
+
     SessionLocal = async_sessionmaker(
         bind=engine,
         class_=AsyncSession,

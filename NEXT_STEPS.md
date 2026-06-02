@@ -16,10 +16,15 @@ are completed.
 - **Deployed to Vercel** (Python serverless, `app.main:app` entrypoint) — app is
   live and running. Config accepts the Supabase↔Vercel integration's env var
   names (`POSTGRES_URL`, `SUPABASE_JWT_SECRET`, `NEXT_PUBLIC_*`).
-- **CI + branch protection**: GitHub Actions runs `Lint (ruff)` and
-  `Test (pytest)` on PRs/pushes to `prod` and `dev`; both branches are protected
-  and require those checks to pass via pull request. See "Branch & deploy
-  workflow" in `README.md`.
+- **CI + branch protection**: GitHub Actions two-tier checks — base tier
+  (`Lint (ruff)`, `Test (pytest)`, `Secret scan (gitleaks)`) runs on `dev` and
+  `prod`; a prod-only `Dependency audit (pip-audit)` job runs when promoting to
+  `prod`. Both branches require a PR; gitleaks false positives (test-only dummy
+  secrets) are allowlisted in `.gitleaks.toml`. See "Branch & deploy workflow"
+  in `README.md`.
+- **Vercel deploys scoped per branch**: `dev-fa-web-api` builds `dev` + PR
+  previews; `finance-alumni-database-api` builds `prod` only — enforced via each
+  project's Ignored Build Step (`[ "$VERCEL_GIT_COMMIT_REF" != "prod" ]`).
 - **Python pinned to 3.12** (`.python-version`) across local dev, CI, and Vercel.
 
 ## 🔧 Immediate follow-ups (config / unblock)

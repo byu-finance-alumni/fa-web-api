@@ -1,7 +1,12 @@
 name: CI
 
-# Runs on PRs into and pushes to the long-lived branches so branch protection
-# can require these checks before merging dev -> prod.
+# Gates code entering the long-lived branches. Mirrors fa-web-app/ci.yml:
+#   - PR into dev:  BASE checks must pass (lint, import smoke, tests)
+#   - PR into prod: BASE checks PLUS the prod-only tier (dependency audit)
+#
+# "Will it break on Vercel?" is verified by Vercel's own GitHub deployment
+# check (each branch deploys to its own Vercel project), which is required
+# separately via branch protection — not duplicated here.
 on:
   push:
     branches: [prod, dev]
@@ -19,6 +24,9 @@ env:
   PYTHON_VERSION: "3.12" # matches Vercel's default runtime
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # BASE TIER — required for BOTH dev and prod.
+  # ---------------------------------------------------------------------------
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
@@ -60,3 +68,25 @@ jobs:
         run: python -c "import app.main; print('app.main imported OK')"
       - name: Run tests
         run: pytest -q
+
+  # ---------------------------------------------------------------------------
+  # PROD-ONLY TIER — extra hardening required only when promoting to prod.
+  # Runs on PRs targeting prod and on direct pushes to prod. Do NOT mark this
+  # check "required" on the dev branch — it is skipped there and a skipped
+  # required check would block dev merges forever.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: Dependency audit (prod only)
+    if: github.base_ref == 'prod' || github.ref_name == 'prod'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+      - name: Audit dependencies for known vulnerabilities
+        run: pip-audit -r requirements.txt

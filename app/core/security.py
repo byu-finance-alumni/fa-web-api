@@ -1,0 +1,94 @@
+"""Supabase JWT verification.
+
+Access tokens are issued by Supabase Auth. We verify them server-side and
+NEVER trust client-provided role/identity claims for authorization decisions —
+roles are resolved from the database (see app/api/dependencies/auth.py).
+
+Both signing schemes Supabase can use are supported, selected from the token's
+`alg` header:
+  * HS256        — shared JWT secret (set JWT_SECRET)
+  * RS256/ES256  — asymmetric keys, verified via the project's JWKS endpoint
+"""
+
+from functools import lru_cache
+from typing import Any
+
+import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import PyJWTError
+
+from app.core.config import get_settings
+
+_SUPABASE_AUDIENCE = "authenticated"
+_SUPPORTED_ASYMMETRIC = {"RS256", "ES256"}
+
+
+class AuthError(Exception):
+    """Raised when a token is missing, malformed, expired, or untrusted.
+
+    The message is safe to surface to clients (no internal details).
+    """
+
+    def __init__(self, message: str = "Could not validate credentials.") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+@lru_cache
+def _jwk_client(jwks_url: str) -> PyJWKClient:
+    return PyJWKClient(jwks_url)
+
+
+def _resolve_key_and_alg(token: str) -> tuple[Any, str]:
+    settings = get_settings()
+    try:
+        header = jwt.get_unverified_header(token)
+    except PyJWTError as exc:
+        raise AuthError("Malformed authentication token.") from exc
+
+    alg = header.get("alg")
+    if alg == "HS256":
+        if not settings.jwt_secret:
+            raise AuthError("Server is not configured to verify HS256 tokens.")
+        return settings.jwt_secret, "HS256"
+
+    if alg in _SUPPORTED_ASYMMETRIC:
+        if not settings.supabase_url:
+            raise AuthError("Server is not configured to verify tokens.")
+        jwks_url = f"{settings.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
+        try:
+            key = _jwk_client(jwks_url).get_signing_key_from_jwt(token).key
+        except Exception as exc:  # JWKS fetch / parse errors
+            raise AuthError("Unable to retrieve token signing key.") from exc
+        return key, alg
+
+    raise AuthError("Unsupported token signing algorithm.")
+
+
+def verify_supabase_jwt(token: str) -> dict[str, Any]:
+    """Verify a Supabase access token and return its decoded claims.
+
+    Raises AuthError on any failure; never leaks underlying error details.
+    """
+    settings = get_settings()
+    key, alg = _resolve_key_and_alg(token)
+
+    issuer = (
+        f"{settings.supabase_url.rstrip('/')}/auth/v1"
+        if settings.supabase_url
+        else None
+    )
+
+    try:
+        claims: dict[str, Any] = jwt.decode(
+            token,
+            key,
+            algorithms=[alg],
+            audience=_SUPABASE_AUDIENCE,
+            issuer=issuer,
+            options={"require": ["exp", "sub"]},
+        )
+    except PyJWTError as exc:
+        raise AuthError("Invalid or expired authentication token.") from exc
+
+    return claims

@@ -1,0 +1,80 @@
+# Next Steps — fa-web-api
+
+Running checklist of outstanding work and the build roadmap. Update as items
+are completed.
+
+## ✅ Done so far
+
+- PostgreSQL schema (`database/schema.sql`) — 25 tables, kept in sync with the
+  Notion "Database Schema Planning" page.
+- `.gitignore` (Python/FastAPI + guards against committing private alumni data
+  and secrets).
+- Basic FastAPI app: `GET /`, `GET /health`, `GET /health/db`.
+- Supabase JWT auth: `app/core/security.py`, `get_current_user` dependency,
+  protected `GET /auth/me`, structured error envelope (401/422). 9 tests passing.
+- Live Supabase Postgres connection verified (`/health/db` green).
+
+## 🔧 Immediate follow-ups (config / unblock)
+
+- [x] **`DATABASE_URL` set in `.env`** — connected via the Supabase session
+      pooler (`aws-1-us-east-1`, port 5432). `GET /health/db` returns
+      `{"database":"connected"}`.
+- [x] **`SUPABASE_SERVICE_ROLE_KEY` set in `.env`** — validated
+      (role=service_role, correct project). Not used by code yet; reserved for
+      Supabase Storage / auth-admin work.
+- [ ] **Add `JWT_SECRET` to `.env`** — the project uses **HS256** signing (the
+      service-role key is HS256), so verifying real user logins (`/auth/me`) will
+      need the JWT secret from dashboard → Project Settings → API → JWT Secret.
+- [x] ~~Python 3.14 + `asyncpg`~~ — resolved: `asyncpg` 0.31.0 ships a cp314
+      wheel and installs cleanly. No version pin needed.
+- [ ] **Before production**: rotate the DB password, service-role key, and JWT
+      secret (shared in plaintext during local setup), and set `DEBUG=false`
+      (also silences SQLAlchemy SQL echo).
+
+## 🧱 Next build step: ORM models + migrations
+
+- [ ] Define SQLAlchemy 2.x ORM models under `app/models/` mirroring
+      `database/schema.sql` (start with `users`, `roles`, `user_roles`, `alumni`).
+- [ ] Initialize **Alembic** (`alembic init alembic`) and wire it to
+      `app.core.config` / `app.core.database`.
+- [ ] Create the first migration and confirm it round-trips against the schema.
+      (Migration rules: every schema change is reversible and preserves data;
+      never modify production directly.)
+
+## 🔐 Authorization (depends on ORM models)
+
+- [ ] On first login, upsert a `users` row keyed by `auth_user_id` (from the JWT
+      `sub`).
+- [ ] Resolve roles from the DB (`users` → `user_roles` → `roles`), **never** from
+      the token's `role` claim.
+- [ ] Add dependencies `require_full_access` and `require_view_only`, enforced
+      server-side. Two roles only: **Full Access** and **View Only**.
+
+## 🚀 Feature roadmap (from CLAUDE.md priorities)
+
+- [ ] Alumni CRUD (archive instead of delete; soft-delete policy).
+- [ ] Search & filtering in PostgreSQL (name, employer, industry, title, grad
+      year, city, state, tags, status labels; combined filters; < 1s).
+- [ ] CSV import (`byu_id` keyed; manual edits win when
+      `manually_edited_at > last_imported_at`; audit + import batch + source).
+- [ ] CSV export.
+- [ ] Interactions, follow-up tasks, events + event attendance.
+- [ ] Attachments via Supabase Storage (metadata in PostgreSQL; auth required for
+      downloads; no public URLs).
+- [ ] Audit logging on every significant modification (immutable).
+- [ ] Duplicate detection (advisory only; human approval required to merge).
+- [ ] Dashboard analytics (DB aggregation; counts, geographic/industry/employer
+      summaries, event stats, missing-data + duplicate metrics).
+
+## 🧪 Testing / quality
+
+- [ ] Add DB-backed integration tests once models + a test database exist.
+- [ ] Coverage targets: auth, authorization, alumni CRUD, imports, exports,
+      duplicate detection, audit logging.
+- [ ] Wire `ruff` (config already in `pyproject.toml`) into the workflow.
+
+## 🖥️ Frontend (separate repo)
+
+- The Supabase **Next.js** quickstart (`@supabase/ssr`, `.tsx`, middleware) does
+  **not** belong in this Python backend repo. If/when a frontend is built, it
+  lives in its own repo and talks to this API.

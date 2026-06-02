@@ -1,0 +1,62 @@
+name: CI
+
+# Runs on PRs into and pushes to the long-lived branches so branch protection
+# can require these checks before merging dev -> prod.
+on:
+  push:
+    branches: [prod, dev]
+  pull_request:
+    branches: [prod, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12" # matches Vercel's default runtime
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Ruff lint
+        run: ruff check .
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Import smoke check (build-equivalent)
+        # No bundler for a Python serverless app; verify the ASGI app imports
+        # cleanly, which is what Vercel does at cold start.
+        run: python -c "import app.main; print('app.main imported OK')"
+      - name: Run tests
+        run: pytest -q

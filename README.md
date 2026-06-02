@@ -41,6 +41,22 @@ uvicorn app.main:app --reload
 pytest
 ```
 
+## CI Checks
+
+GitHub Actions runs on every **pull request** into and **push** to `prod` and
+`dev` (see `.github/workflows/ci.yml`). Two checks must pass before merging
+`dev` → `prod`:
+
+| Check | What it runs | Why |
+|-------|--------------|-----|
+| **Lint (ruff)** | `ruff check .` | catches lint errors, unused imports, bug-prone patterns |
+| **Test (pytest)** | imports the app (cold-start sanity), then `pytest -q` | confirms the app boots and tests pass |
+
+No secrets are required — tests don't touch a live database or Supabase.
+
+To view results: open the repo on GitHub → **Actions** tab (or the **Checks**
+section of a pull request) → select the **CI** workflow run.
+
 ## Project structure
 
 ```text

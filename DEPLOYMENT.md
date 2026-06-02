@@ -46,7 +46,18 @@ public deploy, rotate them in Supabase and use the new values below:
 2. In the Vercel dashboard → **Add New… → Project → Import** the repo.
 3. Framework preset: **Other** (Vercel detects the Python function automatically).
 4. Add the environment variables from step 1 (Production scope).
-5. **Deploy.** Every push to `main` then auto-deploys.
+5. **Deploy.**
+
+### Continuous deployment (branches)
+
+- **Production branch = `prod`** → merges to `prod` deploy production.
+- **`dev`** (and PR branches) → create **Preview** deployments at temporary URLs.
+- Set Vercel's Production Branch under **Settings → Git → Production Branch** to
+  `prod`. All merges go through PRs with CI passing (see README).
+
+> The Supabase↔Vercel integration auto-populates `SUPABASE_*` vars, but **not** a
+> full `DATABASE_URL` (only `POSTGRES_PASSWORD` / `POSTGRES_DATABASE`). Add
+> `DATABASE_URL` manually (transaction pooler, port 6543) for DB connectivity.
 
 ## 2B. Deploy via CLI (alternative)
 

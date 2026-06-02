@@ -69,6 +69,23 @@ jobs:
       - name: Run tests
         run: pytest -q
 
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so gitleaks scans every commit, not just the tip
+      - name: Install gitleaks
+        run: |
+          VERSION=8.21.2
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          mkdir -p "$HOME/bin"
+          tar -xzf gitleaks.tar.gz -C "$HOME/bin" gitleaks
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Scan for committed secrets
+        run: gitleaks detect --redact --no-banner --verbose
+
   # ---------------------------------------------------------------------------
   # PROD-ONLY TIER — extra hardening required only when promoting to prod.
   # Runs on PRs targeting prod and on direct pushes to prod. Do NOT mark this

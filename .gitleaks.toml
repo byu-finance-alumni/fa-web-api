@@ -1,0 +1,16 @@
+# gitleaks configuration for fa-web-api.
+# Auto-loaded by `gitleaks detect` (run from the repo root in CI).
+#
+# Extends the bundled default ruleset, then allowlists known false positives.
+# Keep allowlist entries as narrow as possible so real secrets are still caught.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test-only dummy secrets (offline HS256 JWT tests in tests/test_auth.py)"
+# Match the exact throwaway values only — not the whole file — so a real
+# secret accidentally added to a test would still be flagged.
+regexes = [
+  '''(test|wrong)-secret-0123456789-abcdefghij-klmno''',
+]

@@ -12,7 +12,10 @@ are completed.
 - Basic FastAPI app: `GET /`, `GET /health`, `GET /health/db`.
 - Supabase JWT auth: `app/core/security.py`, `get_current_user` dependency,
   protected `GET /auth/me`, structured error envelope (401/422). 9 tests passing.
-- Live Supabase Postgres connection verified (`/health/db` green).
+- Live Supabase Postgres connection verified locally (`/health/db` green).
+- **Deployed to Vercel** (Python serverless, `app.main:app` entrypoint) — app is
+  live and running. Config accepts the Supabase↔Vercel integration's env var
+  names (`POSTGRES_URL`, `SUPABASE_JWT_SECRET`, `NEXT_PUBLIC_*`).
 
 ## 🔧 Immediate follow-ups (config / unblock)
 
@@ -27,9 +30,13 @@ are completed.
       need the JWT secret from dashboard → Project Settings → API → JWT Secret.
 - [x] ~~Python 3.14 + `asyncpg`~~ — resolved: `asyncpg` 0.31.0 ships a cp314
       wheel and installs cleanly. No version pin needed.
+- [ ] **Confirm `DATABASE_URL` on Vercel** — the Supabase integration only set
+      `POSTGRES_PASSWORD` / `POSTGRES_DATABASE`, not a full connection URL. For
+      the deployed `/health/db` to go green, add `DATABASE_URL` in Vercel using
+      the **transaction pooler (port 6543)**, then redeploy.
 - [ ] **Before production**: rotate the DB password, service-role key, and JWT
       secret (shared in plaintext during local setup), and set `DEBUG=false`
-      (also silences SQLAlchemy SQL echo).
+      (also silences SQLAlchemy SQL echo). Consider hiding `/docs` in prod.
 
 ## 🧱 Next build step: ORM models + migrations
 

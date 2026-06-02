@@ -2,10 +2,16 @@
 
 This API runs on **Vercel's Python serverless runtime** as an ASGI app.
 
-- `api/index.py` — entrypoint that exposes the FastAPI `app`.
-- `vercel.json` — rewrites all routes to that function.
+- `pyproject.toml` — declares runtime `dependencies` (so Vercel installs them)
+  and `[tool.vercel] entrypoint = "app.main:app"` (the ASGI app Vercel serves).
+- `app/main.py` — the FastAPI `app`. Vercel's Python preset auto-routes all
+  requests to it (no `vercel.json` rewrites needed).
 - `app/core/database.py` — auto-switches to a serverless-safe DB config when the
   `DATABASE_URL` uses Supabase's transaction pooler (port `6543`).
+
+> Dependencies **must** be listed in `pyproject.toml` (or `requirements.txt`). If
+> `pyproject.toml` exists with an empty `[project]` and no `dependencies`, Vercel
+> installs nothing and the function crashes with `ModuleNotFoundError`.
 
 > ⚠️ This API handles **private alumni PII** and will be publicly reachable once
 > deployed. Confirm you are authorized to deploy, and treat the URL as sensitive.

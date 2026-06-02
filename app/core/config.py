@@ -57,6 +57,21 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("JWT_SECRET", "SUPABASE_JWT_SECRET"),
     )
 
+    # CORS — comma-separated list of allowed frontend origins.
+    cors_origins: str = Field(
+        default=(
+            "http://localhost:3000,"
+            "https://finance-alumni-database.vercel.app,"
+            "https://dev-fa-web-app.vercel.app"
+        ),
+        validation_alias=AliasChoices("CORS_ORIGINS", "CORS_ORIGIN"),
+    )
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse the comma-separated CORS origins into a clean list."""
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
     @property
     def async_database_url(self) -> str | None:
         """Return the DATABASE_URL normalized to the asyncpg driver.

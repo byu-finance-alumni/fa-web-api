@@ -16,6 +16,11 @@ are completed.
 - **Deployed to Vercel** (Python serverless, `app.main:app` entrypoint) — app is
   live and running. Config accepts the Supabase↔Vercel integration's env var
   names (`POSTGRES_URL`, `SUPABASE_JWT_SECRET`, `NEXT_PUBLIC_*`).
+- **CI + branch protection**: GitHub Actions runs `Lint (ruff)` and
+  `Test (pytest)` on PRs/pushes to `prod` and `dev`; both branches are protected
+  and require those checks to pass via pull request. See "Branch & deploy
+  workflow" in `README.md`.
+- **Python pinned to 3.12** (`.python-version`) across local dev, CI, and Vercel.
 
 ## 🔧 Immediate follow-ups (config / unblock)
 
@@ -28,8 +33,9 @@ are completed.
 - [ ] **Add `JWT_SECRET` to `.env`** — the project uses **HS256** signing (the
       service-role key is HS256), so verifying real user logins (`/auth/me`) will
       need the JWT secret from dashboard → Project Settings → API → JWT Secret.
-- [x] ~~Python 3.14 + `asyncpg`~~ — resolved: `asyncpg` 0.31.0 ships a cp314
-      wheel and installs cleanly. No version pin needed.
+- [x] ~~Python 3.14 + `asyncpg`~~ — `asyncpg` installs cleanly; project is now
+      pinned to **Python 3.12** (`.python-version`) to match CI and the Vercel
+      runtime.
 - [ ] **Confirm `DATABASE_URL` on Vercel** — the Supabase integration only set
       `POSTGRES_PASSWORD` / `POSTGRES_DATABASE`, not a full connection URL. For
       the deployed `/health/db` to go green, add `DATABASE_URL` in Vercel using
@@ -78,7 +84,8 @@ are completed.
 - [ ] Add DB-backed integration tests once models + a test database exist.
 - [ ] Coverage targets: auth, authorization, alumni CRUD, imports, exports,
       duplicate detection, audit logging.
-- [ ] Wire `ruff` (config already in `pyproject.toml`) into the workflow.
+- [x] `ruff` wired into CI (`ruff check .`). Optional: add `ruff format --check`
+      and a pinned lockfile for reproducible installs.
 
 ## 🖥️ Frontend (separate repo)
 

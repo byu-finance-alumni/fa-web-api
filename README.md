@@ -57,6 +57,24 @@ No secrets are required — tests don't touch a live database or Supabase.
 To view results: open the repo on GitHub → **Actions** tab (or the **Checks**
 section of a pull request) → select the **CI** workflow run.
 
+## Branch & deploy workflow
+
+| Branch | Role | Protection | Vercel |
+|--------|------|-----------|--------|
+| `prod` | production | PR + passing checks required | Production deployment |
+| `dev`  | integration | PR + passing checks required | Preview deployments |
+
+Day-to-day flow:
+
+1. Branch off `dev` (e.g. `feat/...`, `docs/...`).
+2. Open a PR into `dev`; the `Lint (ruff)` and `Test (pytest)` checks must pass.
+3. Merge to `dev`.
+4. Release by opening a PR `dev → prod`; once checks pass and it's merged, Vercel
+   deploys production.
+
+Both branches reject direct pushes — all changes go through pull requests. Python
+is pinned to **3.12** (`.python-version`) to match CI and the Vercel runtime.
+
 ## Project structure
 
 ```text

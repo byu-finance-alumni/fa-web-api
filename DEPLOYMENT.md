@@ -48,12 +48,29 @@ public deploy, rotate them in Supabase and use the new values below:
 4. Add the environment variables from step 1 (Production scope).
 5. **Deploy.**
 
-### Continuous deployment (branches)
+### Continuous deployment (two projects, one per branch)
 
-- **Production branch = `prod`** → merges to `prod` deploy production.
-- **`dev`** (and PR branches) → create **Preview** deployments at temporary URLs.
-- Set Vercel's Production Branch under **Settings → Git → Production Branch** to
-  `prod`. All merges go through PRs with CI passing (see README).
+This repo is connected to **two** Vercel projects so each long-lived branch has a
+stable URL:
+
+| Project | Builds | Role |
+|---|---|---|
+| `finance-alumni-database-api` | `prod` only | production API (`fa-web-api.vercel.app`) |
+| `dev-fa-web-api` | `dev` + PR previews | dev API (`dev-fa-web-api.vercel.app`) |
+
+Both projects are linked to the same GitHub repo, so by default each would build
+*every* branch (you'd see duplicate deploys/checks on every PR). To scope them, set
+each project's **Settings → Git → Ignored Build Step → "Run my own command"**:
+
+- `finance-alumni-database-api`: `[ "$VERCEL_GIT_COMMIT_REF" != "prod" ]`  (build only `prod`)
+- `dev-fa-web-api`: `[ "$VERCEL_GIT_COMMIT_REF" = "prod" ]`  (build everything except `prod`)
+
+> Exit **0 = skip** the build, exit **1 = build**; the bracket test returns 0 when
+> true. Use the bare `[ … ]` form — **not** `bash -c '…'`, which can lose its `-c`
+> in that field and error the deploy with "No such file or directory".
+
+The skipped project reports a passing **"Canceled by Ignored Build Step"** status —
+harmless. All merges go through PRs with CI passing (see README).
 
 > The Supabase↔Vercel integration auto-populates `SUPABASE_*` vars, but **not** a
 > full `DATABASE_URL` (only `POSTGRES_PASSWORD` / `POSTGRES_DATABASE`). Add

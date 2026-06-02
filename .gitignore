@@ -1,0 +1,89 @@
+# =============================================================================
+# fa-web-api — .gitignore
+# Stack: FastAPI + PostgreSQL + SQLAlchemy (Python)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Private alumni data — NEVER commit. Student/alumni data is protected.
+# Keep raw exports, spreadsheets, and imports out of version control.
+# -----------------------------------------------------------------------------
+*.csv
+*.xlsx
+*.xls
+/data/
+/imports/
+/exports/
+*.dump
+*.sql.gz
+*.bak
+
+# -----------------------------------------------------------------------------
+# Secrets & environment
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+credentials.json
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+# -----------------------------------------------------------------------------
+# Testing / coverage / type checking
+# -----------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# -----------------------------------------------------------------------------
+# Tooling / IDE / OS
+# -----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# Claude Code — share project guidance, keep local settings out
+# -----------------------------------------------------------------------------
+.claude/settings.local.json

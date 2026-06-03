@@ -7,6 +7,13 @@ name: CI
 # "Will it break on Vercel?" is verified by Vercel's own GitHub deployment
 # check (each branch deploys to its own Vercel project), which is required
 # separately via branch protection — not duplicated here.
+#
+# There is a SINGLE Supabase database (shared by the dev and prod deployments),
+# so migrations are applied exactly once, manually gated: after checks pass on a
+# push to prod, the `migrate` job applies pending SQL migrations — but only after
+# a human approves it via the `production` GitHub Environment's required
+# reviewers. The connection string is the Environment secret
+# MIGRATIONS_DATABASE_URL (see database/migrations/README.md).
 on:
   push:
     branches: [prod, dev]
@@ -107,3 +114,27 @@ jobs:
           pip install pip-audit
       - name: Audit dependencies for known vulnerabilities
         run: pip-audit -r requirements.txt
+
+  # ---------------------------------------------------------------------------
+  # MIGRATION — applies pending database/migrations/*.sql to the single shared
+  # Supabase database. Runs only on a push to prod (i.e. after a prod promotion
+  # merges) once the gating checks pass, and is held for manual approval by the
+  # `production` Environment's required reviewers. Skipped on pull_request events
+  # and on dev pushes, so a dev merge never silently alters the shared database.
+  # ---------------------------------------------------------------------------
+  migrate:
+    name: Migrate database
+    if: github.event_name == 'push' && github.ref_name == 'prod'
+    needs: [lint, test, secret-scan, audit]
+    runs-on: ubuntu-latest
+    environment: production # required reviewers here = manual approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Apply pending migrations
+        env:
+          # Direct (non-pooled, port 5432) Supabase connection — set as a secret
+          # on the `production` Environment in repo Settings → Environments.
+          DATABASE_URL: ${{ secrets.MIGRATIONS_DATABASE_URL }}
+        run: bash database/migrate.sh

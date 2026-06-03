@@ -56,6 +56,14 @@ ALTER TABLE public.attachments           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_logs            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.duplicate_candidates  ENABLE ROW LEVEL SECURITY;
 
+-- Program engagement ---------------------------------------------------------
+ALTER TABLE public.alumni_program_engagement  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.alumni_mentor_industries   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.nettrek_hosting            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.conference_participation   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.finance_society_leadership ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.bbq_attendance             ENABLE ROW LEVEL SECURITY;
+
 -- =============================================================================
 -- VERIFY — every row should show rowsecurity = true. Anything `false` is
 -- exposed through the Data API.

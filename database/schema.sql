@@ -1,6 +1,7 @@
 -- =============================================================================
 -- Finance Alumni Database — PostgreSQL Schema
--- Generated from "Finance Alumni Db.pdf" (dbdiagram.io ERD)
+-- Source of truth for the schema. Maintained by hand (the original dbdiagram.io
+-- ERD PDF was removed once it fell out of date).
 --
 -- Conventions:
 --   * bigint identity surrogate primary keys
@@ -87,6 +88,7 @@ CREATE TABLE alumni (
     source_id            bigint,
     byu_id               varchar(50),
     mst_id               varchar(50),
+    net_id               varchar(50),
     first_name           varchar(100),
     middle_name          varchar(100),
     last_name            varchar(100),
@@ -95,6 +97,8 @@ CREATE TABLE alumni (
     gender               varchar(30),
     birth_year           int,
     graduation_year      int,
+    finance_program_year int,
+    graduate_degree      varchar(100),
     deceased             boolean NOT NULL DEFAULT false,
     linkedin_url         varchar(500),
     notes                text,
@@ -137,6 +141,7 @@ CREATE TABLE current_employment (
     current_city              varchar(100),
     current_state             varchar(100),
     current_country           varchar(100),
+    current_zip               varchar(20),
     seniority_level           varchar(100),
     last_verified_at          timestamptz,
     created_at                timestamptz NOT NULL DEFAULT now(),
@@ -169,6 +174,8 @@ CREATE TABLE employment_history (
     employer_name         varchar(255),
     employment_title      varchar(255),
     employment_industry   varchar(255),
+    city                  varchar(100),
+    state                 varchar(100),
     start_year            int,
     end_year              int,
     is_current            boolean NOT NULL DEFAULT false,
@@ -384,6 +391,88 @@ CREATE TABLE duplicate_candidates (
 );
 
 -- -----------------------------------------------------------------------------
+-- Program engagement (NetTrek, conferences, mentorship, donations, leadership)
+-- Dropdown option lists for the free-text fields below live in dropdowns.md;
+-- they are deliberately NOT enforced as DB enums/constraints.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE alumni_program_engagement (
+    engagement_profile_id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id                       bigint NOT NULL,
+    source_id                       bigint,
+    nettrek_host_willing            boolean NOT NULL DEFAULT false,
+    finance_conference_willing      boolean NOT NULL DEFAULT false,
+    mentor_willing                  boolean NOT NULL DEFAULT false,
+    company_event_sponsor_willing   boolean NOT NULL DEFAULT false,
+    guest_speaker_willing           boolean NOT NULL DEFAULT false,
+    help_at_event_willing           boolean NOT NULL DEFAULT false,
+    case_competition_host_willing   boolean NOT NULL DEFAULT false,
+    women_in_finance_mentor_willing boolean NOT NULL DEFAULT false,
+    hired_finance_intern            boolean NOT NULL DEFAULT false,
+    hired_finance_full_time         boolean NOT NULL DEFAULT false,
+    piff_donor                      boolean NOT NULL DEFAULT false,
+    piff_donor_amount               numeric(12,2),
+    cfp_designation                 boolean NOT NULL DEFAULT false,
+    cfa_designation                 boolean NOT NULL DEFAULT false,
+    engagement_notes                text,
+    created_at                      timestamptz NOT NULL DEFAULT now(),
+    updated_at                      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_alumni_program_engagement_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_alumni_program_engagement_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL,
+    CONSTRAINT uq_alumni_program_engagement UNIQUE (alumni_id)
+);
+
+CREATE TABLE alumni_mentor_industries (
+    mentor_industry_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id          bigint NOT NULL,
+    industry           varchar(100) NOT NULL,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_alumni_mentor_industries_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT uq_alumni_mentor_industries UNIQUE (alumni_id, industry)
+);
+
+CREATE TABLE nettrek_hosting (
+    nettrek_hosting_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id          bigint NOT NULL,
+    source_id          bigint,
+    host_year          int,
+    host_company       varchar(255),
+    notes              text,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_nettrek_hosting_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_nettrek_hosting_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL
+);
+
+CREATE TABLE conference_participation (
+    conference_participation_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id          bigint NOT NULL,
+    conference         varchar(100) NOT NULL,
+    participation_year int,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_conference_participation_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT uq_conference_participation UNIQUE (alumni_id, conference, participation_year)
+);
+
+CREATE TABLE finance_society_leadership (
+    finance_society_leadership_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id       bigint NOT NULL,
+    leadership_role varchar(100) NOT NULL,
+    role_year       int,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_finance_society_leadership_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE
+);
+
+CREATE TABLE bbq_attendance (
+    bbq_attendance_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id         bigint NOT NULL,
+    attended_year     int NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_bbq_attendance_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT uq_bbq_attendance UNIQUE (alumni_id, attended_year)
+);
+
+-- -----------------------------------------------------------------------------
 -- Indexes on foreign keys / common lookups
 -- -----------------------------------------------------------------------------
 
@@ -394,6 +483,7 @@ CREATE INDEX idx_import_batches_source_id        ON import_batches (source_id);
 CREATE INDEX idx_alumni_source_id                ON alumni (source_id);
 CREATE INDEX idx_alumni_last_name                ON alumni (last_name);
 CREATE INDEX idx_alumni_byu_id                   ON alumni (byu_id);
+CREATE INDEX idx_alumni_net_id                   ON alumni (net_id);
 CREATE INDEX idx_alumni_contact_info_alumni_id   ON alumni_contact_info (alumni_id);
 CREATE INDEX idx_current_employment_alumni_id    ON current_employment (alumni_id);
 CREATE INDEX idx_education_history_alumni_id     ON education_history (alumni_id);
@@ -413,5 +503,11 @@ CREATE INDEX idx_attachments_alumni_id           ON attachments (alumni_id);
 CREATE INDEX idx_audit_logs_entity              ON audit_logs (entity_type, entity_id);
 CREATE INDEX idx_duplicate_candidates_alumni_1   ON duplicate_candidates (alumni_id_1);
 CREATE INDEX idx_duplicate_candidates_alumni_2   ON duplicate_candidates (alumni_id_2);
+CREATE INDEX idx_alumni_program_engagement_alumni_id  ON alumni_program_engagement (alumni_id);
+CREATE INDEX idx_alumni_mentor_industries_alumni_id   ON alumni_mentor_industries (alumni_id);
+CREATE INDEX idx_nettrek_hosting_alumni_id            ON nettrek_hosting (alumni_id);
+CREATE INDEX idx_conference_participation_alumni_id   ON conference_participation (alumni_id);
+CREATE INDEX idx_finance_society_leadership_alumni_id ON finance_society_leadership (alumni_id);
+CREATE INDEX idx_bbq_attendance_alumni_id             ON bbq_attendance (alumni_id);
 
 COMMIT;

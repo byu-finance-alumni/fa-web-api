@@ -24,12 +24,30 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 async def list_alumni(
     _: RequireViewAccess,
     session: SessionDep,
+    q: Annotated[
+        str | None,
+        Query(description="Search names and external ids (case-insensitive)."),
+    ] = None,
+    graduation_year: int | None = None,
+    grad_year_min: int | None = None,
+    grad_year_max: int | None = None,
+    deceased: Annotated[
+        bool | None, Query(description="Filter by deceased flag.")
+    ] = None,
+    include_archived: bool = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-    include_archived: bool = False,
 ) -> AlumniPage:
     items, total = await service.list_alumni(
-        session, limit=limit, offset=offset, include_archived=include_archived
+        session,
+        limit=limit,
+        offset=offset,
+        q=q,
+        graduation_year=graduation_year,
+        grad_year_min=grad_year_min,
+        grad_year_max=grad_year_max,
+        deceased=deceased,
+        include_archived=include_archived,
     )
     return AlumniPage(items=items, total=total, limit=limit, offset=offset)
 

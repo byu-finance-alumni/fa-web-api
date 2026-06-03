@@ -32,11 +32,12 @@ async def list_alumni(
     *,
     limit: int,
     offset: int,
-    include_archived: bool = False,
+    **filters: object,
 ) -> tuple[list[Alumni], int]:
-    return await repo.list_page(
-        session, limit=limit, offset=offset, include_archived=include_archived
-    )
+    """List alumni with pagination. ``filters`` are forwarded to the repository
+    (see ``build_alumni_query``: q, graduation_year, grad_year_min/max,
+    deceased, include_archived)."""
+    return await repo.list_page(session, limit=limit, offset=offset, **filters)
 
 
 async def create_alumni(session: AsyncSession, payload: AlumniCreate) -> Alumni:

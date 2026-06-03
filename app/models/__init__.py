@@ -6,6 +6,7 @@ Add new model modules to the imports below as they're built.
 """
 
 from app.models.alumni import Alumni
+from app.models.data_source import DataSource
 from app.models.user import Role, User, UserRole
 
-__all__ = ["Alumni", "Role", "User", "UserRole"]
+__all__ = ["Alumni", "DataSource", "Role", "User", "UserRole"]

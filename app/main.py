@@ -13,9 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api.routes import auth, health
+from app.api.routes import alumni, auth, health
 from app.core.config import get_settings
 from app.core.database import dispose_engine
+from app.core.errors import ConflictError, NotFoundError
 from app.core.security import AuthError, AuthorizationError
 
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +56,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(auth.router)
+app.include_router(alumni.router)
 
 
 @app.exception_handler(AuthError)
@@ -75,6 +77,24 @@ async def authorization_error_handler(
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={"error": {"code": "forbidden", "message": exc.message}},
+    )
+
+
+@app.exception_handler(NotFoundError)
+async def not_found_handler(request: Request, exc: NotFoundError) -> JSONResponse:
+    """Return 404 with the project error envelope."""
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"error": {"code": "not_found", "message": exc.message}},
+    )
+
+
+@app.exception_handler(ConflictError)
+async def conflict_handler(request: Request, exc: ConflictError) -> JSONResponse:
+    """Return 409 with the project error envelope."""
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={"error": {"code": "conflict", "message": exc.message}},
     )
 
 

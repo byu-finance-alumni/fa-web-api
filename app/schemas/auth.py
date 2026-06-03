@@ -51,6 +51,10 @@ class UserContext(BaseModel):
         )
 
     @property
+    def is_super_admin(self) -> bool:
+        return RoleName.SUPER_ADMIN.value in self.roles
+
+    @property
     def is_full_access(self) -> bool:
         return RoleName.FULL_ACCESS.value in self.roles
 

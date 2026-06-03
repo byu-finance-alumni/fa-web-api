@@ -80,6 +80,20 @@ def test_no_roles_is_denied_everywhere():
         asyncio.run(auth_deps.require_full_access(ctx))
 
 
+def test_super_admin_passes_every_guard():
+    ctx = _ctx("super_admin")
+    assert ctx.is_super_admin
+    assert asyncio.run(auth_deps.require_super_admin(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_full_access(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
+
+
+def test_super_admin_guard_rejects_lesser_roles():
+    for role in ("full_access", "view_only"):
+        with pytest.raises(AuthorizationError):
+            asyncio.run(auth_deps.require_super_admin(_ctx(role)))
+
+
 # --- get_current_db_user ------------------------------------------------------
 
 

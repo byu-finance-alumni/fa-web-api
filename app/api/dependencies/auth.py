@@ -91,10 +91,14 @@ def require_roles(
     return _guard
 
 
-# Write access requires full_access. Read access is granted to either role —
-# a full_access user can obviously read.
-require_full_access = require_roles(RoleName.FULL_ACCESS)
-require_view_only = require_roles(RoleName.FULL_ACCESS, RoleName.VIEW_ONLY)
+# Role hierarchy: super_admin ⊇ full_access ⊇ view_only. super_admin satisfies
+# every guard; user/role administration requires super_admin specifically.
+require_super_admin = require_roles(RoleName.SUPER_ADMIN)
+require_full_access = require_roles(RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS)
+require_view_only = require_roles(
+    RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS, RoleName.VIEW_ONLY
+)
 
+RequireSuperAdmin = Annotated[UserContext, Depends(require_super_admin)]
 RequireFullAccess = Annotated[UserContext, Depends(require_full_access)]
 RequireViewAccess = Annotated[UserContext, Depends(require_view_only)]

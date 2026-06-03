@@ -166,7 +166,20 @@ Always verify roles from the database.
 
 # Authorization
 
-Only two roles exist.
+Three roles exist, most → least privileged: `super_admin` ⊇ `full_access` ⊇
+`view_only`. Defined in `app/core/roles.py` (`RoleName`); guards in
+`app/api/dependencies/auth.py` (`require_super_admin` / `require_full_access` /
+`require_view_only`).
+
+## Super Admin
+
+Everything Full Access can do, plus:
+
+* Create user accounts
+* Assign / change roles
+* Issue temporary one-time passwords (first-login forced password reset)
+
+Initially assigned to Tanya Harmon. User/role administration requires this role.
 
 ## Full Access
 
@@ -189,7 +202,8 @@ Allowed:
 
 Never allow write operations for view-only users.
 
-Authorization must be enforced server-side.
+Authorization must be enforced server-side. A higher role satisfies every lower
+role's guard (super_admin passes full_access and view_only checks).
 
 ---
 

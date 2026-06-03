@@ -421,6 +421,53 @@ Never commit .env files.
 
 ---
 
+# Local Development
+
+Python is pinned to **3.12** (`.python-version`, matches CI and the Vercel runtime).
+
+Setup (using `uv`, which fetches 3.12 automatically):
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv -r requirements.txt
+```
+
+Run:
+
+```bash
+.venv\Scripts\python -m uvicorn app.main:app --reload   # http://127.0.0.1:8000  (docs at /docs)
+```
+
+The app boots with **no** database or secrets — all settings default to `None`.
+`/` and `/health` return 200 with nothing configured; `/health/db` returns 503
+until `DATABASE_URL` is set.
+
+Environment values come from the Vercel project (`finance-alumni-database-api`,
+scope `gunnjakes-projects`):
+
+```bash
+vercel link --project finance-alumni-database-api
+vercel env pull .env --environment=production   # NOTE: default target is Development, which is empty
+```
+
+**Sensitive Vercel vars pull back EMPTY** (they are write-only): `DATABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY`, and the JWT/secret keys. Fill these from the
+Supabase Dashboard (Settings ▸ Database / API). `JWT_SECRET` may stay blank —
+the API then verifies tokens via the Supabase JWKS endpoint.
+
+**`DATABASE_URL` / IPv4 gotcha:** the direct host `db.<ref>.supabase.co` is
+**IPv6-only**. On an IPv4-only network use the **Session pooler** instead:
+
+```env
+DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-1-us-east-1.pooler.supabase.com:5432/postgres
+```
+
+(`database.py` treats port 6543 as the transaction pooler and 5432 as the
+session pooler; asyncpg negotiates SSL automatically — no `?sslmode=` needed,
+and query params are stripped anyway.)
+
+---
+
 # Testing Requirements
 
 All new features should include tests.

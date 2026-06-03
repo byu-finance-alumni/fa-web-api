@@ -41,7 +41,7 @@ ORM:
 
 Migrations:
 
-* Alembic
+* Plain SQL files in `database/migrations/`, applied by `database/migrate.sh` (no Alembic)
 
 Validation:
 
@@ -106,10 +106,9 @@ app/
 
 tests/
 
-alembic/
-
 database/
-└── schema.sql
+├── schema.sql          # source-of-truth schema snapshot
+└── migrations/         # plain SQL migrations applied by migrate.sh (no Alembic)
 ```
 
 ---
@@ -488,14 +487,16 @@ Use pytest.
 
 # Migration Rules
 
-Schema changes require Alembic migrations.
+Schema changes require a plain SQL migration in `database/migrations/` (there is
+no Alembic). See `database/migrations/README.md` for the workflow.
 
 Never manually modify production databases.
 
 Every schema change must:
 
-* Have a migration
-* Be reversible
+* Have a migration (`YYYY-MM-DD_description.sql`, wrapped in `BEGIN; ... COMMIT;`)
+* Enable deny-all RLS on any new table (match `database/rls_lockdown.sql`)
+* Update `database/schema.sql` to reflect the new end state
 * Preserve data
 
 ---

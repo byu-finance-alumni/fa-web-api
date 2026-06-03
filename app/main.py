@@ -16,7 +16,7 @@ from app import __version__
 from app.api.routes import auth, health
 from app.core.config import get_settings
 from app.core.database import dispose_engine
-from app.core.security import AuthError
+from app.core.security import AuthError, AuthorizationError
 
 logging.basicConfig(level=logging.INFO)
 
@@ -64,6 +64,17 @@ async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
         status_code=status.HTTP_401_UNAUTHORIZED,
         content={"error": {"code": "unauthorized", "message": exc.message}},
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@app.exception_handler(AuthorizationError)
+async def authorization_error_handler(
+    request: Request, exc: AuthorizationError
+) -> JSONResponse:
+    """Return 403 with the project error envelope for permission failures."""
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"error": {"code": "forbidden", "message": exc.message}},
     )
 
 

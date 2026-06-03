@@ -26,6 +26,11 @@ are completed.
   previews; `finance-alumni-database-api` builds `prod` only — enforced via each
   project's Ignored Build Step (`[ "$VERCEL_GIT_COMMIT_REF" != "prod" ]`).
 - **Python pinned to 3.12** (`.python-version`) across local dev, CI, and Vercel.
+- **Deny-all RLS lockdown** (`database/rls_lockdown.sql`) — RLS enabled with no
+  policies on all 25 public tables, so the Supabase Data API (`anon`/
+  `authenticated` keys) is denied; the backend's privileged Postgres connection
+  bypasses RLS and is unaffected. Applied to the database via the SQL editor.
+  Re-run after schema revisions to cover new tables.
 
 ## 🔧 Immediate follow-ups (config / unblock)
 
@@ -48,6 +53,11 @@ are completed.
 - [ ] **Before production**: rotate the DB password, service-role key, and JWT
       secret (shared in plaintext during local setup), and set `DEBUG=false`
       (also silences SQLAlchemy SQL echo). Consider hiding `/docs` in prod.
+- [ ] **Verify Supabase Storage bucket privacy (dashboard)** — RLS on tables does
+      NOT protect Storage. Before any file upload work, confirm the attachments
+      bucket is **Private** (not Public) and has restrictive Storage policies.
+      Files are served via short-lived signed URLs from the backend — never
+      public URLs (see Attachments in the feature roadmap).
 
 ## 🧱 Next build step: ORM models + migrations
 
@@ -61,12 +71,24 @@ are completed.
 
 ## 🔐 Authorization (depends on ORM models)
 
+> ⚠️ **CRITICAL SECURITY INVARIANT — do not ship CRUD without this.**
+> The deny-all RLS lockdown means the *only* thing protecting alumni PII is this
+> backend. The backend connects with a privileged role that **bypasses RLS**, so
+> a route that forgets its authorization check has **nothing behind it** — the
+> database will not save you. Every data endpoint MUST enforce the full-access /
+> view-only check server-side. RLS is the outer wall; backend RBAC is the only
+> gate. Today this is fine only because no data endpoints exist yet.
+
 - [ ] On first login, upsert a `users` row keyed by `auth_user_id` (from the JWT
       `sub`).
 - [ ] Resolve roles from the DB (`users` → `user_roles` → `roles`), **never** from
       the token's `role` claim.
 - [ ] Add dependencies `require_full_access` and `require_view_only`, enforced
       server-side. Two roles only: **Full Access** and **View Only**.
+- [ ] Default-deny: write operations (create/update/archive/import/export/merge/
+      upload) require **Full Access**; **View Only** gets read endpoints solely.
+- [ ] Add a permission test for every data endpoint — a View-Only token must get
+      403 on every write path. Treat a missing test as a missing check.
 
 ## 🚀 Feature roadmap (from CLAUDE.md priorities)
 

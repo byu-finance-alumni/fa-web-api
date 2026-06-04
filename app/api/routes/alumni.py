@@ -61,24 +61,28 @@ async def get_alumni(
 
 @router.post("", response_model=AlumniRead, status_code=status.HTTP_201_CREATED)
 async def create_alumni(
-    payload: AlumniCreate, _: RequireFullAccess, session: SessionDep
+    payload: AlumniCreate, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
-    return await service.create_alumni(session, payload)
+    return await service.create_alumni(session, payload, actor_user_id=user.user_id)
 
 
 @router.patch("/{alumni_id}", response_model=AlumniRead)
 async def update_alumni(
     alumni_id: int,
     payload: AlumniUpdate,
-    _: RequireFullAccess,
+    user: RequireFullAccess,
     session: SessionDep,
 ) -> AlumniRead:
-    return await service.update_alumni(session, alumni_id, payload)
+    return await service.update_alumni(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
 
 
 @router.delete("/{alumni_id}", response_model=AlumniRead)
 async def archive_alumni(
-    alumni_id: int, _: RequireFullAccess, session: SessionDep
+    alumni_id: int, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
     """Soft-delete (archive) an alumni record."""
-    return await service.archive_alumni(session, alumni_id)
+    return await service.archive_alumni(
+        session, alumni_id, actor_user_id=user.user_id
+    )

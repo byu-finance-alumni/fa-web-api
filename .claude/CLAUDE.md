@@ -41,7 +41,7 @@ ORM:
 
 Migrations:
 
-* Alembic
+* Plain SQL files in `database/migrations/`, applied by `database/migrate.sh` (no Alembic)
 
 Validation:
 
@@ -106,10 +106,9 @@ app/
 
 tests/
 
-alembic/
-
 database/
-└── schema.sql
+├── schema.sql          # source-of-truth schema snapshot
+└── migrations/         # plain SQL migrations applied by migrate.sh (no Alembic)
 ```
 
 ---
@@ -167,7 +166,20 @@ Always verify roles from the database.
 
 # Authorization
 
-Only two roles exist.
+Three roles exist, most → least privileged: `super_admin` ⊇ `full_access` ⊇
+`view_only`. Defined in `app/core/roles.py` (`RoleName`); guards in
+`app/api/dependencies/auth.py` (`require_super_admin` / `require_full_access` /
+`require_view_only`).
+
+## Super Admin
+
+Everything Full Access can do, plus:
+
+* Create user accounts
+* Assign / change roles
+* Issue temporary one-time passwords (first-login forced password reset)
+
+Initially assigned to Tanya Harmon. User/role administration requires this role.
 
 ## Full Access
 
@@ -190,7 +202,8 @@ Allowed:
 
 Never allow write operations for view-only users.
 
-Authorization must be enforced server-side.
+Authorization must be enforced server-side. A higher role satisfies every lower
+role's guard (super_admin passes full_access and view_only checks).
 
 ---
 
@@ -421,6 +434,53 @@ Never commit .env files.
 
 ---
 
+# Local Development
+
+Python is pinned to **3.12** (`.python-version`, matches CI and the Vercel runtime).
+
+Setup (using `uv`, which fetches 3.12 automatically):
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv -r requirements.txt
+```
+
+Run:
+
+```bash
+.venv\Scripts\python -m uvicorn app.main:app --reload   # http://127.0.0.1:8000  (docs at /docs)
+```
+
+The app boots with **no** database or secrets — all settings default to `None`.
+`/` and `/health` return 200 with nothing configured; `/health/db` returns 503
+until `DATABASE_URL` is set.
+
+Environment values come from the Vercel project (`finance-alumni-database-api`,
+scope `gunnjakes-projects`):
+
+```bash
+vercel link --project finance-alumni-database-api
+vercel env pull .env --environment=production   # NOTE: default target is Development, which is empty
+```
+
+**Sensitive Vercel vars pull back EMPTY** (they are write-only): `DATABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY`, and the JWT/secret keys. Fill these from the
+Supabase Dashboard (Settings ▸ Database / API). `JWT_SECRET` may stay blank —
+the API then verifies tokens via the Supabase JWKS endpoint.
+
+**`DATABASE_URL` / IPv4 gotcha:** the direct host `db.<ref>.supabase.co` is
+**IPv6-only**. On an IPv4-only network use the **Session pooler** instead:
+
+```env
+DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-1-us-east-1.pooler.supabase.com:5432/postgres
+```
+
+(`database.py` treats port 6543 as the transaction pooler and 5432 as the
+session pooler; asyncpg negotiates SSL automatically — no `?sslmode=` needed,
+and query params are stripped anyway.)
+
+---
+
 # Testing Requirements
 
 All new features should include tests.
@@ -441,14 +501,16 @@ Use pytest.
 
 # Migration Rules
 
-Schema changes require Alembic migrations.
+Schema changes require a plain SQL migration in `database/migrations/` (there is
+no Alembic). See `database/migrations/README.md` for the workflow.
 
 Never manually modify production databases.
 
 Every schema change must:
 
-* Have a migration
-* Be reversible
+* Have a migration (`YYYY-MM-DD_description.sql`, wrapped in `BEGIN; ... COMMIT;`)
+* Enable deny-all RLS on any new table (match `database/rls_lockdown.sql`)
+* Update `database/schema.sql` to reflect the new end state
 * Preserve data
 
 ---

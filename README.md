@@ -81,6 +81,18 @@ Day-to-day flow:
 3. Merge to `dev`.
 4. Release by opening a PR `dev → prod`; the prod-only dependency audit also runs,
    and on merge `finance-alumni-database-api` deploys production.
+5. **Back-merge `prod → dev` after every release** (end-of-day routine). A
+   `dev → prod` merge creates a merge commit that lives only on `prod`, so `dev`
+   immediately reads as "N commits behind prod" even though the code is identical
+   — one commit per release. Sync it back so the count resets to 0:
+
+   ```bash
+   git fetch origin
+   git push origin origin/prod:dev   # fast-forward dev up to prod (works while dev has no unmerged work)
+   ```
+
+   If branch protection blocks the direct push, open a quick `prod → dev` PR
+   instead. Do this at the end of each working day so `dev` never drifts.
 
 Both branches reject direct pushes — all changes go through pull requests.
 

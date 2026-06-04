@@ -26,10 +26,25 @@ _SUPPORTED_ASYMMETRIC = {"RS256", "ES256"}
 class AuthError(Exception):
     """Raised when a token is missing, malformed, expired, or untrusted.
 
-    The message is safe to surface to clients (no internal details).
+    The message is safe to surface to clients (no internal details). Maps to a
+    401 response.
     """
 
     def __init__(self, message: str = "Could not validate credentials.") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class AuthorizationError(Exception):
+    """Raised when an authenticated user lacks permission for an action.
+
+    Distinct from AuthError: the caller proved *who* they are but isn't allowed
+    to do *this*. Maps to a 403 response. The message is safe to surface.
+    """
+
+    def __init__(
+        self, message: str = "You do not have permission to perform this action."
+    ) -> None:
         self.message = message
         super().__init__(message)
 

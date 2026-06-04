@@ -18,12 +18,22 @@ trivially removable, but it IS visible to both deployments until removed.
 
 import argparse
 import asyncio
+import datetime
 
 from sqlalchemy import delete, select
 
 from app.core.database import SessionLocal
 from app.models.alumni import Alumni
 from app.models.data_source import DataSource
+from app.models.event import Event, EventAttendance
+
+MOCK_EVENTS = [
+    {"name": "Spring NetTrek 2026", "type": "Net Trek", "date": datetime.date(2026, 3, 14), "location": "New York, NY"},
+    {"name": "Alumni Reunion BBQ", "type": "BBQ", "date": datetime.date(2025, 8, 22), "location": "Provo, UT"},
+    {"name": "Finance Conference 2025", "type": "Finance Conference", "date": datetime.date(2025, 11, 5), "location": "Salt Lake City, UT"},
+    {"name": "Women in Finance Mixer", "type": "Club Event", "date": datetime.date(2026, 2, 10), "location": "Provo, UT"},
+    {"name": "Recruiting Night — Goldman Sachs", "type": "Recruiting Event", "date": datetime.date(2026, 1, 20), "location": "Virtual"},
+]
 
 MOCK_SOURCE_NAME = "MOCK_DATA"
 
@@ -57,9 +67,12 @@ async def _get_source(session) -> DataSource | None:
 
 
 async def remove_mock(session) -> int:
-    """Delete all mock alumni and the MOCK_DATA source. Returns rows removed."""
+    """Delete all mock alumni/events and the MOCK_DATA source. Returns rows removed."""
+    # Mock events are tagged in event_notes; FK cascade removes their attendance.
+    await session.execute(delete(Event).where(Event.event_notes.like("%[MOCK]%")))
     source = await _get_source(session)
     if source is None:
+        await session.commit()
         return 0
     result = await session.execute(
         delete(Alumni).where(Alumni.source_id == source.source_id)
@@ -82,8 +95,31 @@ async def seed_mock(session) -> int:
     )
     session.add(source)
     await session.flush()  # assign source_id
-    for row in MOCK_ALUMNI:
-        session.add(Alumni(source_id=source.source_id, **row))
+    alumni = [Alumni(source_id=source.source_id, **row) for row in MOCK_ALUMNI]
+    session.add_all(alumni)
+    await session.flush()  # assign alumni_ids
+    alumni_ids = [a.alumni_id for a in alumni]
+
+    events = [
+        Event(
+            event_name=ev["name"],
+            event_type=ev["type"],
+            event_date=ev["date"],
+            event_location=ev["location"],
+            event_notes="[MOCK] seeded event",
+        )
+        for ev in MOCK_EVENTS
+    ]
+    session.add_all(events)
+    await session.flush()  # assign event_ids
+    # Deterministically attach a few alumni to each event.
+    for i, e in enumerate(events):
+        for aid in alumni_ids[i : i + 4]:
+            session.add(
+                EventAttendance(
+                    event_id=e.event_id, alumni_id=aid, attendance_status="Attended"
+                )
+            )
     await session.commit()
     return len(MOCK_ALUMNI)
 

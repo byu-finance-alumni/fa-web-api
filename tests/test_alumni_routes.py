@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.dependencies.auth import get_current_db_user
+from app.core.database import get_session
 from app.main import app
 from app.schemas.auth import UserContext
 
@@ -22,8 +23,15 @@ def _ctx(*roles: str) -> UserContext:
     )
 
 
+async def _no_db_session():
+    """Stand-in for get_session so these auth/validation tests don't require a
+    real DATABASE_URL (CI has none). No test here reaches a real query."""
+    yield None
+
+
 @pytest.fixture
 def client():
+    app.dependency_overrides[get_session] = _no_db_session
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

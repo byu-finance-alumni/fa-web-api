@@ -92,3 +92,4 @@ desktop.ini
 # Claude Code — share project guidance, keep local settings out
 # -----------------------------------------------------------------------------
 .claude/settings.local.json
+.vercel

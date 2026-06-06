@@ -10,12 +10,60 @@ read-only here — they're set by the service/import layers, never by the client
 from __future__ import annotations
 
 import datetime
+import re
+import unicodedata
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+# --- Validation constants ----------------------------------------------------
+
+# Names: deny-list (permissive) so international / Unicode names pass. We reject
+# characters that carry no meaning inside a human name but ARE meaningful to a
+# SQL parser (semicolons, comparison operators, pipes) plus any control chars.
+# Allowed: Unicode letters, spaces, apostrophes (straight + curly), hyphens,
+# periods — so O'Brien, Anne-Marie and St. John pass while ``' OR 1=1;--``
+# fails on the ``;`` and ``=``.
+_NAME_DISALLOWED = set(";=<>|")
+# Lengths mirror database/schema.sql so we never accept a value the DB rejects.
+_NAME_MAX = 100
+_GENDER_MAX = 30
+_GRADUATE_DEGREE_MAX = 100
+_LINKEDIN_MAX = 500
+_NOTES_MAX = 10000
+
+# byu_id: no seed/mock data exists with a byu_id yet (checked database/ and
+# scripts/), so we enforce the canonical BYU NetID-card length of exactly 9
+# digits. If seeds later use 8 or 10, widen this to {8,10}.
+_BYU_ID_RE = re.compile(r"^\d{9}$")
+_NET_ID_RE = re.compile(r"^[a-z0-9]{2,12}$")
+
+_YEAR_MIN = 1950
+_YEAR_MAX = datetime.date.today().year + 10
+
+
+def _has_control_chars(value: str) -> bool:
+    """True if *value* contains C0/C1 control characters (category ``Cc``)."""
+    return any(unicodedata.category(ch) == "Cc" for ch in value)
+
+
+def _empty_to_none(value: str | None) -> str | None:
+    """Trim and normalize empty/whitespace-only strings to ``None``."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 class AlumniBase(BaseModel):
-    """Client-editable fields. ``extra='forbid'`` rejects unknown keys."""
+    """Client-editable fields. ``extra='forbid'`` rejects unknown keys.
+
+    Field validators add *semantic* validation on top of parameterization:
+    parameterized queries stop injection from executing, but only validation
+    keeps SQL-shaped garbage (``' OR 1=1;--``) out of the data in the first
+    place. The deny-list name rules are deliberately permissive so legitimate
+    international names still pass.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -35,6 +83,159 @@ class AlumniBase(BaseModel):
     deceased: bool | None = None
     linkedin_url: str | None = None
     notes: str | None = None
+
+    # --- Name fields ---------------------------------------------------------
+
+    @field_validator(
+        "first_name",
+        "middle_name",
+        "last_name",
+        "preferred_first_name",
+        "birth_name",
+        mode="before",
+    )
+    @classmethod
+    def _validate_name(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if len(value) > _NAME_MAX:
+            raise ValueError(f"Must be at most {_NAME_MAX} characters.")
+        if _has_control_chars(value):
+            raise ValueError("Must not contain control characters.")
+        bad = sorted(_NAME_DISALLOWED & set(value))
+        if bad:
+            raise ValueError(
+                "Must not contain these characters: " + " ".join(bad)
+            )
+        # Digits-only strings are never valid names (e.g. an ID typed by mistake).
+        if value.isdigit():
+            raise ValueError("Must not be only digits.")
+        return value
+
+    # --- Identifiers ---------------------------------------------------------
+
+    @field_validator("byu_id", mode="before")
+    @classmethod
+    def _validate_byu_id(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if not _BYU_ID_RE.match(value):
+            raise ValueError("Must be exactly 9 digits.")
+        return value
+
+    @field_validator("net_id", mode="before")
+    @classmethod
+    def _validate_net_id(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = value.strip().lower()
+        if not value:
+            return None
+        if not _NET_ID_RE.match(value):
+            raise ValueError(
+                "Must be 2-12 lowercase letters and digits."
+            )
+        return value
+
+    @field_validator("mst_id", mode="before")
+    @classmethod
+    def _normalize_mst_id(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        return _empty_to_none(value)
+
+    # --- Years ---------------------------------------------------------------
+
+    @field_validator("graduation_year", "finance_program_year")
+    @classmethod
+    def _validate_year(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not (_YEAR_MIN <= value <= _YEAR_MAX):
+            raise ValueError(f"Must be between {_YEAR_MIN} and {_YEAR_MAX}.")
+        return value
+
+    # --- Free-text columns ---------------------------------------------------
+
+    @field_validator("gender", mode="before")
+    @classmethod
+    def _validate_gender(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if len(value) > _GENDER_MAX:
+            raise ValueError(f"Must be at most {_GENDER_MAX} characters.")
+        return value
+
+    @field_validator("graduate_degree", mode="before")
+    @classmethod
+    def _validate_graduate_degree(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if len(value) > _GRADUATE_DEGREE_MAX:
+            raise ValueError(
+                f"Must be at most {_GRADUATE_DEGREE_MAX} characters."
+            )
+        return value
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _validate_notes(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if len(value) > _NOTES_MAX:
+            raise ValueError(f"Must be at most {_NOTES_MAX} characters.")
+        return value
+
+    # --- LinkedIn URL --------------------------------------------------------
+
+    @field_validator("linkedin_url", mode="before")
+    @classmethod
+    def _validate_linkedin_url(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if len(value) > _LINKEDIN_MAX:
+            raise ValueError(f"Must be at most {_LINKEDIN_MAX} characters.")
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("Must be an http(s) URL.")
+        host = parts.hostname.lower()
+        if host != "linkedin.com" and not host.endswith(".linkedin.com"):
+            raise ValueError("Must be a linkedin.com URL.")
+        return value
 
 
 class AlumniCreate(AlumniBase):

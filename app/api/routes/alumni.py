@@ -13,7 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
 from app.schemas.alumni import AlumniCreate, AlumniPage, AlumniRead, AlumniUpdate
+from app.schemas.profile import (
+    InteractionCreate,
+    InteractionRead,
+    ProfileRead,
+    TaskCompleteUpdate,
+    TaskCreate,
+    TaskRead,
+)
 from app.services import alumni as service
+from app.services import profile as profile_service
 
 router = APIRouter(prefix="/alumni", tags=["alumni"])
 
@@ -59,26 +68,97 @@ async def get_alumni(
     return await service.get_alumni(session, alumni_id)
 
 
+@router.get("/{alumni_id}/profile", response_model=ProfileRead)
+async def get_alumni_profile(
+    alumni_id: int, _: RequireViewAccess, session: SessionDep
+) -> ProfileRead:
+    """Full profile aggregate (core + contact, career, employment, leadership,
+    engagement, surveys, interactions, tasks, attachments, audit) for the tabs."""
+    return await profile_service.get_profile(session, alumni_id)
+
+
+@router.post(
+    "/{alumni_id}/interactions",
+    response_model=InteractionRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_interaction(
+    alumni_id: int,
+    payload: InteractionCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> InteractionRead:
+    """Log an interaction on an alumni's timeline (full_access)."""
+    return await profile_service.add_interaction(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.post(
+    "/{alumni_id}/tasks",
+    response_model=TaskRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_task(
+    alumni_id: int,
+    payload: TaskCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> TaskRead:
+    """Create a follow-up task for an alumni (full_access)."""
+    return await profile_service.add_task(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.patch("/{alumni_id}/tasks/{task_id}", response_model=TaskRead)
+async def update_task_completion(
+    alumni_id: int,
+    task_id: int,
+    payload: TaskCompleteUpdate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> TaskRead:
+    """Toggle a follow-up task's completion state (full_access)."""
+    return await profile_service.set_task_completed(
+        session, alumni_id, task_id, payload.completed, actor_user_id=user.user_id
+    )
+
+
 @router.post("", response_model=AlumniRead, status_code=status.HTTP_201_CREATED)
 async def create_alumni(
-    payload: AlumniCreate, _: RequireFullAccess, session: SessionDep
+    payload: AlumniCreate, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
-    return await service.create_alumni(session, payload)
+    return await service.create_alumni(session, payload, actor_user_id=user.user_id)
 
 
 @router.patch("/{alumni_id}", response_model=AlumniRead)
 async def update_alumni(
     alumni_id: int,
     payload: AlumniUpdate,
-    _: RequireFullAccess,
+    user: RequireFullAccess,
     session: SessionDep,
 ) -> AlumniRead:
-    return await service.update_alumni(session, alumni_id, payload)
+    return await service.update_alumni(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
 
 
 @router.delete("/{alumni_id}", response_model=AlumniRead)
 async def archive_alumni(
-    alumni_id: int, _: RequireFullAccess, session: SessionDep
+    alumni_id: int, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
     """Soft-delete (archive) an alumni record."""
-    return await service.archive_alumni(session, alumni_id)
+    return await service.archive_alumni(
+        session, alumni_id, actor_user_id=user.user_id
+    )
+
+
+@router.post("/{alumni_id}/restore", response_model=AlumniRead)
+async def restore_alumni(
+    alumni_id: int, user: RequireFullAccess, session: SessionDep
+) -> AlumniRead:
+    """Restore (unarchive) a previously archived alumni record."""
+    return await service.restore_alumni(
+        session, alumni_id, actor_user_id=user.user_id
+    )

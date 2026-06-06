@@ -24,3 +24,15 @@ class TimestampMixin:
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class CreatedAtMixin:
+    """Adds a ``created_at`` timestamptz column only.
+
+    For append-only / join tables that have no ``updated_at`` in
+    ``database/schema.sql`` (e.g. ``alumni_tags``, ``finance_society_leadership``).
+    """
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

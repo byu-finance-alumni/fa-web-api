@@ -13,11 +13,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api.routes import alumni, auth, health
+from app.api.routes import (
+    admin,
+    alumni,
+    audit,
+    auth,
+    dashboard,
+    events,
+    geography,
+    health,
+)
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.errors import ConflictError, NotFoundError
 from app.core.security import AuthError, AuthorizationError
+from app.core.security_log import log_security_event
 
 logging.basicConfig(level=logging.INFO)
 
@@ -57,11 +67,20 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(alumni.router)
+app.include_router(dashboard.router)
+app.include_router(admin.router)
+app.include_router(events.router)
+app.include_router(audit.router)
+app.include_router(geography.router)
 
 
 @app.exception_handler(AuthError)
 async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
     """Return 401 with the project error envelope for auth failures."""
+    # Bad / missing / expired / forged token — a probe or a stale session.
+    log_security_event(
+        request, "auth_failed", status_code=401, detail=exc.message
+    )
     return JSONResponse(
         status_code=status.HTTP_401_UNAUTHORIZED,
         content={"error": {"code": "unauthorized", "message": exc.message}},
@@ -74,6 +93,15 @@ async def authorization_error_handler(
     request: Request, exc: AuthorizationError
 ) -> JSONResponse:
     """Return 403 with the project error envelope for permission failures."""
+    # Distinguish a valid-but-unprovisioned token (someone with a Supabase login
+    # who was never granted access — high signal under deny-all RLS) from a real
+    # user exceeding their role.
+    event = (
+        "not_provisioned"
+        if "provision" in exc.message.lower()
+        else "forbidden"
+    )
+    log_security_event(request, event, status_code=403, detail=exc.message)
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={"error": {"code": "forbidden", "message": exc.message}},
@@ -112,6 +140,35 @@ async def validation_error_handler(
             "error": {
                 "code": "validation_error",
                 "message": "Request validation failed.",
+            }
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all: log the failure and return the generic error envelope.
+
+    Never leaks the exception detail to the client (no stack traces / internals).
+    The security event records only the exception *type*; the full traceback goes
+    to the server logs for debugging.
+    """
+    log_security_event(
+        request,
+        "unhandled_error",
+        status_code=500,
+        detail=type(exc).__name__,
+        level=logging.ERROR,
+    )
+    logging.getLogger(__name__).exception(
+        "Unhandled error on %s %s", request.method, request.url.path
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": {
+                "code": "internal_error",
+                "message": "An unexpected error occurred.",
             }
         },
     )

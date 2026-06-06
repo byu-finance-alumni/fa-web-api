@@ -4,10 +4,10 @@ import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireViewAccess
+from app.api.dependencies.auth import RequireSuperAdmin
 from app.core.database import get_session
 from app.models.audit import AuditLog
 from app.repositories.audit import build_audit_query
@@ -19,7 +19,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("")
 async def list_audit(
-    _: RequireViewAccess,
+    _: RequireSuperAdmin,
     session: SessionDep,
     action_type: Annotated[
         str | None, Query(description="Exact action type, e.g. 'update'.")
@@ -40,10 +40,13 @@ async def list_audit(
         Query(description="Only events on/before this date (inclusive)."),
     ] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-) -> list[dict]:
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
     """Most recent audit events, newest first, with optional server-side
     filtering by action type, entity type, acting-user email, and date range.
-    All filtering happens in PostgreSQL."""
+    Paginated (offset + total) so forensic review can reach past the first
+    page — without it, events older than one page were invisible and could be
+    buried by flooding the log. All filtering happens in PostgreSQL."""
     # A bare date covers the whole day: bound the end at the last instant of
     # that day so same-day events are included regardless of their time.
     end_bound = (
@@ -56,35 +59,44 @@ async def list_audit(
         if date_from is not None
         else None
     )
-    stmt = build_audit_query(
+    base = build_audit_query(
         action_type=action_type,
         entity_type=entity_type,
         user=user,
         date_from=start_bound,
         date_to=end_bound,
-    ).limit(limit)
-    rows = (await session.execute(stmt)).all()
-    return [
-        {
-            "audit_log_id": a.audit_log_id,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
-            "user": email,
-            "action_type": a.action_type,
-            "entity_type": a.entity_type,
-            "entity_id": a.entity_id,
-            "field_name": a.field_name,
-            "old_value": a.old_value,
-            "new_value": a.new_value,
-        }
-        for a, email in rows
-    ]
+    )
+    total = await session.scalar(
+        select(func.count()).select_from(base.subquery())
+    )
+    rows = (await session.execute(base.limit(limit).offset(offset))).all()
+    return {
+        "items": [
+            {
+                "audit_log_id": a.audit_log_id,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "user": email,
+                "action_type": a.action_type,
+                "entity_type": a.entity_type,
+                "entity_id": a.entity_id,
+                "field_name": a.field_name,
+                "old_value": a.old_value,
+                "new_value": a.new_value,
+            }
+            for a, email in rows
+        ],
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/options")
-async def audit_options(_: RequireViewAccess, session: SessionDep) -> dict:
+async def audit_options(_: RequireSuperAdmin, session: SessionDep) -> dict:
     """Distinct, sorted, non-null action and entity types for the filter menu
-    (view access). Two small queries against ``audit_logs`` — the backend still
-    accepts any value, so the toolbar always offers an "Any" default too."""
+    (super admin only — the audit trail's old/new values can contain alumni
+    PII). Two small queries against ``audit_logs`` — the backend still accepts
+    any value, so the toolbar always offers an "Any" default too."""
     action_rows = (
         await session.execute(
             select(AuditLog.action_type)

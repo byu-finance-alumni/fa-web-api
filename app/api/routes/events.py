@@ -13,7 +13,8 @@ from app.core.errors import NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.event import Event, EventAttendance
-from app.schemas.event import EventCreate
+from app.schemas.event import EventCreate, EventUpdate
+from app.utils.sql import escape_like
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -68,10 +69,10 @@ async def list_events(
     if q:
         term = q.strip()
         if term:
-            pattern = f"%{term}%"
+            pattern = f"%{escape_like(term)}%"
             stmt = stmt.where(
-                Event.event_name.ilike(pattern)
-                | Event.event_location.ilike(pattern)
+                Event.event_name.ilike(pattern, escape="\\")
+                | Event.event_location.ilike(pattern, escape="\\")
             )
     if event_type:
         stmt = stmt.where(func.lower(Event.event_type) == event_type.strip().lower())
@@ -134,6 +135,61 @@ async def get_event(
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
+    att = await session.scalar(
+        select(func.count())
+        .select_from(EventAttendance)
+        .where(EventAttendance.event_id == event_id)
+    )
+    return _serialize(event, int(att or 0))
+
+
+def _audit_value(value) -> str | None:
+    """Normalise a field value for the audit log's text columns."""
+    if value is None:
+        return None
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    return str(value)
+
+
+@router.patch("/{event_id}")
+async def update_event(
+    event_id: int,
+    payload: EventUpdate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> dict:
+    """Partially update an event (full_access). Only the fields present in the
+    request body are applied; each changed field is audited with its old/new
+    value (entity_type "event", action "update"). 404 if the event is unknown."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+
+    changes = payload.model_dump(exclude_unset=True)
+    applied: dict[str, tuple[object, object]] = {}
+    for field, value in changes.items():
+        old = getattr(event, field)
+        if old != value:
+            applied[field] = (old, value)
+            setattr(event, field, value)
+
+    if applied:
+        for field, (old, new) in applied.items():
+            session.add(
+                AuditLog(
+                    user_id=user.user_id,
+                    action_type="update",
+                    entity_type="event",
+                    entity_id=event_id,
+                    field_name=field,
+                    old_value=_audit_value(old),
+                    new_value=_audit_value(new),
+                )
+            )
+        await session.commit()
+        await session.refresh(event)
+
     att = await session.scalar(
         select(func.count())
         .select_from(EventAttendance)

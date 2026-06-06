@@ -47,11 +47,18 @@ async def lifespan(app: FastAPI):
     await dispose_engine()
 
 
+# Security: never expose interactive docs / the OpenAPI schema or FastAPI's
+# debug tracebacks in production — the schema is a recon map of the full API.
+_is_prod = settings.environment == "production"
+
 app = FastAPI(
     title="BYU Finance Alumni Database API",
     description="Backend API and database layer for the BYU Finance Alumni Database.",
     version=__version__,
-    debug=settings.debug,
+    debug=settings.debug and not _is_prod,
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
     lifespan=lifespan,
 )
 
@@ -145,20 +152,39 @@ async def conflict_handler(request: Request, exc: ConflictError) -> JSONResponse
     )
 
 
+def _field_path(loc: tuple) -> str:
+    """Render a Pydantic error ``loc`` as a dotted field path.
+
+    Drops the leading request-section marker (``body`` / ``query`` / ``path``)
+    so the client sees ``first_name`` rather than ``body.first_name``. Never
+    includes the offending value, so no request input (possible PII) leaks.
+    """
+    parts = [str(p) for p in loc if p not in ("body", "query", "path")]
+    return ".".join(parts) if parts else "__root__"
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Return 422 with the project error envelope.
+    """Return 422 with the project error envelope plus per-field details.
 
-    The generic message avoids echoing request input (which may contain PII).
+    The top-level message stays generic; the ``fields`` array names each
+    failing field and its message so the UI can surface inline errors. We echo
+    only the field path and our own validation message — never the submitted
+    value (which may contain PII).
     """
+    fields = [
+        {"field": _field_path(err.get("loc", ())), "message": err.get("msg", "")}
+        for err in exc.errors()
+    ]
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "error": {
                 "code": "validation_error",
                 "message": "Request validation failed.",
+                "fields": fields,
             }
         },
     )
@@ -196,8 +222,10 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 @app.get("/", tags=["root"])
 async def root() -> dict[str, str]:
     """Root endpoint — basic service identification."""
-    return {
+    payload = {
         "service": "fa-web-api",
         "status": "ok",
-        "docs": "/docs",
     }
+    if not _is_prod:
+        payload["docs"] = "/docs"
+    return payload

@@ -93,3 +93,6 @@ desktop.ini
 # -----------------------------------------------------------------------------
 .claude/settings.local.json
 .vercel
+
+# Claude Code agent files - never tracked
+.claude/

@@ -286,3 +286,104 @@ def test_create_event_happy_path_creates_and_audits(client):
     assert audits[0].action_type == "create"
     assert audits[0].entity_id == 123
     assert audits[0].user_id == 1
+
+
+# --- update (PATCH /events/{id}) ----------------------------------------------
+
+
+def test_update_event_requires_auth(client):
+    response = client.patch("/events/7", json={"event_name": "Renamed"})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_update_event_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.patch("/events/7", json={"event_name": "Renamed"})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_update_event_unknown_is_404(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _FakeSession(event=None, attendee_rows=[])
+    )
+    response = client.patch("/events/999", json={"event_name": "Renamed"})
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_update_event_rejects_blank_name(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.patch("/events/7", json={"event_name": "   "})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+class _UpdateSession:
+    """Stand-in for the PATCH flow: returns a fixed event from get(), records
+    added audit rows, and answers the attendance-count scalar()."""
+
+    def __init__(self, event, attendance=0):
+        self._event = event
+        self._attendance = attendance
+        self.added: list = []
+        self.committed = False
+
+    async def get(self, _model, _pk):
+        return self._event
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+    async def refresh(self, _obj):
+        pass
+
+    async def scalar(self, _stmt):
+        return self._attendance
+
+
+def test_update_event_happy_path_updates_and_audits(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    event = _event()
+    session = _UpdateSession(event, attendance=5)
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.patch(
+        "/events/7",
+        json={"event_name": "Updated Night", "event_location": "Wilkinson Center"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["event_name"] == "Updated Night"
+    assert body["event_location"] == "Wilkinson Center"
+    assert body["attendance_count"] == 5
+    # The event object was mutated in place.
+    assert event.event_name == "Updated Night"
+    assert session.committed is True
+    # One audit row per changed field, each capturing old/new.
+    audits = [o for o in session.added if hasattr(o, "action_type")]
+    assert {a.field_name for a in audits} == {"event_name", "event_location"}
+    assert all(a.action_type == "update" for a in audits)
+    assert all(a.entity_type == "event" for a in audits)
+    assert all(a.entity_id == 7 for a in audits)
+    assert all(a.user_id == 1 for a in audits)
+    by_field = {a.field_name: a for a in audits}
+    assert by_field["event_name"].old_value == "Spring Networking Night"
+    assert by_field["event_name"].new_value == "Updated Night"
+
+
+def test_update_event_no_changes_skips_audit_and_commit(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    event = _event()
+    session = _UpdateSession(event, attendance=2)
+    app.dependency_overrides[get_session] = _with_session(session)
+    # Send the same name the event already has → no diff → no audit, no commit.
+    response = client.patch("/events/7", json={"event_name": "Spring Networking Night"})
+    assert response.status_code == 200
+    assert response.json()["attendance_count"] == 2
+    assert session.committed is False
+    assert [o for o in session.added if hasattr(o, "action_type")] == []

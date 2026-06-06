@@ -25,9 +25,6 @@ class Settings(BaseSettings):
     # Application
     environment: str = "development"
     debug: bool = False
-    # SQL statement echo is OFF by default — it floods the terminal. Turn it on
-    # only when actively debugging a query (SQL_ECHO=true), independent of DEBUG.
-    sql_echo: bool = False
 
     # Database — optional so the app can boot before a DB is provisioned.
     # Prefers DATABASE_URL, then the Supabase/Vercel integration's POSTGRES_URL

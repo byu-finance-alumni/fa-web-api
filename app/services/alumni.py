@@ -12,43 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
 from app.models.alumni import Alumni
-from app.models.audit import AuditLog
 from app.repositories import alumni as repo
 from app.schemas.alumni import AlumniCreate, AlumniUpdate
 
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
-
-
-def _audit(
-    session: AsyncSession,
-    actor_user_id: int | None,
-    action: str,
-    alumni_id: int,
-    *,
-    field_name: str | None = None,
-    old_value: object | None = None,
-    new_value: object | None = None,
-) -> None:
-    """Record an alumni audit event when an acting user is known.
-
-    For field-level changes (updates), ``field_name`` + old/new values are
-    captured so the audit doubles as version history. Values are stringified to
-    fit the ``text`` audit columns; ``None`` stays ``NULL``.
-    """
-    if actor_user_id is not None:
-        session.add(
-            AuditLog(
-                user_id=actor_user_id,
-                action_type=action,
-                entity_type="alumni",
-                entity_id=alumni_id,
-                field_name=field_name,
-                old_value=None if old_value is None else str(old_value),
-                new_value=None if new_value is None else str(new_value),
-            )
-        )
 
 
 async def get_alumni(session: AsyncSession, alumni_id: int) -> Alumni:
@@ -71,76 +40,45 @@ async def list_alumni(
     return await repo.list_page(session, limit=limit, offset=offset, **filters)
 
 
-async def create_alumni(
-    session: AsyncSession,
-    payload: AlumniCreate,
-    actor_user_id: int | None = None,
-) -> Alumni:
+async def create_alumni(session: AsyncSession, payload: AlumniCreate) -> Alumni:
     alumnus = Alumni(**payload.model_dump(exclude_unset=True))
     session.add(alumnus)
-    if actor_user_id is not None:
-        await session.flush()
-        _audit(session, actor_user_id, "create", alumnus.alumni_id)
     await session.commit()
     await session.refresh(alumnus)
     return alumnus
 
 
 async def update_alumni(
-    session: AsyncSession,
-    alumni_id: int,
-    payload: AlumniUpdate,
-    actor_user_id: int | None = None,
+    session: AsyncSession, alumni_id: int, payload: AlumniUpdate
 ) -> Alumni:
     alumnus = await get_alumni(session, alumni_id)
     changes = payload.model_dump(exclude_unset=True)
-    # Only audit fields that actually changed; capture before/after per field.
-    applied: dict[str, tuple[object, object]] = {}
     for field, value in changes.items():
-        old = getattr(alumnus, field)
-        if old != value:
-            applied[field] = (old, value)
-            setattr(alumnus, field, value)
-    if applied:
+        setattr(alumnus, field, value)
+    if changes:
         alumnus.manually_edited_at = _now()
-        for field, (old, new) in applied.items():
-            _audit(
-                session,
-                actor_user_id,
-                "update",
-                alumni_id,
-                field_name=field,
-                old_value=old,
-                new_value=new,
-            )
         await session.commit()
         await session.refresh(alumnus)
     return alumnus
 
 
-async def archive_alumni(
-    session: AsyncSession, alumni_id: int, actor_user_id: int | None = None
-) -> Alumni:
+async def archive_alumni(session: AsyncSession, alumni_id: int) -> Alumni:
     """Soft-delete: flag the record archived. Idempotent."""
     alumnus = await get_alumni(session, alumni_id)
     if not alumnus.archived:
         alumnus.archived = True
         alumnus.manually_edited_at = _now()
-        _audit(session, actor_user_id, "archive", alumni_id)
         await session.commit()
         await session.refresh(alumnus)
     return alumnus
 
 
-async def restore_alumni(
-    session: AsyncSession, alumni_id: int, actor_user_id: int | None = None
-) -> Alumni:
-    """Reverse a soft-delete (unarchive). Idempotent."""
+async def restore_alumni(session: AsyncSession, alumni_id: int) -> Alumni:
+    """Reverse a soft-delete. Idempotent."""
     alumnus = await get_alumni(session, alumni_id)
     if alumnus.archived:
         alumnus.archived = False
         alumnus.manually_edited_at = _now()
-        _audit(session, actor_user_id, "restore", alumni_id)
         await session.commit()
         await session.refresh(alumnus)
     return alumnus

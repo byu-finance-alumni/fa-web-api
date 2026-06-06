@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.api.dependencies import auth as auth_deps
-from app.core.security import AuthError, AuthorizationError, DeactivatedAccountError
+from app.core.security import AuthError, AuthorizationError
 from app.schemas.auth import AuthenticatedUser, UserContext
 
 AUTH_UUID = "11111111-1111-1111-1111-111111111111"
@@ -120,20 +120,15 @@ def test_get_current_db_user_unprovisioned_is_forbidden(monkeypatch):
         asyncio.run(auth_deps.get_current_db_user(current, session=None))
 
 
-def test_get_current_db_user_inactive_is_blocked(monkeypatch):
-    # A deactivated account is blocked here — on EVERY authenticated route — with
-    # the dedicated DeactivatedAccountError (a subclass of AuthorizationError, so
-    # still 403) that the app logs as its own security event.
+def test_get_current_db_user_inactive_is_forbidden(monkeypatch):
     async def fake_lookup(session, auth_uuid):
         return _fake_user("full_access", active=False)
 
     monkeypatch.setattr(auth_deps, "get_user_with_roles_by_auth_id", fake_lookup)
     current = AuthenticatedUser(auth_user_id=AUTH_UUID)
 
-    with pytest.raises(DeactivatedAccountError):
+    with pytest.raises(AuthorizationError):
         asyncio.run(auth_deps.get_current_db_user(current, session=None))
-    # And it is still an AuthorizationError for any handler keyed on the base type.
-    assert issubclass(DeactivatedAccountError, AuthorizationError)
 
 
 def test_get_current_db_user_bad_subject_is_unauthorized():

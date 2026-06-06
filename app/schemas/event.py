@@ -11,7 +11,6 @@ import datetime
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-
 # Max accepted lengths for the free-text event fields (defence-in-depth caps so
 # a client cannot push unbounded text into the column / audit log).
 _TYPE_MAX = 255

@@ -19,6 +19,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.crm import FollowUpTask, Interaction
 from app.models.employment import CurrentEmployment
 from app.models.user import User
+from app.utils.sql import escape_like
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -203,17 +204,21 @@ async def activity_feed(
     # Build the shared filter predicates once so the count and the page agree.
     conditions = []
     if q and q.strip():
-        like = f"%{q.strip()}%"
+        like = f"%{escape_like(q.strip())}%"
         conditions.append(
             or_(
-                Alumni.first_name.ilike(like),
-                Alumni.last_name.ilike(like),
-                Alumni.preferred_first_name.ilike(like),
-                Interaction.interaction_type.ilike(like),
+                Alumni.first_name.ilike(like, escape="\\"),
+                Alumni.last_name.ilike(like, escape="\\"),
+                Alumni.preferred_first_name.ilike(like, escape="\\"),
+                Interaction.interaction_type.ilike(like, escape="\\"),
             )
         )
     if type and type.strip():
-        conditions.append(Interaction.interaction_type.ilike(type.strip()))
+        conditions.append(
+            Interaction.interaction_type.ilike(
+                escape_like(type.strip()), escape="\\"
+            )
+        )
     # A bare date covers the whole day: expand to full-day UTC bounds so
     # same-day interactions are included regardless of their time.
     if date_from is not None:

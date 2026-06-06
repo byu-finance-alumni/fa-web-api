@@ -15,6 +15,7 @@ from sqlalchemy import Select, and_, select
 
 from app.models.audit import AuditLog
 from app.models.user import User
+from app.utils.sql import escape_like
 
 
 def build_audit_query(
@@ -38,7 +39,9 @@ def build_audit_query(
     if entity_type:
         conditions.append(AuditLog.entity_type == entity_type)
     if user:
-        conditions.append(User.email.ilike(f"%{user}%"))
+        conditions.append(
+            User.email.ilike(f"%{escape_like(user)}%", escape="\\")
+        )
     if date_from is not None:
         conditions.append(AuditLog.created_at >= date_from)
     if date_to is not None:

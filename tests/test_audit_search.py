@@ -129,8 +129,19 @@ def test_audit_options_requires_auth(client):
     assert response.json()["error"]["code"] == "unauthorized"
 
 
+@pytest.mark.parametrize("path", ["/audit", "/audit/options"])
+@pytest.mark.parametrize("role", ["view_only", "full_access"])
+def test_audit_rejects_non_super_admin(client, path, role):
+    """The audit trail (old/new values may contain alumni PII) is super_admin
+    only — view and full access must both get 403."""
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    response = client.get(path)
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
 def test_audit_options_returns_distinct_action_and_entity_types(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
     # First execute() -> action types, second -> entity types.
     app.dependency_overrides[get_session] = _with_session(
         _FakeSession(

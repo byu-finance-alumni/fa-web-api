@@ -20,6 +20,7 @@ from app.models.duplicate import DuplicateCandidate
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import EventAttendance
+from app.utils.sql import escape_like
 
 
 async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
@@ -59,15 +60,15 @@ def build_alumni_query(
     if not include_archived:
         conditions.append(Alumni.archived.is_(False))
     if q:
-        like = f"%{q}%"
+        like = f"%{escape_like(q)}%"
         conditions.append(
             or_(
-                Alumni.first_name.ilike(like),
-                Alumni.last_name.ilike(like),
-                Alumni.preferred_first_name.ilike(like),
-                Alumni.middle_name.ilike(like),
-                Alumni.byu_id.ilike(like),
-                Alumni.net_id.ilike(like),
+                Alumni.first_name.ilike(like, escape="\\"),
+                Alumni.last_name.ilike(like, escape="\\"),
+                Alumni.preferred_first_name.ilike(like, escape="\\"),
+                Alumni.middle_name.ilike(like, escape="\\"),
+                Alumni.byu_id.ilike(like, escape="\\"),
+                Alumni.net_id.ilike(like, escape="\\"),
             )
         )
     if graduation_year is not None:
@@ -83,7 +84,9 @@ def build_alumni_query(
             select(CurrentEmployment.current_employment_id)
             .where(
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
-                CurrentEmployment.current_employer.ilike(employer),
+                CurrentEmployment.current_employer.ilike(
+                    escape_like(employer), escape="\\"
+                ),
             )
             .exists()
         )
@@ -94,8 +97,12 @@ def build_alumni_query(
             .where(
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
                 or_(
-                    CurrentEmployment.current_industry.ilike(industry),
-                    CurrentEmployment.current_industry_secondary.ilike(industry),
+                    CurrentEmployment.current_industry.ilike(
+                        escape_like(industry), escape="\\"
+                    ),
+                    CurrentEmployment.current_industry_secondary.ilike(
+                        escape_like(industry), escape="\\"
+                    ),
                 ),
             )
             .exists()

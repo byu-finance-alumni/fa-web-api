@@ -1,0 +1,1 @@
+- [Core AppSec Context](project-appsec-context.md) — auth/authz layer, SQL safety patterns, LIKE wildcard issue, XSS blast radius, log injection, /docs exposure, known gaps

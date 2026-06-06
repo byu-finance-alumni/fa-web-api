@@ -10,6 +10,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Attachment, FollowUpTask, Interaction, Survey
 from app.models.data_source import DataSource
+from app.models.duplicate import DuplicateCandidate
 from app.models.employment import (
     CurrentEmployment,
     EducationHistory,
@@ -35,6 +36,7 @@ __all__ = [
     "AuditLog",
     "CurrentEmployment",
     "DataSource",
+    "DuplicateCandidate",
     "EducationHistory",
     "EmploymentHistory",
     "Event",

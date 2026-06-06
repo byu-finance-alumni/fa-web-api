@@ -1,5 +1,6 @@
 """Audit log listing route."""
 
+import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies.auth import RequireViewAccess
 from app.core.database import get_session
 from app.models.audit import AuditLog
-from app.models.user import User
+from app.repositories.audit import build_audit_query
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
@@ -20,17 +21,49 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 async def list_audit(
     _: RequireViewAccess,
     session: SessionDep,
+    action_type: Annotated[
+        str | None, Query(description="Exact action type, e.g. 'update'.")
+    ] = None,
+    entity_type: Annotated[
+        str | None, Query(description="Exact entity type, e.g. 'alumni'.")
+    ] = None,
+    user: Annotated[
+        str | None,
+        Query(description="Acting user's email (case-insensitive substring)."),
+    ] = None,
+    date_from: Annotated[
+        datetime.date | None,
+        Query(description="Only events on/after this date (inclusive)."),
+    ] = None,
+    date_to: Annotated[
+        datetime.date | None,
+        Query(description="Only events on/before this date (inclusive)."),
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> list[dict]:
-    """Most recent audit events, newest first."""
-    rows = (
-        await session.execute(
-            select(AuditLog, User.email)
-            .outerjoin(User, AuditLog.user_id == User.user_id)
-            .order_by(AuditLog.created_at.desc())
-            .limit(limit)
-        )
-    ).all()
+    """Most recent audit events, newest first, with optional server-side
+    filtering by action type, entity type, acting-user email, and date range.
+    All filtering happens in PostgreSQL."""
+    # A bare date covers the whole day: bound the end at the last instant of
+    # that day so same-day events are included regardless of their time.
+    end_bound = (
+        datetime.datetime.combine(date_to, datetime.time.max, tzinfo=datetime.UTC)
+        if date_to is not None
+        else None
+    )
+    start_bound = (
+        datetime.datetime.combine(date_from, datetime.time.min, tzinfo=datetime.UTC)
+        if date_from is not None
+        else None
+    )
+    stmt = build_audit_query(
+        action_type=action_type,
+        entity_type=entity_type,
+        user=user,
+        date_from=start_bound,
+        date_to=end_bound,
+    ).limit(limit)
+    rows = (await session.execute(stmt)).all()
     return [
         {
             "audit_log_id": a.audit_log_id,
@@ -45,3 +78,30 @@ async def list_audit(
         }
         for a, email in rows
     ]
+
+
+@router.get("/options")
+async def audit_options(_: RequireViewAccess, session: SessionDep) -> dict:
+    """Distinct, sorted, non-null action and entity types for the filter menu
+    (view access). Two small queries against ``audit_logs`` — the backend still
+    accepts any value, so the toolbar always offers an "Any" default too."""
+    action_rows = (
+        await session.execute(
+            select(AuditLog.action_type)
+            .where(AuditLog.action_type.isnot(None))
+            .distinct()
+            .order_by(AuditLog.action_type)
+        )
+    ).all()
+    entity_rows = (
+        await session.execute(
+            select(AuditLog.entity_type)
+            .where(AuditLog.entity_type.isnot(None))
+            .distinct()
+            .order_by(AuditLog.entity_type)
+        )
+    ).all()
+    return {
+        "action_types": [r[0] for r in action_rows if r[0]],
+        "entity_types": [r[0] for r in entity_rows if r[0]],
+    }

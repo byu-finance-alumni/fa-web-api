@@ -26,7 +26,7 @@ from app.api.routes import (
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.errors import ConflictError, NotFoundError
-from app.core.security import AuthError, AuthorizationError
+from app.core.security import AuthError, AuthorizationError, DeactivatedAccountError
 from app.core.security_log import log_security_event
 
 logging.basicConfig(level=logging.INFO)
@@ -85,6 +85,25 @@ async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
         status_code=status.HTTP_401_UNAUTHORIZED,
         content={"error": {"code": "unauthorized", "message": exc.message}},
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@app.exception_handler(DeactivatedAccountError)
+async def deactivated_account_handler(
+    request: Request, exc: DeactivatedAccountError
+) -> JSONResponse:
+    """Return 403 for a deactivated account attempting an authenticated request.
+
+    Logged as its own ``account_deactivated`` security event: a valid token whose
+    user has been deactivated is high signal (an offboarded / suspended account
+    still trying to act).
+    """
+    log_security_event(
+        request, "account_deactivated", status_code=403, detail=exc.message
+    )
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"error": {"code": "forbidden", "message": exc.message}},
     )
 
 

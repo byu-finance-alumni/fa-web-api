@@ -62,6 +62,12 @@ def test_delete_forbidden_for_view_only(client):
     assert response.status_code == 403
 
 
+def test_restore_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.post("/alumni/1/restore")
+    assert response.status_code == 403
+
+
 def test_create_rejects_empty_identifier(client):
     # full_access passes the guard; the body fails the "at least one identifier"
     # rule, so this is a 422 (validation), not a 403.

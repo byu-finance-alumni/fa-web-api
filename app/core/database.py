@@ -40,14 +40,14 @@ if settings.async_database_url:
     if _is_transaction_pooler:
         engine = create_async_engine(
             _url,
-            echo=settings.debug,
+            echo=settings.sql_echo,
             poolclass=NullPool,
             connect_args={"statement_cache_size": 0},
         )
     else:
         engine = create_async_engine(
             _url,
-            echo=settings.debug,
+            echo=settings.sql_echo,
             pool_pre_ping=True,
         )
 

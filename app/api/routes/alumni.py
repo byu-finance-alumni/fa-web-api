@@ -43,6 +43,43 @@ async def list_alumni(
     deceased: Annotated[
         bool | None, Query(description="Filter by deceased flag.")
     ] = None,
+    employer: Annotated[
+        str | None,
+        Query(description="Current employer (case-insensitive exact match)."),
+    ] = None,
+    industry: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Current industry / work area, primary or secondary "
+                "(case-insensitive exact match)."
+            )
+        ),
+    ] = None,
+    attended_event: Annotated[
+        bool, Query(description="Only alumni who attended at least one event.")
+    ] = False,
+    donor: Annotated[
+        bool, Query(description="Only PIFF donors.")
+    ] = False,
+    mentor_willing: Annotated[
+        bool, Query(description="Only alumni willing to mentor.")
+    ] = False,
+    guest_speaker_willing: Annotated[
+        bool, Query(description="Only alumni willing to guest speak.")
+    ] = False,
+    missing_email: Annotated[
+        bool,
+        Query(description="Only alumni with no contact-info email on file."),
+    ] = False,
+    missing_employer: Annotated[
+        bool,
+        Query(description="Only alumni with no current employer on file."),
+    ] = False,
+    duplicate: Annotated[
+        bool,
+        Query(description="Only alumni flagged as duplicate candidates."),
+    ] = False,
     include_archived: bool = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -56,6 +93,15 @@ async def list_alumni(
         grad_year_min=grad_year_min,
         grad_year_max=grad_year_max,
         deceased=deceased,
+        employer=employer,
+        industry=industry,
+        attended_event=attended_event,
+        donor=donor,
+        mentor_willing=mentor_willing,
+        guest_speaker_willing=guest_speaker_willing,
+        missing_email=missing_email,
+        missing_employer=missing_employer,
+        duplicate=duplicate,
         include_archived=include_archived,
     )
     return AlumniPage(items=items, total=total, limit=limit, offset=offset)

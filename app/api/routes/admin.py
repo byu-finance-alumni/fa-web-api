@@ -35,6 +35,19 @@ class RoleAssign(BaseModel):
     role_name: RoleName
 
 
+class UserActiveUpdate(BaseModel):
+    """Activate or deactivate an existing user account.
+
+    The project never hard-deletes users; deactivation flips ``users.active`` to
+    false, which the auth dependency layer enforces — a deactivated user is
+    blocked (403) on every authenticated route.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    active: bool
+
+
 def _serialize(u: User) -> dict:
     return {
         "user_id": u.user_id,
@@ -62,6 +75,45 @@ async def list_users(_: RequireSuperAdmin, session: SessionDep) -> list[dict]:
         select(User).options(selectinload(User.roles)).order_by(User.email)
     )
     return [_serialize(u) for u in rows.all()]
+
+
+@router.patch("/users/{user_id}")
+async def set_user_active(
+    user_id: int,
+    payload: UserActiveUpdate,
+    actor: RequireSuperAdmin,
+    session: SessionDep,
+) -> dict:
+    """Deactivate or reactivate an existing user. super_admin only.
+
+    Deactivation is the project's stand-in for removing access (users are never
+    hard-deleted): once ``active`` is false the auth dependency rejects every
+    authenticated request from that user. A super_admin cannot deactivate their
+    own account — that could lock administration out of the system. Every change
+    is audited; a no-op (already in the requested state) is idempotent and not
+    re-audited.
+    """
+    if payload.active is False and user_id == actor.user_id:
+        raise ConflictError("You cannot deactivate your own account.")
+
+    user = await _load_user(session, user_id)
+
+    if user.active != payload.active:
+        old_active = user.active
+        user.active = payload.active
+        session.add(
+            AuditLog(
+                user_id=actor.user_id,
+                action_type="activate_user" if payload.active else "deactivate_user",
+                entity_type="user",
+                entity_id=user_id,
+                field_name="active",
+                old_value=str(old_active),
+                new_value=str(payload.active),
+            )
+        )
+        await session.commit()
+    return _serialize(await _load_user(session, user_id))
 
 
 @router.post("/users/{user_id}/roles")

@@ -11,10 +11,15 @@ here is structured so those conditions can be added as joins without reshaping
 callers.
 """
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alumni import Alumni
+from app.models.contact import AlumniContactInfo
+from app.models.duplicate import DuplicateCandidate
+from app.models.employment import CurrentEmployment
+from app.models.engagement import AlumniProgramEngagement
+from app.models.event import EventAttendance
 
 
 async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
@@ -28,9 +33,28 @@ def build_alumni_query(
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
     deceased: bool | None = None,
+    employer: str | None = None,
+    industry: str | None = None,
+    attended_event: bool = False,
+    donor: bool = False,
+    mentor_willing: bool = False,
+    guest_speaker_willing: bool = False,
+    missing_email: bool = False,
+    missing_employer: bool = False,
+    duplicate: bool = False,
     include_archived: bool = False,
 ) -> Select:
-    """Build the filtered ``SELECT alumni`` statement (without limit/offset)."""
+    """Build the filtered ``SELECT alumni`` statement (without limit/offset).
+
+    The missing-data filters mirror the dashboard's KPI logic exactly so the
+    "Review" deep-links land on the same population the dashboard counted:
+      * ``missing_email``    — no contact-info row with a personal/work email
+      * ``missing_employer`` — no current-employment row naming an employer
+      * ``duplicate``        — the alumnus appears on either side of a
+        ``duplicate_candidates`` pair
+    All conditions are correlated EXISTS subqueries so filtering stays in
+    PostgreSQL (never client-side) and the plan is stable at scale.
+    """
     conditions = []
     if not include_archived:
         conditions.append(Alumni.archived.is_(False))
@@ -54,10 +78,105 @@ def build_alumni_query(
         conditions.append(Alumni.graduation_year <= grad_year_max)
     if deceased is not None:
         conditions.append(Alumni.deceased.is_(deceased))
+    if employer:
+        at_employer = (
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                CurrentEmployment.current_employer.ilike(employer),
+            )
+            .exists()
+        )
+        conditions.append(at_employer)
+    if industry:
+        in_industry = (
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                or_(
+                    CurrentEmployment.current_industry.ilike(industry),
+                    CurrentEmployment.current_industry_secondary.ilike(industry),
+                ),
+            )
+            .exists()
+        )
+        conditions.append(in_industry)
+    if attended_event:
+        has_attended = (
+            select(EventAttendance.event_attendance_id)
+            .where(EventAttendance.alumni_id == Alumni.alumni_id)
+            .exists()
+        )
+        conditions.append(has_attended)
+    if donor:
+        is_donor = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                AlumniProgramEngagement.piff_donor.is_(True),
+            )
+            .exists()
+        )
+        conditions.append(is_donor)
+    if mentor_willing:
+        is_mentor = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                AlumniProgramEngagement.mentor_willing.is_(True),
+            )
+            .exists()
+        )
+        conditions.append(is_mentor)
+    if guest_speaker_willing:
+        is_speaker = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                AlumniProgramEngagement.guest_speaker_willing.is_(True),
+            )
+            .exists()
+        )
+        conditions.append(is_speaker)
+    if missing_email:
+        has_email = (
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                or_(
+                    AlumniContactInfo.personal_email.is_not(None),
+                    AlumniContactInfo.work_email.is_not(None),
+                ),
+            )
+            .exists()
+        )
+        conditions.append(~has_email)
+    if missing_employer:
+        has_employer = (
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                CurrentEmployment.current_employer.is_not(None),
+            )
+            .exists()
+        )
+        conditions.append(~has_employer)
+    if duplicate:
+        is_duplicate = (
+            select(DuplicateCandidate.duplicate_candidate_id)
+            .where(
+                or_(
+                    DuplicateCandidate.alumni_id_1 == Alumni.alumni_id,
+                    DuplicateCandidate.alumni_id_2 == Alumni.alumni_id,
+                )
+            )
+            .exists()
+        )
+        conditions.append(is_duplicate)
 
     stmt = select(Alumni)
     if conditions:
-        stmt = stmt.where(*conditions)
+        stmt = stmt.where(and_(*conditions))
     return stmt
 
 

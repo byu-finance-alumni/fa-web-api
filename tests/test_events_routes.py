@@ -387,3 +387,185 @@ def test_update_event_no_changes_skips_audit_and_commit(client):
     assert response.json()["attendance_count"] == 2
     assert session.committed is False
     assert [o for o in session.added if hasattr(o, "action_type")] == []
+
+
+# --- add attendee (POST /events/{id}/attendees) -------------------------------
+
+
+class _AddAttendeeSession:
+    """Stand-in for the add-attendee flow. ``get`` returns the event then the
+    alumni in call order; ``scalar`` answers the duplicate-existence probe;
+    added rows (attendance + audit) are recorded."""
+
+    def __init__(self, *, event, alumni, existing=None):
+        self._gets = [event, alumni]
+        self._existing = existing
+        self.added: list = []
+        self.committed = False
+
+    async def get(self, _model, _pk):
+        return self._gets.pop(0) if self._gets else None
+
+    async def scalar(self, _stmt):
+        return self._existing
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+
+def test_add_attendee_requires_auth(client):
+    response = client.post("/events/7/attendees", json={"alumni_id": 42})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_add_attendee_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.post("/events/7/attendees", json={"alumni_id": 42})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_add_attendee_rejects_unknown_keys(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post(
+        "/events/7/attendees", json={"alumni_id": 42, "bogus": "x"}
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_add_attendee_unknown_event_is_404(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _AddAttendeeSession(event=None, alumni=_attendee())
+    )
+    response = client.post("/events/999/attendees", json={"alumni_id": 42})
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_add_attendee_unknown_alumni_is_404(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _AddAttendeeSession(event=_event(), alumni=None)
+    )
+    response = client.post("/events/7/attendees", json={"alumni_id": 999})
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_add_attendee_duplicate_is_409(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _AddAttendeeSession(event=_event(), alumni=_attendee(), existing=55)
+    )
+    response = client.post("/events/7/attendees", json={"alumni_id": 42})
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
+
+
+def test_add_attendee_happy_path_creates_and_audits(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _AddAttendeeSession(event=_event(), alumni=_attendee())
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.post(
+        "/events/7/attendees",
+        json={"alumni_id": 42, "attendance_status": "attended"},
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body == {
+        "alumni_id": 42,
+        "name": "Jane Doe",
+        "graduation_year": 2018,
+        "attendance_status": "attended",
+    }
+    assert session.committed is True
+    attendance = [o for o in session.added if hasattr(o, "alumni_id")]
+    audits = [o for o in session.added if hasattr(o, "action_type")]
+    assert len(attendance) == 1
+    assert attendance[0].event_id == 7
+    assert attendance[0].alumni_id == 42
+    assert attendance[0].attendance_status == "attended"
+    assert len(audits) == 1
+    assert audits[0].action_type == "add_attendee"
+    assert audits[0].entity_type == "event"
+    assert audits[0].entity_id == 7
+    assert audits[0].user_id == 1
+    assert "42" in audits[0].new_value
+    assert "Jane Doe" in audits[0].new_value
+
+
+# --- remove attendee (DELETE /events/{id}/attendees/{alumni_id}) --------------
+
+
+class _RemoveAttendeeSession:
+    """Stand-in for the remove-attendee flow. ``scalar`` returns the attendance
+    row to delete (or None); deletions and added audit rows are recorded."""
+
+    def __init__(self, attendance):
+        self._attendance = attendance
+        self.added: list = []
+        self.deleted: list = []
+        self.committed = False
+
+    async def scalar(self, _stmt):
+        return self._attendance
+
+    async def delete(self, obj):
+        self.deleted.append(obj)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+
+def test_remove_attendee_requires_auth(client):
+    response = client.delete("/events/7/attendees/42")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_remove_attendee_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.delete("/events/7/attendees/42")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_remove_attendee_not_present_is_404(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _RemoveAttendeeSession(attendance=None)
+    )
+    response = client.delete("/events/7/attendees/42")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_remove_attendee_happy_path_deletes_and_audits(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    attendance = SimpleNamespace(
+        event_attendance_id=99, event_id=7, alumni_id=42
+    )
+    session = _RemoveAttendeeSession(attendance=attendance)
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.delete("/events/7/attendees/42")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"event_id": 7, "alumni_id": 42, "removed": True}
+    assert session.committed is True
+    assert session.deleted == [attendance]
+    audits = [o for o in session.added if hasattr(o, "action_type")]
+    assert len(audits) == 1
+    assert audits[0].action_type == "remove_attendee"
+    assert audits[0].entity_type == "event"
+    assert audits[0].entity_id == 7
+    assert audits[0].user_id == 1
+    assert audits[0].old_value == "42"

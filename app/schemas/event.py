@@ -16,6 +16,30 @@ from pydantic import BaseModel, ConfigDict, field_validator
 _TYPE_MAX = 255
 _LOCATION_MAX = 255
 _NOTES_MAX = 10000
+_STATUS_MAX = 100
+
+
+class AttendeeCreate(BaseModel):
+    """Body for adding an attendee to an event (full_access). ``extra='forbid'``
+    rejects unknown keys; ``alumni_id`` is required; ``attendance_status`` is an
+    optional free-text label capped at 100 chars (blank collapses to None)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alumni_id: int
+    attendance_status: str | None = None
+
+    @field_validator("attendance_status")
+    @classmethod
+    def _status_blank_to_none_capped(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if len(stripped) > _STATUS_MAX:
+            raise ValueError(f"must be at most {_STATUS_MAX} characters.")
+        return stripped
 
 
 class EventCreate(BaseModel):

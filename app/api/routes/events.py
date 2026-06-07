@@ -9,11 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
-from app.core.errors import NotFoundError
+from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.event import Event, EventAttendance
-from app.schemas.event import EventCreate, EventUpdate
+from app.schemas.event import AttendeeCreate, EventCreate, EventUpdate
 from app.utils.sql import escape_like
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -231,3 +231,92 @@ async def list_event_attendees(
         }
         for a, status in rows
     ]
+
+
+@router.post("/{event_id}/attendees", status_code=status.HTTP_201_CREATED)
+async def add_event_attendee(
+    event_id: int,
+    payload: AttendeeCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> dict:
+    """Add an alumni to an event's attendance (full_access). 404 if the event or
+    alumni is unknown; 409 if the (event, alumni) pair already exists. Audits the
+    write (entity_type "event", action "add_attendee", entity_id event_id,
+    new_value the alumni id/name)."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    alumni = await session.get(Alumni, payload.alumni_id)
+    if alumni is None:
+        raise NotFoundError(f"Alumni {payload.alumni_id} not found.")
+
+    existing = await session.scalar(
+        select(EventAttendance.event_attendance_id).where(
+            EventAttendance.event_id == event_id,
+            EventAttendance.alumni_id == payload.alumni_id,
+        )
+    )
+    if existing is not None:
+        raise ConflictError(
+            f"Alumni {payload.alumni_id} is already an attendee of event {event_id}."
+        )
+
+    attendance = EventAttendance(
+        event_id=event_id,
+        alumni_id=payload.alumni_id,
+        attendance_status=payload.attendance_status,
+    )
+    session.add(attendance)
+    name = _attendee_name(alumni)
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="add_attendee",
+            entity_type="event",
+            entity_id=event_id,
+            new_value=f"{payload.alumni_id}: {name}",
+        )
+    )
+    await session.commit()
+    return {
+        "alumni_id": alumni.alumni_id,
+        "name": name,
+        "graduation_year": alumni.graduation_year,
+        "attendance_status": payload.attendance_status,
+    }
+
+
+@router.delete("/{event_id}/attendees/{alumni_id}")
+async def remove_event_attendee(
+    event_id: int,
+    alumni_id: int,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> dict:
+    """Remove an alumni from an event's attendance (full_access). 404 if no such
+    attendance row exists. Audits the write (entity_type "event", action
+    "remove_attendee", entity_id event_id, old_value the alumni id)."""
+    attendance = await session.scalar(
+        select(EventAttendance).where(
+            EventAttendance.event_id == event_id,
+            EventAttendance.alumni_id == alumni_id,
+        )
+    )
+    if attendance is None:
+        raise NotFoundError(
+            f"Alumni {alumni_id} is not an attendee of event {event_id}."
+        )
+
+    await session.delete(attendance)
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="remove_attendee",
+            entity_type="event",
+            entity_id=event_id,
+            old_value=str(alumni_id),
+        )
+    )
+    await session.commit()
+    return {"event_id": event_id, "alumni_id": alumni_id, "removed": True}

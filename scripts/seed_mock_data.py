@@ -60,22 +60,22 @@ MOCK_SOURCE_NAME = "MOCK_DATA"
 # (grad-year range, deceased, archived, search). Employer/location live in
 # related tables (not modeled yet), so these cover the alumni core only.
 MOCK_ALUMNI: list[dict] = [
-    {"byu_id": "00-100-001", "net_id": "jdoe1", "first_name": "James", "last_name": "Doe", "gender": "M", "graduation_year": 2012, "finance_program_year": 2011, "linkedin_url": "https://linkedin.com/in/mock-jdoe", "notes": "[MOCK] Investment banking track."},
-    {"byu_id": "00-100-002", "net_id": "alee2", "first_name": "Ava", "last_name": "Lee", "preferred_first_name": "Avy", "gender": "F", "graduation_year": 2015, "finance_program_year": 2014, "notes": "[MOCK] PE associate."},
-    {"byu_id": "00-100-003", "net_id": "mchen3", "first_name": "Marcus", "middle_name": "T", "last_name": "Chen", "gender": "M", "graduation_year": 2018, "finance_program_year": 2017},
-    {"byu_id": "00-100-004", "net_id": "srivera4", "first_name": "Sofia", "last_name": "Rivera", "gender": "F", "graduation_year": 2020, "finance_program_year": 2019, "linkedin_url": "https://linkedin.com/in/mock-srivera"},
-    {"byu_id": "00-100-005", "net_id": "bpatel5", "first_name": "Benjamin", "last_name": "Patel", "gender": "M", "graduation_year": 2010, "finance_program_year": 2009, "graduate_degree": "MBA"},
-    {"byu_id": "00-100-006", "net_id": "enguyen6", "first_name": "Emily", "last_name": "Nguyen", "gender": "F", "graduation_year": 2022, "finance_program_year": 2021, "notes": "[MOCK] Corporate finance."},
-    {"byu_id": "00-100-007", "net_id": "dkim7", "first_name": "Daniel", "last_name": "Kim", "gender": "M", "graduation_year": 2016, "finance_program_year": 2015},
-    {"byu_id": "00-100-008", "net_id": "ojohnson8", "first_name": "Olivia", "last_name": "Johnson", "gender": "F", "graduation_year": 2019, "finance_program_year": 2018, "linkedin_url": "https://linkedin.com/in/mock-ojohnson"},
-    {"byu_id": "00-100-009", "net_id": "lgarcia9", "first_name": "Lucas", "last_name": "Garcia", "gender": "M", "graduation_year": 2013, "finance_program_year": 2012},
-    {"byu_id": "00-100-010", "net_id": "hwhite10", "first_name": "Hannah", "last_name": "White", "gender": "F", "graduation_year": 2021, "finance_program_year": 2020, "notes": "[MOCK] Wealth management."},
-    {"byu_id": "00-100-011", "net_id": "nwright11", "first_name": "Nathan", "last_name": "Wright", "gender": "M", "graduation_year": 2009, "finance_program_year": 2008, "deceased": True, "notes": "[MOCK] Deceased — for filter testing."},
-    {"byu_id": "00-100-012", "net_id": "gmartin12", "first_name": "Grace", "last_name": "Martin", "gender": "F", "graduation_year": 2017, "finance_program_year": 2016},
-    {"byu_id": "00-100-013", "net_id": "ethomas13", "first_name": "Ethan", "last_name": "Thomas", "gender": "M", "graduation_year": 2023, "finance_program_year": 2022, "linkedin_url": "https://linkedin.com/in/mock-ethomas"},
-    {"byu_id": "00-100-014", "net_id": "iclark14", "first_name": "Isabella", "last_name": "Clark", "gender": "F", "graduation_year": 2014, "finance_program_year": 2013, "archived": True, "notes": "[MOCK] Archived — for soft-delete testing."},
-    {"byu_id": "00-100-015", "net_id": "alewis15", "first_name": "Andrew", "last_name": "Lewis", "gender": "M", "graduation_year": 2011, "finance_program_year": 2010, "graduate_degree": "MAcc"},
-    {"byu_id": "00-100-016", "net_id": "shall16", "first_name": "Sophia", "last_name": "Hall", "gender": "F", "graduation_year": 2020, "finance_program_year": 2019, "notes": "[MOCK] Equity research."},
+    {"byu_id": "001000001", "net_id": "jdoe1", "first_name": "James", "last_name": "Doe", "gender": "M", "graduation_year": 2012, "finance_program_year": 2011, "linkedin_url": "https://linkedin.com/in/mock-jdoe", "notes": "[MOCK] Investment banking track."},
+    {"byu_id": "001000002", "net_id": "alee2", "first_name": "Ava", "last_name": "Lee", "preferred_first_name": "Avy", "gender": "F", "graduation_year": 2015, "finance_program_year": 2014, "notes": "[MOCK] PE associate."},
+    {"byu_id": "001000003", "net_id": "mchen3", "first_name": "Marcus", "middle_name": "T", "last_name": "Chen", "gender": "M", "graduation_year": 2018, "finance_program_year": 2017},
+    {"byu_id": "001000004", "net_id": "srivera4", "first_name": "Sofia", "last_name": "Rivera", "gender": "F", "graduation_year": 2020, "finance_program_year": 2019, "linkedin_url": "https://linkedin.com/in/mock-srivera"},
+    {"byu_id": "001000005", "net_id": "bpatel5", "first_name": "Benjamin", "last_name": "Patel", "gender": "M", "graduation_year": 2010, "finance_program_year": 2009, "graduate_degree": "MBA"},
+    {"byu_id": "001000006", "net_id": "enguyen6", "first_name": "Emily", "last_name": "Nguyen", "gender": "F", "graduation_year": 2022, "finance_program_year": 2021, "notes": "[MOCK] Corporate finance."},
+    {"byu_id": "001000007", "net_id": "dkim7", "first_name": "Daniel", "last_name": "Kim", "gender": "M", "graduation_year": 2016, "finance_program_year": 2015},
+    {"byu_id": "001000008", "net_id": "ojohnson8", "first_name": "Olivia", "last_name": "Johnson", "gender": "F", "graduation_year": 2019, "finance_program_year": 2018, "linkedin_url": "https://linkedin.com/in/mock-ojohnson"},
+    {"byu_id": "001000009", "net_id": "lgarcia9", "first_name": "Lucas", "last_name": "Garcia", "gender": "M", "graduation_year": 2013, "finance_program_year": 2012},
+    {"byu_id": "001000010", "net_id": "hwhite10", "first_name": "Hannah", "last_name": "White", "gender": "F", "graduation_year": 2021, "finance_program_year": 2020, "notes": "[MOCK] Wealth management."},
+    {"byu_id": "001000011", "net_id": "nwright11", "first_name": "Nathan", "last_name": "Wright", "gender": "M", "graduation_year": 2009, "finance_program_year": 2008, "deceased": True, "notes": "[MOCK] Deceased — for filter testing."},
+    {"byu_id": "001000012", "net_id": "gmartin12", "first_name": "Grace", "last_name": "Martin", "gender": "F", "graduation_year": 2017, "finance_program_year": 2016},
+    {"byu_id": "001000013", "net_id": "ethomas13", "first_name": "Ethan", "last_name": "Thomas", "gender": "M", "graduation_year": 2023, "finance_program_year": 2022, "linkedin_url": "https://linkedin.com/in/mock-ethomas"},
+    {"byu_id": "001000014", "net_id": "iclark14", "first_name": "Isabella", "last_name": "Clark", "gender": "F", "graduation_year": 2014, "finance_program_year": 2013, "archived": True, "notes": "[MOCK] Archived — for soft-delete testing."},
+    {"byu_id": "001000015", "net_id": "alewis15", "first_name": "Andrew", "last_name": "Lewis", "gender": "M", "graduation_year": 2011, "finance_program_year": 2010, "graduate_degree": "MAcc"},
+    {"byu_id": "001000016", "net_id": "shall16", "first_name": "Sophia", "last_name": "Hall", "gender": "F", "graduation_year": 2020, "finance_program_year": 2019, "notes": "[MOCK] Equity research."},
 ]
 
 

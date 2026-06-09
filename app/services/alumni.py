@@ -95,29 +95,30 @@ async def create_alumni(
         _audit(session, actor_user_id, "create", alumnus.alumni_id)
 
     # Insert each related section only when it carries at least one real value,
-    # so untouched sections never create empty rows.
-    if payload.contact is not None and payload.contact.has_values():
+    # so untouched sections never create empty rows. getattr keeps this tolerant
+    # of a core-only payload (e.g. direct service callers / tests).
+    contact = getattr(payload, "contact", None)
+    career = getattr(payload, "career", None)
+    education = getattr(payload, "education", None)
+    engagement = getattr(payload, "engagement", None)
+    if contact is not None and contact.has_values():
         session.add(
-            AlumniContactInfo(
-                alumni_id=alumnus.alumni_id, **payload.contact.model_dump()
-            )
+            AlumniContactInfo(alumni_id=alumnus.alumni_id, **contact.model_dump())
         )
-    if payload.career is not None and payload.career.has_values():
+    if career is not None and career.has_values():
         session.add(
-            CurrentEmployment(
-                alumni_id=alumnus.alumni_id, **payload.career.model_dump()
-            )
+            CurrentEmployment(alumni_id=alumnus.alumni_id, **career.model_dump())
         )
-    if payload.education is not None and payload.education.has_values():
+    if education is not None and education.has_values():
         session.add(
             EducationHistory(
-                alumni_id=alumnus.alumni_id, **payload.education.model_dump()
+                alumni_id=alumnus.alumni_id, **education.model_dump()
             )
         )
-    if payload.engagement is not None and payload.engagement.has_values():
+    if engagement is not None and engagement.has_values():
         session.add(
             AlumniProgramEngagement(
-                alumni_id=alumnus.alumni_id, **payload.engagement.model_dump()
+                alumni_id=alumnus.alumni_id, **engagement.model_dump()
             )
         )
 
@@ -174,38 +175,43 @@ async def update_alumni(
             setattr(alumnus, field, value)
 
     # Upsert each related section only when it carries a real value, so empty
-    # sections never create rows. Mirrors create_alumni's section handling.
+    # sections never create rows. Mirrors create_alumni's section handling;
+    # getattr keeps this tolerant of a core-only payload (direct callers/tests).
+    contact = getattr(payload, "contact", None)
+    career = getattr(payload, "career", None)
+    education = getattr(payload, "education", None)
+    engagement = getattr(payload, "engagement", None)
     section_written = False
-    if payload.contact is not None and payload.contact.has_values():
+    if contact is not None and contact.has_values():
         section_written |= await _upsert_section(
             session,
             AlumniContactInfo,
             alumni_id,
-            payload.contact.model_dump(),
+            contact.model_dump(),
             order_by=AlumniContactInfo.contact_info_id,
         )
-    if payload.career is not None and payload.career.has_values():
+    if career is not None and career.has_values():
         section_written |= await _upsert_section(
             session,
             CurrentEmployment,
             alumni_id,
-            payload.career.model_dump(),
+            career.model_dump(),
             order_by=CurrentEmployment.current_employment_id.desc(),
         )
-    if payload.education is not None and payload.education.has_values():
+    if education is not None and education.has_values():
         section_written |= await _upsert_section(
             session,
             EducationHistory,
             alumni_id,
-            payload.education.model_dump(),
+            education.model_dump(),
             order_by=EducationHistory.degree_year.desc().nullslast(),
         )
-    if payload.engagement is not None and payload.engagement.has_values():
+    if engagement is not None and engagement.has_values():
         section_written |= await _upsert_section(
             session,
             AlumniProgramEngagement,
             alumni_id,
-            payload.engagement.model_dump(),
+            engagement.model_dump(),
         )
 
     if applied or section_written:

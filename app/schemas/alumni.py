@@ -12,9 +12,8 @@ from __future__ import annotations
 import datetime
 import re
 import unicodedata
-from urllib.parse import urlsplit
-
 from decimal import Decimal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 

@@ -12,9 +12,12 @@ from __future__ import annotations
 import datetime
 import re
 import unicodedata
+from decimal import Decimal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+from app.core.dropdowns import validate_industry
 
 # --- Validation constants ----------------------------------------------------
 
@@ -252,6 +255,143 @@ class AlumniUpdate(AlumniBase):
     """All fields optional — only those sent (``exclude_unset``) are applied."""
 
 
+# --- Optional nested write sections ------------------------------------------
+#
+# Each section is all-optional and maps 1:1 to a related table's columns. Empty
+# strings are normalized to ``None`` (mirroring ``_empty_to_none``) so a blank
+# input never persists an empty string. These are written by the service only
+# when a section has at least one non-empty value (see ``has_values``).
+
+
+class _Section(BaseModel):
+    """Base for nested write sections: forbid unknown keys, trim strings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _trim_strings(cls, value: object) -> object:
+        if isinstance(value, str):
+            return _empty_to_none(value)
+        return value
+
+    def has_values(self) -> bool:
+        """True if any field carries a meaningful (non-None/non-False) value.
+
+        Booleans default to ``False`` and a section of only-False flags is
+        treated as "nothing to write" — matches the DB ``server_default`` of
+        ``false`` so we don't create rows for untouched engagement profiles.
+        """
+        for value in self.model_dump().values():
+            if value is None or value is False:
+                continue
+            return True
+        return False
+
+
+class ContactCreate(_Section):
+    personal_email: str | None = None
+    work_email: str | None = None
+    phone: str | None = None
+    address_line_1: str | None = None
+    address_line_2: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    country: str | None = None
+    region: str | None = None
+
+
+class CareerCreate(_Section):
+    current_employer: str | None = None
+    current_title: str | None = None
+    current_industry: str | None = None
+    current_industry_secondary: str | None = None
+    current_city: str | None = None
+    current_state: str | None = None
+    current_country: str | None = None
+    current_zip: str | None = None
+    seniority_level: str | None = None
+
+    @field_validator(
+        "current_industry", "current_industry_secondary", mode="before"
+    )
+    @classmethod
+    def _validate_industry(cls, value: object) -> str | None:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        # validate_industry trims, normalizes empty -> None, and raises on a
+        # value outside the canonical INDUSTRIES list (surfaced as a 422).
+        return validate_industry(value)
+
+
+class EducationCreate(_Section):
+    university: str | None = None
+    college: str | None = None
+    department: str | None = None
+    degree: str | None = None
+    major: str | None = None
+    degree_status: str | None = None
+    degree_year: int | None = None
+
+    @field_validator("degree_year")
+    @classmethod
+    def _validate_degree_year(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not (_YEAR_MIN <= value <= _YEAR_MAX):
+            raise ValueError(f"Must be between {_YEAR_MIN} and {_YEAR_MAX}.")
+        return value
+
+
+class EngagementCreate(_Section):
+    nettrek_host_willing: bool = False
+    finance_conference_willing: bool = False
+    mentor_willing: bool = False
+    company_event_sponsor_willing: bool = False
+    guest_speaker_willing: bool = False
+    help_at_event_willing: bool = False
+    case_competition_host_willing: bool = False
+    women_in_finance_mentor_willing: bool = False
+    hired_finance_intern: bool = False
+    hired_finance_full_time: bool = False
+    piff_donor: bool = False
+    piff_donor_amount: Decimal | None = None
+    cfp_designation: bool = False
+    cfa_designation: bool = False
+    engagement_notes: str | None = None
+
+
+class AlumniCreateFull(AlumniCreate):
+    """Create payload: required core fields plus optional nested sections.
+
+    Core validation (``_require_identifier``, name/id/year/linkedin rules) is
+    inherited unchanged from ``AlumniCreate``. The nested sections are written
+    by the service only when they contain at least one non-empty value.
+    """
+
+    contact: ContactCreate | None = None
+    career: CareerCreate | None = None
+    education: EducationCreate | None = None
+    engagement: EngagementCreate | None = None
+
+
+class AlumniUpdateFull(AlumniUpdate):
+    """Update payload: optional core fields plus optional nested sections.
+
+    Mirrors ``AlumniCreateFull`` so the edit wizard can persist every section.
+    Core stays all-optional (inherited from ``AlumniUpdate``); each nested
+    section is upserted by the service only when it carries a non-empty value.
+    The same section schemas are reused, so industry validation and empty-string
+    trimming behave identically to create.
+    """
+
+    contact: ContactCreate | None = None
+    career: CareerCreate | None = None
+    education: EducationCreate | None = None
+    engagement: EngagementCreate | None = None
+
+
 class AlumniRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -280,10 +420,19 @@ class AlumniRead(BaseModel):
     updated_at: datetime.datetime
 
 
+class AlumniListItem(AlumniRead):
+    """List-row variant: adds the alumnus's current employer + industry (joined
+    from ``current_employment``) for the alumni table. Single-record reads use
+    plain ``AlumniRead``, which omits these."""
+
+    current_employer: str | None = None
+    current_industry: str | None = None
+
+
 class AlumniPage(BaseModel):
     """A page of alumni plus the pagination envelope."""
 
-    items: list[AlumniRead]
+    items: list[AlumniListItem]
     total: int
     limit: int
     offset: int

@@ -12,13 +12,94 @@ from __future__ import annotations
 import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.dropdowns import (
+    validate_industry,
+    validate_status_label,
+    validate_tag,
+)
 from app.schemas.alumni import AlumniRead
 
 
 class _Orm(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+
+class EmploymentHistoryCreate(BaseModel):
+    """Add a prior role to an alumnus's employment history (Employment panel)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    employer_name: str = Field(min_length=1, max_length=255)
+    employment_title: str | None = Field(default=None, max_length=255)
+    employment_industry: str | None = Field(default=None, max_length=255)
+    city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    start_year: int | None = Field(default=None, ge=1900, le=2100)
+    end_year: int | None = Field(default=None, ge=1900, le=2100)
+    is_current: bool = False
+
+    @field_validator("employment_industry", mode="before")
+    @classmethod
+    def _check_industry(cls, value: str | None) -> str | None:
+        return validate_industry(value)
+
+    @field_validator("employer_name", mode="before")
+    @classmethod
+    def _employer_trim(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("employment_title", "city", "state", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class TagCreate(BaseModel):
+    """Attach a canonical engagement tag to an alumnus."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tag: str
+
+    @field_validator("tag", mode="before")
+    @classmethod
+    def _check_tag(cls, value: str) -> str:
+        return validate_tag(value)
+
+
+class StatusLabelCreate(BaseModel):
+    """Attach a canonical status label to an alumnus."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _check_label(cls, value: str) -> str:
+        return validate_status_label(value)
+
+
+class EventAttendanceCreate(BaseModel):
+    """Mark an alumnus as an attendee of an existing event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: int
+    attendance_status: str | None = Field(default=None, max_length=100)
+
+    @field_validator("attendance_status", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class InteractionCreate(BaseModel):

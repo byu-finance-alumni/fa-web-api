@@ -13,7 +13,7 @@ import datetime
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import NotFoundError
+from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -38,15 +38,19 @@ from app.schemas.profile import (
     ContactRead,
     CurrentCareerRead,
     EducationRead,
+    EmploymentHistoryCreate,
     EmploymentHistoryRead,
     EngagementNoteRead,
+    EventAttendanceCreate,
     EventAttendedRead,
     InteractionCreate,
     InteractionRead,
     LeadershipRead,
     ProfileRead,
     ProgramEngagementRead,
+    StatusLabelCreate,
     SurveyRead,
+    TagCreate,
     TaskCreate,
     TaskRead,
 )
@@ -346,4 +350,226 @@ async def set_task_completed(
         await session.refresh(task)
     return TaskRead.model_validate(task).model_copy(
         update={"assigned_to": await _actor_name(session, task.assigned_to_user_id)}
+    )
+
+
+async def add_employment(
+    session: AsyncSession,
+    alumni_id: int,
+    payload: EmploymentHistoryCreate,
+    actor_user_id: int | None,
+) -> EmploymentHistoryRead:
+    """Insert a prior role into an alumnus's employment history (full_access)."""
+    await _require_alumni(session, alumni_id)
+    row = EmploymentHistory(
+        alumni_id=alumni_id,
+        employer_name=payload.employer_name,
+        employment_title=payload.employment_title,
+        employment_industry=payload.employment_industry,
+        city=payload.city,
+        state=payload.state,
+        start_year=payload.start_year,
+        end_year=payload.end_year,
+        is_current=payload.is_current,
+    )
+    session.add(row)
+    _audit_alumni(session, actor_user_id, "add_employment", alumni_id)
+    await session.commit()
+    await session.refresh(row)
+    return EmploymentHistoryRead.model_validate(row)
+
+
+async def _tag_names(session: AsyncSession, alumni_id: int) -> list[str]:
+    return list(
+        (
+            await session.scalars(
+                select(Tag.tag_name)
+                .join(AlumniTag, AlumniTag.tag_id == Tag.tag_id)
+                .where(AlumniTag.alumni_id == alumni_id)
+                .order_by(Tag.tag_name)
+            )
+        ).all()
+    )
+
+
+async def _get_or_create_tag(session: AsyncSession, name: str) -> Tag:
+    tag = await session.scalar(select(Tag).where(Tag.tag_name == name))
+    if tag is None:
+        tag = Tag(tag_name=name)
+        session.add(tag)
+        await session.flush()
+    return tag
+
+
+async def add_tag(
+    session: AsyncSession,
+    alumni_id: int,
+    payload: TagCreate,
+    actor_user_id: int | None,
+) -> list[str]:
+    """Attach a canonical tag to an alumnus; return the resulting tag list.
+
+    Idempotent: re-adding an existing tag is a no-op (existence-checked against
+    the unique constraint), never a 500."""
+    await _require_alumni(session, alumni_id)
+    tag = await _get_or_create_tag(session, payload.tag)
+    existing = await session.scalar(
+        select(AlumniTag.alumni_tag_id).where(
+            AlumniTag.alumni_id == alumni_id, AlumniTag.tag_id == tag.tag_id
+        )
+    )
+    if existing is None:
+        session.add(AlumniTag(alumni_id=alumni_id, tag_id=tag.tag_id))
+        _audit_alumni(session, actor_user_id, "add_tag", alumni_id)
+        await session.commit()
+    return await _tag_names(session, alumni_id)
+
+
+async def remove_tag(
+    session: AsyncSession,
+    alumni_id: int,
+    tag_name: str,
+    actor_user_id: int | None,
+) -> list[str]:
+    """Detach a tag from an alumnus; return the resulting tag list. 404 if the
+    alumnus doesn't have that tag."""
+    await _require_alumni(session, alumni_id)
+    assoc = await session.scalar(
+        select(AlumniTag)
+        .join(Tag, Tag.tag_id == AlumniTag.tag_id)
+        .where(AlumniTag.alumni_id == alumni_id, Tag.tag_name == tag_name)
+    )
+    if assoc is None:
+        raise NotFoundError(f"Tag '{tag_name}' is not set on alumni {alumni_id}.")
+    await session.delete(assoc)
+    _audit_alumni(session, actor_user_id, "remove_tag", alumni_id)
+    await session.commit()
+    return await _tag_names(session, alumni_id)
+
+
+async def _status_label_names(session: AsyncSession, alumni_id: int) -> list[str]:
+    return list(
+        (
+            await session.scalars(
+                select(StatusLabel.status_label_name)
+                .join(
+                    AlumniStatusLabel,
+                    AlumniStatusLabel.status_label_id == StatusLabel.status_label_id,
+                )
+                .where(AlumniStatusLabel.alumni_id == alumni_id)
+                .order_by(StatusLabel.status_label_name)
+            )
+        ).all()
+    )
+
+
+async def _get_or_create_status_label(
+    session: AsyncSession, name: str
+) -> StatusLabel:
+    label = await session.scalar(
+        select(StatusLabel).where(StatusLabel.status_label_name == name)
+    )
+    if label is None:
+        label = StatusLabel(status_label_name=name)
+        session.add(label)
+        await session.flush()
+    return label
+
+
+async def add_status_label(
+    session: AsyncSession,
+    alumni_id: int,
+    payload: StatusLabelCreate,
+    actor_user_id: int | None,
+) -> list[str]:
+    """Attach a canonical status label to an alumnus; return the resulting list.
+    Idempotent (existence-checked)."""
+    await _require_alumni(session, alumni_id)
+    label = await _get_or_create_status_label(session, payload.label)
+    existing = await session.scalar(
+        select(AlumniStatusLabel.alumni_status_label_id).where(
+            AlumniStatusLabel.alumni_id == alumni_id,
+            AlumniStatusLabel.status_label_id == label.status_label_id,
+        )
+    )
+    if existing is None:
+        session.add(
+            AlumniStatusLabel(
+                alumni_id=alumni_id, status_label_id=label.status_label_id
+            )
+        )
+        _audit_alumni(session, actor_user_id, "add_status_label", alumni_id)
+        await session.commit()
+    return await _status_label_names(session, alumni_id)
+
+
+async def remove_status_label(
+    session: AsyncSession,
+    alumni_id: int,
+    label_name: str,
+    actor_user_id: int | None,
+) -> list[str]:
+    """Detach a status label from an alumnus; return the resulting list. 404 if
+    the alumnus doesn't have that label."""
+    await _require_alumni(session, alumni_id)
+    assoc = await session.scalar(
+        select(AlumniStatusLabel)
+        .join(
+            StatusLabel,
+            StatusLabel.status_label_id == AlumniStatusLabel.status_label_id,
+        )
+        .where(
+            AlumniStatusLabel.alumni_id == alumni_id,
+            StatusLabel.status_label_name == label_name,
+        )
+    )
+    if assoc is None:
+        raise NotFoundError(
+            f"Status label '{label_name}' is not set on alumni {alumni_id}."
+        )
+    await session.delete(assoc)
+    _audit_alumni(session, actor_user_id, "remove_status_label", alumni_id)
+    await session.commit()
+    return await _status_label_names(session, alumni_id)
+
+
+async def add_event_attendance(
+    session: AsyncSession,
+    alumni_id: int,
+    payload: EventAttendanceCreate,
+    actor_user_id: int | None,
+) -> EventAttendedRead:
+    """Mark an alumnus as an attendee of an existing event (full_access).
+
+    404 if the event or alumnus is unknown. Respects the unique
+    (event_id, alumni_id) constraint: a duplicate raises ConflictError (409),
+    never a 500."""
+    await _require_alumni(session, alumni_id)
+    event = await session.get(Event, payload.event_id)
+    if event is None:
+        raise NotFoundError(f"Event {payload.event_id} not found.")
+
+    existing = await session.scalar(
+        select(EventAttendance).where(
+            EventAttendance.event_id == payload.event_id,
+            EventAttendance.alumni_id == alumni_id,
+        )
+    )
+    if existing is not None:
+        raise ConflictError(
+            f"Alumni {alumni_id} is already an attendee of event "
+            f"{payload.event_id}."
+        )
+
+    session.add(
+        EventAttendance(
+            event_id=payload.event_id,
+            alumni_id=alumni_id,
+            attendance_status=payload.attendance_status,
+        )
+    )
+    _audit_alumni(session, actor_user_id, "add_event_attendance", alumni_id)
+    await session.commit()
+    return EventAttendedRead.model_validate(event).model_copy(
+        update={"attendance_status": payload.attendance_status}
     )

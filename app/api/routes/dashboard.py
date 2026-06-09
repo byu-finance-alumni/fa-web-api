@@ -18,6 +18,8 @@ from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import FollowUpTask, Interaction
 from app.models.employment import CurrentEmployment
+from app.models.engagement import AlumniProgramEngagement
+from app.models.event import Event, EventAttendance
 from app.models.user import User
 from app.utils.sql import escape_like
 
@@ -121,6 +123,34 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         text("SELECT count(*) FROM duplicate_candidates")
     )
 
+    # Distinct alumni who attended an event held in the last 30 days (past
+    # events only — a future event hasn't been "attended" yet).
+    attended_event_this_month = await session.scalar(
+        select(func.count(func.distinct(EventAttendance.alumni_id)))
+        .join(Event, Event.event_id == EventAttendance.event_id)
+        .where(Event.event_date >= month_ago.date(), Event.event_date <= today)
+    )
+    # Events scheduled today or later.
+    upcoming_events = await session.scalar(
+        select(func.count())
+        .select_from(Event)
+        .where(Event.event_date >= today)
+    )
+    # Active alumni flagged as PIFF donors.
+    piff_donors = await session.scalar(
+        select(func.count())
+        .select_from(AlumniProgramEngagement)
+        .join(Alumni, Alumni.alumni_id == AlumniProgramEngagement.alumni_id)
+        .where(active, AlumniProgramEngagement.piff_donor.is_(True))
+    )
+    # Active alumni willing to mentor.
+    willing_mentors = await session.scalar(
+        select(func.count())
+        .select_from(AlumniProgramEngagement)
+        .join(Alumni, Alumni.alumni_id == AlumniProgramEngagement.alumni_id)
+        .where(active, AlumniProgramEngagement.mentor_willing.is_(True))
+    )
+
     cohort = (
         await session.execute(
             select(Alumni.graduation_year, func.count())
@@ -161,12 +191,82 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "contacted_this_month": int(contacted_this_month or 0),
         "upcoming_follow_ups": int(upcoming_follow_ups or 0),
         "duplicate_count": int(duplicate_count or 0),
+        "attended_event_this_month": int(attended_event_this_month or 0),
+        "upcoming_events": int(upcoming_events or 0),
+        "piff_donors": int(piff_donors or 0),
+        "willing_mentors": int(willing_mentors or 0),
         "by_graduation_year": [{"year": r[0], "count": int(r[1])} for r in cohort],
         "top_employers": [
             {"employer": r[0], "count": int(r[1])} for r in top_employers
         ],
         "by_state": [{"state": r[0], "count": int(r[1])} for r in by_state],
     }
+
+
+@router.get("/event-participation")
+async def event_participation(
+    _: RequireViewAccess, session: SessionDep
+) -> list[dict]:
+    """Per-event participation for the ~last 12 months (past/current events —
+    these are what have "participation"). One row per event with its attendee
+    count, aggregated in PostgreSQL (LEFT JOIN so an event with 0 attendees
+    still appears), ordered chronologically and capped at 10 so it fits the
+    dashboard panel.
+
+    Returns oldest→newest, e.g.
+    [{"event_id": 12, "event_name": "Spring Mixer", "event_type": "Networking",
+      "event_date": "2026-05-29", "participant_count": 34}, ...]."""
+    today = datetime.datetime.now(datetime.UTC).date()
+    # First day of the current month, then step back 11 months → the oldest
+    # month in the 12-month window (current month inclusive).
+    current_month_start = today.replace(day=1)
+    year = current_month_start.year
+    month = current_month_start.month - 11
+    # Normalize the month/year after subtracting 11 (handles year rollover).
+    year += (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    window_start = datetime.date(year, month, 1)
+
+    # One row per event with its attendee count. LEFT JOIN keeps events with
+    # zero recorded attendees. Grouping by event_id sidesteps any date_trunc
+    # GROUP BY pitfalls. Take the 10 most recent events in the window, then
+    # re-sort oldest→newest so the panel reads left-to-right in time.
+    rows = (
+        await session.execute(
+            select(
+                Event.event_id,
+                Event.event_name,
+                Event.event_type,
+                Event.event_date,
+                func.count(EventAttendance.event_attendance_id).label("participant_count"),
+            )
+            .select_from(Event)
+            .outerjoin(
+                EventAttendance, EventAttendance.event_id == Event.event_id
+            )
+            .where(Event.event_date >= window_start, Event.event_date <= today)
+            .group_by(
+                Event.event_id,
+                Event.event_name,
+                Event.event_type,
+                Event.event_date,
+            )
+            .order_by(Event.event_date.desc().nullslast(), Event.event_id.desc())
+            .limit(10)
+        )
+    ).all()
+
+    # rows are newest-first (for the LIMIT); reverse to oldest→newest for the UI.
+    return [
+        {
+            "event_id": r.event_id,
+            "event_name": r.event_name,
+            "event_type": r.event_type,
+            "event_date": r.event_date.isoformat() if r.event_date else None,
+            "participant_count": int(r.participant_count),
+        }
+        for r in reversed(rows)
+    ]
 
 
 @router.get("/activity")
@@ -194,6 +294,10 @@ async def activity_feed(
         datetime.date | None,
         Query(description="Only interactions on/before this date (inclusive)."),
     ] = None,
+    sort: Annotated[
+        str,
+        Query(description="Sort order: recent (newest first) | oldest."),
+    ] = "recent",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
@@ -249,8 +353,12 @@ async def activity_feed(
             .outerjoin(User, User.user_id == Interaction.user_id)
             .where(*conditions)
             .order_by(
-                Interaction.interaction_date_time.desc().nullslast(),
-                Interaction.interaction_id.desc(),
+                Interaction.interaction_date_time.asc().nullslast()
+                if sort == "oldest"
+                else Interaction.interaction_date_time.desc().nullslast(),
+                Interaction.interaction_id.asc()
+                if sort == "oldest"
+                else Interaction.interaction_id.desc(),
             )
             .limit(limit)
             .offset(offset)

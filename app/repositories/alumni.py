@@ -194,10 +194,50 @@ async def list_page(
     offset: int,
     **filters,
 ) -> tuple[list[Alumni], int]:
-    """Return a filtered page of alumni and the total count for that filter."""
-    stmt = build_alumni_query(**filters)
-    total = await session.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows = await session.scalars(
-        stmt.order_by(Alumni.last_name, Alumni.alumni_id).limit(limit).offset(offset)
+    """Return a filtered page of alumni and the total count for that filter.
+
+    Each returned Alumni also gets ``current_employer`` / ``current_industry``
+    set as plain instance attributes (from correlated scalar subqueries against
+    ``current_employment``) so the list view can show them without an N+1 or a
+    row-multiplying join. The single-record schema ignores these.
+    """
+    sort = filters.pop("sort", "name") or "name"
+    base = build_alumni_query(**filters)
+    total = await session.scalar(select(func.count()).select_from(base.subquery()))
+
+    current_employer = (
+        select(CurrentEmployment.current_employer)
+        .where(CurrentEmployment.alumni_id == Alumni.alumni_id)
+        .limit(1)
+        .scalar_subquery()
     )
-    return list(rows.all()), int(total or 0)
+    current_industry = (
+        select(CurrentEmployment.current_industry)
+        .where(CurrentEmployment.alumni_id == Alumni.alumni_id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    rows_stmt = select(Alumni, current_employer, current_industry)
+    if base.whereclause is not None:
+        rows_stmt = rows_stmt.where(base.whereclause)
+
+    # Sort options exposed by the list UI. Unknown values fall back to name.
+    order_by = {
+        "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
+        "grad_desc": (
+            Alumni.graduation_year.desc().nulls_last(),
+            Alumni.last_name.asc(),
+        ),
+        "grad_asc": (
+            Alumni.graduation_year.asc().nulls_last(),
+            Alumni.last_name.asc(),
+        ),
+    }.get(sort, (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
+    rows_stmt = rows_stmt.order_by(*order_by).limit(limit).offset(offset)
+    result = await session.execute(rows_stmt)
+    items: list[Alumni] = []
+    for alumnus, employer, industry in result.all():
+        alumnus.current_employer = employer
+        alumnus.current_industry = industry
+        items.append(alumnus)
+    return items, int(total or 0)

@@ -8,13 +8,17 @@ Owns the rules that aren't just data access:
 
 import datetime
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
+from app.models.contact import AlumniContactInfo
+from app.models.employment import CurrentEmployment, EducationHistory
+from app.models.engagement import AlumniProgramEngagement
 from app.repositories import alumni as repo
-from app.schemas.alumni import AlumniCreate, AlumniUpdate
+from app.schemas.alumni import AlumniCreateFull, AlumniUpdateFull
 
 
 def _now() -> datetime.datetime:
@@ -73,27 +77,94 @@ async def list_alumni(
 
 async def create_alumni(
     session: AsyncSession,
-    payload: AlumniCreate,
+    payload: AlumniCreateFull,
     actor_user_id: int | None = None,
 ) -> Alumni:
-    alumnus = Alumni(**payload.model_dump(exclude_unset=True))
+    # Core columns only — nested sections are popped off before constructing the
+    # Alumni row (they map to related tables, not the alumni table).
+    core = payload.model_dump(
+        exclude_unset=True,
+        exclude={"contact", "career", "education", "engagement"},
+    )
+    alumnus = Alumni(**core)
     session.add(alumnus)
+    # Need the generated alumni_id to attach the related rows; flush gets it
+    # without committing, keeping everything in one transaction.
+    await session.flush()
     if actor_user_id is not None:
-        await session.flush()
         _audit(session, actor_user_id, "create", alumnus.alumni_id)
+
+    # Insert each related section only when it carries at least one real value,
+    # so untouched sections never create empty rows.
+    if payload.contact is not None and payload.contact.has_values():
+        session.add(
+            AlumniContactInfo(
+                alumni_id=alumnus.alumni_id, **payload.contact.model_dump()
+            )
+        )
+    if payload.career is not None and payload.career.has_values():
+        session.add(
+            CurrentEmployment(
+                alumni_id=alumnus.alumni_id, **payload.career.model_dump()
+            )
+        )
+    if payload.education is not None and payload.education.has_values():
+        session.add(
+            EducationHistory(
+                alumni_id=alumnus.alumni_id, **payload.education.model_dump()
+            )
+        )
+    if payload.engagement is not None and payload.engagement.has_values():
+        session.add(
+            AlumniProgramEngagement(
+                alumni_id=alumnus.alumni_id, **payload.engagement.model_dump()
+            )
+        )
+
     await session.commit()
     await session.refresh(alumnus)
     return alumnus
 
 
+async def _upsert_section(
+    session: AsyncSession,
+    model: type,
+    alumni_id: int,
+    values: dict[str, object],
+    *,
+    order_by=None,
+) -> bool:
+    """Update the existing related row for *alumni_id* (or insert one) from
+    *values*. Returns True if a row was written (always, when called).
+
+    The matching read query mirrors ``profile.get_profile`` so we update the
+    same row the profile/edit page shows. Only called when the section carries
+    at least one non-empty value (the caller checks ``has_values``).
+    """
+    stmt = select(model).where(model.alumni_id == alumni_id)
+    if order_by is not None:
+        stmt = stmt.order_by(order_by)
+    existing = await session.scalar(stmt.limit(1))
+    if existing is not None:
+        for field, value in values.items():
+            setattr(existing, field, value)
+    else:
+        session.add(model(alumni_id=alumni_id, **values))
+    return True
+
+
 async def update_alumni(
     session: AsyncSession,
     alumni_id: int,
-    payload: AlumniUpdate,
+    payload: AlumniUpdateFull,
     actor_user_id: int | None = None,
 ) -> Alumni:
     alumnus = await get_alumni(session, alumni_id)
-    changes = payload.model_dump(exclude_unset=True)
+    # Core columns only — nested sections are handled via upsert below.
+    changes = payload.model_dump(
+        exclude_unset=True,
+        exclude={"contact", "career", "education", "engagement"},
+    )
     # Only audit fields that actually changed; capture before/after per field.
     applied: dict[str, tuple[object, object]] = {}
     for field, value in changes.items():
@@ -101,7 +172,45 @@ async def update_alumni(
         if old != value:
             applied[field] = (old, value)
             setattr(alumnus, field, value)
-    if applied:
+
+    # Upsert each related section only when it carries a real value, so empty
+    # sections never create rows. Mirrors create_alumni's section handling.
+    section_written = False
+    if payload.contact is not None and payload.contact.has_values():
+        section_written |= await _upsert_section(
+            session,
+            AlumniContactInfo,
+            alumni_id,
+            payload.contact.model_dump(),
+            order_by=AlumniContactInfo.contact_info_id,
+        )
+    if payload.career is not None and payload.career.has_values():
+        section_written |= await _upsert_section(
+            session,
+            CurrentEmployment,
+            alumni_id,
+            payload.career.model_dump(),
+            order_by=CurrentEmployment.current_employment_id.desc(),
+        )
+    if payload.education is not None and payload.education.has_values():
+        section_written |= await _upsert_section(
+            session,
+            EducationHistory,
+            alumni_id,
+            payload.education.model_dump(),
+            order_by=EducationHistory.degree_year.desc().nullslast(),
+        )
+    if payload.engagement is not None and payload.engagement.has_values():
+        section_written |= await _upsert_section(
+            session,
+            AlumniProgramEngagement,
+            alumni_id,
+            payload.engagement.model_dump(),
+        )
+
+    if applied or section_written:
+        # Any manual edit (core or section) stamps provenance so later imports
+        # won't clobber it.
         alumnus.manually_edited_at = _now()
         for field, (old, new) in applied.items():
             _audit(
@@ -113,6 +222,9 @@ async def update_alumni(
                 old_value=old,
                 new_value=new,
             )
+        if section_written and not applied:
+            # Record at least one audit entry for a section-only edit.
+            _audit(session, actor_user_id, "update", alumni_id)
         await session.commit()
         await session.refresh(alumnus)
     return alumnus

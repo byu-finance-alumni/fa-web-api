@@ -41,12 +41,17 @@ from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import User
 
+# Event dates are RELATIVE to "today" (set in seed_mock) so the dashboard's
+# time-windowed KPIs always have data no matter when this is run:
+#   * two events in the last 30 days  -> "Attended an event this month"
+#   * two events today-or-later       -> "Upcoming events"
+#   * one older event                 -> history
 MOCK_EVENTS = [
-    {"name": "Spring NetTrek 2026", "type": "Net Trek", "date": datetime.date(2026, 3, 14), "location": "New York, NY"},
-    {"name": "Alumni Reunion BBQ", "type": "BBQ", "date": datetime.date(2025, 8, 22), "location": "Provo, UT"},
-    {"name": "Finance Conference 2025", "type": "Finance Conference", "date": datetime.date(2025, 11, 5), "location": "Salt Lake City, UT"},
-    {"name": "Women in Finance Mixer", "type": "Club Event", "date": datetime.date(2026, 2, 10), "location": "Provo, UT"},
-    {"name": "Recruiting Night — Goldman Sachs", "type": "Recruiting Event", "date": datetime.date(2026, 1, 20), "location": "Virtual"},
+    {"name": "Spring NetTrek", "type": "Net Trek", "days": -10, "location": "New York, NY"},
+    {"name": "Women in Finance Mixer", "type": "Club Event", "days": -24, "location": "Provo, UT"},
+    {"name": "Alumni Reunion BBQ", "type": "BBQ", "days": -120, "location": "Provo, UT"},
+    {"name": "Recruiting Night — Goldman Sachs", "type": "Recruiting Event", "days": 18, "location": "Virtual"},
+    {"name": "Finance Conference", "type": "Finance Conference", "days": 45, "location": "Salt Lake City, UT"},
 ]
 
 MOCK_SOURCE_NAME = "MOCK_DATA"
@@ -111,6 +116,7 @@ MOCK_DETAIL: dict[str, dict] = {
         "employment_history": [
             {"employer_name": "Goldman Sachs", "employment_title": "Vice President", "employment_industry": "Investment Banking", "city": "New York", "state": "NY", "start_year": 2018, "end_year": None, "is_current": True},
             {"employer_name": "J.P. Morgan", "employment_title": "Analyst", "employment_industry": "Investment Banking", "city": "New York", "state": "NY", "start_year": 2012, "end_year": 2018, "is_current": False},
+            {"employer_name": "Deloitte", "employment_title": "Summer Analyst", "employment_industry": "Consulting", "city": "New York", "state": "NY", "start_year": 2011, "end_year": 2011, "is_current": False},
         ],
         "education": [
             {"university": "Brigham Young University", "college": "Marriott School of Business", "department": "Finance", "degree": "BS", "major": "Finance", "degree_status": "Completed", "degree_year": 2012},
@@ -146,6 +152,10 @@ MOCK_DETAIL: dict[str, dict] = {
         ],
         "tasks": [
             {"task_title": "Schedule Q3 mentorship call", "due_in_days": 21, "completed": False, "task_notes": "Pair with two IB-track juniors."},
+            {"task_title": "Confirm spring recruiting visit", "due_in_days": 7, "completed": False, "task_notes": "NYC office, two-day trip."},
+            {"task_title": "Review mentee resumes", "due_in_days": 14, "completed": False, "task_notes": "Three students in the IB track."},
+            {"task_title": "Send thank-you note", "due_in_days": -3, "completed": False, "task_notes": "After the Finance Conference panel."},
+            {"task_title": "Plan alumni panel session", "due_in_days": 30, "completed": False},
             {"task_title": "Send NetTrek host packet", "due_in_days": -5, "completed": True, "task_notes": "Logistics for spring trek."},
         ],
         "attachments": [
@@ -156,7 +166,8 @@ MOCK_DETAIL: dict[str, dict] = {
     "alee2": {
         "contact": {"personal_email": "ava.lee@example.com", "phone": "+1 (415) 555-0199", "city": "San Francisco", "state": "CA", "country": "USA", "region": "West"},
         "career": {"current_employer": "Bain Capital", "current_title": "Associate", "current_industry": "Private Equity", "current_city": "San Francisco", "current_state": "CA", "seniority_level": "Associate"},
-        "tags": ["Highly Engaged"],
+        "program": {"piff_donor": True, "piff_donor_amount": 1500, "mentor_willing": True},
+        "tags": ["Highly Engaged", "Donor"],
         "interactions": [
             {"interaction_type": "Event Follow-Up", "days_ago": 30, "interaction_notes": "Followed up after Women in Finance mixer."},
         ],
@@ -164,7 +175,8 @@ MOCK_DETAIL: dict[str, dict] = {
     "srivera4": {
         "contact": {"personal_email": "sofia.rivera@example.com", "city": "Chicago", "state": "IL", "country": "USA", "region": "Midwest"},
         "career": {"current_employer": "Northern Trust", "current_title": "Senior Analyst", "current_industry": "Asset Management", "current_city": "Chicago", "current_state": "IL", "seniority_level": "Senior Analyst"},
-        "tags": ["Recruiter"],
+        "program": {"mentor_willing": True},
+        "tags": ["Recruiter", "Mentor"],
     },
     "enguyen6": {
         "contact": {"city": "San Jose", "state": "CA", "country": "USA", "region": "West"},
@@ -175,6 +187,8 @@ MOCK_DETAIL: dict[str, dict] = {
     "mchen3": {
         "contact": {"city": "Provo", "state": "UT", "country": "USA", "region": "Mountain West"},
         "career": {"current_employer": "Qualtrics", "current_title": "Finance Manager", "current_industry": "Technology", "current_city": "Provo", "current_state": "UT", "seniority_level": "Manager"},
+        "program": {"mentor_willing": True},
+        "tags": ["Mentor"],
     },
     "bpatel5": {
         "contact": {"city": "Salt Lake City", "state": "UT", "country": "USA", "region": "Mountain West"},
@@ -183,10 +197,14 @@ MOCK_DETAIL: dict[str, dict] = {
     "dkim7": {
         "contact": {"city": "Lehi", "state": "UT", "country": "USA", "region": "Mountain West"},
         "career": {"current_employer": "Adobe", "current_title": "FP&A Analyst", "current_industry": "Technology", "current_city": "Lehi", "current_state": "UT", "seniority_level": "Analyst"},
+        "program": {"mentor_willing": True},
+        "tags": ["Mentor"],
     },
     "ojohnson8": {
         "contact": {"city": "Provo", "state": "UT", "country": "USA", "region": "Mountain West"},
         "career": {"current_employer": "Fidelity", "current_title": "Wealth Advisor", "current_industry": "Asset Management", "current_city": "Provo", "current_state": "UT", "seniority_level": "Advisor"},
+        "program": {"piff_donor": True, "piff_donor_amount": 2500, "mentor_willing": True},
+        "tags": ["Donor", "Mentor"],
     },
     "lgarcia9": {
         "contact": {"city": "Dallas", "state": "TX", "country": "USA", "region": "South"},
@@ -195,6 +213,8 @@ MOCK_DETAIL: dict[str, dict] = {
     "hwhite10": {
         "contact": {"city": "New York", "state": "NY", "country": "USA", "region": "Northeast"},
         "career": {"current_employer": "Morgan Stanley", "current_title": "Wealth Manager", "current_industry": "Wealth Management", "current_city": "New York", "current_state": "NY", "seniority_level": "Vice President"},
+        "program": {"piff_donor": True, "piff_donor_amount": 1000, "mentor_willing": True},
+        "tags": ["Donor", "Mentor"],
     },
     "gmartin12": {
         "contact": {"city": "Salt Lake City", "state": "UT", "country": "USA", "region": "Mountain West"},
@@ -342,11 +362,36 @@ async def seed_mock(session) -> int:
     )
     await _seed_details(session, alumni_by_net_id, actor_user_id)
 
+    # Guarantee every alumnus has a current employer + industry and a LinkedIn
+    # so the alumni list never renders blank cells. Fallbacks are deterministic
+    # (indexed) and use the canonical industry vocabulary.
+    fallback_careers = [
+        ("Deloitte", "Consulting"),
+        ("Wells Fargo", "Commercial Banking"),
+        ("Charles Schwab", "Wealth Management"),
+        ("KPMG", "Valuation & Advisory"),
+        ("PIMCO", "Asset Management"),
+    ]
+    for idx, (row, a) in enumerate(zip(MOCK_ALUMNI, alumni, strict=True)):
+        nid = row.get("net_id")
+        if not MOCK_DETAIL.get(nid or "", {}).get("career"):
+            employer, industry = fallback_careers[idx % len(fallback_careers)]
+            session.add(
+                CurrentEmployment(
+                    alumni_id=a.alumni_id,
+                    current_employer=employer,
+                    current_industry=industry,
+                )
+            )
+        if not a.linkedin_url:
+            a.linkedin_url = f"https://www.linkedin.com/in/mock-{nid}"
+
+    today = datetime.date.today()
     events = [
         Event(
             event_name=ev["name"],
             event_type=ev["type"],
-            event_date=ev["date"],
+            event_date=today + datetime.timedelta(days=ev["days"]),
             event_location=ev["location"],
             event_notes="[MOCK] seeded event",
         )
@@ -354,14 +399,24 @@ async def seed_mock(session) -> int:
     ]
     session.add_all(events)
     await session.flush()  # assign event_ids
-    # Deterministically attach a few alumni to each event.
+    # Deterministically attach a few alumni to each event (deduped via a set so
+    # explicit additions below can't violate the (event, alumni) unique key).
+    attendance: set[tuple[int, int]] = set()
     for i, e in enumerate(events):
         for aid in alumni_ids[i : i + 4]:
-            session.add(
-                EventAttendance(
-                    event_id=e.event_id, alumni_id=aid, attendance_status="Attended"
-                )
+            attendance.add((e.event_id, aid))
+    # Ensure the demo-rich profile (James Doe) attends three recent events so the
+    # profile's Recent events panel is well populated.
+    james_id = alumni_by_net_id.get("jdoe1")
+    if james_id is not None:
+        for e in events[:3]:
+            attendance.add((e.event_id, james_id))
+    for event_id, aid in attendance:
+        session.add(
+            EventAttendance(
+                event_id=event_id, alumni_id=aid, attendance_status="Attended"
             )
+        )
     await session.commit()
     return len(MOCK_ALUMNI)
 

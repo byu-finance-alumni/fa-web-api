@@ -12,11 +12,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
-from app.schemas.alumni import AlumniCreate, AlumniPage, AlumniRead, AlumniUpdate
+from app.schemas.alumni import (
+    AlumniCreateFull,
+    AlumniPage,
+    AlumniRead,
+    AlumniUpdateFull,
+)
 from app.schemas.profile import (
+    EmploymentHistoryCreate,
+    EmploymentHistoryRead,
+    EventAttendanceCreate,
+    EventAttendedRead,
     InteractionCreate,
     InteractionRead,
     ProfileRead,
+    StatusLabelCreate,
+    TagCreate,
     TaskCompleteUpdate,
     TaskCreate,
     TaskRead,
@@ -81,6 +92,10 @@ async def list_alumni(
         Query(description="Only alumni flagged as duplicate candidates."),
     ] = False,
     include_archived: bool = False,
+    sort: Annotated[
+        str,
+        Query(description="Sort order: name | grad_desc | grad_asc."),
+    ] = "name",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> AlumniPage:
@@ -103,6 +118,7 @@ async def list_alumni(
         missing_employer=missing_employer,
         duplicate=duplicate,
         include_archived=include_archived,
+        sort=sort,
     )
     return AlumniPage(items=items, total=total, limit=limit, offset=offset)
 
@@ -171,9 +187,108 @@ async def update_task_completion(
     )
 
 
+@router.post(
+    "/{alumni_id}/employment",
+    response_model=EmploymentHistoryRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_employment(
+    alumni_id: int,
+    payload: EmploymentHistoryCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> EmploymentHistoryRead:
+    """Add a prior role to an alumni's employment history (full_access)."""
+    return await profile_service.add_employment(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.post(
+    "/{alumni_id}/tags",
+    response_model=list[str],
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_tag(
+    alumni_id: int,
+    payload: TagCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> list[str]:
+    """Attach a canonical engagement tag to an alumni (full_access). Returns the
+    resulting tag list. Idempotent."""
+    return await profile_service.add_tag(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.delete("/{alumni_id}/tags/{tag}", response_model=list[str])
+async def remove_tag(
+    alumni_id: int,
+    tag: str,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> list[str]:
+    """Detach a tag from an alumni (full_access). Returns the resulting tag list.
+    404 if the alumni doesn't have that tag."""
+    return await profile_service.remove_tag(
+        session, alumni_id, tag, actor_user_id=user.user_id
+    )
+
+
+@router.post(
+    "/{alumni_id}/status-labels",
+    response_model=list[str],
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_status_label(
+    alumni_id: int,
+    payload: StatusLabelCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> list[str]:
+    """Attach a canonical status label to an alumni (full_access). Returns the
+    resulting label list. Idempotent."""
+    return await profile_service.add_status_label(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.delete("/{alumni_id}/status-labels/{label}", response_model=list[str])
+async def remove_status_label(
+    alumni_id: int,
+    label: str,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> list[str]:
+    """Detach a status label from an alumni (full_access). Returns the resulting
+    label list. 404 if the alumni doesn't have that label."""
+    return await profile_service.remove_status_label(
+        session, alumni_id, label, actor_user_id=user.user_id
+    )
+
+
+@router.post(
+    "/{alumni_id}/events",
+    response_model=EventAttendedRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_event_attendance(
+    alumni_id: int,
+    payload: EventAttendanceCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> EventAttendedRead:
+    """Mark an alumni as an attendee of an existing event (full_access). 404 if
+    the event/alumni is unknown; 409 if attendance already exists."""
+    return await profile_service.add_event_attendance(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
 @router.post("", response_model=AlumniRead, status_code=status.HTTP_201_CREATED)
 async def create_alumni(
-    payload: AlumniCreate, user: RequireFullAccess, session: SessionDep
+    payload: AlumniCreateFull, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
     return await service.create_alumni(session, payload, actor_user_id=user.user_id)
 
@@ -181,7 +296,7 @@ async def create_alumni(
 @router.patch("/{alumni_id}", response_model=AlumniRead)
 async def update_alumni(
     alumni_id: int,
-    payload: AlumniUpdate,
+    payload: AlumniUpdateFull,
     user: RequireFullAccess,
     session: SessionDep,
 ) -> AlumniRead:

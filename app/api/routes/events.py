@@ -4,7 +4,7 @@ import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
@@ -53,6 +53,10 @@ async def list_events(
         datetime.date | None,
         Query(description="Only events on or before this date (inclusive)."),
     ] = None,
+    sort: Annotated[
+        str,
+        Query(description="Sort order: date | upcoming | type."),
+    ] = "date",
 ) -> list[dict]:
     count_sq = (
         select(
@@ -80,7 +84,27 @@ async def list_events(
         stmt = stmt.where(Event.event_date >= date_from)
     if date_to is not None:
         stmt = stmt.where(Event.event_date <= date_to)
-    stmt = stmt.order_by(Event.event_date.desc().nullslast())
+    if sort == "type":
+        stmt = stmt.order_by(
+            Event.event_type.asc().nullslast(),
+            Event.event_date.desc().nullslast(),
+        )
+    elif sort == "upcoming":
+        # Upcoming (today or later) first, soonest at the top; past events follow,
+        # most recent first.
+        today = datetime.date.today()
+        is_past = case((Event.event_date >= today, 0), else_=1)
+        within = case(
+            (Event.event_date >= today, Event.event_date),
+            else_=None,
+        )
+        stmt = stmt.order_by(
+            is_past.asc(),
+            within.asc().nullslast(),
+            Event.event_date.desc().nullslast(),
+        )
+    else:  # "date" — newest first (default)
+        stmt = stmt.order_by(Event.event_date.desc().nullslast())
     rows = (await session.execute(stmt)).all()
     return [_serialize(e, int(att)) for e, att in rows]
 

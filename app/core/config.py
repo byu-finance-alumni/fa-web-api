@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     # only when actively debugging a query (SQL_ECHO=true), independent of DEBUG.
     sql_echo: bool = False
 
+    # Connection-pool sizing for the session-pooler (:5432) path. Supabase's
+    # session-mode pooler caps TOTAL clients to 15, so the app pool MUST stay
+    # small (default 5 + 2 overflow = hard cap 7) to leave headroom for one-off
+    # scripts and migrations. Overridable via env if needed. See database.py.
+    db_pool_size: int = 5
+    db_max_overflow: int = 2
+    db_pool_timeout: int = 10
+    db_pool_recycle: int = 1800
+
     # Database — optional so the app can boot before a DB is provisioned.
     # Prefers DATABASE_URL, then the Supabase/Vercel integration's POSTGRES_URL
     # (pooled) and POSTGRES_URL_NON_POOLING (direct).

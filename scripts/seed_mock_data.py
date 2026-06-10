@@ -22,7 +22,7 @@ import datetime
 
 from sqlalchemy import delete, select
 
-from app.core.database import SessionLocal
+from app.core.database import SessionLocal, dispose_engine
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Attachment, FollowUpTask, Interaction, Survey
@@ -457,13 +457,18 @@ async def seed_mock(session) -> int:
 async def main(remove: bool) -> None:
     if SessionLocal is None:
         raise SystemExit("DATABASE_URL is not configured — set it in .env.")
-    async with SessionLocal() as session:
-        if remove:
-            removed = await remove_mock(session)
-            print(f"Removed mock data: {removed} alumni (+ MOCK_DATA source).")
-        else:
-            seeded = await seed_mock(session)
-            print(f"Seeded {seeded} mock alumni (tagged source={MOCK_SOURCE_NAME}).")
+    # Dispose the engine in a finally so this one-off script never leaks
+    # connections against Supabase's 15-client session-pooler cap.
+    try:
+        async with SessionLocal() as session:
+            if remove:
+                removed = await remove_mock(session)
+                print(f"Removed mock data: {removed} alumni (+ MOCK_DATA source).")
+            else:
+                seeded = await seed_mock(session)
+                print(f"Seeded {seeded} mock alumni (tagged source={MOCK_SOURCE_NAME}).")
+    finally:
+        await dispose_engine()
 
 
 if __name__ == "__main__":

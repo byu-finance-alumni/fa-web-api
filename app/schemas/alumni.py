@@ -12,7 +12,6 @@ from __future__ import annotations
 import datetime
 import re
 import unicodedata
-from decimal import Decimal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -43,6 +42,10 @@ _NET_ID_RE = re.compile(r"^[a-z0-9]{2,12}$")
 
 _YEAR_MIN = 1950
 _YEAR_MAX = datetime.date.today().year + 10
+
+# Birthdays: anyone in an alumni database was plausibly born no earlier than
+# 1900; a birth date can't be in the future. Same bounds apply to a spouse.
+_BIRTH_DATE_MIN = datetime.date(1900, 1, 1)
 
 
 def _has_control_chars(value: str) -> bool:
@@ -80,9 +83,14 @@ class AlumniBase(BaseModel):
     birth_name: str | None = None
     gender: str | None = None
     birth_year: int | None = None
+    birth_date: datetime.date | None = None
     graduation_year: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    spouse_first_name: str | None = None
+    spouse_last_name: str | None = None
+    spouse_birth_date: datetime.date | None = None
+    spouse_alumni_id: int | None = None
     deceased: bool | None = None
     linkedin_url: str | None = None
     notes: str | None = None
@@ -95,6 +103,8 @@ class AlumniBase(BaseModel):
         "last_name",
         "preferred_first_name",
         "birth_name",
+        "spouse_first_name",
+        "spouse_last_name",
         mode="before",
     )
     @classmethod
@@ -170,6 +180,37 @@ class AlumniBase(BaseModel):
             return None
         if not (_YEAR_MIN <= value <= _YEAR_MAX):
             raise ValueError(f"Must be between {_YEAR_MIN} and {_YEAR_MAX}.")
+        return value
+
+    # --- Birthdays -----------------------------------------------------------
+
+    @field_validator("birth_date", "spouse_birth_date")
+    @classmethod
+    def _validate_birth_date(
+        cls, value: datetime.date | None
+    ) -> datetime.date | None:
+        # Pydantic has already coerced an ISO "YYYY-MM-DD" string to a date.
+        if value is None:
+            return None
+        today = datetime.date.today()
+        if not (_BIRTH_DATE_MIN <= value <= today):
+            raise ValueError(
+                f"Must be between {_BIRTH_DATE_MIN.isoformat()} and today."
+            )
+        return value
+
+    # --- Spouse link ---------------------------------------------------------
+
+    @field_validator("spouse_alumni_id")
+    @classmethod
+    def _validate_spouse_alumni_id(cls, value: int | None) -> int | None:
+        # Existence and not-self are checked in the service (it has the DB
+        # session and, on update, the alumnus's own id); here we just reject
+        # structurally invalid ids early.
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("Must be a positive alumni id.")
         return value
 
     # --- Free-text columns ---------------------------------------------------
@@ -356,7 +397,6 @@ class EngagementCreate(_Section):
     hired_finance_intern: bool = False
     hired_finance_full_time: bool = False
     piff_donor: bool = False
-    piff_donor_amount: Decimal | None = None
     cfp_designation: bool = False
     cfa_designation: bool = False
     engagement_notes: str | None = None
@@ -407,9 +447,14 @@ class AlumniRead(BaseModel):
     birth_name: str | None = None
     gender: str | None = None
     birth_year: int | None = None
+    birth_date: datetime.date | None = None
     graduation_year: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    spouse_first_name: str | None = None
+    spouse_last_name: str | None = None
+    spouse_birth_date: datetime.date | None = None
+    spouse_alumni_id: int | None = None
     deceased: bool
     linkedin_url: str | None = None
     notes: str | None = None

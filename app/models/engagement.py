@@ -8,14 +8,11 @@ Maps from ``database/schema.sql``:
 
 from __future__ import annotations
 
-from decimal import Decimal
-
 from sqlalchemy import (
     BigInteger,
     Boolean,
     ForeignKey,
     Integer,
-    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -91,7 +88,6 @@ class AlumniProgramEngagement(TimestampMixin, Base):
     piff_donor: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
-    piff_donor_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     cfp_designation: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )

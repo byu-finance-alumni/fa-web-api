@@ -10,7 +10,6 @@ sparse record (most fields awaiting data) serializes cleanly.
 from __future__ import annotations
 
 import datetime
-from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -53,6 +52,107 @@ class EmploymentHistoryCreate(BaseModel):
     @field_validator("employment_title", "city", "state", mode="before")
     @classmethod
     def _blank_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class EmploymentHistoryUpdate(BaseModel):
+    """Edit fields on an existing employment-history row (all optional)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    employer_name: str | None = Field(default=None, min_length=1, max_length=255)
+    employment_title: str | None = Field(default=None, max_length=255)
+    employment_industry: str | None = Field(default=None, max_length=255)
+    city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    start_year: int | None = Field(default=None, ge=1900, le=2100)
+    end_year: int | None = Field(default=None, ge=1900, le=2100)
+    is_current: bool | None = None
+
+    @field_validator("employment_industry", mode="before")
+    @classmethod
+    def _check_industry(cls, value: str | None) -> str | None:
+        return validate_industry(value)
+
+    @field_validator("employer_name", mode="before")
+    @classmethod
+    def _employer_trim(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator("employment_title", "city", "state", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class EducationCreate(BaseModel):
+    """Add an education entry to an alumnus's record (Education panel)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    university: str | None = Field(default=None, max_length=255)
+    college: str | None = Field(default=None, max_length=255)
+    department: str | None = Field(default=None, max_length=255)
+    degree: str | None = Field(default=None, max_length=255)
+    major: str | None = Field(default=None, max_length=255)
+    degree_status: str | None = Field(default=None, max_length=100)
+    degree_year: int | None = Field(default=None, ge=1900, le=2100)
+
+    @field_validator(
+        "university",
+        "college",
+        "department",
+        "degree",
+        "major",
+        "degree_status",
+        mode="before",
+    )
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class EducationUpdate(EducationCreate):
+    """Edit fields on an existing education entry (all optional, same shape)."""
+
+
+class LeadershipCreate(BaseModel):
+    """Add a Finance Society leadership entry to an alumnus's record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    leadership_role: str = Field(min_length=1, max_length=100)
+    role_year: int | None = Field(default=None, ge=1900, le=2100)
+
+    @field_validator("leadership_role", mode="before")
+    @classmethod
+    def _role_trim(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+
+class LeadershipUpdate(BaseModel):
+    """Edit fields on an existing leadership entry (all optional)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    leadership_role: str | None = Field(default=None, min_length=1, max_length=100)
+    role_year: int | None = Field(default=None, ge=1900, le=2100)
+
+    @field_validator("leadership_role", mode="before")
+    @classmethod
+    def _role_trim(cls, value: str | None) -> str | None:
         if value is None:
             return None
         stripped = value.strip()
@@ -200,7 +300,6 @@ class ProgramEngagementRead(_Orm):
     hired_finance_intern: bool
     hired_finance_full_time: bool
     piff_donor: bool
-    piff_donor_amount: Decimal | None = None
     cfp_designation: bool
     cfa_designation: bool
     engagement_notes: str | None = None
@@ -242,6 +341,34 @@ class TaskRead(_Orm):
     assigned_to: str | None = None
 
 
+class AdminTaskItem(_Orm):
+    """A single follow-up task in the cross-alumni admin task list.
+
+    Reuses the ``TaskRead`` task fields, plus the owning alumnus's id and display
+    name so the row can deep-link to the profile. ``assigned_to`` is the
+    resolved assignee display name (None when unassigned)."""
+
+    follow_up_task_id: int
+    alumni_id: int
+    alumni_name: str | None = None
+    task_title: str | None = None
+    due_date: datetime.date | None = None
+    completed: bool
+    completed_at: datetime.datetime | None = None
+    task_notes: str | None = None
+    assigned_to_user_id: int | None = None
+    assigned_to: str | None = None
+
+
+class AdminTaskPage(BaseModel):
+    """A page of cross-alumni follow-up tasks plus the pagination envelope."""
+
+    items: list[AdminTaskItem]
+    total: int
+    limit: int
+    offset: int
+
+
 class AttachmentRead(_Orm):
     attachment_id: int
     file_name: str
@@ -274,6 +401,10 @@ class ProfileRead(BaseModel):
     """The full profile aggregate for one alumni."""
 
     alumni: AlumniRead
+    # When alumni.spouse_alumni_id is set, the linked alumnus's current display
+    # name — so the profile can render a deep-link with an up-to-date label even
+    # if the stored spouse_first_name/last_name drift. None when not linked.
+    spouse_alumni_name: str | None = None
     contact: ContactRead | None = None
     current_career: CurrentCareerRead | None = None
     employment_history: list[EmploymentHistoryRead] = []

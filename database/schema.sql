@@ -96,9 +96,14 @@ CREATE TABLE alumni (
     birth_name           varchar(100),
     gender               varchar(30),
     birth_year           int,
+    birth_date           date,
     graduation_year      int,
     finance_program_year int,
     graduate_degree      varchar(100),
+    spouse_first_name    varchar(100),
+    spouse_last_name     varchar(100),
+    spouse_birth_date    date,
+    spouse_alumni_id     bigint,
     deceased             boolean NOT NULL DEFAULT false,
     linkedin_url         varchar(500),
     notes                text,
@@ -107,8 +112,12 @@ CREATE TABLE alumni (
     last_imported_at     timestamptz,
     created_at           timestamptz NOT NULL DEFAULT now(),
     updated_at           timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT fk_alumni_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL
+    CONSTRAINT fk_alumni_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL,
+    CONSTRAINT fk_alumni_spouse_alumni_id FOREIGN KEY (spouse_alumni_id) REFERENCES alumni (alumni_id) ON DELETE SET NULL,
+    CONSTRAINT ck_alumni_spouse_not_self CHECK (spouse_alumni_id IS NULL OR spouse_alumni_id <> alumni_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_alumni_spouse_alumni_id ON alumni (spouse_alumni_id);
 
 CREATE TABLE alumni_contact_info (
     contact_info_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -411,7 +420,6 @@ CREATE TABLE alumni_program_engagement (
     hired_finance_intern            boolean NOT NULL DEFAULT false,
     hired_finance_full_time         boolean NOT NULL DEFAULT false,
     piff_donor                      boolean NOT NULL DEFAULT false,
-    piff_donor_amount               numeric(12,2),
     cfp_designation                 boolean NOT NULL DEFAULT false,
     cfa_designation                 boolean NOT NULL DEFAULT false,
     engagement_notes                text,

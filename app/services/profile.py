@@ -37,15 +37,20 @@ from app.schemas.profile import (
     AuditEntryRead,
     ContactRead,
     CurrentCareerRead,
+    EducationCreate,
     EducationRead,
+    EducationUpdate,
     EmploymentHistoryCreate,
     EmploymentHistoryRead,
+    EmploymentHistoryUpdate,
     EngagementNoteRead,
     EventAttendanceCreate,
     EventAttendedRead,
     InteractionCreate,
     InteractionRead,
+    LeadershipCreate,
     LeadershipRead,
+    LeadershipUpdate,
     ProfileRead,
     ProgramEngagementRead,
     StatusLabelCreate,
@@ -79,10 +84,24 @@ async def _actor_name(session: AsyncSession, user_id: int | None) -> str | None:
     return _full_name(user.first_name, user.last_name, user.email) if user else None
 
 
-async def get_profile(session: AsyncSession, alumni_id: int) -> ProfileRead:
+async def get_profile(
+    session: AsyncSession, alumni_id: int, *, include_tasks: bool = True
+) -> ProfileRead:
     alumnus = await session.get(Alumni, alumni_id)
     if alumnus is None:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
+
+    # Resolve the linked spouse's current display name (for the profile link
+    # label). Prefer the preferred first name when present.
+    spouse_alumni_name: str | None = None
+    if alumnus.spouse_alumni_id is not None:
+        spouse = await session.get(Alumni, alumnus.spouse_alumni_id)
+        if spouse is not None:
+            spouse_alumni_name = _full_name(
+                spouse.preferred_first_name or spouse.first_name,
+                spouse.last_name,
+                None,
+            )
 
     contact = await session.scalar(
         select(AlumniContactInfo)
@@ -174,16 +193,22 @@ async def get_profile(session: AsyncSession, alumni_id: int) -> ProfileRead:
             .limit(50)
         )
     ).all()
+    # Tasks are admin-only: skip the query entirely for view_only callers so the
+    # data never leaves the API (the profile page also hides the panel for them).
     tasks = (
-        await session.scalars(
-            select(FollowUpTask)
-            .where(FollowUpTask.alumni_id == alumni_id)
-            .order_by(
-                FollowUpTask.completed.asc(),
-                FollowUpTask.due_date.asc().nullslast(),
+        (
+            await session.scalars(
+                select(FollowUpTask)
+                .where(FollowUpTask.alumni_id == alumni_id)
+                .order_by(
+                    FollowUpTask.completed.asc(),
+                    FollowUpTask.due_date.asc().nullslast(),
+                )
             )
-        )
-    ).all()
+        ).all()
+        if include_tasks
+        else []
+    )
     attachments = (
         await session.scalars(
             select(Attachment)
@@ -221,6 +246,7 @@ async def get_profile(session: AsyncSession, alumni_id: int) -> ProfileRead:
 
     return ProfileRead(
         alumni=AlumniRead.model_validate(alumnus),
+        spouse_alumni_name=spouse_alumni_name,
         contact=ContactRead.model_validate(contact) if contact else None,
         current_career=CurrentCareerRead.model_validate(career) if career else None,
         employment_history=[EmploymentHistoryRead.model_validate(e) for e in employment],
@@ -377,6 +403,180 @@ async def add_employment(
     await session.commit()
     await session.refresh(row)
     return EmploymentHistoryRead.model_validate(row)
+
+
+async def update_employment(
+    session: AsyncSession,
+    alumni_id: int,
+    employment_history_id: int,
+    payload: EmploymentHistoryUpdate,
+    actor_user_id: int | None,
+) -> EmploymentHistoryRead:
+    """Edit a prior role on an alumnus's employment history (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(EmploymentHistory, employment_history_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(
+            f"Employment history {employment_history_id} not found."
+        )
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(row, field, value)
+    _audit_alumni(session, actor_user_id, "update_employment", alumni_id)
+    await session.commit()
+    await session.refresh(row)
+    return EmploymentHistoryRead.model_validate(row)
+
+
+async def delete_employment(
+    session: AsyncSession,
+    alumni_id: int,
+    employment_history_id: int,
+    actor_user_id: int | None,
+) -> None:
+    """Delete a prior role from an alumnus's employment history (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(EmploymentHistory, employment_history_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(
+            f"Employment history {employment_history_id} not found."
+        )
+    await session.delete(row)
+    _audit_alumni(session, actor_user_id, "delete_employment", alumni_id)
+    await session.commit()
+
+
+async def add_education(
+    session: AsyncSession,
+    alumni_id: int,
+    payload: EducationCreate,
+    actor_user_id: int | None,
+) -> EducationRead:
+    """Add an education entry to an alumnus's record (full_access)."""
+    await _require_alumni(session, alumni_id)
+    row = EducationHistory(
+        alumni_id=alumni_id,
+        university=payload.university,
+        college=payload.college,
+        department=payload.department,
+        degree=payload.degree,
+        major=payload.major,
+        degree_status=payload.degree_status,
+        degree_year=payload.degree_year,
+    )
+    session.add(row)
+    _audit_alumni(session, actor_user_id, "add_education", alumni_id)
+    await session.commit()
+    await session.refresh(row)
+    return EducationRead.model_validate(row)
+
+
+async def update_education(
+    session: AsyncSession,
+    alumni_id: int,
+    education_id: int,
+    payload: EducationUpdate,
+    actor_user_id: int | None,
+) -> EducationRead:
+    """Edit an education entry on an alumnus's record (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(EducationHistory, education_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(f"Education {education_id} not found.")
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(row, field, value)
+    _audit_alumni(session, actor_user_id, "update_education", alumni_id)
+    await session.commit()
+    await session.refresh(row)
+    return EducationRead.model_validate(row)
+
+
+async def delete_education(
+    session: AsyncSession,
+    alumni_id: int,
+    education_id: int,
+    actor_user_id: int | None,
+) -> None:
+    """Delete an education entry from an alumnus's record (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(EducationHistory, education_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(f"Education {education_id} not found.")
+    await session.delete(row)
+    _audit_alumni(session, actor_user_id, "delete_education", alumni_id)
+    await session.commit()
+
+
+async def add_leadership(
+    session: AsyncSession,
+    alumni_id: int,
+    payload: LeadershipCreate,
+    actor_user_id: int | None,
+) -> LeadershipRead:
+    """Add a Finance Society leadership entry to an alumnus (full_access)."""
+    await _require_alumni(session, alumni_id)
+    row = FinanceSocietyLeadership(
+        alumni_id=alumni_id,
+        leadership_role=payload.leadership_role,
+        role_year=payload.role_year,
+    )
+    session.add(row)
+    _audit_alumni(session, actor_user_id, "add_leadership", alumni_id)
+    await session.commit()
+    await session.refresh(row)
+    return LeadershipRead.model_validate(row)
+
+
+async def update_leadership(
+    session: AsyncSession,
+    alumni_id: int,
+    finance_society_leadership_id: int,
+    payload: LeadershipUpdate,
+    actor_user_id: int | None,
+) -> LeadershipRead:
+    """Edit a Finance Society leadership entry (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(
+        FinanceSocietyLeadership, finance_society_leadership_id
+    )
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(
+            f"Leadership {finance_society_leadership_id} not found."
+        )
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(row, field, value)
+    _audit_alumni(session, actor_user_id, "update_leadership", alumni_id)
+    await session.commit()
+    await session.refresh(row)
+    return LeadershipRead.model_validate(row)
+
+
+async def delete_leadership(
+    session: AsyncSession,
+    alumni_id: int,
+    finance_society_leadership_id: int,
+    actor_user_id: int | None,
+) -> None:
+    """Delete a Finance Society leadership entry (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(
+        FinanceSocietyLeadership, finance_society_leadership_id
+    )
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(
+            f"Leadership {finance_society_leadership_id} not found."
+        )
+    await session.delete(row)
+    _audit_alumni(session, actor_user_id, "delete_leadership", alumni_id)
+    await session.commit()
 
 
 async def _tag_names(session: AsyncSession, alumni_id: int) -> list[str]:

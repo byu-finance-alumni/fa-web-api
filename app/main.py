@@ -22,6 +22,7 @@ from app.api.routes import (
     events,
     geography,
     health,
+    tasks,
 )
 from app.core.config import get_settings
 from app.core.database import dispose_engine
@@ -79,6 +80,7 @@ app.include_router(admin.router)
 app.include_router(events.router)
 app.include_router(audit.router)
 app.include_router(geography.router)
+app.include_router(tasks.router)
 
 
 @app.exception_handler(AuthError)

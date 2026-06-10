@@ -14,6 +14,7 @@ import datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -50,9 +51,20 @@ class Alumni(TimestampMixin, Base):
     # Demographics / program.
     gender: Mapped[str | None] = mapped_column(String(30))
     birth_year: Mapped[int | None] = mapped_column(Integer)
+    birth_date: Mapped[datetime.date | None] = mapped_column(Date)
     graduation_year: Mapped[int | None] = mapped_column(Integer)
     finance_program_year: Mapped[int | None] = mapped_column(Integer)
     graduate_degree: Mapped[str | None] = mapped_column(String(100))
+
+    # Spouse. Free-text name + birthday; spouse_alumni_id links to another
+    # alumni record when the spouse is also an alumnus (self-referential FK,
+    # ON DELETE SET NULL so deleting the spouse just clears the pointer).
+    spouse_first_name: Mapped[str | None] = mapped_column(String(100))
+    spouse_last_name: Mapped[str | None] = mapped_column(String(100))
+    spouse_birth_date: Mapped[datetime.date | None] = mapped_column(Date)
+    spouse_alumni_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("alumni.alumni_id", ondelete="SET NULL")
+    )
 
     deceased: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")

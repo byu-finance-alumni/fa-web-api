@@ -19,12 +19,19 @@ from app.schemas.alumni import (
     AlumniUpdateFull,
 )
 from app.schemas.profile import (
+    EducationCreate,
+    EducationRead,
+    EducationUpdate,
     EmploymentHistoryCreate,
     EmploymentHistoryRead,
+    EmploymentHistoryUpdate,
     EventAttendanceCreate,
     EventAttendedRead,
     InteractionCreate,
     InteractionRead,
+    LeadershipCreate,
+    LeadershipRead,
+    LeadershipUpdate,
     ProfileRead,
     StatusLabelCreate,
     TagCreate,
@@ -132,11 +139,17 @@ async def get_alumni(
 
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
 async def get_alumni_profile(
-    alumni_id: int, _: RequireViewAccess, session: SessionDep
+    alumni_id: int, user: RequireViewAccess, session: SessionDep
 ) -> ProfileRead:
     """Full profile aggregate (core + contact, career, employment, leadership,
-    engagement, surveys, interactions, tasks, attachments, audit) for the tabs."""
-    return await profile_service.get_profile(session, alumni_id)
+    engagement, surveys, interactions, tasks, attachments, audit) for the tabs.
+
+    Follow-up tasks are admin-only: view_only users get an empty ``tasks`` list
+    (enforced here, not just hidden in the UI). full_access/super_admin see all."""
+    include_tasks = user.is_full_access or user.is_super_admin
+    return await profile_service.get_profile(
+        session, alumni_id, include_tasks=include_tasks
+    )
 
 
 @router.post(
@@ -201,6 +214,156 @@ async def add_employment(
     """Add a prior role to an alumni's employment history (full_access)."""
     return await profile_service.add_employment(
         session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.patch(
+    "/{alumni_id}/employment/{employment_history_id}",
+    response_model=EmploymentHistoryRead,
+)
+async def update_employment(
+    alumni_id: int,
+    employment_history_id: int,
+    payload: EmploymentHistoryUpdate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> EmploymentHistoryRead:
+    """Edit a prior role on an alumni's employment history (full_access). 404 if
+    the row is missing or belongs to another alumnus."""
+    return await profile_service.update_employment(
+        session,
+        alumni_id,
+        employment_history_id,
+        payload,
+        actor_user_id=user.user_id,
+    )
+
+
+@router.delete(
+    "/{alumni_id}/employment/{employment_history_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_employment(
+    alumni_id: int,
+    employment_history_id: int,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> None:
+    """Delete a prior role from an alumni's employment history (full_access). 404
+    if the row is missing or belongs to another alumnus."""
+    await profile_service.delete_employment(
+        session, alumni_id, employment_history_id, actor_user_id=user.user_id
+    )
+
+
+@router.post(
+    "/{alumni_id}/education",
+    response_model=EducationRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_education(
+    alumni_id: int,
+    payload: EducationCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> EducationRead:
+    """Add an education entry to an alumni's record (full_access)."""
+    return await profile_service.add_education(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.patch(
+    "/{alumni_id}/education/{education_id}",
+    response_model=EducationRead,
+)
+async def update_education(
+    alumni_id: int,
+    education_id: int,
+    payload: EducationUpdate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> EducationRead:
+    """Edit an education entry on an alumni's record (full_access). 404 if the
+    row is missing or belongs to another alumnus."""
+    return await profile_service.update_education(
+        session, alumni_id, education_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.delete(
+    "/{alumni_id}/education/{education_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_education(
+    alumni_id: int,
+    education_id: int,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> None:
+    """Delete an education entry from an alumni's record (full_access). 404 if the
+    row is missing or belongs to another alumnus."""
+    await profile_service.delete_education(
+        session, alumni_id, education_id, actor_user_id=user.user_id
+    )
+
+
+@router.post(
+    "/{alumni_id}/leadership",
+    response_model=LeadershipRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_leadership(
+    alumni_id: int,
+    payload: LeadershipCreate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> LeadershipRead:
+    """Add a Finance Society leadership entry to an alumni (full_access)."""
+    return await profile_service.add_leadership(
+        session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.patch(
+    "/{alumni_id}/leadership/{finance_society_leadership_id}",
+    response_model=LeadershipRead,
+)
+async def update_leadership(
+    alumni_id: int,
+    finance_society_leadership_id: int,
+    payload: LeadershipUpdate,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> LeadershipRead:
+    """Edit a Finance Society leadership entry (full_access). 404 if the row is
+    missing or belongs to another alumnus."""
+    return await profile_service.update_leadership(
+        session,
+        alumni_id,
+        finance_society_leadership_id,
+        payload,
+        actor_user_id=user.user_id,
+    )
+
+
+@router.delete(
+    "/{alumni_id}/leadership/{finance_society_leadership_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_leadership(
+    alumni_id: int,
+    finance_society_leadership_id: int,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> None:
+    """Delete a Finance Society leadership entry (full_access). 404 if the row is
+    missing or belongs to another alumnus."""
+    await profile_service.delete_leadership(
+        session,
+        alumni_id,
+        finance_society_leadership_id,
+        actor_user_id=user.user_id,
     )
 
 

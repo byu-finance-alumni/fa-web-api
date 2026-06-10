@@ -59,24 +59,37 @@ MOCK_SOURCE_NAME = "MOCK_DATA"
 # Synthetic BYU Finance alumni. Obviously-fake, varied for exercising filters
 # (grad-year range, deceased, archived, search). Employer/location live in
 # related tables (not modeled yet), so these cover the alumni core only.
+# Every alumnus has a full birth_date (mock). A few have a free-text spouse
+# (non-alumni). James Doe (jdoe1) and Ava Lee (alee2) are married AND both
+# alumni — that reciprocal link is wired post-flush via MOCK_SPOUSE_LINKS (their
+# alumni_ids aren't known until the rows are inserted), so it demonstrates the
+# clickable spouse → profile link.
 MOCK_ALUMNI: list[dict] = [
-    {"byu_id": "001000001", "net_id": "jdoe1", "first_name": "James", "last_name": "Doe", "gender": "M", "graduation_year": 2012, "finance_program_year": 2011, "linkedin_url": "https://linkedin.com/in/mock-jdoe", "notes": "[MOCK] Investment banking track."},
-    {"byu_id": "001000002", "net_id": "alee2", "first_name": "Ava", "last_name": "Lee", "preferred_first_name": "Avy", "gender": "F", "graduation_year": 2015, "finance_program_year": 2014, "notes": "[MOCK] PE associate."},
-    {"byu_id": "001000003", "net_id": "mchen3", "first_name": "Marcus", "middle_name": "T", "last_name": "Chen", "gender": "M", "graduation_year": 2018, "finance_program_year": 2017},
-    {"byu_id": "001000004", "net_id": "srivera4", "first_name": "Sofia", "last_name": "Rivera", "gender": "F", "graduation_year": 2020, "finance_program_year": 2019, "linkedin_url": "https://linkedin.com/in/mock-srivera"},
-    {"byu_id": "001000005", "net_id": "bpatel5", "first_name": "Benjamin", "last_name": "Patel", "gender": "M", "graduation_year": 2010, "finance_program_year": 2009, "graduate_degree": "MBA"},
-    {"byu_id": "001000006", "net_id": "enguyen6", "first_name": "Emily", "last_name": "Nguyen", "gender": "F", "graduation_year": 2022, "finance_program_year": 2021, "notes": "[MOCK] Corporate finance."},
-    {"byu_id": "001000007", "net_id": "dkim7", "first_name": "Daniel", "last_name": "Kim", "gender": "M", "graduation_year": 2016, "finance_program_year": 2015},
-    {"byu_id": "001000008", "net_id": "ojohnson8", "first_name": "Olivia", "last_name": "Johnson", "gender": "F", "graduation_year": 2019, "finance_program_year": 2018, "linkedin_url": "https://linkedin.com/in/mock-ojohnson"},
-    {"byu_id": "001000009", "net_id": "lgarcia9", "first_name": "Lucas", "last_name": "Garcia", "gender": "M", "graduation_year": 2013, "finance_program_year": 2012},
-    {"byu_id": "001000010", "net_id": "hwhite10", "first_name": "Hannah", "last_name": "White", "gender": "F", "graduation_year": 2021, "finance_program_year": 2020, "notes": "[MOCK] Wealth management."},
-    {"byu_id": "001000011", "net_id": "nwright11", "first_name": "Nathan", "last_name": "Wright", "gender": "M", "graduation_year": 2009, "finance_program_year": 2008, "deceased": True, "notes": "[MOCK] Deceased — for filter testing."},
-    {"byu_id": "001000012", "net_id": "gmartin12", "first_name": "Grace", "last_name": "Martin", "gender": "F", "graduation_year": 2017, "finance_program_year": 2016},
-    {"byu_id": "001000013", "net_id": "ethomas13", "first_name": "Ethan", "last_name": "Thomas", "gender": "M", "graduation_year": 2023, "finance_program_year": 2022, "linkedin_url": "https://linkedin.com/in/mock-ethomas"},
-    {"byu_id": "001000014", "net_id": "iclark14", "first_name": "Isabella", "last_name": "Clark", "gender": "F", "graduation_year": 2014, "finance_program_year": 2013, "archived": True, "notes": "[MOCK] Archived — for soft-delete testing."},
-    {"byu_id": "001000015", "net_id": "alewis15", "first_name": "Andrew", "last_name": "Lewis", "gender": "M", "graduation_year": 2011, "finance_program_year": 2010, "graduate_degree": "MAcc"},
-    {"byu_id": "001000016", "net_id": "shall16", "first_name": "Sophia", "last_name": "Hall", "gender": "F", "graduation_year": 2020, "finance_program_year": 2019, "notes": "[MOCK] Equity research."},
+    {"byu_id": "001000001", "net_id": "jdoe1", "first_name": "James", "last_name": "Doe", "gender": "M", "birth_date": datetime.date(1990, 3, 15), "graduation_year": 2012, "finance_program_year": 2011, "linkedin_url": "https://linkedin.com/in/mock-jdoe", "notes": "[MOCK] Investment banking track."},
+    {"byu_id": "001000002", "net_id": "alee2", "first_name": "Ava", "last_name": "Lee", "preferred_first_name": "Avy", "gender": "F", "birth_date": datetime.date(1993, 7, 22), "graduation_year": 2015, "finance_program_year": 2014, "notes": "[MOCK] PE associate."},
+    {"byu_id": "001000003", "net_id": "mchen3", "first_name": "Marcus", "middle_name": "T", "last_name": "Chen", "gender": "M", "birth_date": datetime.date(1996, 1, 10), "graduation_year": 2018, "finance_program_year": 2017},
+    {"byu_id": "001000004", "net_id": "srivera4", "first_name": "Sofia", "last_name": "Rivera", "gender": "F", "birth_date": datetime.date(1998, 11, 5), "graduation_year": 2020, "finance_program_year": 2019, "linkedin_url": "https://linkedin.com/in/mock-srivera"},
+    {"byu_id": "001000005", "net_id": "bpatel5", "first_name": "Benjamin", "last_name": "Patel", "gender": "M", "birth_date": datetime.date(1987, 5, 30), "graduation_year": 2010, "finance_program_year": 2009, "graduate_degree": "MBA", "spouse_first_name": "Priya", "spouse_last_name": "Patel", "spouse_birth_date": datetime.date(1988, 9, 9)},
+    {"byu_id": "001000006", "net_id": "enguyen6", "first_name": "Emily", "last_name": "Nguyen", "gender": "F", "birth_date": datetime.date(2000, 2, 18), "graduation_year": 2022, "finance_program_year": 2021, "notes": "[MOCK] Corporate finance."},
+    {"byu_id": "001000007", "net_id": "dkim7", "first_name": "Daniel", "last_name": "Kim", "gender": "M", "birth_date": datetime.date(1994, 9, 12), "graduation_year": 2016, "finance_program_year": 2015},
+    {"byu_id": "001000008", "net_id": "ojohnson8", "first_name": "Olivia", "last_name": "Johnson", "gender": "F", "birth_date": datetime.date(1997, 6, 25), "graduation_year": 2019, "finance_program_year": 2018, "linkedin_url": "https://linkedin.com/in/mock-ojohnson", "spouse_first_name": "Mark", "spouse_last_name": "Johnson", "spouse_birth_date": datetime.date(1996, 2, 2)},
+    {"byu_id": "001000009", "net_id": "lgarcia9", "first_name": "Lucas", "last_name": "Garcia", "gender": "M", "birth_date": datetime.date(1991, 4, 8), "graduation_year": 2013, "finance_program_year": 2012},
+    {"byu_id": "001000010", "net_id": "hwhite10", "first_name": "Hannah", "last_name": "White", "gender": "F", "birth_date": datetime.date(1999, 12, 1), "graduation_year": 2021, "finance_program_year": 2020, "notes": "[MOCK] Wealth management.", "spouse_first_name": "Caleb", "spouse_last_name": "White", "spouse_birth_date": datetime.date(1998, 8, 8)},
+    {"byu_id": "001000011", "net_id": "nwright11", "first_name": "Nathan", "last_name": "Wright", "gender": "M", "birth_date": datetime.date(1986, 8, 19), "graduation_year": 2009, "finance_program_year": 2008, "deceased": True, "notes": "[MOCK] Deceased — for filter testing."},
+    {"byu_id": "001000012", "net_id": "gmartin12", "first_name": "Grace", "last_name": "Martin", "gender": "F", "birth_date": datetime.date(1995, 3, 27), "graduation_year": 2017, "finance_program_year": 2016},
+    {"byu_id": "001000013", "net_id": "ethomas13", "first_name": "Ethan", "last_name": "Thomas", "gender": "M", "birth_date": datetime.date(2001, 10, 14), "graduation_year": 2023, "finance_program_year": 2022, "linkedin_url": "https://linkedin.com/in/mock-ethomas"},
+    {"byu_id": "001000014", "net_id": "iclark14", "first_name": "Isabella", "last_name": "Clark", "gender": "F", "birth_date": datetime.date(1992, 7, 3), "graduation_year": 2014, "finance_program_year": 2013, "archived": True, "notes": "[MOCK] Archived — for soft-delete testing."},
+    {"byu_id": "001000015", "net_id": "alewis15", "first_name": "Andrew", "last_name": "Lewis", "gender": "M", "birth_date": datetime.date(1988, 1, 22), "graduation_year": 2011, "finance_program_year": 2010, "graduate_degree": "MAcc"},
+    {"byu_id": "001000016", "net_id": "shall16", "first_name": "Sophia", "last_name": "Hall", "gender": "F", "birth_date": datetime.date(1998, 5, 16), "graduation_year": 2020, "finance_program_year": 2019, "notes": "[MOCK] Equity research."},
 ]
+
+# Reciprocal spouse links between alumni records (net_id -> spouse net_id).
+# Wired after the alumni rows are flushed (so alumni_ids exist). Each side's
+# spouse name + birthday is copied from the partner's row.
+MOCK_SPOUSE_LINKS: dict[str, str] = {
+    "jdoe1": "alee2",
+    "alee2": "jdoe1",
+}
 
 
 # Canonical reference labels used by the chips/filters (from Features.md §4b).
@@ -106,7 +119,7 @@ MOCK_DETAIL: dict[str, dict] = {
             "current_employer": "Goldman Sachs",
             "current_title": "Vice President",
             "current_industry": "Investment Banking",
-            "current_industry_secondary": "Financial Services",
+            "current_industry_secondary": "Private Equity",
             "current_city": "New York",
             "current_state": "NY",
             "current_country": "USA",
@@ -133,7 +146,6 @@ MOCK_DETAIL: dict[str, dict] = {
             "hired_finance_intern": True,
             "cfa_designation": True,
             "piff_donor": True,
-            "piff_donor_amount": 5000,
             "engagement_notes": "Hosts NetTrek in NYC; active IB-track mentor.",
         },
         "engagement_notes": [
@@ -166,7 +178,7 @@ MOCK_DETAIL: dict[str, dict] = {
     "alee2": {
         "contact": {"personal_email": "ava.lee@example.com", "phone": "+1 (415) 555-0199", "city": "San Francisco", "state": "CA", "country": "USA", "region": "West"},
         "career": {"current_employer": "Bain Capital", "current_title": "Associate", "current_industry": "Private Equity", "current_city": "San Francisco", "current_state": "CA", "seniority_level": "Associate"},
-        "program": {"piff_donor": True, "piff_donor_amount": 1500, "mentor_willing": True},
+        "program": {"piff_donor": True, "mentor_willing": True},
         "tags": ["Highly Engaged", "Donor"],
         "interactions": [
             {"interaction_type": "Event Follow-Up", "days_ago": 30, "interaction_notes": "Followed up after Women in Finance mixer."},
@@ -203,7 +215,7 @@ MOCK_DETAIL: dict[str, dict] = {
     "ojohnson8": {
         "contact": {"city": "Provo", "state": "UT", "country": "USA", "region": "Mountain West"},
         "career": {"current_employer": "Fidelity", "current_title": "Wealth Advisor", "current_industry": "Asset Management", "current_city": "Provo", "current_state": "UT", "seniority_level": "Advisor"},
-        "program": {"piff_donor": True, "piff_donor_amount": 2500, "mentor_willing": True},
+        "program": {"piff_donor": True, "mentor_willing": True},
         "tags": ["Donor", "Mentor"],
     },
     "lgarcia9": {
@@ -213,7 +225,7 @@ MOCK_DETAIL: dict[str, dict] = {
     "hwhite10": {
         "contact": {"city": "New York", "state": "NY", "country": "USA", "region": "Northeast"},
         "career": {"current_employer": "Morgan Stanley", "current_title": "Wealth Manager", "current_industry": "Wealth Management", "current_city": "New York", "current_state": "NY", "seniority_level": "Vice President"},
-        "program": {"piff_donor": True, "piff_donor_amount": 1000, "mentor_willing": True},
+        "program": {"piff_donor": True, "mentor_willing": True},
         "tags": ["Donor", "Mentor"],
     },
     "gmartin12": {
@@ -354,6 +366,27 @@ async def seed_mock(session) -> int:
         for row, a in zip(MOCK_ALUMNI, alumni, strict=True)
         if row.get("net_id")
     }
+
+    # Wire reciprocal spouse links now that alumni_ids exist. Copy each spouse's
+    # name + birthday from the partner's row so the linked records stay in sync.
+    alumni_obj_by_net_id = {
+        row["net_id"]: a
+        for row, a in zip(MOCK_ALUMNI, alumni, strict=True)
+        if row.get("net_id")
+    }
+    row_by_net_id = {r["net_id"]: r for r in MOCK_ALUMNI if r.get("net_id")}
+    for net_id, spouse_net_id in MOCK_SPOUSE_LINKS.items():
+        a = alumni_obj_by_net_id.get(net_id)
+        spouse_obj = alumni_obj_by_net_id.get(spouse_net_id)
+        spouse_row = row_by_net_id.get(spouse_net_id)
+        if a is None or spouse_obj is None or spouse_row is None:
+            continue
+        a.spouse_alumni_id = spouse_obj.alumni_id
+        a.spouse_first_name = (
+            spouse_row.get("preferred_first_name") or spouse_row.get("first_name")
+        )
+        a.spouse_last_name = spouse_row.get("last_name")
+        a.spouse_birth_date = spouse_row.get("birth_date")
 
     # Attribute seeded interactions/tasks/attachments to a real provisioned user
     # so the "logged by / assigned to" names render (falls back to None).

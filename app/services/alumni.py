@@ -11,7 +11,7 @@ import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import NotFoundError
+from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -55,6 +55,29 @@ def _audit(
         )
 
 
+async def _validate_spouse_link(
+    session: AsyncSession,
+    spouse_alumni_id: int | None,
+    *,
+    self_id: int | None = None,
+) -> None:
+    """Guard the spouse self-link before it hits the DB constraints.
+
+    A clean 404/409 here beats letting the FK / CHECK constraint surface as a
+    500. ``self_id`` is the editing alumnus's own id (None on create, where the
+    record doesn't exist yet so self-linking is impossible).
+    """
+    if spouse_alumni_id is None:
+        return
+    if self_id is not None and spouse_alumni_id == self_id:
+        raise ConflictError("An alumnus cannot be linked as their own spouse.")
+    exists = await session.scalar(
+        select(Alumni.alumni_id).where(Alumni.alumni_id == spouse_alumni_id)
+    )
+    if exists is None:
+        raise NotFoundError(f"Spouse alumni {spouse_alumni_id} not found.")
+
+
 async def get_alumni(session: AsyncSession, alumni_id: int) -> Alumni:
     alumnus = await repo.get(session, alumni_id)
     if alumnus is None:
@@ -86,6 +109,7 @@ async def create_alumni(
         exclude_unset=True,
         exclude={"contact", "career", "education", "engagement"},
     )
+    await _validate_spouse_link(session, core.get("spouse_alumni_id"))
     alumnus = Alumni(**core)
     session.add(alumnus)
     # Need the generated alumni_id to attach the related rows; flush gets it
@@ -166,6 +190,10 @@ async def update_alumni(
         exclude_unset=True,
         exclude={"contact", "career", "education", "engagement"},
     )
+    if "spouse_alumni_id" in changes:
+        await _validate_spouse_link(
+            session, changes["spouse_alumni_id"], self_id=alumni_id
+        )
     # Only audit fields that actually changed; capture before/after per field.
     applied: dict[str, tuple[object, object]] = {}
     for field, value in changes.items():

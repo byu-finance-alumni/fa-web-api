@@ -77,6 +77,75 @@ def test_add_task_rejects_unknown_field(client):
     assert response.status_code == 422
 
 
+def test_update_employment_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.patch(
+        "/alumni/1/employment/5", json={"employer_name": "Acme"}
+    )
+    assert response.status_code == 403
+
+
+def test_delete_employment_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.delete("/alumni/1/employment/5")
+    assert response.status_code == 403
+
+
+def test_add_education_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.post("/alumni/1/education", json={"university": "BYU"})
+    assert response.status_code == 403
+
+
+def test_update_education_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.patch("/alumni/1/education/5", json={"university": "BYU"})
+    assert response.status_code == 403
+
+
+def test_delete_education_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.delete("/alumni/1/education/5")
+    assert response.status_code == 403
+
+
+def test_add_leadership_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.post(
+        "/alumni/1/leadership", json={"leadership_role": "President"}
+    )
+    assert response.status_code == 403
+
+
+def test_update_leadership_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.patch(
+        "/alumni/1/leadership/5", json={"leadership_role": "President"}
+    )
+    assert response.status_code == 403
+
+
+def test_delete_leadership_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.delete("/alumni/1/leadership/5")
+    assert response.status_code == 403
+
+
+def test_add_leadership_rejects_empty_role(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post("/alumni/1/leadership", json={"leadership_role": ""})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_add_education_rejects_unknown_field(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post(
+        "/alumni/1/education", json={"university": "BYU", "not_a_field": 1}
+    )
+    assert response.status_code == 422
+
+
 def test_super_admin_passes_guard(client):
     # super_admin satisfies full_access; blank title then fails validation (422),
     # proving the guard let it through rather than 403-ing.

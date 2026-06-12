@@ -8,7 +8,7 @@ import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import extract, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -82,6 +82,16 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     now = datetime.datetime.now(datetime.UTC)
     month_ago = now - datetime.timedelta(days=30)
     today = now.date()
+    # First and last day of the current calendar month (server local-UTC date),
+    # used by the two new "this month" KPIs which are calendar-month scoped (not
+    # the rolling 30-day window the older KPIs use). month_end is the last day
+    # of the month (next-month-start minus one day) so the bound is inclusive.
+    month_start = today.replace(day=1)
+    month_end = (
+        month_start.replace(year=month_start.year + 1, month=1)
+        if month_start.month == 12
+        else month_start.replace(month=month_start.month + 1)
+    ) - datetime.timedelta(days=1)
 
     total = await session.scalar(
         select(func.count()).select_from(Alumni).where(active)
@@ -135,6 +145,36 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         select(func.count())
         .select_from(Event)
         .where(Event.event_date >= today)
+    )
+    # Events held in the current calendar month (any day this month — past or
+    # still upcoming within the month). Calendar-month scoped, not rolling-30d.
+    events_this_month = await session.scalar(
+        select(func.count())
+        .select_from(Event)
+        .where(
+            Event.event_date >= month_start,
+            Event.event_date <= month_end,
+        )
+    )
+    # Distinct alumni who served as a guest speaker at an event this calendar
+    # month. SIGNAL: EventAttendance.attendance_status — it is the only
+    # per-event, per-alumnus role field in the data model, so it is the only
+    # signal that can answer "served as a speaker AT AN EVENT this month".
+    # (The "Speaker" engagement tag and the guest_speaker_willing flag are
+    # alumnus-level and carry no event/date, so they cannot be month-scoped.)
+    # We match attendance_status case-insensitively against any value
+    # containing "speaker" (e.g. "Speaker", "Guest Speaker") so the KPI is
+    # robust to label variants. NOTE TO TEAM: confirm attendance_status is the
+    # field event check-in records the speaker role in; today's mock data only
+    # writes "Attended", so this KPI reads 0 until speaker statuses are entered.
+    guest_speakers_this_month = await session.scalar(
+        select(func.count(func.distinct(EventAttendance.alumni_id)))
+        .join(Event, Event.event_id == EventAttendance.event_id)
+        .where(
+            Event.event_date >= month_start,
+            Event.event_date <= month_end,
+            EventAttendance.attendance_status.ilike("%speaker%"),
+        )
     )
     # Active alumni flagged as PIFF donors.
     piff_donors = await session.scalar(
@@ -193,6 +233,8 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "duplicate_count": int(duplicate_count or 0),
         "attended_event_this_month": int(attended_event_this_month or 0),
         "upcoming_events": int(upcoming_events or 0),
+        "events_this_month": int(events_this_month or 0),
+        "guest_speakers_this_month": int(guest_speakers_this_month or 0),
         "piff_donors": int(piff_donors or 0),
         "willing_mentors": int(willing_mentors or 0),
         "by_graduation_year": [{"year": r[0], "count": int(r[1])} for r in cohort],
@@ -201,6 +243,60 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         ],
         "by_state": [{"state": r[0], "count": int(r[1])} for r in by_state],
     }
+
+
+@router.get("/birthdays")
+async def birthdays(_: RequireViewAccess, session: SessionDep) -> list[dict]:
+    """Active alumni whose birthday falls in the current calendar month, ordered
+    by day-of-month ascending (earliest in the month first). Each row carries
+    the alumnus's current/most-recent employer via the same correlated scalar
+    subquery the alumni list uses, so the value matches that view exactly.
+
+    Filters on the month component of ``birth_date`` (the year is irrelevant for
+    a recurring birthday). Aggregation/derivation happens in PostgreSQL.
+
+    Returns, e.g.
+    [{"id": 7, "first_name": "Jane", "last_name": "Doe",
+      "current_employer": "Goldman Sachs", "graduation_year": 2019,
+      "birth_date": "1997-06-03"}, ...]."""
+    active = Alumni.archived.is_(False)
+    current_month = datetime.datetime.now(datetime.UTC).date().month
+
+    # Same correlated scalar subquery the alumni list uses to surface the
+    # current/most-recent employer (current_employment.current_employer).
+    current_employer = (
+        select(CurrentEmployment.current_employer)
+        .where(CurrentEmployment.alumni_id == Alumni.alumni_id)
+        .limit(1)
+        .scalar_subquery()
+    )
+
+    rows = (
+        await session.execute(
+            select(Alumni, current_employer)
+            .where(
+                active,
+                Alumni.birth_date.is_not(None),
+                extract("month", Alumni.birth_date) == current_month,
+            )
+            .order_by(
+                extract("day", Alumni.birth_date).asc(),
+                Alumni.last_name.asc(),
+                Alumni.alumni_id.asc(),
+            )
+        )
+    ).all()
+    return [
+        {
+            "id": a.alumni_id,
+            "first_name": a.first_name,
+            "last_name": a.last_name,
+            "current_employer": employer,
+            "graduation_year": a.graduation_year,
+            "birth_date": a.birth_date.isoformat() if a.birth_date else None,
+        }
+        for a, employer in rows
+    ]
 
 
 @router.get("/event-participation")

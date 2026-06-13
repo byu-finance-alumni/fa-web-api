@@ -22,6 +22,7 @@ from app.models.engagement import (
     FinanceSocietyLeadership,
 )
 from app.models.event import Event, EventAttendance
+from app.models.login_attempt import LoginAttempt
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import Role, User, UserRole
 
@@ -44,6 +45,7 @@ __all__ = [
     "FinanceSocietyLeadership",
     "FollowUpTask",
     "Interaction",
+    "LoginAttempt",
     "Role",
     "StatusLabel",
     "Survey",

@@ -26,7 +26,7 @@ from app.api.routes import (
 )
 from app.core.config import get_settings
 from app.core.database import dispose_engine
-from app.core.errors import ConflictError, NotFoundError
+from app.core.errors import ConflictError, NotFoundError, ServiceError
 from app.core.security import AuthError, AuthorizationError, DeactivatedAccountError
 from app.core.security_log import log_security_event
 
@@ -151,6 +151,23 @@ async def conflict_handler(request: Request, exc: ConflictError) -> JSONResponse
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
         content={"error": {"code": "conflict", "message": exc.message}},
+    )
+
+
+@app.exception_handler(ServiceError)
+async def service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
+    """Return 502 for an upstream/dependency failure (e.g. Supabase Admin API).
+
+    Logged as a security event (the detail is our own generic message, never the
+    upstream body) so repeated failures are observable, and surfaced to the
+    client with the generic envelope only.
+    """
+    log_security_event(
+        request, "upstream_service_error", status_code=502, detail=exc.message
+    )
+    return JSONResponse(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        content={"error": {"code": "service_unavailable", "message": exc.message}},
     )
 
 

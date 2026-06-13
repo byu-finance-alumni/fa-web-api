@@ -6,12 +6,14 @@ roles. Authorization (`require_full_access` / `require_view_only`) is decided
 from those database roles — never from the token's claims.
 """
 
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
@@ -22,8 +24,11 @@ from app.core.security import (
     DeactivatedAccountError,
     verify_supabase_jwt,
 )
+from app.models.login_attempt import LoginAttempt
 from app.repositories.user import get_user_with_roles_by_auth_id
 from app.schemas.auth import AuthenticatedUser, UserContext
+
+logger = logging.getLogger(__name__)
 
 # auto_error=False so a missing/!Bearer header routes through our AuthError
 # handler (401 + error envelope) instead of FastAPI's default 403.
@@ -77,7 +82,35 @@ async def get_current_db_user(
     if not user.active:
         raise DeactivatedAccountError()
 
+    await _clear_login_attempts(session, user.email)
+
     return UserContext.from_orm_user(user)
+
+
+async def _clear_login_attempts(session: AsyncSession, email: str) -> None:
+    """Best-effort clear of the rolling failed-login counter for ``email``.
+
+    A genuinely successful login is the only way to reach an authenticated
+    route, so resolving the DB user here is the trustworthy signal to drop the
+    rolling ``login_attempts`` row — this replaces the old (abusable)
+    unauthenticated ``/auth/login/record {success:true}`` clear. Keyed on the
+    lowercased email to match the throttle's case-insensitive keying.
+
+    Deliberately defensive: a failure here must never break the authenticated
+    request, so any error is swallowed (the counter just isn't cleared this
+    time; it self-expires via the rolling window anyway).
+    """
+    try:
+        await session.execute(
+            delete(LoginAttempt).where(LoginAttempt.email_lc == email.lower())
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - best-effort; never fail the request
+        logger.warning("Failed to clear login_attempts on auth", exc_info=True)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 CurrentDBUser = Annotated[UserContext, Depends(get_current_db_user)]

@@ -27,7 +27,24 @@ CREATE TABLE users (
     active          boolean NOT NULL DEFAULT true,
     auth_provider   varchar(50),
     last_login_at   timestamptz,
+    -- Hard account lock after too many failed logins (see login_attempts and
+    -- app/services/login_lockout.py). Cleared by a super_admin password reset.
+    locked_at       timestamptz,
+    locked_reason   text,
     created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+
+-- Rolling per-email failed-login counter driving the pre-login cooldown and
+-- (for registered emails) the hard lock above. Keyed by lowercased email so it
+-- is case-insensitive; intentionally NOT a FK to users so the cooldown path
+-- works for non-existent emails too and cannot be used to enumerate accounts.
+CREATE TABLE login_attempts (
+    email_lc        text PRIMARY KEY,
+    failed_count    int NOT NULL DEFAULT 0,
+    first_failed_at timestamptz,
+    last_failed_at  timestamptz,
+    cooldown_until  timestamptz,
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 

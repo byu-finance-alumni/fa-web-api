@@ -40,13 +40,14 @@ def client():
     app.dependency_overrides.clear()
 
 
-def _fake_user(user_id: int, *, active: bool, roles=("full_access",)):
+def _fake_user(user_id: int, *, active: bool, roles=("full_access",), locked_at=None):
     return SimpleNamespace(
         user_id=user_id,
         email=f"user{user_id}@byu.edu",
         first_name="Test",
         last_name="User",
         active=active,
+        locked_at=locked_at,
         roles=[SimpleNamespace(role_name=r) for r in roles],
     )
 

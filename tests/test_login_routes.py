@@ -128,6 +128,43 @@ def test_record_success_response_shape_hides_locked(throttle_client):
     assert set(resp.json()) == {"allowed", "reason", "retry_after_seconds"}
 
 
+def test_record_success_does_not_clear_existing_cooldown(throttle_client):
+    """An unauthenticated `success:true` MUST NOT wipe a set cooldown row.
+
+    Otherwise an attacker could POST `{email, success:true}` to clear a
+    legitimately-set cooldown and brute-force unbounded. The genuine clear only
+    happens on the authenticated path (see get_current_db_user).
+    """
+    client, session = throttle_client
+    # Trip the cooldown with COOLDOWN_THRESHOLD failures.
+    for _ in range(10):
+        client.post(
+            "/auth/login/record", json={"email": "x@byu.edu", "success": False}
+        )
+    assert session.attempts  # a cooldown row exists
+    row_before = session.attempts["x@byu.edu"]
+    commits_before = session.commits
+
+    # A "success" claim from the unauthenticated caller returns ok but leaves
+    # the row (and counter) intact — and does not mutate/commit.
+    resp = client.post(
+        "/auth/login/record", json={"email": "x@byu.edu", "success": True}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "allowed": True,
+        "reason": "ok",
+        "retry_after_seconds": None,
+    }
+    # The cooldown row is untouched.
+    assert session.attempts.get("x@byu.edu") is row_before
+    assert session.commits == commits_before
+
+    # And the cooldown is still in force on a subsequent precheck.
+    pre = client.post("/auth/login/precheck", json={"email": "x@byu.edu"})
+    assert pre.json()["reason"] == "cooldown"
+
+
 # --- super_admin reset-password ----------------------------------------------
 
 
@@ -245,6 +282,11 @@ def test_reset_password_clears_lock_and_audits(monkeypatch):
     assert audit.entity_type == "user"
     assert audit.entity_id == 2
     assert audit.user_id == 1
+    # Field detail is populated (FIX 2): the audited field is the password, the
+    # prior state is recorded (locked, since this user was locked), new is reset.
+    assert audit.field_name == "password"
+    assert audit.old_value == "locked"
+    assert audit.new_value == "reset"
     # The password must never appear in the audit row.
     assert body["temp_password"] not in (audit.old_value or "")
     assert body["temp_password"] not in (audit.new_value or "")
@@ -278,3 +320,117 @@ def test_reset_password_upstream_failure_is_502_and_does_not_clear_lock(monkeypa
     # The lock must remain because the auth-provider reset failed.
     assert user.locked_at is not None
     assert session.commits == 0
+
+
+# --- authenticated-path login_attempts clear ---------------------------------
+
+
+class _AuthClearSession:
+    """Fake session for get_current_db_user: records executed statements and
+    commits/rollbacks so we can assert the login_attempts clear fired."""
+
+    def __init__(self):
+        self.executed: list = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    async def execute(self, stmt):
+        self.executed.append(stmt)
+
+    async def commit(self):
+        self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
+
+
+def test_authenticated_user_resolution_clears_login_attempts(monkeypatch):
+    """Resolving an authenticated DB user clears that email's login_attempts row.
+
+    This is the trustworthy success-clear that replaced the abusable
+    unauthenticated `/auth/login/record {success:true}` path.
+    """
+    import asyncio
+
+    from app.api.dependencies import auth as auth_deps
+    from app.models.login_attempt import LoginAttempt
+
+    auth_uuid = uuid.UUID("33333333-3333-3333-3333-333333333333")
+    user = SimpleNamespace(
+        user_id=7,
+        auth_user_id=auth_uuid,
+        email="Alum@BYU.edu",  # mixed case; clear must lowercase
+        first_name="A",
+        last_name="B",
+        active=True,
+        roles=[SimpleNamespace(role_name="view_only")],
+    )
+
+    async def _fake_lookup(session, _auth_id):
+        return user
+
+    monkeypatch.setattr(
+        auth_deps, "get_user_with_roles_by_auth_id", _fake_lookup
+    )
+
+    session = _AuthClearSession()
+    current = SimpleNamespace(auth_user_id=str(auth_uuid))
+
+    ctx = asyncio.run(auth_deps.get_current_db_user(current, session))
+
+    assert ctx.user_id == 7
+    # Exactly one DELETE against login_attempts was issued and committed.
+    assert len(session.executed) == 1
+    stmt = session.executed[0]
+    assert stmt.is_delete
+    assert stmt.table.name == LoginAttempt.__tablename__
+    # Lowercased-email keying in the WHERE clause.
+    assert "alum@byu.edu" in str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert session.commits == 1
+    assert session.rollbacks == 0
+
+
+def test_authenticated_clear_failure_never_breaks_request(monkeypatch):
+    """A failure clearing login_attempts must not break the authenticated request."""
+    import asyncio
+
+    from app.api.dependencies import auth as auth_deps
+
+    auth_uuid = uuid.UUID("44444444-4444-4444-4444-444444444444")
+    user = SimpleNamespace(
+        user_id=8,
+        auth_user_id=auth_uuid,
+        email="x@byu.edu",
+        first_name="A",
+        last_name="B",
+        active=True,
+        roles=[SimpleNamespace(role_name="view_only")],
+    )
+
+    async def _fake_lookup(session, _auth_id):
+        return user
+
+    monkeypatch.setattr(
+        auth_deps, "get_user_with_roles_by_auth_id", _fake_lookup
+    )
+
+    class _BoomSession:
+        def __init__(self):
+            self.rollbacks = 0
+
+        async def execute(self, stmt):
+            raise RuntimeError("db down")
+
+        async def commit(self):
+            raise RuntimeError("db down")
+
+        async def rollback(self):
+            self.rollbacks += 1
+
+    session = _BoomSession()
+    current = SimpleNamespace(auth_user_id=str(auth_uuid))
+
+    # Must still resolve the user despite the clear blowing up.
+    ctx = asyncio.run(auth_deps.get_current_db_user(current, session))
+    assert ctx.user_id == 8
+    assert session.rollbacks == 1

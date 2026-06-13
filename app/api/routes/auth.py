@@ -107,13 +107,26 @@ async def login_record(
 ) -> LoginThrottleStatus:
     """Record a login attempt outcome and return the resulting throttle status.
 
-    Unauthenticated. A success resets the counter; a failure may trip the
-    cooldown and (for a registered email) the hard lock. The ``locked`` flag the
-    service returns is intentionally NOT echoed to the client (anti-enumeration);
-    only the coarse ``reason`` is.
+    Unauthenticated. Only FAILURES are accumulated here: a failure may trip the
+    cooldown and (for a registered email) the hard lock. A ``success=true`` from
+    this unauthenticated caller is deliberately IGNORED — it must NOT clear the
+    rolling counter, because an attacker could otherwise POST ``{email,
+    success:true}`` to wipe a legitimately-set cooldown and brute-force
+    unbounded. The genuine success-clear happens on the AUTHENTICATED path
+    (``get_current_db_user``), which only a real, signed-in user can reach.
+
+    The ``locked`` flag the service returns is intentionally NOT echoed to the
+    client (anti-enumeration); only the coarse ``reason`` is.
     """
+    if payload.success:
+        # Do NOT clear/delete the login_attempts row for an unauthenticated
+        # "success" claim. Report the benign status without mutating state.
+        return LoginThrottleStatus(
+            allowed=True, reason="ok", retry_after_seconds=None
+        )
+
     status_dict = await login_lockout.record_attempt(
-        session, payload.email, payload.success
+        session, payload.email, success=False
     )
     return LoginThrottleStatus(
         allowed=status_dict["allowed"],

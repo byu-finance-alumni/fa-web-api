@@ -268,9 +268,11 @@ async def reset_password(
             action_type="reset_password",
             entity_type="user",
             entity_id=user_id,
-            field_name="locked_at" if was_locked else None,
-            old_value="locked" if was_locked else None,
-            new_value="unlocked" if was_locked else None,
+            # The audited field is the password; the prior account state is
+            # recorded as old_value. The password itself is NEVER stored.
+            field_name="password",
+            old_value="locked" if was_locked else "active",
+            new_value="reset",
         )
     )
     await session.commit()

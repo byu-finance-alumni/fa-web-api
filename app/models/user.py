@@ -45,6 +45,14 @@ class User(TimestampMixin, Base):
     last_login_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    # Hard account lock set after too many failed logins (see
+    # app/services/login_lockout.py). While ``locked_at`` is non-null the account
+    # is denied at the pre-login precheck regardless of credentials; only a
+    # super_admin password reset clears it.
+    locked_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    locked_reason: Mapped[str | None] = mapped_column(Text)
 
     user_roles: Mapped[list[UserRole]] = relationship(
         back_populates="user", cascade="all, delete-orphan"

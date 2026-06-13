@@ -19,6 +19,10 @@ from app.models.employment import CurrentEmployment, EducationHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.repositories import alumni as repo
 from app.schemas.alumni import AlumniCreateFull, AlumniUpdateFull
+from app.services import hygiene
+
+# Nested write sections handled via related tables, not the alumni core row.
+SECTION_KEYS = frozenset({"contact", "career", "education", "engagement"})
 
 
 def _now() -> datetime.datetime:
@@ -103,12 +107,16 @@ async def create_alumni(
     payload: AlumniCreateFull,
     actor_user_id: int | None = None,
 ) -> Alumni:
+    # Data-hygiene pass: clean the payload and persist the CLEANED values (the
+    # UI's /preview is not trusted — defense-in-depth). Exact duplicates block.
+    cleaned, _changes = hygiene.clean_alumni_payload(payload, jsonable=False)
+    blockers, _warnings = await hygiene.detect_duplicates(session, cleaned)
+    if blockers:
+        raise ConflictError(blockers[0]["message"])
+
     # Core columns only — nested sections are popped off before constructing the
     # Alumni row (they map to related tables, not the alumni table).
-    core = payload.model_dump(
-        exclude_unset=True,
-        exclude={"contact", "career", "education", "engagement"},
-    )
+    core = {k: v for k, v in cleaned.items() if k not in SECTION_KEYS}
     await _validate_spouse_link(session, core.get("spouse_alumni_id"))
     alumnus = Alumni(**core)
     session.add(alumnus)
@@ -119,30 +127,36 @@ async def create_alumni(
         _audit(session, actor_user_id, "create", alumnus.alumni_id)
 
     # Insert each related section only when it carries at least one real value,
-    # so untouched sections never create empty rows. getattr keeps this tolerant
-    # of a core-only payload (e.g. direct service callers / tests).
+    # so untouched sections never create empty rows. The presence/has_values
+    # gate still comes from the validated payload section; the values written
+    # come from the cleaned dict. getattr keeps this tolerant of a core-only
+    # payload (e.g. direct service callers / tests).
     contact = getattr(payload, "contact", None)
     career = getattr(payload, "career", None)
     education = getattr(payload, "education", None)
     engagement = getattr(payload, "engagement", None)
     if contact is not None and contact.has_values():
         session.add(
-            AlumniContactInfo(alumni_id=alumnus.alumni_id, **contact.model_dump())
+            AlumniContactInfo(
+                alumni_id=alumnus.alumni_id, **cleaned.get("contact", {})
+            )
         )
     if career is not None and career.has_values():
         session.add(
-            CurrentEmployment(alumni_id=alumnus.alumni_id, **career.model_dump())
+            CurrentEmployment(
+                alumni_id=alumnus.alumni_id, **cleaned.get("career", {})
+            )
         )
     if education is not None and education.has_values():
         session.add(
             EducationHistory(
-                alumni_id=alumnus.alumni_id, **education.model_dump()
+                alumni_id=alumnus.alumni_id, **cleaned.get("education", {})
             )
         )
     if engagement is not None and engagement.has_values():
         session.add(
             AlumniProgramEngagement(
-                alumni_id=alumnus.alumni_id, **engagement.model_dump()
+                alumni_id=alumnus.alumni_id, **cleaned.get("engagement", {})
             )
         )
 
@@ -185,11 +199,19 @@ async def update_alumni(
     actor_user_id: int | None = None,
 ) -> Alumni:
     alumnus = await get_alumni(session, alumni_id)
-    # Core columns only — nested sections are handled via upsert below.
-    changes = payload.model_dump(
-        exclude_unset=True,
-        exclude={"contact", "career", "education", "engagement"},
+    # Data-hygiene pass: clean the provided fields (write the CLEANED values) and
+    # block exact duplicates against everyone *except* this record. Fuzzy
+    # warnings never block. jsonable=False keeps dates as date objects for the
+    # ORM. Cleaning is idempotent, so a re-save of already-clean data is a no-op.
+    cleaned, _changes = hygiene.clean_alumni_payload(payload, jsonable=False)
+    blockers, _warnings = await hygiene.detect_duplicates(
+        session, cleaned, exclude_alumni_id=alumni_id
     )
+    if blockers:
+        raise ConflictError(blockers[0]["message"])
+
+    # Core columns only — nested sections are handled via upsert below.
+    changes = {k: v for k, v in cleaned.items() if k not in SECTION_KEYS}
     if "spouse_alumni_id" in changes:
         await _validate_spouse_link(
             session, changes["spouse_alumni_id"], self_id=alumni_id
@@ -215,7 +237,7 @@ async def update_alumni(
             session,
             AlumniContactInfo,
             alumni_id,
-            contact.model_dump(),
+            hygiene.clean_section("contact", contact.model_dump()),
             order_by=AlumniContactInfo.contact_info_id,
         )
     if career is not None and career.has_values():
@@ -223,7 +245,7 @@ async def update_alumni(
             session,
             CurrentEmployment,
             alumni_id,
-            career.model_dump(),
+            hygiene.clean_section("career", career.model_dump()),
             order_by=CurrentEmployment.current_employment_id.desc(),
         )
     if education is not None and education.has_values():
@@ -231,7 +253,7 @@ async def update_alumni(
             session,
             EducationHistory,
             alumni_id,
-            education.model_dump(),
+            hygiene.clean_section("education", education.model_dump()),
             order_by=EducationHistory.degree_year.desc().nullslast(),
         )
     if engagement is not None and engagement.has_values():
@@ -239,7 +261,7 @@ async def update_alumni(
             session,
             AlumniProgramEngagement,
             alumni_id,
-            engagement.model_dump(),
+            hygiene.clean_section("engagement", engagement.model_dump()),
         )
 
     if applied or section_written:

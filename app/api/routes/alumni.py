@@ -7,11 +7,13 @@ retained records.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
+from app.core.errors import NotFoundError
 from app.schemas.alumni import (
     AlumniCreateFull,
     AlumniPage,
@@ -40,6 +42,7 @@ from app.schemas.profile import (
     TaskRead,
 )
 from app.services import alumni as service
+from app.services import hygiene, import_csv
 from app.services import profile as profile_service
 
 router = APIRouter(prefix="/alumni", tags=["alumni"])
@@ -143,6 +146,121 @@ async def list_alumni(
         sort=sort,
     )
     return AlumniPage(items=items, total=total, limit=limit, offset=offset)
+
+
+# --- Bulk CSV import (full_access) -------------------------------------------
+#
+# Declared BEFORE the ``/{alumni_id}`` routes so the literal ``/import/...``
+# paths win over the ``/{alumni_id}`` / ``/{alumni_id}/preview`` patterns (route
+# matching is declaration-ordered).
+
+
+async def _read_capped(file: UploadFile) -> bytes | None:
+    """Read an upload, capped at ``MAX_UPLOAD_BYTES``.
+
+    Reads one byte past the cap so we can tell "exactly at the limit" from "over".
+    Returns the bytes, or ``None`` if the file exceeds the cap (the caller turns
+    that into a 413 response). Bounds memory before any parsing happens (DoS).
+    """
+    data = await file.read(import_csv.MAX_UPLOAD_BYTES + 1)
+    if len(data) > import_csv.MAX_UPLOAD_BYTES:
+        return None
+    return data
+
+
+def _too_large_response() -> JSONResponse:
+    mib = import_csv.MAX_UPLOAD_BYTES // (1024 * 1024)
+    return JSONResponse(
+        status_code=413,  # Content Too Large
+        content={
+            "error": {
+                "code": "payload_too_large",
+                "message": (
+                    f"File exceeds the {mib} MB upload limit. Split into "
+                    "smaller batches."
+                ),
+            }
+        },
+    )
+
+
+@router.get("/import/template")
+async def alumni_import_template(_: RequireFullAccess) -> Response:
+    """Download the bulk-import CSV template: the exact Alumni columns plus one
+    example row (full_access). Same column source as the xlsx intake template."""
+    return Response(
+        content=import_csv.build_template_csv(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="alumni_import_template.csv"'
+            )
+        },
+    )
+
+
+@router.post("/import/preview", response_model=None)
+async def preview_import_alumni(
+    _: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict | JSONResponse:
+    """Dry-run a bulk CSV import (full_access, NO writes).
+
+    Parses + maps the uploaded CSV against the Alumni template columns, then
+    evaluates every row (clean + duplicate-detect against the DB and earlier
+    rows in the file + completeness warnings). Returns the full preview report;
+    a bad header set surfaces as ``columns_ok: false`` with ``header_errors``."""
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_csv.parse_and_map(
+        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
+    )
+    if header_errors:
+        return {
+            "columns_ok": False,
+            "header_errors": header_errors,
+            "summary": {
+                "total": 0,
+                "importable": 0,
+                "rejected": 0,
+                "with_warnings": 0,
+                "cleaned": 0,
+            },
+            "rows": [],
+        }
+    return await import_csv.evaluate(session, rows)
+
+
+@router.post("/import", response_model=None)
+async def import_alumni(
+    user: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict | JSONResponse:
+    """Commit a bulk CSV import (full_access). Re-evaluates and inserts every
+    importable row in one transaction (audit logging fires per row); rejected
+    rows are skipped and reported. A bad header set imports nothing."""
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_csv.parse_and_map(
+        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
+    )
+    if header_errors:
+        return {
+            "imported": 0,
+            "skipped": 0,
+            "created_ids": [],
+            "rejects": [
+                {"row": 0, "name": "(header)", "reason": msg}
+                for msg in header_errors
+            ],
+        }
+    return await import_csv.commit_import(
+        session, rows, actor_user_id=user.user_id
+    )
 
 
 @router.get("/{alumni_id}", response_model=AlumniRead)
@@ -461,6 +579,39 @@ async def add_event_attendance(
     the event/alumni is unknown; 409 if attendance already exists."""
     return await profile_service.add_event_attendance(
         session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.post("/preview")
+async def preview_create_alumni(
+    payload: AlumniCreateFull, _: RequireFullAccess, session: SessionDep
+) -> dict:
+    """Dry-run data-hygiene preview for a NEW alumni (full_access, no writes).
+
+    Returns ``{cleaned, changes, warnings, blockers}`` — the cleaned (normalized)
+    payload, the per-field changes cleaning would make, soft warnings (completeness
+    + fuzzy possible-duplicates), and exact-duplicate blockers (a non-empty list
+    means the real POST would 409)."""
+    return await hygiene.build_preview(session, payload)
+
+
+@router.post("/{alumni_id}/preview")
+async def preview_update_alumni(
+    alumni_id: int,
+    payload: AlumniUpdateFull,
+    _: RequireFullAccess,
+    session: SessionDep,
+) -> dict:
+    """Dry-run data-hygiene preview for an EDIT (full_access, no writes).
+
+    Loads the current record (404 if missing/archived) and computes the preview
+    against the EFFECTIVE record (the cleaned partial overlaid on the stored
+    values) so duplicate + completeness checks reflect the resulting state."""
+    existing = await service.get_alumni(session, alumni_id)
+    if existing.archived:
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    return await hygiene.build_preview(
+        session, payload, existing=existing, exclude_alumni_id=alumni_id
     )
 
 

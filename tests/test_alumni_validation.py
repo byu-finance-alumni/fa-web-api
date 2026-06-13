@@ -1,0 +1,193 @@
+"""Field-level (semantic) validation tests for AlumniCreate / AlumniUpdate.
+
+Parameterized queries stop injection from *executing*; these tests assert the
+schema also keeps SQL-shaped garbage out of the data, while still accepting
+legitimate (including international) names. They exercise the schemas directly
+and through POST /alumni so the 422 envelope (with per-field ``fields``) is
+covered end to end.
+"""
+
+import datetime
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+from app.api.dependencies.auth import get_current_db_user
+from app.core.database import get_session
+from app.main import app
+from app.schemas.alumni import AlumniCreate, AlumniUpdate
+from app.schemas.auth import UserContext
+
+
+def _ctx(*roles: str) -> UserContext:
+    return UserContext(
+        user_id=1,
+        auth_user_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        roles=list(roles),
+    )
+
+
+async def _no_db_session():
+    yield None
+
+
+@pytest.fixture
+def client():
+    app.dependency_overrides[get_session] = _no_db_session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+# --- Schema-level tests ------------------------------------------------------
+
+
+def test_valid_create_passes():
+    model = AlumniCreate(
+        byu_id="123456789",
+        net_id="JDoe12",
+        first_name="  Jane  ",
+        last_name="Doe",
+        graduation_year=2020,
+        linkedin_url="https://www.linkedin.com/in/janedoe",
+        gender="Female",
+    )
+    assert model.first_name == "Jane"  # trimmed
+    assert model.net_id == "jdoe12"  # lowercased
+    assert model.byu_id == "123456789"
+
+
+def test_sql_injection_name_rejected():
+    with pytest.raises(ValidationError) as exc:
+        AlumniCreate(first_name="' OR 1=1;--")
+    # Fails on the disallowed ; / = characters.
+    assert "characters" in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["O'Brien", "Anne-Marie", "St. John", "José"])
+def test_legitimate_names_accepted(name):
+    model = AlumniCreate(last_name=name)
+    assert model.last_name == name
+
+
+def test_digits_only_name_rejected():
+    with pytest.raises(ValidationError):
+        AlumniCreate(first_name="12345")
+
+
+def test_control_char_name_rejected():
+    with pytest.raises(ValidationError):
+        AlumniCreate(first_name="Bad\x00Name")
+
+
+@pytest.mark.parametrize(
+    "byu_id", ["12345678", "1234567890", "12345678a", "abcdefghi"]
+)
+def test_bad_byu_id_rejected(byu_id):
+    with pytest.raises(ValidationError):
+        AlumniCreate(byu_id=byu_id)
+
+
+@pytest.mark.parametrize("net_id", ["a", "thisistoolongnetid", "bad id", "bad!"])
+def test_bad_net_id_rejected(net_id):
+    with pytest.raises(ValidationError):
+        AlumniCreate(net_id=net_id, last_name="Doe")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/in/x",
+        "ftp://linkedin.com/in/x",
+        "https://notlinkedin.com/in/x",
+        "https://linkedin.com.evil.com/in/x",
+        "not a url",
+    ],
+)
+def test_bad_linkedin_host_rejected(url):
+    with pytest.raises(ValidationError):
+        AlumniCreate(last_name="Doe", linkedin_url=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://linkedin.com/in/x",
+        "https://www.linkedin.com/in/x",
+        "http://uk.linkedin.com/in/x",
+    ],
+)
+def test_good_linkedin_host_accepted(url):
+    model = AlumniCreate(last_name="Doe", linkedin_url=url)
+    assert model.linkedin_url == url
+
+
+@pytest.mark.parametrize("year", [1949, datetime.date.today().year + 11, 0])
+def test_out_of_range_year_rejected(year):
+    with pytest.raises(ValidationError):
+        AlumniCreate(last_name="Doe", graduation_year=year)
+
+
+def test_empty_strings_normalize_to_none():
+    model = AlumniUpdate(
+        first_name="Doe",
+        middle_name="   ",
+        gender="",
+        notes="",
+        linkedin_url="",
+    )
+    assert model.middle_name is None
+    assert model.gender is None
+    assert model.notes is None
+    assert model.linkedin_url is None
+
+
+# --- Route-level tests (422 envelope with per-field details) -----------------
+
+
+def test_route_rejects_injection_name_with_field_details(client):
+    response = client.post(
+        "/alumni", json={"first_name": "' OR 1=1;--", "last_name": "Doe"}
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    fields = body["error"]["fields"]
+    assert isinstance(fields, list) and fields
+    assert any(f["field"] == "first_name" for f in fields)
+    # The submitted value must never be echoed back.
+    assert "OR 1=1" not in response.text
+
+
+def test_route_accepts_obrien_passes_validation():
+    # raise_server_exceptions=False so the no-DB session surfaces as a 500
+    # response rather than propagating; the point is only that validation
+    # passed (no 422).
+    app.dependency_overrides[get_session] = _no_db_session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app, raise_server_exceptions=False) as test_client:
+            response = test_client.post("/alumni", json={"last_name": "O'Brien"})
+        assert response.status_code != 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_route_rejects_bad_byu_id(client):
+    response = client.post("/alumni", json={"byu_id": "123"})
+    assert response.status_code == 422
+    fields = response.json()["error"]["fields"]
+    assert any(f["field"] == "byu_id" for f in fields)
+
+
+def test_route_rejects_bad_linkedin_host(client):
+    response = client.post(
+        "/alumni",
+        json={"last_name": "Doe", "linkedin_url": "https://evil.com/in/x"},
+    )
+    assert response.status_code == 422
+    fields = response.json()["error"]["fields"]
+    assert any(f["field"] == "linkedin_url" for f in fields)

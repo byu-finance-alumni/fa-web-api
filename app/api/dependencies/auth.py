@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
 from app.core.roles import RoleName
-from app.core.security import AuthError, AuthorizationError, verify_supabase_jwt
+from app.core.security import (
+    AuthError,
+    AuthorizationError,
+    DeactivatedAccountError,
+    verify_supabase_jwt,
+)
 from app.repositories.user import get_user_with_roles_by_auth_id
 from app.schemas.auth import AuthenticatedUser, UserContext
 
@@ -54,9 +59,12 @@ async def get_current_db_user(
 ) -> UserContext:
     """Resolve the verified token identity to a provisioned, active DB user.
 
-    Raises AuthError (401) if the token subject isn't a valid id, and
-    AuthorizationError (403) if there's no matching active user — a valid token
-    for someone who hasn't been granted access.
+    Raises AuthError (401) if the token subject isn't a valid id,
+    AuthorizationError (403) if there's no matching user (a valid token for
+    someone who was never granted access), and DeactivatedAccountError (403) if
+    the user exists but has been deactivated — the latter is enforced here so a
+    deactivated account is blocked on EVERY authenticated route, not just at the
+    point of deactivation, and surfaces as its own security event.
     """
     try:
         auth_uuid = uuid.UUID(current.auth_user_id)
@@ -64,8 +72,10 @@ async def get_current_db_user(
         raise AuthError("Token subject is not a valid identifier.") from exc
 
     user = await get_user_with_roles_by_auth_id(session, auth_uuid)
-    if user is None or not user.active:
+    if user is None:
         raise AuthorizationError("Your account is not provisioned for access.")
+    if not user.active:
+        raise DeactivatedAccountError()
 
     return UserContext.from_orm_user(user)
 

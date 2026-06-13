@@ -49,6 +49,20 @@ class AuthorizationError(Exception):
         super().__init__(message)
 
 
+class DeactivatedAccountError(AuthorizationError):
+    """Raised when a valid token belongs to a *deactivated* user account.
+
+    A subclass of AuthorizationError so it still maps to 403, but distinct so the
+    block is recorded as its own ``account_deactivated`` security event — a
+    deactivated user attempting an authenticated request is high signal.
+    """
+
+    def __init__(
+        self, message: str = "Your account has been deactivated."
+    ) -> None:
+        super().__init__(message)
+
+
 @lru_cache
 def _jwk_client(jwks_url: str) -> PyJWKClient:
     return PyJWKClient(jwks_url)

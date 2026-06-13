@@ -23,6 +23,11 @@ class FakeSession:
     def add(self, obj: object) -> None:
         self.added.append(obj)
 
+    async def flush(self) -> None:
+        # create_alumni flushes to obtain the generated alumni_id before
+        # attaching related-section rows; no-op for the fake.
+        pass
+
     async def commit(self) -> None:
         self.committed += 1
 

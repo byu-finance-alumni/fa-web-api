@@ -2,8 +2,8 @@
 
 from fastapi import APIRouter
 
-from app.api.dependencies.auth import CurrentUser
-from app.schemas.auth import AuthenticatedUser
+from app.api.dependencies.auth import CurrentDBUser, CurrentUser
+from app.schemas.auth import AuthenticatedUser, UserContext
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -16,3 +16,13 @@ async def me(current_user: CurrentUser) -> AuthenticatedUser:
     header.
     """
     return current_user
+
+
+@router.get("/context", response_model=UserContext)
+async def context(user: CurrentDBUser) -> UserContext:
+    """Return the signed-in user resolved against the database, with roles.
+
+    Used by the frontend for role-aware UI. Returns 403 if the authenticated
+    user isn't provisioned (no active `users` row).
+    """
+    return user

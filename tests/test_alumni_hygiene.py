@@ -165,8 +165,32 @@ def test_whitespace_collapsed():
 def test_whitespace_collapsed_in_allcaps_name():
     payload = AlumniCreateFull(first_name="Jane", last_name="VAN   DER  BERG")
     cleaned, _ = hygiene.clean_alumni_payload(payload)
-    # All-caps -> collapse then title-case every token.
-    assert cleaned["last_name"] == "Van Der Berg"
+    # All-caps -> collapse, title-case, then re-lowercase nobiliary particles
+    # that aren't the first word: "Van der Berg".
+    assert cleaned["last_name"] == "Van der Berg"
+
+
+# --- Cleaning: nobiliary particles -------------------------------------------
+
+
+def test_lowercase_particles_van_der_berg():
+    payload = AlumniCreateFull(last_name="van der berg")
+    cleaned, _ = hygiene.clean_alumni_payload(payload)
+    # First word capitalized; "der" stays lowercase (not first).
+    assert cleaned["last_name"] == "Van der Berg"
+
+
+def test_lowercase_particles_de_la_cruz():
+    payload = AlumniCreateFull(last_name="DE LA CRUZ")
+    cleaned, _ = hygiene.clean_alumni_payload(payload)
+    assert cleaned["last_name"] == "De la Cruz"
+
+
+def test_particle_first_word_capitalized():
+    # A particle as the FIRST word is always capitalized.
+    payload = AlumniCreateFull(last_name="van")
+    cleaned, _ = hygiene.clean_alumni_payload(payload)
+    assert cleaned["last_name"] == "Van"
 
 
 # --- Cleaning: state ---------------------------------------------------------
@@ -287,6 +311,34 @@ def test_detect_exact_net_id_blocker():
     )
     assert len(blockers) == 1
     assert blockers[0]["code"] == "duplicate_net_id"
+
+
+def test_detect_archived_ghost_byu_id_warns():
+    # No ACTIVE byu match (first scalar None) -> the archived lookup (second
+    # scalar) returns a ghost -> a duplicate_archived WARNING, never a blocker.
+    ghost = _alum(alumni_id=9, first_name="Old", last_name="Record")
+    session = FakeSession(scalars=[None, ghost])
+    blockers, warnings = asyncio.run(
+        hygiene.detect_duplicates(session, {"byu_id": "123456789"})
+    )
+    assert blockers == []
+    codes = {w["code"] for w in warnings}
+    assert "duplicate_archived" in codes
+    ghost_warn = next(w for w in warnings if w["code"] == "duplicate_archived")
+    assert ghost_warn["alumni_id"] == 9
+    assert "Old Record" in ghost_warn["message"]
+
+
+def test_detect_active_byu_match_skips_archived_lookup():
+    # An ACTIVE match blocks; the archived lookup must NOT run (only one scalar
+    # is consumed), so an extra queued scalar would be left untouched.
+    session = FakeSession(scalars=[_alum(byu_id="123456789")])
+    blockers, warnings = asyncio.run(
+        hygiene.detect_duplicates(session, {"byu_id": "123456789"})
+    )
+    assert len(blockers) == 1
+    assert blockers[0]["code"] == "duplicate_byu_id"
+    assert not any(w["code"] == "duplicate_archived" for w in warnings)
 
 
 def test_detect_fuzzy_warning():

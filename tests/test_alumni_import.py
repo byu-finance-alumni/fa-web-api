@@ -84,6 +84,34 @@ class _ExecResult:
         return list(self._rows)
 
 
+class _Savepoint:
+    """Minimal async-context savepoint mirroring ``session.begin_nested``.
+
+    Records how many objects were ``add``-ed when it opened so a ``rollback``
+    can discard exactly the rows staged inside this nested block — enough to
+    exercise the per-row SAVEPOINT logic in ``commit_import`` offline.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self._mark = len(session.added)
+        self.rolled_back = False
+
+    async def __aenter__(self):
+        self._mark = len(self._session.added)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        # commit_import catches its own exceptions and calls rollback itself, so
+        # nothing should propagate; just don't swallow anything unexpectedly.
+        return False
+
+    async def rollback(self):
+        self.rolled_back = True
+        self._session.savepoint_rollbacks += 1
+        del self._session.added[self._mark :]
+
+
 class FakeSession:
     """Serves the one-time identity index plus queued per-row results.
 
@@ -91,18 +119,34 @@ class FakeSession:
     batch identity load). Subsequent ``execute`` calls (fuzzy dup scan) return
     ``execute_rows`` entries; ``scalar`` calls (exact byu/net dup, spouse
     resolve) return ``scalars`` entries.
+
+    ``fail_on_add`` optionally raises from ``add`` when a staged Alumni's
+    ``first_name`` matches, to simulate a row blowing up mid-batch so the
+    savepoint/rollback path can be exercised.
     """
 
-    def __init__(self, index_rows=(), scalars=(), execute_rows=()):
+    def __init__(
+        self, index_rows=(), scalars=(), execute_rows=(), fail_on_add=None
+    ):
         self._index_rows = list(index_rows)
         self._index_served = False
         self._scalars = list(scalars)
         self._execute_rows = list(execute_rows)
         self.added = []
         self.committed = 0
+        self.savepoint_rollbacks = 0
+        self._fail_on_add = fail_on_add
 
     def add(self, obj):
+        if (
+            self._fail_on_add is not None
+            and getattr(obj, "first_name", None) == self._fail_on_add
+        ):
+            raise RuntimeError("simulated DB error: relation does not exist")
         self.added.append(obj)
+
+    def begin_nested(self):
+        return _Savepoint(self)
 
     async def scalar(self, stmt):
         return self._scalars.pop(0) if self._scalars else None
@@ -146,6 +190,41 @@ def test_header_validation_passes_for_template():
     rows, errors = import_csv.parse_and_map(_csv_bytes())  # header only
     assert errors == []
     assert rows == []  # no data rows
+
+
+# --- Row-cap + decoding guards -----------------------------------------------
+
+
+def test_too_many_rows_rejected():
+    many = [
+        _row_values(first_name=f"P{i}", last_name="X") for i in range(5)
+    ]
+    csv = _csv_bytes(*many)
+    rows, errors = import_csv.parse_and_map(csv, max_rows=3)
+    assert rows == []
+    assert errors
+    assert "3-row import limit" in errors[0]
+
+
+def test_row_cap_default_constant():
+    assert import_csv.MAX_IMPORT_ROWS == 2000
+    assert import_csv.MAX_UPLOAD_BYTES == 5 * 1024 * 1024
+
+
+def test_non_utf8_file_reports_friendly_error():
+    # 0x80 is invalid as a leading UTF-8 byte -> decode fails gracefully.
+    bad = b"First name,Last name\n\x80\x80,Doe\n"
+    rows, errors = import_csv.parse_and_map(bad)
+    assert rows == []
+    assert errors
+    assert "UTF-8" in errors[0]
+
+
+def test_existing_index_normalizes_formatted_byu_id():
+    # A stored formatted id "123-456-789" must collide with incoming "123456789".
+    index = [(7, "123-456-789", None, "Jane", "Doe", 2018)]
+    idx = _run(import_csv._load_existing_index(FakeSession(index_rows=index)))
+    assert idx["byu_ids"] == {"123456789": 7}
 
 
 # --- Clean row imports -------------------------------------------------------
@@ -342,6 +421,43 @@ def test_commit_import_inserts_and_reports_rejects():
     assert session.committed == 1
 
 
+def test_commit_import_midbatch_failure_keeps_earlier_rows():
+    # Row 2 (Jane) imports; row 3 (Boom) raises inside add() -> its savepoint
+    # rolls back, row 4 (Late) still imports. imported/created_ids reflect ONLY
+    # the two that flushed cleanly; the reject reason is the SAFE generic text
+    # (no raw DB string), since RuntimeError isn't a domain error.
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", graduation_year="2018"),
+        _row_values(first_name="Boom", last_name="Row", graduation_year="2019"),
+        _row_values(first_name="Late", last_name="Row", graduation_year="2020"),
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    session = FakeSession(fail_on_add="Boom")
+    result = _run(import_csv.commit_import(session, rows))
+
+    assert result["imported"] == 2
+    assert len(result["created_ids"]) == 2
+    assert result["skipped"] == 1
+    # Exactly the failing row was savepoint-rolled-back.
+    assert session.savepoint_rollbacks == 1
+    # One real commit for the surviving batch.
+    assert session.committed == 1
+    boom = next(r for r in result["rejects"] if r["name"] == "Boom Row")
+    # SAFE classification: generic "Unexpected error (...)", not the raw message.
+    assert boom["reason"] == "Unexpected error (RuntimeError)"
+    assert "relation does not exist" not in boom["reason"]
+
+
+def test_commit_import_conflict_error_message_surfaced():
+    # A ConflictError (domain error) keeps its client-safe message verbatim.
+    from app.core.errors import ConflictError
+
+    reason = import_csv._classify_reject(
+        ConflictError("BYU ID 123456789 already belongs to Jane Doe."), 5
+    )
+    assert reason == "BYU ID 123456789 already belongs to Jane Doe."
+
+
 def test_commit_import_no_importable_does_not_commit():
     csv = _csv_bytes(
         _row_values(
@@ -462,6 +578,29 @@ def test_route_import_commits():
     body = resp.json()
     assert body["imported"] == 1
     assert len(body["created_ids"]) == 1
+
+
+def test_route_import_preview_oversized_413():
+    big = b"x" * (import_csv.MAX_UPLOAD_BYTES + 10)
+    with _full_access_client(FakeSession()) as c:
+        resp = c.post(
+            "/alumni/import/preview",
+            files={"file": ("big.csv", big, "text/csv")},
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 413
+    assert resp.json()["error"]["code"] == "payload_too_large"
+
+
+def test_route_import_oversized_413():
+    big = b"x" * (import_csv.MAX_UPLOAD_BYTES + 10)
+    with _full_access_client(FakeSession()) as c:
+        resp = c.post(
+            "/alumni/import",
+            files={"file": ("big.csv", big, "text/csv")},
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 413
 
 
 def test_route_template_download():

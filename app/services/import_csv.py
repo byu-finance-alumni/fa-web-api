@@ -31,17 +31,27 @@ from __future__ import annotations
 import csv
 import datetime
 import io
+import logging
+import re
 
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dropdowns import validate_industry
+from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.schemas.alumni import AlumniCreateFull
 from app.services import alumni as alumni_service
 from app.services import hygiene
 from scripts.export_intake_template import _ALUMNI_COLUMNS
+
+log = logging.getLogger(__name__)
+
+# Upload guards (also enforced at the route layer for the byte cap). The row cap
+# is enforced here in parse_and_map so both /preview and /import share it.
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB
+MAX_IMPORT_ROWS = 2000
 
 # --- Column mapping ----------------------------------------------------------
 #
@@ -178,7 +188,9 @@ EXPECTED_HEADERS: list[str] = [header for header, _ in _ALUMNI_COLUMNS]
 EXAMPLE_ROW: list[str] = [example for _, example in _ALUMNI_COLUMNS]
 
 _TRUE_TOKENS = frozenset({"yes", "true", "1", "y", "t"})
-_FALSE_TOKENS = frozenset({"no", "false", "0", "n", "f", ""})
+# Empty cells are skipped by _map_row before coercion, so "" is intentionally
+# NOT a token here — a blank bool cell never reaches _coerce_bool.
+_FALSE_TOKENS = frozenset({"no", "false", "0", "n", "f"})
 
 
 # --- Value coercion ----------------------------------------------------------
@@ -243,14 +255,18 @@ def _display_name(core: dict) -> str:
     return core.get("byu_id") or core.get("net_id") or "(unnamed)"
 
 
-def parse_and_map(file_bytes: bytes) -> tuple[list[dict], list[str]]:
+def parse_and_map(
+    file_bytes: bytes, max_rows: int | None = MAX_IMPORT_ROWS
+) -> tuple[list[dict], list[str]]:
     """Parse a CSV and map each data row to an ``AlumniCreateFull`` payload dict.
 
     Returns ``(rows, header_errors)``:
 
       * ``header_errors`` — a list of human messages for missing required
         headers and unknown extra headers. Non-empty means the file's columns
-        don't match the template (``columns_ok`` is False downstream).
+        don't match the template (``columns_ok`` is False downstream). A
+        non-decodable file or a file exceeding ``max_rows`` is reported here too
+        (as a single header-style error) and ``rows`` is empty.
       * ``rows`` — one dict per data row, each:
             ``{"row": int, "name": str, "payload": dict,
                "spouse_byu_id": str|None, "error": str|None}``
@@ -261,9 +277,19 @@ def parse_and_map(file_bytes: bytes) -> tuple[list[dict], list[str]]:
         ``error`` is set when a cell failed to coerce (bad date / number /
         industry), which marks the row rejected without building the model.
 
+    ``max_rows`` caps the number of data rows processed (``None`` disables the
+    cap); over the cap, a header-style error is returned instead of processing,
+    so a hostile/huge file can't exhaust memory or DB time.
+
     The CSV is decoded as ``utf-8-sig`` so an Excel BOM is stripped.
     """
-    text = file_bytes.decode("utf-8-sig")
+    try:
+        text = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return [], [
+            "The file could not be read as UTF-8. Re-save it as UTF-8 (or "
+            "UTF-8 with BOM) from Excel and re-upload."
+        ]
     reader = csv.reader(io.StringIO(text))
     try:
         header_row = next(reader)
@@ -283,6 +309,11 @@ def parse_and_map(file_bytes: bytes) -> tuple[list[dict], list[str]]:
         # Skip fully-blank lines (Excel often pads with empty trailing rows).
         if not any(cell.strip() for cell in raw_row):
             continue
+        if max_rows is not None and len(rows) >= max_rows:
+            return [], [
+                f"File exceeds the {max_rows:,}-row import limit. Split into "
+                "smaller batches."
+            ]
         rows.append(_map_row(offset, headers, raw_row))
     return rows, header_errors
 
@@ -368,7 +399,9 @@ async def _load_existing_index(session: AsyncSession) -> dict:
     """Batch-load existing non-archived identity keys ONCE.
 
     Returns sets used for O(1) duplicate checks in the per-row loop:
-      * ``byu_ids``  — lowercased existing byu_id -> alumni_id
+      * ``byu_ids``  — DIGIT-STRIPPED existing byu_id -> alumni_id (normalized
+        the SAME way the cleaner / detect_duplicates normalize incoming ids, so
+        a stored "123-456-789" matches an incoming "123456789")
       * ``net_ids``  — lowercased existing net_id -> alumni_id
       * ``names``    — (lower first, lower last, grad_year) -> alumni_id
 
@@ -391,7 +424,11 @@ async def _load_existing_index(session: AsyncSession) -> dict:
     names: dict[tuple[str, str, int], int] = {}
     for alumni_id, byu_id, net_id, first, last, grad_year in result.all():
         if byu_id:
-            byu_ids.setdefault(byu_id.strip().lower(), alumni_id)
+            # Digit-strip to match the cleaner (which stores byu_id digits-only)
+            # so a stored formatted id still collides with an incoming one.
+            byu_key = re.sub(r"\D", "", byu_id.strip())
+            if byu_key:
+                byu_ids.setdefault(byu_key, alumni_id)
         if net_id:
             net_ids.setdefault(net_id.strip().lower(), alumni_id)
         if first and last and grad_year is not None:
@@ -430,6 +467,11 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
 
     Returns the exact preview-report shape the frontend consumes (see module
     docstring / task contract).
+
+    NOTE: this is a PRE-FILTER / gate, not the last word. The authoritative
+    duplicate check fires inside ``create_alumni`` at flush time (backed by the
+    DB partial-unique index on byu_id/net_id), so ``commit_import`` re-runs this
+    AND relies on the write-time check as defense in depth.
     """
     existing = await _load_existing_index(session)
 
@@ -624,14 +666,24 @@ async def commit_import(
     """Re-evaluate *rows* and insert every importable one in ONE transaction.
 
     Re-evaluating (rather than trusting a client-supplied preview) is the same
-    defense-in-depth stance the single-record create path takes. Each importable
-    row is created through ``alumni_service.create_alumni`` so cleaning + audit
-    logging fire exactly as for a manual create — but committed together at the
-    end. ``create_alumni`` commits internally; to keep a single transaction we
-    temporarily neutralize its commit and run one real commit after the loop.
+    defense-in-depth stance the single-record create path takes. ``evaluate()``
+    here is only a PRE-FILTER / gate: the AUTHORITATIVE duplicate check fires
+    inside ``create_alumni`` at flush time (and ultimately the DB unique index),
+    so a row that slips past the gate is still rejected at write time. The spouse
+    link is re-resolved here on purpose — spouse warnings are produced only by
+    the preview step, so the commit path resolves the id fresh and silently
+    imports unlinked if it no longer matches (warn-only contract).
 
-    Per-row exceptions are caught and recorded as rejects so one bad row never
-    aborts the whole import. Returns:
+    Each importable row is created through ``alumni_service.create_alumni`` so
+    cleaning + audit logging fire exactly as for a manual create. ``create_alumni``
+    commits internally; to keep a single batch transaction we temporarily
+    neutralize its commit (flush instead) and run one real commit after the loop.
+
+    Crash-safety: each row's insert runs inside its OWN SAVEPOINT
+    (``begin_nested``). If a row raises mid-batch, only that savepoint rolls back
+    — the outer transaction stays valid so later rows still commit. ``imported``
+    / ``created_ids`` therefore count ONLY rows that actually flushed cleanly;
+    the final ``commit`` persists exactly those. Returns:
         ``{"imported": int, "skipped": int, "created_ids": [int],
            "rejects": [{"row": int, "name": str, "reason": str}]}``
     """
@@ -671,40 +723,48 @@ async def commit_import(
             continue
 
         parsed = parsed_by_row[row_num]
-        try:
-            model = AlumniCreateFull(**parsed["payload"])
-            # Resolve the spouse link onto the model (evaluate proved it valid;
-            # an unresolved id stays None, matching the warn-only contract).
-            if parsed["spouse_byu_id"]:
-                spouse_id = await _resolve_spouse(
-                    session, parsed["spouse_byu_id"]
-                )
-                if spouse_id is not None:
-                    model = model.model_copy(
-                        update={"spouse_alumni_id": spouse_id}
+        # Per-row SAVEPOINT: a failure rolls back ONLY this row, leaving the
+        # outer transaction (and the already-inserted rows) intact.
+        async with session.begin_nested() as savepoint:
+            try:
+                model = AlumniCreateFull(**parsed["payload"])
+                # Re-resolve the spouse link onto the model (warn-only: an
+                # unresolved id stays None, importing the record unlinked).
+                if parsed["spouse_byu_id"]:
+                    spouse_id = await _resolve_spouse(
+                        session, parsed["spouse_byu_id"]
                     )
+                    if spouse_id is not None:
+                        model = model.model_copy(
+                            update={"spouse_alumni_id": spouse_id}
+                        )
 
-            session.commit = _noop_commit  # type: ignore[method-assign]
-            if real_refresh is not None:
-                session.refresh = _noop_refresh  # type: ignore[method-assign]
-            created = await alumni_service.create_alumni(
-                session, model, actor_user_id=actor_user_id
-            )
-            created_ids.append(created.alumni_id)
-            imported += 1
-        except Exception as exc:  # noqa: BLE001 - record + continue per row
-            skipped += 1
-            rejects.append(
-                {
-                    "row": row_num,
-                    "name": evaluated["name"],
-                    "reason": str(exc) or exc.__class__.__name__,
-                }
-            )
-        finally:
-            session.commit = real_commit  # type: ignore[method-assign]
-            if real_refresh is not None:
-                session.refresh = real_refresh  # type: ignore[method-assign]
+                # Keep the commit/refresh no-op swap INSIDE the savepoint so the
+                # create flushes (not commits) within this nested transaction;
+                # restore in finally so the outer commit/refresh are unaffected.
+                session.commit = _noop_commit  # type: ignore[method-assign]
+                if real_refresh is not None:
+                    session.refresh = _noop_refresh  # type: ignore[method-assign]
+                try:
+                    created = await alumni_service.create_alumni(
+                        session, model, actor_user_id=actor_user_id
+                    )
+                finally:
+                    session.commit = real_commit  # type: ignore[method-assign]
+                    if real_refresh is not None:
+                        session.refresh = real_refresh  # type: ignore[method-assign]
+                created_ids.append(created.alumni_id)
+                imported += 1
+            except Exception as exc:  # noqa: BLE001 - record + continue per row
+                await savepoint.rollback()
+                skipped += 1
+                rejects.append(
+                    {
+                        "row": row_num,
+                        "name": evaluated["name"],
+                        "reason": _classify_reject(exc, row_num),
+                    }
+                )
 
     # One real commit for the whole importable batch.
     if imported:
@@ -716,6 +776,22 @@ async def commit_import(
         "created_ids": created_ids,
         "rejects": rejects,
     }
+
+
+def _classify_reject(exc: Exception, row_num: int) -> str:
+    """Turn a per-row insert failure into a SAFE reject reason.
+
+    Domain errors (``ConflictError`` / ``NotFoundError`` / pydantic
+    ``ValidationError``) carry client-safe messages and are surfaced verbatim.
+    Anything else (DB driver errors, etc.) may leak internal/SQL detail, so it is
+    logged server-side and reported as a generic, class-only message.
+    """
+    if isinstance(exc, (ConflictError, NotFoundError)):
+        return str(exc) or exc.__class__.__name__
+    if isinstance(exc, ValidationError):
+        return _format_validation_error(exc)
+    log.exception("Unexpected error importing row %s", row_num)
+    return f"Unexpected error ({exc.__class__.__name__})"
 
 
 def _reject_reason(evaluated: dict) -> str:

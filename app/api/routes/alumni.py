@@ -8,7 +8,7 @@ retained records.
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
@@ -155,6 +155,35 @@ async def list_alumni(
 # matching is declaration-ordered).
 
 
+async def _read_capped(file: UploadFile) -> bytes | None:
+    """Read an upload, capped at ``MAX_UPLOAD_BYTES``.
+
+    Reads one byte past the cap so we can tell "exactly at the limit" from "over".
+    Returns the bytes, or ``None`` if the file exceeds the cap (the caller turns
+    that into a 413 response). Bounds memory before any parsing happens (DoS).
+    """
+    data = await file.read(import_csv.MAX_UPLOAD_BYTES + 1)
+    if len(data) > import_csv.MAX_UPLOAD_BYTES:
+        return None
+    return data
+
+
+def _too_large_response() -> JSONResponse:
+    mib = import_csv.MAX_UPLOAD_BYTES // (1024 * 1024)
+    return JSONResponse(
+        status_code=413,  # Content Too Large
+        content={
+            "error": {
+                "code": "payload_too_large",
+                "message": (
+                    f"File exceeds the {mib} MB upload limit. Split into "
+                    "smaller batches."
+                ),
+            }
+        },
+    )
+
+
 @router.get("/import/template")
 async def alumni_import_template(_: RequireFullAccess) -> Response:
     """Download the bulk-import CSV template: the exact Alumni columns plus one
@@ -170,20 +199,24 @@ async def alumni_import_template(_: RequireFullAccess) -> Response:
     )
 
 
-@router.post("/import/preview")
+@router.post("/import/preview", response_model=None)
 async def preview_import_alumni(
     _: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
-) -> dict:
+) -> dict | JSONResponse:
     """Dry-run a bulk CSV import (full_access, NO writes).
 
     Parses + maps the uploaded CSV against the Alumni template columns, then
     evaluates every row (clean + duplicate-detect against the DB and earlier
     rows in the file + completeness warnings). Returns the full preview report;
     a bad header set surfaces as ``columns_ok: false`` with ``header_errors``."""
-    file_bytes = await file.read()
-    rows, header_errors = import_csv.parse_and_map(file_bytes)
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_csv.parse_and_map(
+        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
+    )
     if header_errors:
         return {
             "columns_ok": False,
@@ -200,17 +233,21 @@ async def preview_import_alumni(
     return await import_csv.evaluate(session, rows)
 
 
-@router.post("/import")
+@router.post("/import", response_model=None)
 async def import_alumni(
     user: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
-) -> dict:
+) -> dict | JSONResponse:
     """Commit a bulk CSV import (full_access). Re-evaluates and inserts every
     importable row in one transaction (audit logging fires per row); rejected
     rows are skipped and reported. A bad header set imports nothing."""
-    file_bytes = await file.read()
-    rows, header_errors = import_csv.parse_and_map(file_bytes)
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_csv.parse_and_map(
+        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
+    )
     if header_errors:
         return {
             "imported": 0,

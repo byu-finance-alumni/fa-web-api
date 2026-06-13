@@ -273,10 +273,11 @@ def test_update_preview_excludes_self_from_dup_detection():
     existing = _alum(alumni_id=5, graduation_year=2018)
     contact_row = SimpleNamespace(personal_email="jane@x.com", work_email=None)
     career_row = SimpleNamespace(current_employer="Goldman")
-    # get() -> existing; scalars: byu_id dup lookup (None, self excluded),
-    # then effective loads contact then career.
+    # get() -> existing; scalars: active byu_id dup lookup (None, self
+    # excluded), archived byu_id ghost lookup (None), then effective loads
+    # contact then career.
     session = _FakeSession(
-        scalars=[None, contact_row, career_row], get_result=existing
+        scalars=[None, None, contact_row, career_row], get_result=existing
     )
     with _full_access_client(session) as c:
         resp = c.post(

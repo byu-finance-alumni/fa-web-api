@@ -1,8 +1,10 @@
 """Data-hygiene / validation pipeline for alumni write payloads.
 
-Three jobs, all enforced at the *application* layer (no DB schema changes — the
-dev/prod databases share one instance and the mock data may contain duplicates,
-so we cannot add unique constraints):
+Three jobs, enforced primarily at the *application* layer. A DB-level partial
+unique index on active byu_id / net_id (migrations/2026-06-12_alumni_unique_
+byu_net.sql) backs the duplicate check as the authoritative TOCTOU guard, but
+the app-layer detection here is what produces the friendly preview/blocker
+messages and the archived "ghost" warnings:
 
   1. Cleaning  — normalize strings (trim/collapse whitespace, casing, phone,
      LinkedIn URL, US-state codes) so what we store is consistent. Cleaning is
@@ -74,6 +76,33 @@ _LABELS: dict[tuple[str, str], str] = {
     ("career", "current_country"): "Current country",
     ("career", "current_zip"): "Current ZIP",
 }
+
+# Nobiliary / nominal particles kept lowercase when title-casing a name —
+# UNLESS the particle is the first word (then it's capitalized normally). This
+# is the standard English-language convention for European surnames, e.g.
+# "van der berg" -> "Van der Berg", "de la cruz" -> "De la Cruz".
+_NAME_PARTICLES = frozenset(
+    {
+        "van",
+        "von",
+        "der",
+        "den",
+        "de",
+        "del",
+        "della",
+        "di",
+        "da",
+        "das",
+        "dos",
+        "du",
+        "la",
+        "le",
+        "lo",
+        "ten",
+        "ter",
+        "of",
+    }
+)
 
 # Name-style fields per section (trim+collapse + smart Title-Case).
 _NAME_FIELDS = {
@@ -171,6 +200,21 @@ def _smart_title(value: str | None) -> str | None:
     intentionally cased and is preserved. Casing is applied per whitespace token
     so multi-word names ("anne marie") each get capitalized; hyphen/apostrophe
     sub-parts are handled by ``str.title``'s word-boundary logic.
+
+    Nobiliary particles (``van, von, der, de, la, ...`` — see ``_NAME_PARTICLES``)
+    are kept lowercase when they are NOT the first word, following the standard
+    English convention for European surnames::
+
+        "van der berg" -> "Van der Berg"   (first word always capitalized)
+        "de la cruz"   -> "De la Cruz"
+        "VAN DER BERG" -> "Van der Berg"
+
+    Limits: this only fires on the all-upper / all-lower normalization path, so
+    an intentionally-mixed input is left untouched. The particle list is a fixed
+    set of common particles, not exhaustive, and it cannot distinguish a genuine
+    particle from a same-spelled given name (a first name "Della" coming in as
+    all-lower would be lowercased if it appeared after the first word). These are
+    acceptable trade-offs for cleaning bulk-imported names.
     """
     cleaned = _collapse(value)
     if cleaned is None:
@@ -181,7 +225,13 @@ def _smart_title(value: str | None) -> str | None:
     if not letters:
         return cleaned
     if all(ch.islower() for ch in letters) or all(ch.isupper() for ch in letters):
-        return cleaned.title()
+        titled = cleaned.title()
+        # Re-lowercase recognized particles, but never the first word.
+        tokens = titled.split(" ")
+        for i in range(1, len(tokens)):
+            if tokens[i].lower() in _NAME_PARTICLES:
+                tokens[i] = tokens[i].lower()
+        return " ".join(tokens)
     return cleaned  # already mixed -> leave as-is
 
 
@@ -397,10 +447,14 @@ async def detect_duplicates(
       * blockers: exact ``byu_id`` and/or ``net_id`` collisions (each a
         ``{"code","field","message","alumni_id"}`` dict).
       * warnings: fuzzy ``possible_duplicate`` matches (same first+last+grad
-        year), excluding anyone already flagged as a blocker.
+        year, excluding anyone already flagged as a blocker), plus
+        ``duplicate_archived`` warnings when an ARCHIVED record carries the same
+        byu_id / net_id (active matches block; archived ones only warn, so the
+        admin knows restoring the ghost would create a duplicate).
     """
     blockers: list[dict] = []
     blocker_ids: set[int] = set()
+    warnings: list[dict] = []
 
     byu_id = cleaned.get("byu_id")
     net_id = cleaned.get("net_id")
@@ -426,6 +480,29 @@ async def detect_duplicates(
                 }
             )
             blocker_ids.add(match.alumni_id)
+        else:
+            # No ACTIVE collision — but an ARCHIVED ("ghost") record may carry
+            # the same id. Surface it as a warning so the admin knows restoring
+            # that record (instead of creating a new one) would otherwise make a
+            # duplicate. Never blocks.
+            stmt_arch = select(Alumni).where(
+                Alumni.byu_id == byu_id, Alumni.archived.is_(True)
+            )
+            if exclude_alumni_id is not None:
+                stmt_arch = stmt_arch.where(Alumni.alumni_id != exclude_alumni_id)
+            ghost = await session.scalar(stmt_arch.limit(1))
+            if ghost is not None:
+                warnings.append(
+                    {
+                        "code": "duplicate_archived",
+                        "message": (
+                            f"BYU ID {byu_id} matches an archived record for "
+                            f"{_display_name(ghost.first_name, ghost.last_name)}"
+                            " — restoring it would create a duplicate."
+                        ),
+                        "alumni_id": ghost.alumni_id,
+                    }
+                )
 
     # --- Exact: Net ID ---
     if net_id:
@@ -448,9 +525,27 @@ async def detect_duplicates(
                 }
             )
             blocker_ids.add(match.alumni_id)
+        else:
+            stmt_arch = select(Alumni).where(
+                Alumni.net_id == net_id, Alumni.archived.is_(True)
+            )
+            if exclude_alumni_id is not None:
+                stmt_arch = stmt_arch.where(Alumni.alumni_id != exclude_alumni_id)
+            ghost = await session.scalar(stmt_arch.limit(1))
+            if ghost is not None:
+                warnings.append(
+                    {
+                        "code": "duplicate_archived",
+                        "message": (
+                            f"Net ID {net_id} matches an archived record for "
+                            f"{_display_name(ghost.first_name, ghost.last_name)}"
+                            " — restoring it would create a duplicate."
+                        ),
+                        "alumni_id": ghost.alumni_id,
+                    }
+                )
 
     # --- Fuzzy: same first+last (case-insensitive) AND same graduation_year ---
-    warnings: list[dict] = []
     first = cleaned.get("first_name")
     last = cleaned.get("last_name")
     grad_year = cleaned.get("graduation_year")

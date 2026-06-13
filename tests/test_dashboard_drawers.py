@@ -85,6 +85,7 @@ def _with_session(session):
         "/dashboard/follow-ups",
         "/dashboard/activity",
         "/dashboard/data-quality",
+        "/dashboard/birthdays",
     ],
 )
 def test_drilldowns_require_auth(client, path):
@@ -259,6 +260,102 @@ def test_activity_no_filters_has_no_where(client):
     sql = _compiled(session.execute_args[0])
     assert "ILIKE" not in sql
     assert "interaction_date_time >=" not in sql
+
+
+def test_summary_includes_this_month_kpis(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # Scalars consumed in handler order: total, archived, deceased,
+    # missing_email, missing_employer, contacted_this_month,
+    # upcoming_follow_ups, duplicate_count, attended_event_this_month,
+    # upcoming_events, events_this_month, guest_speakers_this_month,
+    # piff_donors, willing_mentors. The three execute() calls (cohort /
+    # top_employers / by_state) fall back to the empty rows list.
+    scalars = [100, 5, 2, 12, 9, 8, 4, 3, 6, 7, 11, 2, 1, 0]
+    app.dependency_overrides[get_session] = _with_session(
+        _FakeSession([], scalars=scalars)
+    )
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["events_this_month"] == 11
+    assert body["guest_speakers_this_month"] == 2
+
+
+def test_summary_guest_speaker_signal_uses_attendance_status_ilike(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 14)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    # The 12th scalar query (index 11) is the guest-speaker KPI; assert it
+    # filters event attendance by a "speaker" status (the chosen signal).
+    speaker_sql = _compiled(session.scalar_args[11])
+    assert "attendance_status ILIKE" in speaker_sql
+    assert "event_date" in speaker_sql
+
+
+def test_birthdays_serializes_rows_matching_contract(client):
+    # The handler selects (Alumni, current_employer) rows.
+    alum = SimpleNamespace(
+        alumni_id=7,
+        first_name="Jane",
+        last_name="Doe",
+        graduation_year=2019,
+        birth_date=datetime.date(1997, 6, 3),
+    )
+    rows = [(alum, "Goldman Sachs")]
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    app.dependency_overrides[get_session] = _with_session(_FakeSession(rows))
+
+    response = client.get("/dashboard/birthdays")
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "id": 7,
+            "first_name": "Jane",
+            "last_name": "Doe",
+            "current_employer": "Goldman Sachs",
+            "graduation_year": 2019,
+            "birth_date": "1997-06-03",
+        }
+    ]
+
+
+def test_birthdays_handles_null_employer(client):
+    alum = SimpleNamespace(
+        alumni_id=8,
+        first_name="John",
+        last_name="Smith",
+        graduation_year=None,
+        birth_date=datetime.date(2000, 6, 15),
+    )
+    rows = [(alum, None)]
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    app.dependency_overrides[get_session] = _with_session(_FakeSession(rows))
+
+    response = client.get("/dashboard/birthdays")
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["current_employer"] is None
+    assert body[0]["graduation_year"] is None
+
+
+def test_birthdays_filters_current_month_and_orders_by_day(client):
+    session = _FakeSession([])
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/birthdays")
+    assert response.status_code == 200
+    sql = _compiled(session.execute_args[0])
+    # Month-filter on birth_date and day-of-month ordering both present.
+    assert "EXTRACT(month FROM alumni.birth_date)" in sql
+    assert "ORDER BY EXTRACT(day FROM alumni.birth_date)" in sql
+    # Only active (non-archived) alumni with a birth_date on file.
+    assert "birth_date IS NOT NULL" in sql
+    assert "archived" in sql
 
 
 def test_follow_ups_serializes_rows_and_handles_missing_user(client):

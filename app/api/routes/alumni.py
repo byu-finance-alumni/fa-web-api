@@ -74,6 +74,19 @@ async def list_alumni(
             )
         ),
     ] = None,
+    city: Annotated[
+        str | None,
+        Query(description="Current city (case-insensitive exact match)."),
+    ] = None,
+    tag: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Engagement tag label, e.g. 'Speaker' or 'Highly Engaged' "
+                "(case-insensitive exact match). Accepts any tag value."
+            )
+        ),
+    ] = None,
     attended_event: Annotated[
         bool, Query(description="Only alumni who attended at least one event.")
     ] = False,
@@ -117,6 +130,8 @@ async def list_alumni(
         deceased=deceased,
         employer=employer,
         industry=industry,
+        city=city,
+        tag=tag,
         attended_event=attended_event,
         donor=donor,
         mentor_willing=mentor_willing,

@@ -12,7 +12,7 @@ from sqlalchemy import extract, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.api.dependencies.auth import RequireViewAccess
+from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
@@ -481,9 +481,12 @@ async def activity_feed(
 
 
 @router.get("/data-quality")
-async def data_quality(_: RequireViewAccess, session: SessionDep) -> dict:
+async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
     """The data-quality alert counts (same predicates as the summary KPIs),
-    for the dedicated data-quality page."""
+    for the dedicated data-quality page.
+
+    Full-access only (matches the sidebar gate): view_only users get 403, like
+    the cross-alumni Tasks list."""
     active = Alumni.archived.is_(False)
     total = await session.scalar(
         select(func.count()).select_from(Alumni).where(active)

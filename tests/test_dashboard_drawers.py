@@ -172,8 +172,10 @@ def test_activity_feed_paginates_and_serializes(client):
     ]
 
 
-def test_data_quality_returns_counts(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+@pytest.mark.parametrize("role", ["full_access", "super_admin"])
+def test_data_quality_returns_counts(client, role):
+    # Data-quality is full-access only (matches the sidebar gate), like /tasks.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     # Scalars consumed in handler order: total, missing_email,
     # missing_employer, duplicate_count.
     app.dependency_overrides[get_session] = _with_session(
@@ -188,6 +190,16 @@ def test_data_quality_returns_counts(client):
         "missing_employer": 9,
         "duplicate_count": 3,
     }
+
+
+def test_data_quality_forbidden_for_view_only(client):
+    # view_only callers get 403 (the sidebar already hides the link).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    app.dependency_overrides[get_session] = _with_session(_FakeSession([]))
+
+    response = client.get("/dashboard/data-quality")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
 
 
 # --- activity feed filtering (SQL assertions on the compiled statement) -------

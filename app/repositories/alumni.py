@@ -20,6 +20,7 @@ from app.models.duplicate import DuplicateCandidate
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import EventAttendance
+from app.models.tags import AlumniTag, Tag
 from app.utils.sql import escape_like
 
 
@@ -36,6 +37,8 @@ def build_alumni_query(
     deceased: bool | None = None,
     employer: str | None = None,
     industry: str | None = None,
+    city: str | None = None,
+    tag: str | None = None,
     attended_event: bool = False,
     donor: bool = False,
     mentor_willing: bool = False,
@@ -108,6 +111,27 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(in_industry)
+    if city:
+        in_city = (
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                AlumniContactInfo.city.ilike(escape_like(city), escape="\\"),
+            )
+            .exists()
+        )
+        conditions.append(in_city)
+    if tag:
+        has_tag = (
+            select(AlumniTag.alumni_tag_id)
+            .join(Tag, Tag.tag_id == AlumniTag.tag_id)
+            .where(
+                AlumniTag.alumni_id == Alumni.alumni_id,
+                Tag.tag_name.ilike(escape_like(tag), escape="\\"),
+            )
+            .exists()
+        )
+        conditions.append(has_tag)
     if attended_event:
         has_attended = (
             select(EventAttendance.event_attendance_id)

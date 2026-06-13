@@ -490,6 +490,7 @@ async def get_summary(session, filters: dict) -> dict:
             "employers": await _distinct(
                 session, CurrentEmployment.current_employer
             ),
+            "cities": await _distinct(session, AlumniContactInfo.city),
             "industries": await _distinct(
                 session, CurrentEmployment.current_industry
             ),

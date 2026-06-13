@@ -94,6 +94,33 @@ def test_industry_filter_checks_primary_and_secondary():
     assert "current_industry_secondary ILIKE" in sql
 
 
+def test_city_filter():
+    sql = _sql(build_alumni_query(city="Provo"))
+    # Correlated EXISTS against the contact-info table, case-insensitive.
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_contact_info" in sql
+    assert "city ILIKE" in sql
+
+
+def test_tag_filter():
+    sql = _sql(build_alumni_query(tag="Speaker"))
+    # EXISTS over the alumni_tags join to the tags lookup, matched case-insensitively
+    # on the tag label — generic, accepts any tag value.
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_tags" in sql
+    assert "tags" in sql
+    assert "tag_name ILIKE" in sql
+
+
+def test_city_and_tag_compose_with_archived_default():
+    sql = _sql(build_alumni_query(city="Provo", tag="Highly Engaged"))
+    assert "archived IS false" in sql
+    assert "city ILIKE" in sql
+    assert "tag_name ILIKE" in sql
+
+
 def test_attended_event_filter():
     sql = _sql(build_alumni_query(attended_event=True))
     assert "EXISTS" in sql

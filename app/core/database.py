@@ -40,15 +40,32 @@ if settings.async_database_url:
     if _is_transaction_pooler:
         engine = create_async_engine(
             _url,
-            echo=settings.debug,
+            echo=settings.sql_echo,
             poolclass=NullPool,
             connect_args={"statement_cache_size": 0},
         )
     else:
+        # Session-pooler (:5432) path. Supabase's session-mode pooler caps the
+        # TOTAL number of clients across ALL connectors to 15. SQLAlchemy's
+        # default QueuePool (pool_size=5 + max_overflow=10 = up to 15) can alone
+        # exhaust that cap, leaving no headroom for one-off scripts/migrations
+        # and triggering asyncpg EMAXCONNSESSION ("max clients reached"). So we
+        # keep a deliberately SMALL pool (default 5 + 2 overflow = hard cap 7),
+        # recycle stale connections, and pre-ping. Sizes are overridable via env
+        # (DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_POOL_TIMEOUT, DB_POOL_RECYCLE).
+        #
+        # LONG-TERM FIX: the RUNTIME app should point DATABASE_URL at the
+        # transaction pooler (:6543) — handled above with NullPool — while
+        # migrations keep using the direct/session (:5432) connection. The
+        # capping here makes the :5432 runtime path safe in the meantime.
         engine = create_async_engine(
             _url,
-            echo=settings.debug,
+            echo=settings.sql_echo,
             pool_pre_ping=True,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_recycle=settings.db_pool_recycle,
         )
 
     SessionLocal = async_sessionmaker(

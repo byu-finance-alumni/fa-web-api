@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
+from app.core.errors import NotFoundError
 from app.schemas.alumni import (
     AlumniCreateFull,
     AlumniPage,
@@ -40,6 +41,7 @@ from app.schemas.profile import (
     TaskRead,
 )
 from app.services import alumni as service
+from app.services import hygiene
 from app.services import profile as profile_service
 
 router = APIRouter(prefix="/alumni", tags=["alumni"])
@@ -461,6 +463,39 @@ async def add_event_attendance(
     the event/alumni is unknown; 409 if attendance already exists."""
     return await profile_service.add_event_attendance(
         session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.post("/preview")
+async def preview_create_alumni(
+    payload: AlumniCreateFull, _: RequireFullAccess, session: SessionDep
+) -> dict:
+    """Dry-run data-hygiene preview for a NEW alumni (full_access, no writes).
+
+    Returns ``{cleaned, changes, warnings, blockers}`` — the cleaned (normalized)
+    payload, the per-field changes cleaning would make, soft warnings (completeness
+    + fuzzy possible-duplicates), and exact-duplicate blockers (a non-empty list
+    means the real POST would 409)."""
+    return await hygiene.build_preview(session, payload)
+
+
+@router.post("/{alumni_id}/preview")
+async def preview_update_alumni(
+    alumni_id: int,
+    payload: AlumniUpdateFull,
+    _: RequireFullAccess,
+    session: SessionDep,
+) -> dict:
+    """Dry-run data-hygiene preview for an EDIT (full_access, no writes).
+
+    Loads the current record (404 if missing/archived) and computes the preview
+    against the EFFECTIVE record (the cleaned partial overlaid on the stored
+    values) so duplicate + completeness checks reflect the resulting state."""
+    existing = await service.get_alumni(session, alumni_id)
+    if existing.archived:
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    return await hygiene.build_preview(
+        session, payload, existing=existing, exclude_alumni_id=alumni_id
     )
 
 

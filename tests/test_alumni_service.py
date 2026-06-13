@@ -15,6 +15,16 @@ from app.schemas.alumni import AlumniCreate, AlumniUpdate
 from app.services import alumni as service
 
 
+class _EmptyScalars:
+    def all(self):
+        return []
+
+
+class _EmptyResult:
+    def scalars(self):
+        return _EmptyScalars()
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.added: list[object] = []
@@ -22,6 +32,15 @@ class FakeSession:
 
     def add(self, obj: object) -> None:
         self.added.append(obj)
+
+    async def scalar(self, stmt: object) -> None:
+        # The hygiene duplicate check runs on create/update; no fixtures here
+        # have duplicates, so every exact/spouse lookup returns nothing.
+        return None
+
+    async def execute(self, stmt: object) -> _EmptyResult:
+        # Fuzzy duplicate scan -> no matches.
+        return _EmptyResult()
 
     async def flush(self) -> None:
         # create_alumni flushes to obtain the generated alumni_id before

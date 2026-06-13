@@ -7,7 +7,8 @@ retained records.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
@@ -41,7 +42,7 @@ from app.schemas.profile import (
     TaskRead,
 )
 from app.services import alumni as service
-from app.services import hygiene
+from app.services import hygiene, import_csv
 from app.services import profile as profile_service
 
 router = APIRouter(prefix="/alumni", tags=["alumni"])
@@ -145,6 +146,84 @@ async def list_alumni(
         sort=sort,
     )
     return AlumniPage(items=items, total=total, limit=limit, offset=offset)
+
+
+# --- Bulk CSV import (full_access) -------------------------------------------
+#
+# Declared BEFORE the ``/{alumni_id}`` routes so the literal ``/import/...``
+# paths win over the ``/{alumni_id}`` / ``/{alumni_id}/preview`` patterns (route
+# matching is declaration-ordered).
+
+
+@router.get("/import/template")
+async def alumni_import_template(_: RequireFullAccess) -> Response:
+    """Download the bulk-import CSV template: the exact Alumni columns plus one
+    example row (full_access). Same column source as the xlsx intake template."""
+    return Response(
+        content=import_csv.build_template_csv(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="alumni_import_template.csv"'
+            )
+        },
+    )
+
+
+@router.post("/import/preview")
+async def preview_import_alumni(
+    _: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict:
+    """Dry-run a bulk CSV import (full_access, NO writes).
+
+    Parses + maps the uploaded CSV against the Alumni template columns, then
+    evaluates every row (clean + duplicate-detect against the DB and earlier
+    rows in the file + completeness warnings). Returns the full preview report;
+    a bad header set surfaces as ``columns_ok: false`` with ``header_errors``."""
+    file_bytes = await file.read()
+    rows, header_errors = import_csv.parse_and_map(file_bytes)
+    if header_errors:
+        return {
+            "columns_ok": False,
+            "header_errors": header_errors,
+            "summary": {
+                "total": 0,
+                "importable": 0,
+                "rejected": 0,
+                "with_warnings": 0,
+                "cleaned": 0,
+            },
+            "rows": [],
+        }
+    return await import_csv.evaluate(session, rows)
+
+
+@router.post("/import")
+async def import_alumni(
+    user: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict:
+    """Commit a bulk CSV import (full_access). Re-evaluates and inserts every
+    importable row in one transaction (audit logging fires per row); rejected
+    rows are skipped and reported. A bad header set imports nothing."""
+    file_bytes = await file.read()
+    rows, header_errors = import_csv.parse_and_map(file_bytes)
+    if header_errors:
+        return {
+            "imported": 0,
+            "skipped": 0,
+            "created_ids": [],
+            "rejects": [
+                {"row": 0, "name": "(header)", "reason": msg}
+                for msg in header_errors
+            ],
+        }
+    return await import_csv.commit_import(
+        session, rows, actor_user_id=user.user_id
+    )
 
 
 @router.get("/{alumni_id}", response_model=AlumniRead)

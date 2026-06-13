@@ -119,6 +119,16 @@ CREATE TABLE alumni (
 
 CREATE INDEX IF NOT EXISTS idx_alumni_spouse_alumni_id ON alumni (spouse_alumni_id);
 
+-- Partial unique indexes: an active (non-archived) alum's byu_id / net_id must
+-- be unique. These are the authoritative guard behind the application-layer
+-- duplicate detection (closes a TOCTOU race between concurrent writes). NULL ids
+-- and archived rows are excluded. byu_id is stored digits-only by the cleaner.
+-- See migrations/2026-06-12_alumni_unique_byu_net.sql.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_byu_id_active
+    ON alumni (byu_id) WHERE archived = false AND byu_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_net_id_active
+    ON alumni (net_id) WHERE archived = false AND net_id IS NOT NULL;
+
 CREATE TABLE alumni_contact_info (
     contact_info_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id       bigint NOT NULL,

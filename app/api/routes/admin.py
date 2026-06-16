@@ -23,6 +23,7 @@ from app.api.dependencies.auth import RequireSuperAdmin
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.roles import RoleName
+from app.core.security import AuthorizationError
 from app.models.audit import AuditLog
 from app.models.login_attempt import LoginAttempt
 from app.models.user import Role, User, UserRole
@@ -88,10 +89,11 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class CreateUserRequest(BaseModel):
-    """Provision a new login user. ``role_name`` is restricted to
-    full_access/view_only (super_admin is NOT bootstrappable here), so an unknown
-    or disallowed role is a 422 before any query runs; names follow the alumni
-    NAME rules (≤100 chars). ``extra='forbid'`` rejects unknown keys."""
+    """Provision a new login user. ``role_name`` is restricted to the
+    non-privileged roles (full_access / student / view_only) — the top roles
+    (engineer, super_admin) are NOT bootstrappable here — so an unknown or
+    disallowed role is a 422 before any query runs; names follow the alumni NAME
+    rules (≤100 chars). ``extra='forbid'`` rejects unknown keys."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -265,7 +267,16 @@ async def assign_role(
     actor: RequireSuperAdmin,
     session: SessionDep,
 ) -> dict:
-    """Grant a role to an existing user (idempotent). super_admin only."""
+    """Grant a role to an existing user (idempotent). super_admin and up.
+
+    Privilege ceiling: only an ``engineer`` may grant the ``engineer`` role. A
+    ``super_admin`` (who is below engineer) cannot mint an account that outranks
+    them — that would be a privilege escalation above the actor's own ceiling.
+    """
+    if payload.role_name == RoleName.ENGINEER and not actor.is_engineer:
+        raise AuthorizationError(
+            "Only an engineer can grant the engineer role."
+        )
     user = await _load_user(session, user_id)
     role = await session.scalar(
         select(Role).where(Role.role_name == payload.role_name.value)
@@ -296,10 +307,11 @@ async def remove_role(
     actor: RequireSuperAdmin,
     session: SessionDep,
 ) -> dict:
-    """Revoke a role from an existing user (idempotent). super_admin only.
+    """Revoke a role from an existing user (idempotent). super_admin and up.
 
-    Guards against a super_admin removing their own last super_admin role, which
-    would lock user administration out of the system.
+    Guards against an admin removing their OWN top role (super_admin or
+    engineer), which would lock user administration (or, for engineer, vocab /
+    database administration) out of the system if they were the last holder.
     """
     await _load_user(session, user_id)  # 404 if the user doesn't exist
     role = await session.scalar(
@@ -315,10 +327,13 @@ async def remove_role(
     )
     if link is not None:
         if (
-            role.role_name == RoleName.SUPER_ADMIN.value
+            role.role_name
+            in {RoleName.SUPER_ADMIN.value, RoleName.ENGINEER.value}
             and user_id == actor.user_id
         ):
-            raise ConflictError("You cannot remove your own super_admin role.")
+            raise ConflictError(
+                f"You cannot remove your own {role.role_name} role."
+            )
         await session.delete(link)
         session.add(
             AuditLog(

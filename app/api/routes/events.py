@@ -267,7 +267,13 @@ async def add_event_attendee(
     """Add an alumni to an event's attendance (full_access). 404 if the event or
     alumni is unknown; 409 if the (event, alumni) pair already exists. Audits the
     write (entity_type "event", action "add_attendee", entity_id event_id,
-    new_value the alumni id/name)."""
+    new_value the alumni id/name).
+
+    Note: this is the event-roster management surface and stays ``full_access``
+    on purpose. Recording attendance from an alumnus's PROFILE
+    (``POST /alumni/{id}/events``) is profile data-entry and is intentionally
+    open to ``student`` via ``RequireAlumniEdit`` — a deliberate split, not an
+    oversight. Students manage attendance per-alumnus, not from the event roster."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")

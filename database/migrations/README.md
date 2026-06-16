@@ -40,22 +40,31 @@ DATABASE_URL="postgresql://postgres:PASSWORD@db.PROJECT_REF.supabase.co:5432/pos
 
 ## CI: manual-gated on prod promotion
 
-There is a **single Supabase database**, shared by the dev and prod deployments,
-so any schema change is global the moment it lands. To avoid a dev merge silently
-altering the shared (production) database, migrations are applied only on a **push
-to `prod`**, and only **after a human approves**:
+`dev` and `prod` now have **separate Supabase databases** (dev = the original
+project, which keeps the mock/seed data; prod = a new, dedicated project).
+Migrations must be applied to **each** database to keep them in sync.
+
+The CI `migrate` job applies pending migrations to the **prod** database on a
+**push to `prod`**, and only **after a human approves** (the `production`
+Environment's required reviewer):
 
 | Branch pushed | Job       | Target DB        | Approval                       |
 | ------------- | --------- | ---------------- | ------------------------------ |
-| `dev`         | —         | —                | (migrations do not run)        |
-| `prod`        | `migrate` | the shared DB    | **manual** (required reviewer) |
+| `dev`         | —         | —                | (CI does not migrate dev)      |
+| `prod`        | `migrate` | the **prod** DB  | **manual** (required reviewer) |
 
 `.github/workflows/ci.yml` runs `migrate` after the gating checks pass on the
 post-merge push to `prod`. Migrations do **not** run on pull requests.
 
-> If you later want dev migrations to apply automatically and safely, create a
-> separate (free-tier) Supabase project for dev and split this back into
-> per-environment jobs.
+**Applying migrations to the dev database:** run `../migrate.sh` by hand against
+the dev project's direct connection string (see "How it runs" above), or add a
+dev `migrate` job mirroring the prod one. Keep both databases in sync so a change
+tested on dev matches what lands on prod.
+
+> ⏳ **Provisioned during the database split (in progress):** the dedicated prod
+> project and its `MIGRATIONS_DATABASE_URL` (the `production` Environment secret)
+> are created / repointed as part of that step. Until the split completes, the
+> `migrate` job still targets the original database.
 
 ### One-time GitHub setup
 

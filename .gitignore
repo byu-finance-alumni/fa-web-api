@@ -96,3 +96,12 @@ desktop.ini
 
 # Claude Code agent files - never tracked
 .claude/
+
+# Throwaway test / scratch artifacts — never commit (dev promotes to prod with real data).
+# Anchored to repo root so they never match the real lowercase tests/ suite.
+/TEST_*
+/SCRATCH*
+/DRAFT_*
+/.board-seed*
+*.scratch
+*DO_NOT_MERGE*

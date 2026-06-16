@@ -115,6 +115,25 @@ jobs:
         run: |
           python -c "import app.main; print('app.main imports OK with pyproject deps only')"
 
+  hygiene:
+    name: Repo hygiene (no scratch artifacts)
+    runs-on: ubuntu-latest
+    # dev is the AI/testing sandbox and promotes to prod (real alumni data), so
+    # throwaway test/scratch files must never be committed. Fails if any tracked
+    # file looks like a scratch artifact. Legit tests live in lowercase tests/,
+    # which these uppercase patterns do not match.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Block scratch / throwaway test files
+        run: |
+          bad=$(git ls-files | grep -E '(^|/)(TEST_[^/]*|SCRATCH[^/]*|DRAFT_[^/]*|[^/]*\.scratch|\.board-seed[^/]*|[^/]*DO_NOT_MERGE[^/]*)$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Scratch/throwaway files must not be committed — dev promotes to prod:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: no scratch/test artifacts tracked"
+
   # ---------------------------------------------------------------------------
   # PROD-ONLY TIER — extra hardening required only when promoting to prod.
   # Runs on PRs targeting prod and on direct pushes to prod. Do NOT mark this

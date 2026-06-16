@@ -1,16 +1,19 @@
 """User administration routes (super_admin only).
 
-Scope today: list provisioned users and manage their roles on EXISTING accounts.
-Creating brand-new auth users with a temporary one-time password (and forced
-first-login reset) is a separate, security-sensitive flow over the Supabase
-Admin API — see docs/PRE-LAUNCH.md — and is intentionally not implemented here.
+Scope: list provisioned users, manage their roles on EXISTING accounts, reset a
+user's password, edit a user's name, and create a brand-new login user. Creating
+a user provisions a Supabase *auth* identity over the Admin API (service-role
+key, server-side only) and returns a one-time temporary password exactly once —
+the same security posture as the password-reset flow (see docs/PRE-LAUNCH.md).
 """
 
+import re
 import secrets
+import unicodedata
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -22,6 +25,7 @@ from app.core.roles import RoleName
 from app.models.audit import AuditLog
 from app.models.login_attempt import LoginAttempt
 from app.models.user import Role, User, UserRole
+from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import set_user_password
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -42,9 +46,106 @@ def _generate_temp_password() -> str:
     return "".join(secrets.choice(_TEMP_PW_ALPHABET) for _ in range(_TEMP_PW_LENGTH))
 
 
+# --- Name validation ---------------------------------------------------------
+#
+# Mirror the alumni NAME rules (app/schemas/alumni.py): a permissive deny-list so
+# international/Unicode names pass, rejecting only characters that are meaningless
+# inside a human name but meaningful to a SQL parser, plus control chars. Names
+# are optional and capped at 100 to match ``users.first_name``/``last_name``.
+_NAME_DISALLOWED = set(";=<>|")
+_NAME_MAX = 100
+
+
+def _validate_optional_name(value: object) -> str | None:
+    """Validate/normalize an optional person-name field (or return ``None``)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Must be a string.")
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > _NAME_MAX:
+        raise ValueError(f"Must be at most {_NAME_MAX} characters.")
+    if any(unicodedata.category(ch) == "Cc" for ch in value):
+        raise ValueError("Must not contain control characters.")
+    bad = sorted(_NAME_DISALLOWED & set(value))
+    if bad:
+        raise ValueError("Must not contain these characters: " + " ".join(bad))
+    if value.isdigit():
+        raise ValueError("Must not be only digits.")
+    return value
+
+
+# Email: kept a bounded plain string (no email-validator dependency, matching the
+# rest of the project — see app/api/routes/auth.py). A light shape check rejects
+# obvious non-addresses; the value is stored lowercased and the throttle/auth
+# layers never trust it as a verified identity.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class CreateUserRequest(BaseModel):
+    """Provision a new login user. ``role_name`` is validated against RoleName so
+    an unknown role is a 422 before any query runs; names follow the alumni NAME
+    rules (≤100 chars). ``extra='forbid'`` rejects unknown keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=255)
+    first_name: str | None = None
+    last_name: str | None = None
+    role_name: RoleName = RoleName.VIEW_ONLY
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _validate_email(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = value.strip().lower()
+        if not _EMAIL_RE.match(value):
+            raise ValueError("Must be a valid email address.")
+        return value
+
+    @field_validator("first_name", "last_name", mode="before")
+    @classmethod
+    def _validate_name(cls, value: object) -> str | None:
+        return _validate_optional_name(value)
+
+
+class UpdateUserNameRequest(BaseModel):
+    """Edit a user's name. Both fields optional; same NAME rules (≤100 chars).
+    Only keys present in the body (``exclude_unset``) are applied — so a client
+    can clear a name by sending ``null``, or leave it untouched by omitting it.
+    ``extra='forbid'`` rejects unknown keys (notably ``active``, which has its own
+    endpoint)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    first_name: str | None = None
+    last_name: str | None = None
+
+    @field_validator("first_name", "last_name", mode="before")
+    @classmethod
+    def _validate_name(cls, value: object) -> str | None:
+        return _validate_optional_name(value)
+
+
 class ResetPasswordResponse(BaseModel):
     """The one-time temporary password, shown to the super_admin exactly once."""
 
+    temp_password: str
+
+
+class CreateUserResponse(BaseModel):
+    """The created user plus the one-time temporary password (shown exactly once,
+    like the reset flow). The password is NEVER persisted or audited."""
+
+    user_id: int
+    email: str
+    first_name: str | None = None
+    last_name: str | None = None
+    active: bool
+    roles: list[str]
     temp_password: str
 
 
@@ -278,3 +379,130 @@ async def reset_password(
     await session.commit()
 
     return ResetPasswordResponse(temp_password=temp_password)
+
+
+@router.post("/users", response_model=CreateUserResponse, status_code=201)
+async def create_user(
+    payload: CreateUserRequest,
+    actor: RequireSuperAdmin,
+    session: SessionDep,
+) -> CreateUserResponse:
+    """Provision a brand-new login user. super_admin only.
+
+    Flow:
+      1. Reject up front if a ``users`` row with that email already exists. The
+         message is generic (anti-enumeration, consistent with the rest of the
+         codebase) — a 409 either way.
+      2. Generate a CSPRNG temp password and create the Supabase *auth* user over
+         the Admin API (server-side, service-role key, ``email_confirm=True`` so
+         the user can sign in immediately). A transport/non-2xx failure raises
+         ServiceError (502) WITHOUT leaking the upstream response, and BEFORE we
+         touch our DB — so a failed provision never leaves an orphaned row.
+      3. Insert the ``users`` row (linked by ``auth_user_id``) and a
+         ``user_roles`` row for the chosen role.
+      4. Audit the action (``create_user``; actor = the super_admin, entity = the
+         new user; ``new_value`` = email). The password is NEVER logged, audited,
+         or returned in any channel other than this one-time response body.
+
+    The temp password is returned ONCE for the super_admin to hand to the user;
+    the user should change it on next login.
+    """
+    # Anti-enumeration: a duplicate email is a generic conflict, not a "user
+    # already exists" disclosure beyond the 409 itself.
+    existing = await session.scalar(
+        select(User.user_id).where(User.email == payload.email)
+    )
+    if existing is not None:
+        raise ConflictError("A user with that email already exists.")
+
+    role = await session.scalar(
+        select(Role).where(Role.role_name == payload.role_name.value)
+    )
+    if role is None:
+        raise NotFoundError(f"Role {payload.role_name.value} is not seeded.")
+
+    temp_password = _generate_temp_password()
+
+    # Create the auth identity FIRST. If this fails we raise (502) before writing
+    # any row, so we never persist a user without a matching auth account.
+    auth_user_id = await create_auth_user(payload.email, temp_password)
+
+    user = User(
+        auth_user_id=auth_user_id,
+        email=payload.email,
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        active=True,
+    )
+    session.add(user)
+    await session.flush()  # populate user.user_id for the role link + audit
+
+    session.add(UserRole(user_id=user.user_id, role_id=role.role_id))
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="create_user",
+            entity_type="user",
+            entity_id=user.user_id,
+            field_name="email",
+            # The email is the safe identifier to record; the password is NEVER
+            # stored or audited.
+            new_value=payload.email,
+        )
+    )
+    await session.commit()
+
+    created = await _load_user(session, user.user_id)
+    return CreateUserResponse(
+        user_id=created.user_id,
+        email=created.email,
+        first_name=created.first_name,
+        last_name=created.last_name,
+        active=created.active,
+        roles=[r.role_name for r in created.roles],
+        temp_password=temp_password,
+    )
+
+
+@router.patch("/users/{user_id}/name")
+async def update_user_name(
+    user_id: int,
+    payload: UpdateUserNameRequest,
+    actor: RequireSuperAdmin,
+    session: SessionDep,
+) -> dict:
+    """Edit a user's first/last name. super_admin only.
+
+    Only fields present in the body are applied (``exclude_unset``); each field
+    that actually changes is audited separately (``update_user``; ``field_name``
+    = ``first_name``/``last_name``; old + new value). A no-op (same value, or no
+    fields sent) is idempotent and not audited. 404 if the user doesn't exist.
+    """
+    user = await _load_user(session, user_id)
+
+    changes = payload.model_dump(exclude_unset=True)
+    audited = False
+    for field_name in ("first_name", "last_name"):
+        if field_name not in changes:
+            continue
+        new_value = changes[field_name]
+        old_value = getattr(user, field_name)
+        if old_value == new_value:
+            continue
+        setattr(user, field_name, new_value)
+        session.add(
+            AuditLog(
+                user_id=actor.user_id,
+                action_type="update_user",
+                entity_type="user",
+                entity_id=user_id,
+                field_name=field_name,
+                old_value=old_value,
+                new_value=new_value,
+            )
+        )
+        audited = True
+
+    if audited:
+        await session.commit()
+    return _serialize(await _load_user(session, user_id))

@@ -343,6 +343,7 @@ def _fake_user(user_id=2, *, first_name="Test", last_name="User"):
         auth_user_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
         locked_at=None,
         locked_reason=None,
+        created_at=None,
         roles=[SimpleNamespace(role_name="view_only")],
     )
 

@@ -38,6 +38,10 @@ class UserContext(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     roles: list[str] = []
+    # True while the user is on an admin-issued temp password and must set their
+    # own (the frontend gates them into a set-password screen). Reflects the
+    # CURRENT authenticated user's flag; cleared via POST /auth/password/complete.
+    must_change_password: bool = False
 
     @classmethod
     def from_orm_user(cls, user: User) -> UserContext:
@@ -48,6 +52,7 @@ class UserContext(BaseModel):
             first_name=user.first_name,
             last_name=user.last_name,
             roles=[role.role_name for role in user.roles],
+            must_change_password=user.must_change_password,
         )
 
     @property

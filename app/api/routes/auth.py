@@ -4,10 +4,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import CurrentDBUser, CurrentUser
 from app.core.database import get_session
+from app.models.audit import AuditLog
+from app.models.user import User
 from app.schemas.auth import AuthenticatedUser, UserContext
 from app.services import login_lockout
 
@@ -69,9 +72,51 @@ async def context(user: CurrentDBUser) -> UserContext:
     """Return the signed-in user resolved against the database, with roles.
 
     Used by the frontend for role-aware UI. Returns 403 if the authenticated
-    user isn't provisioned (no active `users` row).
+    user isn't provisioned (no active `users` row). ``must_change_password``
+    reflects the current user's force-change flag.
     """
     return user
+
+
+class PasswordCompleteResponse(BaseModel):
+    """Acknowledgement that the caller's force-change flag was cleared."""
+
+    status: str = "ok"
+
+
+@router.post("/password/complete", response_model=PasswordCompleteResponse)
+async def password_complete(
+    user: CurrentDBUser, session: SessionDep
+) -> PasswordCompleteResponse:
+    """Clear the force-password-change flag for the AUTHENTICATED caller.
+
+    Called by the frontend AFTER the user has set a new password via their own
+    Supabase session (the actual password change happens client-side). This
+    endpoint only flips ``users.must_change_password`` to false, and ONLY for
+    the token's own user — it takes no id and so can never clear anyone else's
+    flag. Any role may call it (it is a self-service action, not an admin one).
+
+    Idempotent: a caller whose flag is already false simply gets a 200 and no
+    audit row is written.
+    """
+    db_user = await session.scalar(
+        select(User).where(User.user_id == user.user_id)
+    )
+    if db_user is not None and db_user.must_change_password:
+        db_user.must_change_password = False
+        session.add(
+            AuditLog(
+                user_id=user.user_id,
+                action_type="password_changed",
+                entity_type="user",
+                entity_id=user.user_id,
+                field_name="must_change_password",
+                old_value="true",
+                new_value="false",
+            )
+        )
+        await session.commit()
+    return PasswordCompleteResponse()
 
 
 # --- Pre-login throttling / lockout ------------------------------------------

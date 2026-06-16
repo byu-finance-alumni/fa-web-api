@@ -27,6 +27,10 @@ CREATE TABLE users (
     active          boolean NOT NULL DEFAULT true,
     auth_provider   varchar(50),
     last_login_at   timestamptz,
+    -- Force a password change on next login. Set true on account creation (temp
+    -- password) or a super_admin password reset; cleared by the user themselves
+    -- via POST /auth/password/complete. See app/api/routes/auth.py.
+    must_change_password boolean NOT NULL DEFAULT false,
     -- Hard account lock after too many failed logins (see login_attempts and
     -- app/services/login_lockout.py). Cleared by a super_admin password reset.
     locked_at       timestamptz,

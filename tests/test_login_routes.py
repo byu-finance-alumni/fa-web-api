@@ -363,6 +363,7 @@ def test_authenticated_user_resolution_clears_login_attempts(monkeypatch):
         first_name="A",
         last_name="B",
         active=True,
+        must_change_password=False,
         roles=[SimpleNamespace(role_name="view_only")],
     )
 
@@ -404,6 +405,7 @@ def test_authenticated_clear_failure_never_breaks_request(monkeypatch):
         first_name="A",
         last_name="B",
         active=True,
+        must_change_password=False,
         roles=[SimpleNamespace(role_name="view_only")],
     )
 

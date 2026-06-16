@@ -45,6 +45,14 @@ class User(TimestampMixin, Base):
     last_login_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    # Force a password change on next login. Set true when an account is created
+    # with a temp password or when a super_admin resets a password; the user
+    # clears it via POST /auth/password/complete after setting their own
+    # password client-side (see app/api/routes/auth.py). Authoritative for the
+    # frontend's force-change gate — never a JWT claim.
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     # Hard account lock set after too many failed logins (see
     # app/services/login_lockout.py). While ``locked_at`` is non-null the account
     # is denied at the pre-login precheck regardless of credentials; only a

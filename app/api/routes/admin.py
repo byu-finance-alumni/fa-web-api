@@ -366,6 +366,9 @@ async def reset_password(
     was_locked = user.locked_at is not None
     user.locked_at = None
     user.locked_reason = None
+    # The user is now on a temp password — force them to set their own on next
+    # login (cleared via POST /auth/password/complete).
+    user.must_change_password = True
 
     # Drop the rolling failed-login counter for this email so a prior cooldown
     # doesn't immediately re-block the freshly-reset user. Match the throttle's
@@ -450,6 +453,9 @@ async def create_user(
             first_name=payload.first_name,
             last_name=payload.last_name,
             active=True,
+            # New users start on a one-time temp password and must set their own
+            # on first login (cleared via POST /auth/password/complete).
+            must_change_password=True,
         )
         session.add(user)
         await session.flush()  # populate user.user_id for the role link + audit

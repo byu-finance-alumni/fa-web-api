@@ -1,0 +1,88 @@
+name: Board → In Review
+
+# When a PR is opened (or a draft PR is marked ready for review), move every
+# issue the PR *closes* into the "In Review" column of the org project board
+# ("BYU Finance Alumni Database", project #4), so a reviewer sees what's waiting.
+#
+# Board lifecycle:
+#   Backlog → Ready → In progress → [PR opened] In Review → [PR merged → the
+#   linked issue auto-closes] Done  (the Done move is handled by the project's
+#   native "Item closed → Done" workflow, enabled in the project's Workflows UI).
+#
+# Requires an org/repo secret PROJECTS_TOKEN: a PAT with `project` + `repo` (read)
+# scope, because the default GITHUB_TOKEN cannot write org-level Projects v2.
+# Until that secret is added the job is a graceful no-op (it will not fail PRs).
+#
+# The link only exists if the PR references its issue with a closing keyword,
+# e.g. "Closes #41" in the PR body.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+# No repo write needed; all writes go to the Project via PROJECTS_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  in-review:
+    name: Move linked issues to In Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set linked issues to In Review on the board
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PROJECTS_TOKEN not configured — skipping (add the secret to enable)."
+            exit 0
+          fi
+
+          PROJECT_ID="PVT_kwDOEUaChc4BaxUN"          # org project #4
+          FIELD_ID="PVTSSF_lADOEUaChc4BaxUNzhVmfLQ"  # Status field
+          IN_REVIEW="8eb19212"                       # "In Review" option id
+
+          issues=$(gh api graphql -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" -f query='
+            query($owner:String!,$repo:String!,$pr:Int!){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$pr){
+                  closingIssuesReferences(first:20){
+                    nodes{ id number projectItems(first:20){ nodes{ id project{ id } } } }
+                  }
+                }
+              }
+            }')
+
+          echo "$issues" \
+            | jq -c '.data.repository.pullRequest.closingIssuesReferences.nodes[]?' \
+            | while read -r node; do
+                num=$(echo "$node" | jq -r '.number')
+                issue_id=$(echo "$node" | jq -r '.id')
+                item_id=$(echo "$node" | jq -r --arg p "$PROJECT_ID" \
+                  '.projectItems.nodes[] | select(.project.id==$p) | .id' | head -n1)
+
+                if [ -z "$item_id" ]; then
+                  echo "Issue #$num not on the board yet — adding it."
+                  item_id=$(gh api graphql -f project="$PROJECT_ID" -f content="$issue_id" -f query='
+                    mutation($project:ID!,$content:ID!){
+                      addProjectV2ItemById(input:{projectId:$project,contentId:$content}){ item{ id } }
+                    }' --jq '.data.addProjectV2ItemById.item.id')
+                fi
+
+                echo "Issue #$num → In Review (item $item_id)"
+                gh api graphql -f project="$PROJECT_ID" -f item="$item_id" \
+                  -f field="$FIELD_ID" -f opt="$IN_REVIEW" -f query='
+                  mutation($project:ID!,$item:ID!,$field:ID!,$opt:String!){
+                    updateProjectV2ItemFieldValue(input:{
+                      projectId:$project, itemId:$item, fieldId:$field,
+                      value:{ singleSelectOptionId:$opt }
+                    }){ projectV2Item{ id } }
+                  }' >/dev/null
+              done
+
+          echo "Done."

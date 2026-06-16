@@ -311,6 +311,21 @@ CREATE TABLE alumni_status_labels (
     CONSTRAINT uq_alumni_status_labels UNIQUE (alumni_id, status_label_id)
 );
 
+-- Editable controlled vocabulary (#82): one row per dropdown option in a
+-- category (industry, event_type, attendance_status, interaction_type).
+-- Engineer/super_admin manage these at runtime; active=false soft-hides a term.
+CREATE TABLE vocabulary_terms (
+    term_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    category    varchar(50) NOT NULL,
+    value       varchar(100) NOT NULL,
+    sort_order  integer NOT NULL DEFAULT 0,
+    active      boolean NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT uq_vocabulary_terms_category_value UNIQUE (category, value)
+);
+CREATE INDEX ix_vocabulary_terms_category_active ON vocabulary_terms (category, active);
+
 -- -----------------------------------------------------------------------------
 -- CRM activity: interactions, tasks, events, surveys, attachments
 -- -----------------------------------------------------------------------------

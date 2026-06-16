@@ -23,6 +23,7 @@ from app.api.routes import (
     geography,
     health,
     tasks,
+    vocabulary,
 )
 from app.core.config import get_settings
 from app.core.database import dispose_engine
@@ -86,6 +87,8 @@ app.include_router(events.router)
 app.include_router(audit.router)
 app.include_router(geography.router)
 app.include_router(tasks.router)
+app.include_router(vocabulary.router)
+app.include_router(vocabulary.admin_router)
 
 
 @app.exception_handler(AuthError)

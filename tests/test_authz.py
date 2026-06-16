@@ -35,6 +35,7 @@ def _fake_user(*roles: str, active: bool = True) -> SimpleNamespace:
         first_name="Test",
         last_name="Worker",
         active=active,
+        must_change_password=False,
         roles=[SimpleNamespace(role_name=r) for r in roles],
     )
 

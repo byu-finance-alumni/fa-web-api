@@ -63,6 +63,27 @@ class DeactivatedAccountError(AuthorizationError):
         super().__init__(message)
 
 
+class MustChangePasswordError(AuthorizationError):
+    """Raised when a valid token belongs to a user who must change their
+    (admin-issued temp) password before doing anything else.
+
+    A subclass of AuthorizationError so it still maps to 403, but distinct so it
+    surfaces with the machine code ``password_change_required`` and is recorded
+    as its own ``password_change_required`` security event. Enforced on EVERY
+    authenticated route except the two needed to complete the change itself, so a
+    user holding a valid session can't bypass the forced change by calling the
+    backend directly.
+    """
+
+    def __init__(
+        self,
+        message: str = (
+            "You must change your password before continuing."
+        ),
+    ) -> None:
+        super().__init__(message)
+
+
 @lru_cache
 def _jwk_client(jwks_url: str) -> PyJWKClient:
     return PyJWKClient(jwks_url)

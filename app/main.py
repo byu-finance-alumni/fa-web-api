@@ -27,7 +27,12 @@ from app.api.routes import (
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.errors import ConflictError, NotFoundError, ServiceError
-from app.core.security import AuthError, AuthorizationError, DeactivatedAccountError
+from app.core.security import (
+    AuthError,
+    AuthorizationError,
+    DeactivatedAccountError,
+    MustChangePasswordError,
+)
 from app.core.security_log import log_security_event
 
 logging.basicConfig(level=logging.INFO)
@@ -113,6 +118,33 @@ async def deactivated_account_handler(
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={"error": {"code": "forbidden", "message": exc.message}},
+    )
+
+
+@app.exception_handler(MustChangePasswordError)
+async def must_change_password_handler(
+    request: Request, exc: MustChangePasswordError
+) -> JSONResponse:
+    """Return 403 / ``password_change_required`` for a user who still holds the
+    force-password-change flag.
+
+    Registered ahead of (and distinctly from) the generic AuthorizationError
+    handler so the subclass is dispatched here: a user on an admin-issued temp
+    password is blocked on EVERY authenticated route except the two that let them
+    complete the change, and the block is recorded as its own
+    ``password_change_required`` security event.
+    """
+    log_security_event(
+        request, "password_change_required", status_code=403, detail=exc.message
+    )
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={
+            "error": {
+                "code": "password_change_required",
+                "message": exc.message,
+            }
+        },
     )
 
 

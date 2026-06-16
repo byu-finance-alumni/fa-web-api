@@ -56,6 +56,10 @@ class UserContext(BaseModel):
         )
 
     @property
+    def is_engineer(self) -> bool:
+        return RoleName.ENGINEER.value in self.roles
+
+    @property
     def is_super_admin(self) -> bool:
         return RoleName.SUPER_ADMIN.value in self.roles
 
@@ -64,5 +68,24 @@ class UserContext(BaseModel):
         return RoleName.FULL_ACCESS.value in self.roles
 
     @property
+    def is_student(self) -> bool:
+        return RoleName.STUDENT.value in self.roles
+
+    @property
     def is_view_only(self) -> bool:
         return RoleName.VIEW_ONLY.value in self.roles
+
+    @property
+    def can_edit_alumni(self) -> bool:
+        """True for any role permitted to edit an existing alumnus and their
+        nested records: engineer, super_admin, full_access, or student. Mirrors
+        the ``require_alumni_edit`` guard. Does NOT imply create/archive/import
+        rights (those are ``full_access`` and up)."""
+        return bool(
+            {
+                RoleName.ENGINEER.value,
+                RoleName.SUPER_ADMIN.value,
+                RoleName.FULL_ACCESS.value,
+                RoleName.STUDENT.value,
+            }.intersection(self.roles)
+        )

@@ -173,14 +173,42 @@ def require_roles(
     return _guard
 
 
-# Role hierarchy: super_admin ⊇ full_access ⊇ view_only. super_admin satisfies
-# every guard; user/role administration requires super_admin specifically.
-require_super_admin = require_roles(RoleName.SUPER_ADMIN)
-require_full_access = require_roles(RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS)
-require_view_only = require_roles(
-    RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS, RoleName.VIEW_ONLY
+# Role hierarchy: engineer ⊇ super_admin ⊇ full_access ⊇ student ⊇ view_only.
+# `engineer` is the top role and therefore appears in EVERY allow-set (it
+# satisfies every guard, including super_admin's). `super_admin` satisfies
+# every guard except, by design, nothing above it. Guards are allow-lists
+# (set-disjoint), not ranked comparisons, so each new role must be added
+# explicitly to each guard it should satisfy.
+#
+# `student` is a narrow writer: it may EDIT existing alumni records (and their
+# nested data) but may NOT create new alumni, archive/restore, import, or touch
+# user administration. It is therefore added to `require_view_only` (read) and
+# to `require_alumni_edit` (edit existing) ONLY — never to `require_full_access`.
+require_super_admin = require_roles(RoleName.ENGINEER, RoleName.SUPER_ADMIN)
+require_full_access = require_roles(
+    RoleName.ENGINEER, RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS
 )
+# Edit an EXISTING alumnus / their nested records. Adds `student` on top of the
+# full_access set. Does NOT permit create, archive, restore, or import.
+require_alumni_edit = require_roles(
+    RoleName.ENGINEER,
+    RoleName.SUPER_ADMIN,
+    RoleName.FULL_ACCESS,
+    RoleName.STUDENT,
+)
+require_view_only = require_roles(
+    RoleName.ENGINEER,
+    RoleName.SUPER_ADMIN,
+    RoleName.FULL_ACCESS,
+    RoleName.STUDENT,
+    RoleName.VIEW_ONLY,
+)
+# Database / controlled-vocabulary administration (editable dropdowns, #82).
+# Restricted to the top two roles.
+require_vocab_admin = require_roles(RoleName.ENGINEER, RoleName.SUPER_ADMIN)
 
 RequireSuperAdmin = Annotated[UserContext, Depends(require_super_admin)]
 RequireFullAccess = Annotated[UserContext, Depends(require_full_access)]
+RequireAlumniEdit = Annotated[UserContext, Depends(require_alumni_edit)]
 RequireViewAccess = Annotated[UserContext, Depends(require_view_only)]
+RequireVocabAdmin = Annotated[UserContext, Depends(require_vocab_admin)]

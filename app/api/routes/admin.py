@@ -98,11 +98,14 @@ class CreateUserRequest(BaseModel):
     email: str = Field(min_length=3, max_length=255)
     first_name: str | None = None
     last_name: str | None = None
-    # super_admin must NOT be bootstrappable via account creation — it can only
-    # be granted to an EXISTING user through the assign-role endpoint. Restrict
-    # the create payload to full_access/view_only; anything else (incl.
-    # super_admin) is a clean 422.
-    role_name: Literal[RoleName.FULL_ACCESS, RoleName.VIEW_ONLY] = RoleName.VIEW_ONLY
+    # The top roles (engineer, super_admin) must NOT be bootstrappable via
+    # account creation — they can only be granted to an EXISTING user through
+    # the assign-role endpoint. Restrict the create payload to the non-privileged
+    # roles (full_access / student / view_only); anything else (incl. engineer
+    # and super_admin) is a clean 422.
+    role_name: Literal[
+        RoleName.FULL_ACCESS, RoleName.STUDENT, RoleName.VIEW_ONLY
+    ] = RoleName.VIEW_ONLY
 
     @field_validator("email", mode="before")
     @classmethod

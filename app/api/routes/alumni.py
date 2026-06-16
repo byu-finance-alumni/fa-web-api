@@ -1,8 +1,12 @@
 """Alumni CRUD routes.
 
-Reads require view access (either role); writes require full_access. ``DELETE``
-is a soft-delete (archive), never a hard delete — audit history depends on
-retained records.
+Reads require view access (any role). Editing an EXISTING alumnus and their
+nested records (interactions, employment, education, leadership, tags, status
+labels, tasks, event attendance) requires edit access (``student`` and up, via
+``RequireAlumniEdit``). Creating a new alumnus, archiving/restoring, and CSV
+import require ``full_access`` and up (``RequireFullAccess``) — ``student`` is
+deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
+(archive), never a hard delete — audit history depends on retained records.
 """
 
 from typing import Annotated
@@ -11,7 +15,11 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.dependencies.auth import (
+    RequireAlumniEdit,
+    RequireFullAccess,
+    RequireViewAccess,
+)
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.schemas.alumni import (
@@ -277,9 +285,10 @@ async def get_alumni_profile(
     """Full profile aggregate (core + contact, career, employment, leadership,
     engagement, surveys, interactions, tasks, attachments, audit) for the tabs.
 
-    Follow-up tasks are admin-only: view_only users get an empty ``tasks`` list
-    (enforced here, not just hidden in the UI). full_access/super_admin see all."""
-    include_tasks = user.is_full_access or user.is_super_admin
+    Follow-up tasks are edit-only: view_only ("Professor") users get an empty
+    ``tasks`` list (enforced here, not just hidden in the UI). Anyone with edit
+    access — engineer / super_admin / full_access / student — sees all."""
+    include_tasks = user.can_edit_alumni
     return await profile_service.get_profile(
         session, alumni_id, include_tasks=include_tasks
     )
@@ -293,7 +302,7 @@ async def get_alumni_profile(
 async def add_interaction(
     alumni_id: int,
     payload: InteractionCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> InteractionRead:
     """Log an interaction on an alumni's timeline (full_access)."""
@@ -310,7 +319,7 @@ async def add_interaction(
 async def add_task(
     alumni_id: int,
     payload: TaskCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> TaskRead:
     """Create a follow-up task for an alumni (full_access)."""
@@ -324,7 +333,7 @@ async def update_task_completion(
     alumni_id: int,
     task_id: int,
     payload: TaskCompleteUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> TaskRead:
     """Toggle a follow-up task's completion state (full_access)."""
@@ -341,7 +350,7 @@ async def update_task_completion(
 async def add_employment(
     alumni_id: int,
     payload: EmploymentHistoryCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EmploymentHistoryRead:
     """Add a prior role to an alumni's employment history (full_access)."""
@@ -358,7 +367,7 @@ async def update_employment(
     alumni_id: int,
     employment_history_id: int,
     payload: EmploymentHistoryUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EmploymentHistoryRead:
     """Edit a prior role on an alumni's employment history (full_access). 404 if
@@ -379,7 +388,7 @@ async def update_employment(
 async def delete_employment(
     alumni_id: int,
     employment_history_id: int,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
     """Delete a prior role from an alumni's employment history (full_access). 404
@@ -397,7 +406,7 @@ async def delete_employment(
 async def add_education(
     alumni_id: int,
     payload: EducationCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EducationRead:
     """Add an education entry to an alumni's record (full_access)."""
@@ -414,7 +423,7 @@ async def update_education(
     alumni_id: int,
     education_id: int,
     payload: EducationUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EducationRead:
     """Edit an education entry on an alumni's record (full_access). 404 if the
@@ -431,7 +440,7 @@ async def update_education(
 async def delete_education(
     alumni_id: int,
     education_id: int,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
     """Delete an education entry from an alumni's record (full_access). 404 if the
@@ -449,7 +458,7 @@ async def delete_education(
 async def add_leadership(
     alumni_id: int,
     payload: LeadershipCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> LeadershipRead:
     """Add a Finance Society leadership entry to an alumni (full_access)."""
@@ -466,7 +475,7 @@ async def update_leadership(
     alumni_id: int,
     finance_society_leadership_id: int,
     payload: LeadershipUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> LeadershipRead:
     """Edit a Finance Society leadership entry (full_access). 404 if the row is
@@ -487,7 +496,7 @@ async def update_leadership(
 async def delete_leadership(
     alumni_id: int,
     finance_society_leadership_id: int,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
     """Delete a Finance Society leadership entry (full_access). 404 if the row is
@@ -508,7 +517,7 @@ async def delete_leadership(
 async def add_tag(
     alumni_id: int,
     payload: TagCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Attach a canonical engagement tag to an alumni (full_access). Returns the
@@ -522,7 +531,7 @@ async def add_tag(
 async def remove_tag(
     alumni_id: int,
     tag: str,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Detach a tag from an alumni (full_access). Returns the resulting tag list.
@@ -540,7 +549,7 @@ async def remove_tag(
 async def add_status_label(
     alumni_id: int,
     payload: StatusLabelCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Attach a canonical status label to an alumni (full_access). Returns the
@@ -554,7 +563,7 @@ async def add_status_label(
 async def remove_status_label(
     alumni_id: int,
     label: str,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Detach a status label from an alumni (full_access). Returns the resulting
@@ -572,7 +581,7 @@ async def remove_status_label(
 async def add_event_attendance(
     alumni_id: int,
     payload: EventAttendanceCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EventAttendedRead:
     """Mark an alumni as an attendee of an existing event (full_access). 404 if
@@ -599,7 +608,7 @@ async def preview_create_alumni(
 async def preview_update_alumni(
     alumni_id: int,
     payload: AlumniUpdateFull,
-    _: RequireFullAccess,
+    _: RequireAlumniEdit,
     session: SessionDep,
 ) -> dict:
     """Dry-run data-hygiene preview for an EDIT (full_access, no writes).
@@ -626,7 +635,7 @@ async def create_alumni(
 async def update_alumni(
     alumni_id: int,
     payload: AlumniUpdateFull,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> AlumniRead:
     return await service.update_alumni(

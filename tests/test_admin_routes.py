@@ -48,6 +48,7 @@ def _fake_user(user_id: int, *, active: bool, roles=("full_access",), locked_at=
         last_name="User",
         active=active,
         locked_at=locked_at,
+        created_at=None,
         roles=[SimpleNamespace(role_name=r) for r in roles],
     )
 
@@ -146,6 +147,17 @@ class _QueueSession:
 
     async def commit(self):
         self.commits += 1
+
+
+def test_super_admin_cannot_remove_engineer(client):
+    # Symmetric with assign: a super_admin may not demote an engineer. The
+    # ceiling check runs before any DB access, so the no-db client is fine.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    resp = client.delete("/admin/users/2/roles/engineer")
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
 
 
 def test_engineer_can_grant_engineer():

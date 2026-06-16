@@ -196,6 +196,8 @@ def _serialize(u: User) -> dict:
         # the timestamp; locked_at is exposed for display/sorting.
         "locked": u.locked_at is not None,
         "locked_at": u.locked_at,
+        # When the account was provisioned — shown in the Users tab.
+        "created_at": u.created_at,
         "roles": [r.role_name for r in u.roles],
     }
 
@@ -309,10 +311,18 @@ async def remove_role(
 ) -> dict:
     """Revoke a role from an existing user (idempotent). super_admin and up.
 
+    Privilege ceiling (symmetric with assign_role): only an ``engineer`` may
+    remove the ``engineer`` role. A ``super_admin`` cannot demote an engineer —
+    the engineer tier is managed exclusively by engineers.
+
     Guards against an admin removing their OWN top role (super_admin or
     engineer), which would lock user administration (or, for engineer, vocab /
     database administration) out of the system if they were the last holder.
     """
+    if role_name == RoleName.ENGINEER and not actor.is_engineer:
+        raise AuthorizationError(
+            "Only an engineer can remove the engineer role."
+        )
     await _load_user(session, user_id)  # 404 if the user doesn't exist
     role = await session.scalar(
         select(Role).where(Role.role_name == role_name.value)

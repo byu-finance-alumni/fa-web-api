@@ -25,6 +25,7 @@ from app.models.event import Event, EventAttendance
 from app.models.login_attempt import LoginAttempt
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import Role, User, UserRole
+from app.models.vocabulary import VocabularyTerm
 
 __all__ = [
     "Alumni",
@@ -52,4 +53,5 @@ __all__ = [
     "Tag",
     "User",
     "UserRole",
+    "VocabularyTerm",
 ]

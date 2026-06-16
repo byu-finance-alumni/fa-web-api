@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import CurrentDBUser, CurrentUser
+from app.api.dependencies.auth import CurrentDBUserAllowMustChange, CurrentUser
 from app.core.database import get_session
 from app.models.audit import AuditLog
 from app.models.user import User
@@ -68,12 +68,16 @@ async def me(current_user: CurrentUser) -> AuthenticatedUser:
 
 
 @router.get("/context", response_model=UserContext)
-async def context(user: CurrentDBUser) -> UserContext:
+async def context(user: CurrentDBUserAllowMustChange) -> UserContext:
     """Return the signed-in user resolved against the database, with roles.
 
     Used by the frontend for role-aware UI. Returns 403 if the authenticated
     user isn't provisioned (no active `users` row). ``must_change_password``
     reflects the current user's force-change flag.
+
+    EXEMPT from the force-password-change gate: a flagged user must be able to
+    read their own context (to learn they're flagged) — so this depends on the
+    exempt resolver, not the gated ``get_current_db_user``.
     """
     return user
 
@@ -86,9 +90,13 @@ class PasswordCompleteResponse(BaseModel):
 
 @router.post("/password/complete", response_model=PasswordCompleteResponse)
 async def password_complete(
-    user: CurrentDBUser, session: SessionDep
+    user: CurrentDBUserAllowMustChange, session: SessionDep
 ) -> PasswordCompleteResponse:
     """Clear the force-password-change flag for the AUTHENTICATED caller.
+
+    EXEMPT from the force-password-change gate (it depends on the exempt
+    resolver): this is the very endpoint a flagged user calls to clear the flag,
+    so it must remain reachable while ``must_change_password`` is true.
 
     Called by the frontend AFTER the user has set a new password via their own
     Supabase session (the actual password change happens client-side). This

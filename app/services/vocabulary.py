@@ -10,7 +10,7 @@ they previously hid).
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, NotFoundError
@@ -58,9 +58,13 @@ async def is_valid_value(
 async def _get_by_category_value(
     session: AsyncSession, category: str, value: str
 ) -> VocabularyTerm | None:
+    """Find a term by (category, value), matching value CASE-INSENSITIVELY so
+    "Networking" and "networking" are treated as the same option — this is what
+    blocks near-duplicate vocabulary entries on create and rename."""
     return await session.scalar(
         select(VocabularyTerm).where(
-            VocabularyTerm.category == category, VocabularyTerm.value == value
+            VocabularyTerm.category == category,
+            func.lower(VocabularyTerm.value) == value.lower(),
         )
     )
 

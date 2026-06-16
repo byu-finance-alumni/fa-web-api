@@ -83,17 +83,30 @@ def test_public_vocab_requires_auth(client):
 # --- service logic ------------------------------------------------------------
 
 
-class _Sess:
-    """Fake session: returns preset values for scalar/get; records add/flush."""
+class _ScalarsResult:
+    def __init__(self, items):
+        self._items = items
 
-    def __init__(self, *, scalar=None, get=None):
+    def all(self):
+        return self._items
+
+
+class _Sess:
+    """Fake session: returns preset values for scalar/scalars/get; records
+    add/flush."""
+
+    def __init__(self, *, scalar=None, get=None, scalars=None):
         self._scalar = scalar
         self._get = get
+        self._scalars = scalars or []
         self.added: list = []
         self.flushed = 0
 
     async def scalar(self, _stmt):
         return self._scalar
+
+    async def scalars(self, _stmt):
+        return _ScalarsResult(self._scalars)
 
     async def get(self, _model, _id):
         return self._get
@@ -129,6 +142,27 @@ def test_create_term_active_duplicate_conflicts():
         asyncio.run(
             svc.create_term(session, VocabularyCategory.EVENT_TYPE, "Gala")
         )
+
+
+def test_create_term_case_insensitive_duplicate_conflicts():
+    # "networking" collides with an existing active "Networking" — the
+    # case-insensitive lookup is what the service relies on (the fake returns
+    # the existing term regardless of case), so a near-duplicate is a 409.
+    session = _Sess(scalar=_term("Networking", active=True))
+    with pytest.raises(ConflictError):
+        asyncio.run(
+            svc.create_term(session, VocabularyCategory.EVENT_TYPE, "networking")
+        )
+
+
+def test_list_active_values_returns_ordered_strings():
+    session = _Sess(
+        scalars=[_term("Networking", term_id=1), _term("Social", term_id=2)]
+    )
+    values = asyncio.run(
+        svc.list_active_values(session, VocabularyCategory.EVENT_TYPE)
+    )
+    assert values == ["Networking", "Social"]
 
 
 def test_create_term_reactivates_inactive_duplicate():

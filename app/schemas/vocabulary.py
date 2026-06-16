@@ -39,7 +39,9 @@ class VocabularyTermCreate(BaseModel):
 
     category: VocabularyCategory
     value: str = Field(min_length=1, max_length=100)
-    sort_order: int = 0
+    # Bounded so an out-of-range value is a clean 422, not a Postgres int4
+    # overflow 500. 9999 is generous for any dropdown ordering.
+    sort_order: int = Field(default=0, ge=0, le=9999)
 
     @field_validator("value", mode="before")
     @classmethod
@@ -54,7 +56,7 @@ class VocabularyTermUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     value: str | None = Field(default=None, min_length=1, max_length=100)
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=9999)
     active: bool | None = None
 
     @field_validator("value", mode="before")

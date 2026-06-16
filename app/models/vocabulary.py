@@ -7,15 +7,14 @@ dropdowns and to validate writes. Deactivation (``active=false``) is a soft
 delete — the value stays valid for existing records but is hidden from new entry.
 """
 
-import datetime
-
-from sqlalchemy import Boolean, DateTime, Integer, String, UniqueConstraint, func
+from sqlalchemy import Boolean, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.models.mixins import TimestampMixin
 
 
-class VocabularyTerm(Base):
+class VocabularyTerm(TimestampMixin, Base):
     __tablename__ = "vocabulary_terms"
     __table_args__ = (
         UniqueConstraint("category", "value", name="uq_vocabulary_terms_category_value"),
@@ -26,9 +25,4 @@ class VocabularyTerm(Base):
     value: Mapped[str] = mapped_column(String(100), nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    # created_at / updated_at (with onupdate bump) come from TimestampMixin.

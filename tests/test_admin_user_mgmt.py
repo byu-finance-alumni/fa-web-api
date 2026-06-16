@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from app.api.dependencies.auth import get_current_db_user
 from app.api.routes import admin as admin_routes
 from app.core.database import get_session
+from app.core.errors import ServiceError
 from app.main import app
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
@@ -251,6 +252,82 @@ def test_create_user_defaults_to_view_only(create_client, monkeypatch):
     resp = test_client.post("/admin/users", json={"email": "default@byu.edu"})
     assert resp.status_code == 201
     assert resp.json()["roles"] == ["view_only"]
+
+
+def test_create_user_supabase_failure_is_502_and_writes_nothing(
+    create_client, monkeypatch
+):
+    """If the Supabase auth create fails, the request is a 502 and NO users /
+    user_roles rows are committed. delete_auth_user is not attempted because no
+    auth identity was created in the first place."""
+    test_client, session = create_client
+
+    async def _failing_create_auth_user(email, password, email_confirm=True):
+        raise ServiceError("upstream down")
+
+    delete_calls: list = []
+
+    async def _fake_delete_auth_user(auth_user_id):
+        delete_calls.append(auth_user_id)
+
+    monkeypatch.setattr(admin_routes, "create_auth_user", _failing_create_auth_user)
+    monkeypatch.setattr(admin_routes, "delete_auth_user", _fake_delete_auth_user)
+
+    resp = test_client.post("/admin/users", json={"email": "fail@byu.edu"})
+
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "service_unavailable"
+    # Nothing was committed, and no user / user_roles rows were written.
+    assert session.commits == 0
+    assert not any(isinstance(o, User) for o in session.added)
+    assert not any(isinstance(o, UserRole) for o in session.added)
+    # The auth identity was never created, so there is nothing to compensate.
+    assert delete_calls == []
+
+
+def test_create_user_db_failure_triggers_compensating_delete(
+    create_client, monkeypatch
+):
+    """If the auth identity is created but the DB commit fails, the route
+    best-effort deletes the orphaned auth user and re-raises the original error
+    (502)."""
+    test_client, session = create_client
+
+    new_auth_id = uuid.UUID("55555555-5555-5555-5555-555555555555")
+
+    async def _fake_create_auth_user(email, password, email_confirm=True):
+        return new_auth_id
+
+    async def _boom_commit():
+        raise RuntimeError("db down")
+
+    delete_calls: list = []
+
+    async def _fake_delete_auth_user(auth_user_id):
+        delete_calls.append(auth_user_id)
+
+    monkeypatch.setattr(admin_routes, "create_auth_user", _fake_create_auth_user)
+    monkeypatch.setattr(admin_routes, "delete_auth_user", _fake_delete_auth_user)
+    monkeypatch.setattr(session, "commit", _boom_commit)
+
+    # The ORIGINAL error must propagate (not be swallowed). The TestClient
+    # re-raises server-side exceptions, so we assert the same RuntimeError
+    # surfaces — and that the compensating delete was attempted first.
+    with pytest.raises(RuntimeError, match="db down"):
+        test_client.post("/admin/users", json={"email": "dbfail@byu.edu"})
+
+    assert delete_calls == [new_auth_id]
+    # The failed transaction was not committed.
+    assert session.commits == 0
+
+
+def test_create_user_rejects_super_admin_role(create_client):
+    """super_admin must not be bootstrappable via account creation -> 422."""
+    test_client, _ = create_client
+    resp = test_client.post(
+        "/admin/users", json={"email": "boss@byu.edu", "role_name": "super_admin"}
+    )
+    assert resp.status_code == 422
 
 
 # --- edit user name ----------------------------------------------------------

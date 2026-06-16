@@ -7,10 +7,11 @@ key, server-side only) and returns a one-time temporary password exactly once �
 the same security posture as the password-reset flow (see docs/PRE-LAUNCH.md).
 """
 
+import logging
 import re
 import secrets
 import unicodedata
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -26,7 +27,9 @@ from app.models.audit import AuditLog
 from app.models.login_attempt import LoginAttempt
 from app.models.user import Role, User, UserRole
 from app.services.supabase_admin import create_user as create_auth_user
-from app.services.supabase_admin import set_user_password
+from app.services.supabase_admin import delete_auth_user, set_user_password
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -85,16 +88,21 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class CreateUserRequest(BaseModel):
-    """Provision a new login user. ``role_name`` is validated against RoleName so
-    an unknown role is a 422 before any query runs; names follow the alumni NAME
-    rules (≤100 chars). ``extra='forbid'`` rejects unknown keys."""
+    """Provision a new login user. ``role_name`` is restricted to
+    full_access/view_only (super_admin is NOT bootstrappable here), so an unknown
+    or disallowed role is a 422 before any query runs; names follow the alumni
+    NAME rules (≤100 chars). ``extra='forbid'`` rejects unknown keys."""
 
     model_config = ConfigDict(extra="forbid")
 
     email: str = Field(min_length=3, max_length=255)
     first_name: str | None = None
     last_name: str | None = None
-    role_name: RoleName = RoleName.VIEW_ONLY
+    # super_admin must NOT be bootstrappable via account creation — it can only
+    # be granted to an EXISTING user through the assign-role endpoint. Restrict
+    # the create payload to full_access/view_only; anything else (incl.
+    # super_admin) is a clean 422.
+    role_name: Literal[RoleName.FULL_ACCESS, RoleName.VIEW_ONLY] = RoleName.VIEW_ONLY
 
     @field_validator("email", mode="before")
     @classmethod
@@ -205,6 +213,9 @@ async def list_users(_: RequireSuperAdmin, session: SessionDep) -> list[dict]:
     return [_serialize(u) for u in rows.all()]
 
 
+# ``{user_id}`` is declared ``int`` (below), so string sub-paths like
+# ``/users/{user_id}/name`` are unambiguous and never shadowed by this route —
+# a non-numeric segment can't match an int path param.
 @router.patch("/users/{user_id}")
 async def set_user_active(
     user_id: int,
@@ -399,7 +410,9 @@ async def create_user(
          ServiceError (502) WITHOUT leaking the upstream response, and BEFORE we
          touch our DB — so a failed provision never leaves an orphaned row.
       3. Insert the ``users`` row (linked by ``auth_user_id``) and a
-         ``user_roles`` row for the chosen role.
+         ``user_roles`` row for the chosen role. If this DB write fails after the
+         auth identity was created, the auth user is deleted (compensating
+         action) so no orphaned identity with a known temp password is left.
       4. Audit the action (``create_user``; actor = the super_admin, entity = the
          new user; ``new_value`` = email). The password is NEVER logged, audited,
          or returned in any channel other than this one-time response body.
@@ -427,30 +440,48 @@ async def create_user(
     # any row, so we never persist a user without a matching auth account.
     auth_user_id = await create_auth_user(payload.email, temp_password)
 
-    user = User(
-        auth_user_id=auth_user_id,
-        email=payload.email,
-        first_name=payload.first_name,
-        last_name=payload.last_name,
-        active=True,
-    )
-    session.add(user)
-    await session.flush()  # populate user.user_id for the role link + audit
-
-    session.add(UserRole(user_id=user.user_id, role_id=role.role_id))
-    session.add(
-        AuditLog(
-            user_id=actor.user_id,
-            action_type="create_user",
-            entity_type="user",
-            entity_id=user.user_id,
-            field_name="email",
-            # The email is the safe identifier to record; the password is NEVER
-            # stored or audited.
-            new_value=payload.email,
+    # The auth identity now exists with a known temp password. If the DB write
+    # below fails for ANY reason, that identity would be orphaned — so we
+    # compensate by best-effort deleting it, then re-raise the original error.
+    try:
+        user = User(
+            auth_user_id=auth_user_id,
+            email=payload.email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            active=True,
         )
-    )
-    await session.commit()
+        session.add(user)
+        await session.flush()  # populate user.user_id for the role link + audit
+
+        session.add(UserRole(user_id=user.user_id, role_id=role.role_id))
+        session.add(
+            AuditLog(
+                user_id=actor.user_id,
+                action_type="create_user",
+                entity_type="user",
+                entity_id=user.user_id,
+                field_name="email",
+                # The email is the safe identifier to record; the password is
+                # NEVER stored or audited.
+                new_value=payload.email,
+            )
+        )
+        await session.commit()
+    except Exception:
+        # Compensating delete of the just-created auth user so we don't leave an
+        # orphaned identity with a known temp password. Best-effort: if cleanup
+        # also fails, log the orphaned UUID at ERROR (never the password) so it
+        # can be reconciled manually, then re-raise the ORIGINAL error.
+        try:
+            await delete_auth_user(auth_user_id)
+        except Exception:
+            logger.error(
+                "Orphaned Supabase auth user %s: DB write failed and the "
+                "compensating delete also failed; reconcile manually.",
+                auth_user_id,
+            )
+        raise
 
     created = await _load_user(session, user.user_id)
     return CreateUserResponse(

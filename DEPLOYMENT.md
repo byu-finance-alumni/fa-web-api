@@ -26,6 +26,14 @@ public deploy, rotate them in Supabase and use the new values below:
 
 ## 1. Environment variables (set these in Vercel)
 
+> 🔁 **`dev` and `prod` use separate Supabase projects.** The values below are for
+> the **prod** project (a new, dedicated project created in the database split);
+> the `dev-fa-web-api` deployment uses the **original** project's values (mock
+> data). ⏳ Until the split completes, prod still uses the original project shown
+> here (`tnnhhnzglyfqolxdojyb`) — swap in the new prod project's URL / keys /
+> `DATABASE_URL` (and the `production` Environment's `MIGRATIONS_DATABASE_URL`)
+> when it's provisioned.
+
 | Variable | Value |
 |---|---|
 | `DATABASE_URL` | **Transaction pooler** URL — same host, **port 6543**: `postgresql://postgres.tnnhhnzglyfqolxdojyb:[NEW_PASSWORD]@aws-1-us-east-1.pooler.supabase.com:6543/postgres` |

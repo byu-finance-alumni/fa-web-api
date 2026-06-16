@@ -1,0 +1,117 @@
+name: Board → In Review
+
+# When a PR is opened (or a draft PR is marked ready for review), move every
+# issue the PR closes into the "In Review" column of the org project board
+# ("BYU Finance Alumni Database", project #4), so a reviewer sees what's waiting.
+#
+# Board lifecycle:
+#   Backlog → Ready → In progress → [PR opened] In Review → [PR merged → the
+#   linked issue closes] Done  (the Done move is handled by the project's native
+#   "Item closed → Done" workflow, enabled in the project's Workflows UI).
+#
+# How linking works: this repo's DEFAULT branch is `prod`, but work flows through
+# PRs into `dev`. GitHub only auto-populates "closing issue references" for PRs
+# into the DEFAULT branch, so we cannot rely on that here. Instead we parse the PR
+# title/body for closing keywords (close/fix/resolve + #N, or owner/repo#N for
+# cross-repo) — which works no matter the base branch. GitHub's own closing
+# references are also folded in (covers manual Development-panel links).
+#
+# Requires an org/repo secret PROJECTS_TOKEN: a PAT with `project` + `repo` scope,
+# because the default GITHUB_TOKEN cannot write org-level Projects v2. Until that
+# secret is added the job is a graceful no-op (it will not fail PRs).
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  in-review:
+    name: Move linked issues to In Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set linked issues to In Review on the board
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PROJECTS_TOKEN not configured — skipping (add the secret to enable)."
+            exit 0
+          fi
+
+          PROJECT_ID="PVT_kwDOEUaChc4BaxUN"          # org project #4
+          FIELD_ID="PVTSSF_lADOEUaChc4BaxUNzhVmfLQ"  # Status field
+          IN_REVIEW="8eb19212"                       # "In Review" option id
+
+          refs="$(mktemp)"
+
+          # (a) GitHub's computed closing references (manual links / default-branch PRs)
+          gh api graphql -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" -f query='
+            query($owner:String!,$repo:String!,$pr:Int!){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$pr){
+                  closingIssuesReferences(first:50){ nodes{ number repository{ nameWithOwner } } }
+                }
+              }
+            }' --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[]? | "\(.repository.nameWithOwner)#\(.number)"' >> "$refs" 2>/dev/null || true
+
+          # (b) closing keywords in the PR title/body (base-branch-independent)
+          {
+            printf '%s\n%s\n' "${PR_TITLE:-}" "${PR_BODY:-}" \
+              | grep -oiE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' \
+              | grep -oiE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' \
+              | while read -r ref; do
+                  case "$ref" in
+                    */*) echo "$ref" ;;
+                    *)   echo "${OWNER}/${REPO}${ref}" ;;
+                  esac
+                done >> "$refs"
+          } || true
+
+          sort -u "$refs" -o "$refs"
+
+          if [ ! -s "$refs" ]; then
+            echo "No closing issue references found in PR #$PR — nothing to move."
+            exit 0
+          fi
+
+          while read -r ref; do
+            [ -z "$ref" ] && continue
+            r="${ref%%#*}"; num="${ref##*#}"
+            o="${r%%/*}"; rp="${r##*/}"
+
+            node="$(gh api "repos/$o/$rp/issues/$num" --jq '.node_id' 2>/dev/null || true)"
+            if [ -z "$node" ]; then
+              echo "Could not resolve $ref — skipping."
+              continue
+            fi
+
+            # addProjectV2ItemById is idempotent: returns the existing item if the
+            # issue is already on the board, otherwise adds it.
+            item="$(gh api graphql -f project="$PROJECT_ID" -f content="$node" -f query='
+              mutation($project:ID!,$content:ID!){
+                addProjectV2ItemById(input:{projectId:$project,contentId:$content}){ item{ id } }
+              }' --jq '.data.addProjectV2ItemById.item.id')"
+
+            gh api graphql -f project="$PROJECT_ID" -f item="$item" \
+              -f field="$FIELD_ID" -f opt="$IN_REVIEW" -f query='
+              mutation($project:ID!,$item:ID!,$field:ID!,$opt:String!){
+                updateProjectV2ItemFieldValue(input:{
+                  projectId:$project, itemId:$item, fieldId:$field,
+                  value:{ singleSelectOptionId:$opt }
+                }){ projectV2Item{ id } }
+              }' >/dev/null
+
+            echo "$ref → In Review (item $item)"
+          done < "$refs"
+
+          echo "Done."

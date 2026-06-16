@@ -105,6 +105,25 @@ Each uses an *Ignored Build Step* (Settings → Git) so it only builds its own b
 (Exit 0 = skip build, exit 1 = build; the bracket test returns 0 when true.) Python
 is pinned to **3.12** (`.python-version`) to match CI and the Vercel runtime.
 
+### Databases (Supabase) — one per environment
+
+`dev` and `prod` each have their **own Supabase project** — a separate Postgres
+database, Auth users, and keys. They no longer share one database:
+
+| Environment (Vercel)          | Supabase project           | Data                              |
+|-------------------------------|----------------------------|-----------------------------------|
+| `dev` (`dev-fa-web-api`)      | the original project       | mock/seed data — safe to test on  |
+| `prod` (`finance-alumni-database-api`) | a new, dedicated project | clean; real alumni data later     |
+
+Each deployment gets its own `DATABASE_URL` / `SUPABASE_*` (pointing at its
+project). Schema migrations are applied to each database — see
+[`database/migrations/README.md`](database/migrations/README.md).
+
+> ⏳ The dedicated **prod** project is provisioned during the database split.
+> Until then prod still points at the original project; the prod Vercel env vars
+> and the `production` Environment's `MIGRATIONS_DATABASE_URL` are repointed as
+> part of that step.
+
 ## Project structure
 
 ```text

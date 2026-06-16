@@ -8,12 +8,14 @@ name: CI
 # check (each branch deploys to its own Vercel project), which is required
 # separately via branch protection — not duplicated here.
 #
-# There is a SINGLE Supabase database (shared by the dev and prod deployments),
-# so migrations are applied exactly once, manually gated: after checks pass on a
-# push to prod, the `migrate` job applies pending SQL migrations — but only after
-# a human approves it via the `production` GitHub Environment's required
-# reviewers. The connection string is the Environment secret
-# MIGRATIONS_DATABASE_URL (see database/migrations/README.md).
+# `dev` and `prod` have SEPARATE Supabase databases (dev = the original project
+# with mock data; prod = a new, dedicated project). After checks pass on a push to
+# prod, the `migrate` job applies pending SQL migrations to the PROD database —
+# but only after a human approves it via the `production` GitHub Environment's
+# required reviewers. The connection string is the Environment secret
+# MIGRATIONS_DATABASE_URL (see database/migrations/README.md). The dev database is
+# migrated separately (by hand or a dev job). ⏳ Until the prod-DB split finishes,
+# MIGRATIONS_DATABASE_URL still points at the original database.
 on:
   push:
     branches: [prod, dev]
@@ -93,6 +95,26 @@ jobs:
       - name: Scan for committed secrets
         run: gitleaks detect --redact --no-banner --verbose
 
+  deploy-deps:
+    name: Deploy deps (pyproject parity)
+    runs-on: ubuntu-latest
+    # Vercel's Python builder installs ONLY pyproject.toml [project.dependencies]
+    # (not requirements*.txt). Install exactly those into a clean env and import the
+    # ASGI app, so a runtime dependency that's missing from pyproject.toml fails CI
+    # here instead of crashing the deployed function ("could not import app/main").
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install only pyproject.toml runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          python -c "import tomllib,subprocess,sys; deps=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; subprocess.check_call([sys.executable,'-m','pip','install',*deps])"
+      - name: Import app.main (mirrors Vercel cold start)
+        run: |
+          python -c "import app.main; print('app.main imports OK with pyproject deps only')"
+
   # ---------------------------------------------------------------------------
   # PROD-ONLY TIER — extra hardening required only when promoting to prod.
   # Runs on PRs targeting prod and on direct pushes to prod. Do NOT mark this
@@ -116,11 +138,11 @@ jobs:
         run: pip-audit -r requirements.txt
 
   # ---------------------------------------------------------------------------
-  # MIGRATION — applies pending database/migrations/*.sql to the single shared
-  # Supabase database. Runs only on a push to prod (i.e. after a prod promotion
-  # merges) once the gating checks pass, and is held for manual approval by the
-  # `production` Environment's required reviewers. Skipped on pull_request events
-  # and on dev pushes, so a dev merge never silently alters the shared database.
+  # MIGRATION — applies pending database/migrations/*.sql to the PROD Supabase
+  # database (dev has its own database, migrated separately). Runs only on a push
+  # to prod (i.e. after a prod promotion merges) once the gating checks pass, and
+  # is held for manual approval by the `production` Environment's required
+  # reviewers. Skipped on pull_request events and on dev pushes.
   # ---------------------------------------------------------------------------
   migrate:
     name: Migrate database

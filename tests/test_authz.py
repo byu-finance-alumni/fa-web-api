@@ -90,9 +90,59 @@ def test_super_admin_passes_every_guard():
 
 
 def test_super_admin_guard_rejects_lesser_roles():
-    for role in ("full_access", "view_only"):
+    for role in ("full_access", "student", "view_only"):
         with pytest.raises(AuthorizationError):
             asyncio.run(auth_deps.require_super_admin(_ctx(role)))
+
+
+# --- engineer (top role, above super_admin) -----------------------------------
+
+
+def test_engineer_passes_every_guard():
+    ctx = _ctx("engineer")
+    assert ctx.is_engineer
+    assert asyncio.run(auth_deps.require_super_admin(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_full_access(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_edit(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_vocab_admin(ctx)) is ctx
+
+
+# --- student (edit existing only) ---------------------------------------------
+
+
+def test_student_can_edit_and_read_but_not_create_or_admin():
+    ctx = _ctx("student")
+    assert ctx.is_student and ctx.can_edit_alumni
+    # Read + edit-existing are allowed.
+    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_edit(ctx)) is ctx
+    # Create / archive / import (full_access), user admin, and vocab admin are not.
+    for guard in (
+        auth_deps.require_full_access,
+        auth_deps.require_super_admin,
+        auth_deps.require_vocab_admin,
+    ):
+        with pytest.raises(AuthorizationError):
+            asyncio.run(guard(ctx))
+
+
+def test_full_access_can_edit_existing():
+    ctx = _ctx("full_access")
+    assert asyncio.run(auth_deps.require_alumni_edit(ctx)) is ctx
+
+
+def test_view_only_cannot_edit_existing():
+    ctx = _ctx("view_only")
+    assert not ctx.can_edit_alumni
+    with pytest.raises(AuthorizationError):
+        asyncio.run(auth_deps.require_alumni_edit(ctx))
+
+
+def test_vocab_admin_rejects_non_top_roles():
+    for role in ("full_access", "student", "view_only"):
+        with pytest.raises(AuthorizationError):
+            asyncio.run(auth_deps.require_vocab_admin(_ctx(role)))
 
 
 # --- get_current_db_user ------------------------------------------------------

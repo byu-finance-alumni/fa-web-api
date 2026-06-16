@@ -116,6 +116,85 @@ def test_assign_role_rejects_unknown_role(client):
     assert response.status_code == 422
 
 
+def test_super_admin_cannot_grant_engineer(client):
+    # Privilege ceiling: a super_admin (below engineer) may not mint an engineer.
+    # The check runs before any DB access, so the no-db client is fine -> 403.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    response = client.post("/admin/users/2/roles", json={"role_name": "engineer"})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+class _QueueSession:
+    """Session stand-in returning a queued sequence of ``scalar`` results."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.added: list = []
+        self.commits = 0
+
+    async def scalar(self, _stmt):
+        return self._results.pop(0)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def delete(self, _obj):
+        pass
+
+    async def commit(self):
+        self.commits += 1
+
+
+def test_engineer_can_grant_engineer():
+    # An engineer actor passes the privilege ceiling and the grant succeeds.
+    target = _fake_user(2, active=True, roles=("full_access",))
+    engineer_role = SimpleNamespace(role_id=9, role_name="engineer")
+    # assign_role scalars: _load_user -> Role lookup -> _load_user (re-serialize).
+    session = _QueueSession([target, engineer_role, target])
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "engineer", user_id=1
+    )
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/admin/users/2/roles", json={"role_name": "engineer"}
+        )
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert session.commits == 1
+    assert any(type(a).__name__ == "UserRole" for a in session.added)
+
+
+def test_remove_own_engineer_role_blocked():
+    # An engineer removing their OWN engineer role would risk locking vocab/db
+    # administration out of the system -> 409 ConflictError, no commit.
+    actor_user = _fake_user(1, active=True, roles=("engineer",))
+    engineer_role = SimpleNamespace(role_id=9, role_name="engineer")
+    link = SimpleNamespace(user_id=1, role_id=9)
+    # remove_role scalars in order: _load_user -> Role lookup -> UserRole link.
+    session = _QueueSession([actor_user, engineer_role, link])
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "engineer", user_id=1
+    )
+    with TestClient(app) as test_client:
+        response = test_client.delete("/admin/users/1/roles/engineer")
+    app.dependency_overrides.clear()
+    assert response.status_code == 409
+    assert session.commits == 0
+
+
 # --- deactivate / reactivate --------------------------------------------------
 
 

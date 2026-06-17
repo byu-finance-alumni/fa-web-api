@@ -4,21 +4,15 @@ name: FERPA check
 # No LLM / API key — pure stdlib static analysis, so it is safe to require as a
 # branch-protection status check. The job fails iff the script exits non-zero
 # (a hard FERPA control is missing). See scripts/FERPA_CHECKS.md.
+# Runs on EVERY push/PR to dev & prod — no `paths:` filter on purpose. This is a
+# REQUIRED status check, and a path-filtered required check that doesn't run on a
+# given PR is reported as "expected, never received" and blocks the merge forever.
+# The check is fast (~seconds) and deterministic, so always running it is cheap.
 on:
   push:
     branches: [dev, prod]
-    paths:
-      - "app/**"
-      - "database/**"
-      - "scripts/ferpa_check.py"
-      - ".github/workflows/ferpa-audit.yml"
   pull_request:
     branches: [dev, prod]
-    paths:
-      - "app/**"
-      - "database/**"
-      - "scripts/ferpa_check.py"
-      - ".github/workflows/ferpa-audit.yml"
 
 permissions:
   contents: read

@@ -43,28 +43,67 @@ pytest
 
 ## CI Checks
 
-GitHub Actions runs on every **pull request** into and **push** to `prod` and
-`dev` (see `.github/workflows/ci.yml`). Checks are **two-tiered**:
+Every **pull request into** and **push to** `dev` and `prod` runs a set of checks
+across three GitHub Actions workflows — `ci.yml`, `ferpa-audit.yml`,
+`board-in-review.yml` — plus Vercel's own deployment check. This section
+documents **every check**: what it does, why it exists, when it runs, and whether
+it's a **required** status check (a required check that isn't green blocks the
+merge; required checks are configured in the repo's branch **rulesets**, not in
+these files).
 
-**Base tier — runs for both `dev` and `prod`:**
+Two principles drive the design:
+- **`dev` promotes to `prod`** (which holds **real alumni data**), so every gate
+  that protects prod also runs on dev — bad code/secrets/data exposure must be
+  caught before they can ride a promotion.
+- **Tiered:** a *base* tier runs on both branches; a *prod-only* tier adds extra
+  hardening that only matters at release time. A prod-only check is **skipped on
+  dev** and must therefore **never** be marked required on `dev` (a skipped
+  required check blocks merges forever).
 
-| Check | What it runs | Why |
-|-------|--------------|-----|
-| **Lint (ruff)** | `ruff check .` | lint errors, unused imports, bug-prone patterns |
-| **Test (pytest)** | imports the app (cold-start sanity), then `pytest -q` | confirms the app boots and tests pass |
-| **Secret scan (gitleaks)** | `gitleaks detect` over full git history | blocks committed secrets (keys, tokens, DB URLs) |
+### Base tier — runs on `dev` **and** `prod` (required on both)
 
-**Prod-only tier — runs only when promoting to `prod`:**
+| Check | What it runs | Why it exists |
+|-------|--------------|---------------|
+| **Lint (ruff)** | `ruff check .` | Catches lint errors, unused imports, and bug-prone patterns before they land. |
+| **Test (pytest)** | imports `app.main` (cold-start sanity), then `pytest -q` | Confirms the ASGI app boots (what Vercel does at cold start) and the full test suite passes — auth/RBAC, data integrity, FERPA, etc. |
+| **Secret scan (gitleaks)** | `gitleaks detect` over **full** git history | Blocks committed secrets (API keys, tokens, DB URLs) anywhere in history, not just the tip. Test-only dummy secrets are narrowly allowlisted in `.gitleaks.toml`. |
+| **Deploy deps (pyproject parity)** | installs **only** `pyproject.toml` `[project.dependencies]` into a clean env, then imports `app.main` | Vercel's Python builder installs from `pyproject.toml`, **not** `requirements.txt`. A runtime dep missing there deploys fine in CI but 500s the live function on import — this catches it here instead. |
+| **Repo hygiene (no scratch artifacts)** | fails if any tracked file matches scratch patterns (`TEST_*`, `SCRATCH*`, `DRAFT_*`, `*.scratch`, `.board-seed*`, `*DO_NOT_MERGE*`) | `dev` is the AI/testing sandbox that promotes to prod — throwaway files must never ride along. Lowercase `tests/` is unaffected. |
+| **FERPA static check** | `python scripts/ferpa_check.py` (deterministic, no API key) | Enforces FERPA/privacy controls statically: **every DB table has deny-all RLS**, `SQL_ECHO` is guarded off in production, and no secrets are committed. See `scripts/FERPA_CHECKS.md`. |
 
-| Check | What it runs | Why |
-|-------|--------------|-----|
-| **Dependency audit (prod only)** | `pip-audit` | blocks known-vulnerable dependencies before release |
+### Prod-only tier — runs only when promoting to `prod` (required on `prod`)
 
-gitleaks false positives (test-only dummy secrets in `tests/`) are allowlisted in
-`.gitleaks.toml` — keep entries narrow so real secrets are still caught. No secrets
-are required for the run itself; tests don't touch a live database or Supabase.
+| Check | What it runs | Why it exists |
+|-------|--------------|---------------|
+| **Dependency audit (prod only)** | `pip-audit -r requirements.txt` | Blocks known-vulnerable dependencies before a release. Skipped on `dev` (so routine dev work isn't blocked by a new advisory) — and therefore **not** required on `dev`. |
 
-To view results: repo → **Actions** tab (or a PR's **Checks** section) → **CI** workflow.
+### Deploy & automation (not pass/fail gates you write code against)
+
+| Check / job | When | What it does |
+|-------------|------|--------------|
+| **Migrate database** | only on **push to `prod`**, after the base+audit checks pass | Applies pending `database/migrations/*.sql` to the **prod** Supabase DB via `migrate.sh`, **held for manual approval** by the `production` Environment's required reviewers (secret `MIGRATIONS_DATABASE_URL`). The **dev** DB is migrated separately, by hand. Skipped on PRs and on dev pushes. |
+| **Move linked issues to In Review** | when a PR is opened / marked ready | Moves the PR's linked board issues into **In Review** on org Project #4. Needs the `PROJECTS_TOKEN` secret; a graceful no-op without it (never fails a PR). |
+
+### External — Vercel deployment check (required)
+
+| Check | Branch | What it does |
+|-------|--------|--------------|
+| **Vercel – dev-fa-web-api** | `dev` | Vercel builds + deploys the branch to the **dev** API project. Green = the deploy didn't break. Required on `dev`. |
+| **Vercel – finance-alumni-database-api** | `prod` | Same for the **prod** API project. Required on `prod`. |
+
+> ⚠️ The Vercel check names contain a real **en-dash `–` (U+2013)**. When editing
+> the rulesets' required checks, preserve that exact character — a mangled name
+> (e.g. via a Windows cp1252 round-trip) becomes a required check that can never
+> report, silently **blocking all merges**.
+
+### Required status checks (summary)
+
+| Branch | Required to merge |
+|--------|-------------------|
+| **`dev`** | Lint (ruff) · Test (pytest) · Secret scan · Deploy deps · Repo hygiene · FERPA static check · Vercel – dev-fa-web-api |
+| **`prod`** | the above **+** Dependency audit (prod only) · Vercel – finance-alumni-database-api |
+
+To view results: repo → **Actions** tab, or a PR's **Checks** section.
 
 ## Branch & deploy workflow
 

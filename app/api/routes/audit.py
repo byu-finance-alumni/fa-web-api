@@ -19,7 +19,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("")
 async def list_audit(
-    _: RequireSuperAdmin,
+    actor: RequireSuperAdmin,
     session: SessionDep,
     action_type: Annotated[
         str | None, Query(description="Exact action type, e.g. 'update'.")
@@ -29,7 +29,13 @@ async def list_audit(
     ] = None,
     user: Annotated[
         str | None,
-        Query(description="Acting user's email (case-insensitive substring)."),
+        Query(
+            min_length=3,
+            description=(
+                "Acting user's email (case-insensitive substring; min 3 chars to "
+                "prevent single-character enumeration of the directory)."
+            ),
+        ),
     ] = None,
     date_from: Annotated[
         datetime.date | None,
@@ -70,6 +76,33 @@ async def list_audit(
         select(func.count()).select_from(base.subquery())
     )
     rows = (await session.execute(base.limit(limit).offset(offset))).all()
+
+    # Reading the audit trail is itself an auditable event (the trail can contain
+    # alumni PII in old/new values). Record WHO read it and WHICH filters were
+    # applied — never the returned rows/values themselves.
+    applied = ";".join(
+        f"{name}={value}"
+        for name, value in (
+            ("action_type", action_type),
+            ("entity_type", entity_type),
+            ("user", user),
+            ("date_from", date_from.isoformat() if date_from else None),
+            ("date_to", date_to.isoformat() if date_to else None),
+            ("limit", limit),
+            ("offset", offset),
+        )
+        if value is not None
+    )
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_audit_log",
+            entity_type="audit_log",
+            field_name=applied or None,
+        )
+    )
+    await session.commit()
+
     return {
         "items": [
             {

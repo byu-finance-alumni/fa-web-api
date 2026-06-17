@@ -56,6 +56,8 @@ class _FakeSession:
         self._executes = list(executes) if executes is not None else None
         self.execute_args = []
         self.scalar_args = []
+        self.added: list = []
+        self.commits = 0
 
     async def execute(self, stmt):
         self.execute_args.append(stmt)
@@ -66,6 +68,17 @@ class _FakeSession:
     async def scalar(self, stmt):
         self.scalar_args.append(stmt)
         return self._scalars.pop(0) if self._scalars else 0
+
+    # The FERPA-audited drill-downs write a best-effort AuditLog after serving
+    # the read; support add/commit/rollback so the audit path is exercised.
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.commits += 1
+
+    async def rollback(self):
+        pass
 
 
 def _with_session(session):
@@ -117,7 +130,8 @@ def test_contacted_this_month_serializes_rows(client):
         user_id=2,
     )
     rows = [(interaction, _alumni(), _user())]
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # FERPA: this drill-down now requires full_access (view_only gets 403).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(_FakeSession(rows))
 
     response = client.get("/dashboard/contacted-this-month")
@@ -145,7 +159,8 @@ def test_activity_feed_paginates_and_serializes(client):
         user_id=2,
     )
     rows = [(interaction, _alumni(), _user())]
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # FERPA: the searchable activity feed now requires full_access.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     # execute() is called twice: the page rows, then the distinct-types query.
     app.dependency_overrides[get_session] = _with_session(
         _FakeSession(
@@ -219,7 +234,8 @@ def _compiled(stmt) -> str:
 
 def test_activity_q_searches_names_and_type_with_ilike(client):
     session = _activity_session()
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # FERPA: the activity feed now requires full_access.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/activity?q=jane")
@@ -239,7 +255,8 @@ def test_activity_q_searches_names_and_type_with_ilike(client):
 
 def test_activity_type_filters_exact_ilike(client):
     session = _activity_session()
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # FERPA: the activity feed now requires full_access.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/activity?type=Email")
@@ -250,7 +267,8 @@ def test_activity_type_filters_exact_ilike(client):
 
 def test_activity_date_range_bounds_full_day(client):
     session = _activity_session()
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # FERPA: the activity feed now requires full_access.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get(
@@ -264,7 +282,8 @@ def test_activity_date_range_bounds_full_day(client):
 
 def test_activity_no_filters_has_no_where(client):
     session = _activity_session()
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # FERPA: the activity feed now requires full_access.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/activity")
@@ -323,6 +342,7 @@ def test_birthdays_serializes_rows_matching_contract(client):
 
     response = client.get("/dashboard/birthdays")
     assert response.status_code == 200
+    # FERPA: only the recurring month+day is returned (never the birth year).
     assert response.json() == [
         {
             "id": 7,
@@ -330,7 +350,8 @@ def test_birthdays_serializes_rows_matching_contract(client):
             "last_name": "Doe",
             "current_employer": "Goldman Sachs",
             "graduation_year": 2019,
-            "birth_date": "1997-06-03",
+            "birth_month": 6,
+            "birth_day": 3,
         }
     ]
 
@@ -379,7 +400,8 @@ def test_follow_ups_serializes_rows_and_handles_missing_user(client):
         assigned_to_user_id=None,
     )
     rows = [(task, _alumni(), None)]
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # FERPA: the follow-ups drill-down now requires full_access.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(_FakeSession(rows))
 
     response = client.get("/dashboard/follow-ups")

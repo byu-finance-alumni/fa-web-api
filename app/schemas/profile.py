@@ -326,7 +326,8 @@ class InteractionRead(_Orm):
     interaction_type: str | None = None
     interaction_date_time: datetime.datetime | None = None
     interaction_notes: str | None = None
-    user_id: int | None = None
+    # Internal user PK is never disclosed; only the resolved display name
+    # ``logged_by`` leaves the API (FERPA — minimize internal identifiers).
     logged_by: str | None = None
 
 
@@ -337,7 +338,8 @@ class TaskRead(_Orm):
     completed: bool
     completed_at: datetime.datetime | None = None
     task_notes: str | None = None
-    assigned_to_user_id: int | None = None
+    # Internal assignee PK is never disclosed; only the resolved display name
+    # ``assigned_to`` leaves the API.
     assigned_to: str | None = None
 
 

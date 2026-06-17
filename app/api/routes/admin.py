@@ -13,15 +13,20 @@ import secrets
 import unicodedata
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.dependencies.auth import RequireSuperAdmin
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
+from app.core.rate_limit import (
+    AssignRoleRateLimit,
+    CreateUserRateLimit,
+    ResetPasswordRateLimit,
+)
 from app.core.roles import RoleName
 from app.core.security import AuthorizationError
 from app.models.audit import AuditLog
@@ -212,12 +217,46 @@ async def _load_user(session: AsyncSession, user_id: int) -> User:
 
 
 @router.get("/users")
-async def list_users(_: RequireSuperAdmin, session: SessionDep) -> list[dict]:
-    """List all users with their assigned roles."""
+async def list_users(
+    actor: RequireSuperAdmin,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    """List provisioned users with their assigned roles (paginated).
+
+    Paginated (default 50, hard cap 200 — mirrors the audit endpoint) so a single
+    request can't enumerate the entire user directory at once, and each call is
+    audited (``list_users``) so reads of the user list leave a forensic trail.
+    The ``total`` count lets the UI page through. The access itself is recorded
+    (actor + applied limit/offset); the returned rows are NOT logged.
+    """
+    total = await session.scalar(select(func.count()).select_from(User))
     rows = await session.scalars(
-        select(User).options(selectinload(User.roles)).order_by(User.email)
+        select(User)
+        .options(selectinload(User.roles))
+        .order_by(User.email)
+        .limit(limit)
+        .offset(offset)
     )
-    return [_serialize(u) for u in rows.all()]
+    items = [_serialize(u) for u in rows.all()]
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="list_users",
+            entity_type="user",
+            field_name=f"limit={limit};offset={offset}",
+        )
+    )
+    await session.commit()
+
+    return {
+        "items": items,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 # ``{user_id}`` is declared ``int`` (below), so string sub-paths like
@@ -266,12 +305,14 @@ async def set_user_active(
 async def assign_role(
     user_id: int,
     payload: RoleAssign,
-    actor: RequireSuperAdmin,
+    actor: AssignRoleRateLimit,
     session: SessionDep,
 ) -> dict:
     """Grant a role to an existing user (idempotent). super_admin and up.
 
-    Privilege ceiling: only an ``engineer`` may grant the ``engineer`` role. A
+    Rate-limited per actor (best-effort, in-process) to brake bulk privilege
+    changes. Privilege ceiling: only an ``engineer`` may grant the ``engineer``
+    role. A
     ``super_admin`` (who is below engineer) cannot mint an account that outranks
     them — that would be a privilege escalation above the actor's own ceiling.
     """
@@ -336,14 +377,27 @@ async def remove_role(
         )
     )
     if link is not None:
-        if (
-            role.role_name
-            in {RoleName.SUPER_ADMIN.value, RoleName.ENGINEER.value}
-            and user_id == actor.user_id
-        ):
-            raise ConflictError(
-                f"You cannot remove your own {role.role_name} role."
+        if role.role_name in {
+            RoleName.SUPER_ADMIN.value,
+            RoleName.ENGINEER.value,
+        }:
+            if user_id == actor.user_id:
+                raise ConflictError(
+                    f"You cannot remove your own {role.role_name} role."
+                )
+            # System-wide last-holder guard: never let the final holder of a top
+            # role (super_admin / engineer) be stripped, which would lock user
+            # (or, for engineer, vocab/database) administration out of the system
+            # for everyone — not just the actor. One COUNT over the role's links.
+            holders = await session.scalar(
+                select(func.count())
+                .select_from(UserRole)
+                .where(UserRole.role_id == role.role_id)
             )
+            if (holders or 0) <= 1:
+                raise ConflictError(
+                    f"Cannot remove the last {role.role_name}."
+                )
         await session.delete(link)
         session.add(
             AuditLog(
@@ -362,7 +416,7 @@ async def remove_role(
 @router.post("/users/{user_id}/reset-password", response_model=ResetPasswordResponse)
 async def reset_password(
     user_id: int,
-    actor: RequireSuperAdmin,
+    actor: ResetPasswordRateLimit,
     session: SessionDep,
 ) -> ResetPasswordResponse:
     """Set a strong one-time temporary password on a user. super_admin only.
@@ -426,7 +480,7 @@ async def reset_password(
 @router.post("/users", response_model=CreateUserResponse, status_code=201)
 async def create_user(
     payload: CreateUserRequest,
-    actor: RequireSuperAdmin,
+    actor: CreateUserRateLimit,
     session: SessionDep,
 ) -> CreateUserResponse:
     """Provision a brand-new login user. super_admin only.

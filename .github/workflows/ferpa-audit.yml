@@ -1,0 +1,40 @@
+name: FERPA check
+
+# Deterministic, no-secrets FERPA-compliance static check (scripts/ferpa_check.py).
+# No LLM / API key — pure stdlib static analysis, so it is safe to require as a
+# branch-protection status check. The job fails iff the script exits non-zero
+# (a hard FERPA control is missing). See scripts/FERPA_CHECKS.md.
+on:
+  push:
+    branches: [dev, prod]
+    paths:
+      - "app/**"
+      - "database/**"
+      - "scripts/ferpa_check.py"
+      - ".github/workflows/ferpa-audit.yml"
+  pull_request:
+    branches: [dev, prod]
+    paths:
+      - "app/**"
+      - "database/**"
+      - "scripts/ferpa_check.py"
+      - ".github/workflows/ferpa-audit.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ferpa-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ferpa-check:
+    name: FERPA static check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run FERPA check
+        run: python scripts/ferpa_check.py

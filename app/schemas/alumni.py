@@ -481,3 +481,43 @@ class AlumniPage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# --- FERPA role-scoping ------------------------------------------------------
+#
+# Fields a ``view_only`` ("Professor") caller must NOT receive on any alumni
+# read. These are sensitive PII (national/birth identifiers, demographics,
+# spouse PII), free-text notes, and import-provenance metadata that has no
+# bearing on the read-only directory view. They are NULLED (not dropped) so the
+# response still validates against ``AlumniRead`` / ``AlumniListItem``.
+VIEW_ONLY_HIDDEN_FIELDS: frozenset[str] = frozenset(
+    {
+        "byu_id",
+        "net_id",
+        "mst_id",
+        "birth_date",
+        "birth_year",
+        "gender",
+        "spouse_first_name",
+        "spouse_last_name",
+        "spouse_birth_date",
+        "notes",
+        "manually_edited_at",
+        "last_imported_at",
+        "source_id",
+    }
+)
+
+
+def minimize_alumni_read[T: AlumniRead](read: T, *, can_edit: bool) -> T:
+    """Null the FERPA-sensitive fields for a ``view_only`` caller.
+
+    ``can_edit`` is ``user.can_edit_alumni`` (engineer / super_admin /
+    full_access / student). Those callers get the record untouched; only
+    ``view_only`` is scoped down. Returns a copy (the input is left intact).
+    """
+    if can_edit:
+        return read
+    return read.model_copy(
+        update={field: None for field in VIEW_ONLY_HIDDEN_FIELDS}
+    )

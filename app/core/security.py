@@ -123,6 +123,15 @@ def verify_supabase_jwt(token: str) -> dict[str, Any]:
     settings = get_settings()
     key, alg = _resolve_key_and_alg(token)
 
+    # Issuer validation: when supabase_url is configured we PIN the issuer so a
+    # correctly-signed token minted by a DIFFERENT Supabase project is rejected.
+    # The asymmetric (RS256/ES256) path already hard-requires supabase_url (it is
+    # needed to fetch the JWKS, see _resolve_key_and_alg), so an asymmetric token
+    # can never reach here with issuer=None. The HS256 path is the documented
+    # offline mode (shared secret, no project URL) and intentionally still
+    # verifies signature + audience + exp without an issuer pin.
+    if alg in _SUPPORTED_ASYMMETRIC and not settings.supabase_url:
+        raise AuthError("Server is not configured to verify tokens.")
     issuer = (
         f"{settings.supabase_url.rstrip('/')}/auth/v1"
         if settings.supabase_url

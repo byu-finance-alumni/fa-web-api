@@ -326,6 +326,18 @@ CREATE TABLE vocabulary_terms (
 );
 CREATE INDEX ix_vocabulary_terms_category_active ON vocabulary_terms (category, active);
 
+-- Engineer-curated "who to contact" entries shown to logged-in users on the
+-- in-app error screen. See migration 2026-06-17_support_contacts.sql.
+CREATE TABLE support_contacts (
+    support_contact_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    role_label         varchar(100) NOT NULL,
+    name               varchar(255) NOT NULL,
+    email              varchar(255) NOT NULL,
+    sort_order         integer NOT NULL DEFAULT 0,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now()
+);
+
 -- -----------------------------------------------------------------------------
 -- CRM activity: interactions, tasks, events, surveys, attachments
 -- -----------------------------------------------------------------------------

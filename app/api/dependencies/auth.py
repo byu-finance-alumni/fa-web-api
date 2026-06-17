@@ -22,6 +22,7 @@ from app.core.security import (
     AuthError,
     AuthorizationError,
     DeactivatedAccountError,
+    MustChangePasswordError,
     verify_supabase_jwt,
 )
 from app.models.login_attempt import LoginAttempt
@@ -58,11 +59,19 @@ async def get_current_user(
 CurrentUser = Annotated[AuthenticatedUser, Depends(get_current_user)]
 
 
-async def get_current_db_user(
+async def get_current_db_user_allow_must_change(
     current: CurrentUser,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> UserContext:
-    """Resolve the verified token identity to a provisioned, active DB user.
+    """Resolve the verified token identity to a provisioned, active DB user,
+    WITHOUT enforcing the force-password-change gate.
+
+    Identical to ``get_current_db_user`` (valid token, provisioned + active user
+    required) EXCEPT it does NOT raise ``MustChangePasswordError`` when the user
+    still holds the flag. This is the EXEMPT variant used only by the handful of
+    routes a flagged user must still reach to complete the change itself
+    (``GET /auth/context`` and ``POST /auth/password/complete``). Every other
+    authenticated route uses ``get_current_db_user``, which enforces the gate.
 
     Raises AuthError (401) if the token subject isn't a valid id,
     AuthorizationError (403) if there's no matching user (a valid token for
@@ -85,6 +94,29 @@ async def get_current_db_user(
     await _clear_login_attempts(session, user.email)
 
     return UserContext.from_orm_user(user)
+
+
+async def get_current_db_user(
+    current: CurrentUser,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> UserContext:
+    """Resolve the verified token identity to a provisioned, active DB user and
+    ENFORCE the force-password-change gate.
+
+    Performs the same resolution as ``get_current_db_user_allow_must_change``
+    (delegated, so the lookup / deactivation logic lives in one place) and then
+    layers the ``must_change_password`` check on top: raises
+    MustChangePasswordError (403 / ``password_change_required``) when the user is
+    on an admin-issued temp password. This is enforced server-side on EVERY
+    authenticated route — the frontend gate is NOT sufficient, since a valid
+    session token could otherwise call data endpoints directly and bypass the
+    forced change. Only ``GET /auth/context`` and ``POST /auth/password/complete``
+    depend on the exempt variant above so the user can read and clear the flag.
+    """
+    user = await get_current_db_user_allow_must_change(current, session)
+    if user.must_change_password:
+        raise MustChangePasswordError()
+    return user
 
 
 async def _clear_login_attempts(session: AsyncSession, email: str) -> None:
@@ -114,6 +146,13 @@ async def _clear_login_attempts(session: AsyncSession, email: str) -> None:
 
 
 CurrentDBUser = Annotated[UserContext, Depends(get_current_db_user)]
+# EXEMPT variant: same resolution (valid token, provisioned + active) but does
+# NOT enforce the force-password-change gate. Use ONLY on the routes a flagged
+# user must reach to complete the change (GET /auth/context, POST
+# /auth/password/complete).
+CurrentDBUserAllowMustChange = Annotated[
+    UserContext, Depends(get_current_db_user_allow_must_change)
+]
 
 
 def require_roles(
@@ -134,14 +173,42 @@ def require_roles(
     return _guard
 
 
-# Role hierarchy: super_admin ⊇ full_access ⊇ view_only. super_admin satisfies
-# every guard; user/role administration requires super_admin specifically.
-require_super_admin = require_roles(RoleName.SUPER_ADMIN)
-require_full_access = require_roles(RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS)
-require_view_only = require_roles(
-    RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS, RoleName.VIEW_ONLY
+# Role hierarchy: engineer ⊇ super_admin ⊇ full_access ⊇ student ⊇ view_only.
+# `engineer` is the top role and therefore appears in EVERY allow-set (it
+# satisfies every guard, including super_admin's). `super_admin` satisfies
+# every guard except, by design, nothing above it. Guards are allow-lists
+# (set-disjoint), not ranked comparisons, so each new role must be added
+# explicitly to each guard it should satisfy.
+#
+# `student` is a narrow writer: it may EDIT existing alumni records (and their
+# nested data) but may NOT create new alumni, archive/restore, import, or touch
+# user administration. It is therefore added to `require_view_only` (read) and
+# to `require_alumni_edit` (edit existing) ONLY — never to `require_full_access`.
+require_super_admin = require_roles(RoleName.ENGINEER, RoleName.SUPER_ADMIN)
+require_full_access = require_roles(
+    RoleName.ENGINEER, RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS
 )
+# Edit an EXISTING alumnus / their nested records. Adds `student` on top of the
+# full_access set. Does NOT permit create, archive, restore, or import.
+require_alumni_edit = require_roles(
+    RoleName.ENGINEER,
+    RoleName.SUPER_ADMIN,
+    RoleName.FULL_ACCESS,
+    RoleName.STUDENT,
+)
+require_view_only = require_roles(
+    RoleName.ENGINEER,
+    RoleName.SUPER_ADMIN,
+    RoleName.FULL_ACCESS,
+    RoleName.STUDENT,
+    RoleName.VIEW_ONLY,
+)
+# Database / controlled-vocabulary administration (editable dropdowns, #82).
+# Restricted to the top two roles.
+require_vocab_admin = require_roles(RoleName.ENGINEER, RoleName.SUPER_ADMIN)
 
 RequireSuperAdmin = Annotated[UserContext, Depends(require_super_admin)]
 RequireFullAccess = Annotated[UserContext, Depends(require_full_access)]
+RequireAlumniEdit = Annotated[UserContext, Depends(require_alumni_edit)]
 RequireViewAccess = Annotated[UserContext, Depends(require_view_only)]
+RequireVocabAdmin = Annotated[UserContext, Depends(require_vocab_admin)]

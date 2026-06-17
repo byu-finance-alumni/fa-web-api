@@ -44,6 +44,7 @@ ALTER TABLE public.tags                  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.alumni_tags           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.status_labels         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.alumni_status_labels  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.vocabulary_terms      ENABLE ROW LEVEL SECURITY;
 
 -- Engagement -----------------------------------------------------------------
 ALTER TABLE public.interactions          ENABLE ROW LEVEL SECURITY;

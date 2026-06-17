@@ -31,6 +31,10 @@ SessionLocal: async_sessionmaker[AsyncSession] | None = None
 
 if settings.async_database_url:
     _url = settings.async_database_url
+    # Never echo SQL in production — even if SQL_ECHO slips into the prod env,
+    # echoed statements can carry alumni PII (bound parameters) into logs. Force
+    # it off when running as production, regardless of the configured flag.
+    _echo = settings.sql_echo and settings.environment != "production"
     # Supabase pooler ports: 5432 = session pooler, 6543 = transaction pooler.
     # The transaction pooler (pgbouncer) is what serverless platforms like
     # Vercel should use. In that mode we must disable asyncpg's prepared-
@@ -40,7 +44,7 @@ if settings.async_database_url:
     if _is_transaction_pooler:
         engine = create_async_engine(
             _url,
-            echo=settings.sql_echo,
+            echo=_echo,
             poolclass=NullPool,
             connect_args={"statement_cache_size": 0},
         )
@@ -60,7 +64,7 @@ if settings.async_database_url:
         # capping here makes the :5432 runtime path safe in the meantime.
         engine = create_async_engine(
             _url,
-            echo=settings.sql_echo,
+            echo=_echo,
             pool_pre_ping=True,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,

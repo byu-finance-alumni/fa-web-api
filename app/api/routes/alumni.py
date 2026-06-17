@@ -1,8 +1,12 @@
 """Alumni CRUD routes.
 
-Reads require view access (either role); writes require full_access. ``DELETE``
-is a soft-delete (archive), never a hard delete — audit history depends on
-retained records.
+Reads require view access (any role). Editing an EXISTING alumnus and their
+nested records (interactions, employment, education, leadership, tags, status
+labels, tasks, event attendance) requires edit access (``student`` and up, via
+``RequireAlumniEdit``). Creating a new alumnus, archiving/restoring, and CSV
+import require ``full_access`` and up (``RequireFullAccess``) — ``student`` is
+deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
+(archive), never a hard delete — audit history depends on retained records.
 """
 
 from typing import Annotated
@@ -11,14 +15,20 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.dependencies.auth import (
+    RequireAlumniEdit,
+    RequireFullAccess,
+    RequireViewAccess,
+)
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.schemas.alumni import (
     AlumniCreateFull,
+    AlumniListItem,
     AlumniPage,
     AlumniRead,
     AlumniUpdateFull,
+    minimize_alumni_read,
 )
 from app.schemas.profile import (
     EducationCreate,
@@ -52,7 +62,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("", response_model=AlumniPage)
 async def list_alumni(
-    _: RequireViewAccess,
+    user: RequireViewAccess,
     session: SessionDep,
     q: Annotated[
         str | None,
@@ -122,6 +132,12 @@ async def list_alumni(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> AlumniPage:
+    # Archived rows are full_access-and-up only: a view_only / student caller
+    # passing ``include_archived=true`` must NOT receive soft-deleted records.
+    has_full_access = (
+        user.is_full_access or user.is_super_admin or user.is_engineer
+    )
+    effective_include_archived = include_archived and has_full_access
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -142,10 +158,35 @@ async def list_alumni(
         missing_email=missing_email,
         missing_employer=missing_employer,
         duplicate=duplicate,
-        include_archived=include_archived,
+        include_archived=effective_include_archived,
         sort=sort,
     )
-    return AlumniPage(items=items, total=total, limit=limit, offset=offset)
+    # Search/disclosure audit: record the actor + a short filter summary (never
+    # the result payload). One lightweight row per search.
+    await service.log_search(
+        session,
+        actor_user_id=user.user_id,
+        filters={
+            "q": q,
+            "graduation_year": graduation_year,
+            "grad_year_min": grad_year_min,
+            "grad_year_max": grad_year_max,
+            "employer": employer,
+            "industry": industry,
+            "city": city,
+            "tag": tag,
+            "limit": limit,
+            "offset": offset,
+            "sort": sort,
+        },
+    )
+    rows = [
+        minimize_alumni_read(
+            AlumniListItem.model_validate(item), can_edit=user.can_edit_alumni
+        )
+        for item in items
+    ]
+    return AlumniPage(items=rows, total=total, limit=limit, offset=offset)
 
 
 # --- Bulk CSV import (full_access) -------------------------------------------
@@ -265,9 +306,18 @@ async def import_alumni(
 
 @router.get("/{alumni_id}", response_model=AlumniRead)
 async def get_alumni(
-    alumni_id: int, _: RequireViewAccess, session: SessionDep
+    alumni_id: int, user: RequireViewAccess, session: SessionDep
 ) -> AlumniRead:
-    return await service.get_alumni(session, alumni_id)
+    """Single lightweight alumni core record.
+
+    Archived records 404 (they were removed from the directory). view_only
+    ("Professor") callers receive a FERPA-minimized record — sensitive PII,
+    notes, and import provenance are nulled. This lightweight read is not
+    audit-logged (the full profile aggregate is)."""
+    alumnus = await service.get_alumni(session, alumni_id)
+    return minimize_alumni_read(
+        AlumniRead.model_validate(alumnus), can_edit=user.can_edit_alumni
+    )
 
 
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
@@ -277,11 +327,35 @@ async def get_alumni_profile(
     """Full profile aggregate (core + contact, career, employment, leadership,
     engagement, surveys, interactions, tasks, attachments, audit) for the tabs.
 
-    Follow-up tasks are admin-only: view_only users get an empty ``tasks`` list
-    (enforced here, not just hidden in the UI). full_access/super_admin see all."""
-    include_tasks = user.is_full_access or user.is_super_admin
+    Archived records 404. Follow-up tasks are edit-only: view_only ("Professor")
+    users get an empty ``tasks`` list AND a FERPA-minimized aggregate (sensitive
+    PII nulled, free-text notes and audit trail stripped) — enforced here, not
+    just hidden in the UI. Anyone with edit access — engineer / super_admin /
+    full_access / student — sees all. The disclosure is audit-logged
+    (``view_profile``)."""
+    include_tasks = user.can_edit_alumni
     return await profile_service.get_profile(
-        session, alumni_id, include_tasks=include_tasks
+        session,
+        alumni_id,
+        include_tasks=include_tasks,
+        can_edit=user.can_edit_alumni,
+        actor_user_id=user.user_id,
+    )
+
+
+@router.get("/{alumni_id}/export")
+async def export_alumni_profile(
+    alumni_id: int, user: RequireFullAccess, session: SessionDep
+) -> dict:
+    """Server-side, audited profile export (full_access).
+
+    Returns the full profile aggregate as a MINIMIZED JSON body: the embedded
+    ``audit`` trail is excluded and internal user PKs (interaction ``user_id``,
+    task ``assigned_to_user_id``) are never present. Writes an ``export_profile``
+    audit row before returning. Archived records 404. The frontend calls this
+    instead of doing a client-side export."""
+    return await profile_service.export_profile(
+        session, alumni_id, actor_user_id=user.user_id
     )
 
 
@@ -293,7 +367,7 @@ async def get_alumni_profile(
 async def add_interaction(
     alumni_id: int,
     payload: InteractionCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> InteractionRead:
     """Log an interaction on an alumni's timeline (full_access)."""
@@ -310,7 +384,7 @@ async def add_interaction(
 async def add_task(
     alumni_id: int,
     payload: TaskCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> TaskRead:
     """Create a follow-up task for an alumni (full_access)."""
@@ -324,7 +398,7 @@ async def update_task_completion(
     alumni_id: int,
     task_id: int,
     payload: TaskCompleteUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> TaskRead:
     """Toggle a follow-up task's completion state (full_access)."""
@@ -341,7 +415,7 @@ async def update_task_completion(
 async def add_employment(
     alumni_id: int,
     payload: EmploymentHistoryCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EmploymentHistoryRead:
     """Add a prior role to an alumni's employment history (full_access)."""
@@ -358,7 +432,7 @@ async def update_employment(
     alumni_id: int,
     employment_history_id: int,
     payload: EmploymentHistoryUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EmploymentHistoryRead:
     """Edit a prior role on an alumni's employment history (full_access). 404 if
@@ -379,7 +453,7 @@ async def update_employment(
 async def delete_employment(
     alumni_id: int,
     employment_history_id: int,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
     """Delete a prior role from an alumni's employment history (full_access). 404
@@ -397,7 +471,7 @@ async def delete_employment(
 async def add_education(
     alumni_id: int,
     payload: EducationCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EducationRead:
     """Add an education entry to an alumni's record (full_access)."""
@@ -414,7 +488,7 @@ async def update_education(
     alumni_id: int,
     education_id: int,
     payload: EducationUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EducationRead:
     """Edit an education entry on an alumni's record (full_access). 404 if the
@@ -431,7 +505,7 @@ async def update_education(
 async def delete_education(
     alumni_id: int,
     education_id: int,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
     """Delete an education entry from an alumni's record (full_access). 404 if the
@@ -449,7 +523,7 @@ async def delete_education(
 async def add_leadership(
     alumni_id: int,
     payload: LeadershipCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> LeadershipRead:
     """Add a Finance Society leadership entry to an alumni (full_access)."""
@@ -466,7 +540,7 @@ async def update_leadership(
     alumni_id: int,
     finance_society_leadership_id: int,
     payload: LeadershipUpdate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> LeadershipRead:
     """Edit a Finance Society leadership entry (full_access). 404 if the row is
@@ -487,7 +561,7 @@ async def update_leadership(
 async def delete_leadership(
     alumni_id: int,
     finance_society_leadership_id: int,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
     """Delete a Finance Society leadership entry (full_access). 404 if the row is
@@ -508,7 +582,7 @@ async def delete_leadership(
 async def add_tag(
     alumni_id: int,
     payload: TagCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Attach a canonical engagement tag to an alumni (full_access). Returns the
@@ -522,7 +596,7 @@ async def add_tag(
 async def remove_tag(
     alumni_id: int,
     tag: str,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Detach a tag from an alumni (full_access). Returns the resulting tag list.
@@ -540,7 +614,7 @@ async def remove_tag(
 async def add_status_label(
     alumni_id: int,
     payload: StatusLabelCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Attach a canonical status label to an alumni (full_access). Returns the
@@ -554,7 +628,7 @@ async def add_status_label(
 async def remove_status_label(
     alumni_id: int,
     label: str,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> list[str]:
     """Detach a status label from an alumni (full_access). Returns the resulting
@@ -572,7 +646,7 @@ async def remove_status_label(
 async def add_event_attendance(
     alumni_id: int,
     payload: EventAttendanceCreate,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> EventAttendedRead:
     """Mark an alumni as an attendee of an existing event (full_access). 404 if
@@ -584,35 +658,45 @@ async def add_event_attendance(
 
 @router.post("/preview")
 async def preview_create_alumni(
-    payload: AlumniCreateFull, _: RequireFullAccess, session: SessionDep
+    payload: AlumniCreateFull, user: RequireFullAccess, session: SessionDep
 ) -> dict:
     """Dry-run data-hygiene preview for a NEW alumni (full_access, no writes).
 
     Returns ``{cleaned, changes, warnings, blockers}`` — the cleaned (normalized)
     payload, the per-field changes cleaning would make, soft warnings (completeness
     + fuzzy possible-duplicates), and exact-duplicate blockers (a non-empty list
-    means the real POST would 409)."""
-    return await hygiene.build_preview(session, payload)
+    means the real POST would 409). The preview reads stored data, so it is
+    audit-logged (``preview``)."""
+    result = await hygiene.build_preview(session, payload)
+    await service.log_preview(session, actor_user_id=user.user_id)
+    return result
 
 
 @router.post("/{alumni_id}/preview")
 async def preview_update_alumni(
     alumni_id: int,
     payload: AlumniUpdateFull,
-    _: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> dict:
     """Dry-run data-hygiene preview for an EDIT (full_access, no writes).
 
     Loads the current record (404 if missing/archived) and computes the preview
     against the EFFECTIVE record (the cleaned partial overlaid on the stored
-    values) so duplicate + completeness checks reflect the resulting state."""
-    existing = await service.get_alumni(session, alumni_id)
+    values) so duplicate + completeness checks reflect the resulting state. The
+    preview reads stored data, so it is audit-logged (``preview``)."""
+    existing = await service.get_alumni(
+        session, alumni_id, include_archived=True
+    )
     if existing.archived:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
-    return await hygiene.build_preview(
+    result = await hygiene.build_preview(
         session, payload, existing=existing, exclude_alumni_id=alumni_id
     )
+    await service.log_preview(
+        session, actor_user_id=user.user_id, alumni_id=alumni_id
+    )
+    return result
 
 
 @router.post("", response_model=AlumniRead, status_code=status.HTTP_201_CREATED)
@@ -626,7 +710,7 @@ async def create_alumni(
 async def update_alumni(
     alumni_id: int,
     payload: AlumniUpdateFull,
-    user: RequireFullAccess,
+    user: RequireAlumniEdit,
     session: SessionDep,
 ) -> AlumniRead:
     return await service.update_alumni(

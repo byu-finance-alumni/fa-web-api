@@ -60,3 +60,108 @@ async def set_user_password(auth_user_id: uuid.UUID, new_password: str) -> None:
     if not response.is_success:
         # Deliberately opaque: do not leak the Supabase status/body to the client.
         raise ServiceError("The authentication service rejected the password reset.")
+
+
+async def create_user(
+    email: str, password: str, email_confirm: bool = True
+) -> uuid.UUID:
+    """Create a Supabase auth user via the Admin API and return its UUID.
+
+    POST {supabase_url}/auth/v1/admin/users with the service-role key (mirrors
+    ``set_user_password``). ``email_confirm=True`` marks the address confirmed so
+    the freshly-provisioned user can sign in immediately with the one-time
+    password. Raises ``ServiceError`` (mapped to 502) on any misconfiguration,
+    transport failure, non-2xx response, or a missing ``id`` in the response —
+    and NEVER surfaces the upstream Supabase response body to the caller. The
+    password is never logged.
+    """
+    settings = get_settings()
+    base_url = settings.supabase_url
+    service_key = settings.supabase_service_role_key
+    if not base_url or not service_key:
+        # Misconfiguration is an internal/operational failure, not a client error.
+        raise ServiceError("User creation is unavailable: auth admin not configured.")
+
+    url = f"{base_url.rstrip('/')}/auth/v1/admin/users"
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json={
+                    "email": email,
+                    "password": password,
+                    "email_confirm": email_confirm,
+                },
+            )
+    except httpx.HTTPError as exc:
+        # Transport-level failure (DNS, timeout, connection reset). Log the
+        # exception TYPE only — never the URL with the key or the body.
+        raise ServiceError(
+            "Could not reach the authentication service to create the user."
+        ) from exc
+
+    if not response.is_success:
+        # Deliberately opaque: do not leak the Supabase status/body to the client.
+        raise ServiceError("The authentication service rejected the user creation.")
+
+    # The created auth user's UUID is the link to our ``users.auth_user_id``.
+    try:
+        new_id = response.json().get("id")
+    except ValueError as exc:
+        raise ServiceError(
+            "The authentication service returned an unreadable response."
+        ) from exc
+    if not new_id:
+        raise ServiceError("The authentication service returned no user id.")
+    try:
+        return uuid.UUID(str(new_id))
+    except ValueError as exc:
+        raise ServiceError(
+            "The authentication service returned an invalid user id."
+        ) from exc
+
+
+async def delete_auth_user(auth_user_id: uuid.UUID) -> None:
+    """Delete a Supabase auth user via the Admin API.
+
+    DELETE {supabase_url}/auth/v1/admin/users/{auth_user_id} with the
+    service-role key (mirrors ``create_user``/``set_user_password``). Used as a
+    compensating action: if creating the auth identity succeeds but the
+    subsequent DB write fails, the caller deletes the just-created auth user so
+    no orphaned identity (with a known temp password) is left behind. Raises
+    ``ServiceError`` (mapped to 502) on any misconfiguration, transport failure,
+    or non-2xx response — and NEVER surfaces the upstream Supabase response body
+    to the caller.
+    """
+    settings = get_settings()
+    base_url = settings.supabase_url
+    service_key = settings.supabase_service_role_key
+    if not base_url or not service_key:
+        # Misconfiguration is an internal/operational failure, not a client error.
+        raise ServiceError("User deletion is unavailable: auth admin not configured.")
+
+    url = f"{base_url.rstrip('/')}/auth/v1/admin/users/{auth_user_id}"
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            response = await client.delete(url, headers=headers)
+    except httpx.HTTPError as exc:
+        # Transport-level failure (DNS, timeout, connection reset). Log the
+        # exception TYPE only — never the URL with the key or the body.
+        raise ServiceError(
+            "Could not reach the authentication service to delete the user."
+        ) from exc
+
+    if not response.is_success:
+        # Deliberately opaque: do not leak the Supabase status/body to the client.
+        raise ServiceError("The authentication service rejected the user deletion.")

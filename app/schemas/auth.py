@@ -38,6 +38,10 @@ class UserContext(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     roles: list[str] = []
+    # True while the user is on an admin-issued temp password and must set their
+    # own (the frontend gates them into a set-password screen). Reflects the
+    # CURRENT authenticated user's flag; cleared via POST /auth/password/complete.
+    must_change_password: bool = False
 
     @classmethod
     def from_orm_user(cls, user: User) -> UserContext:
@@ -48,7 +52,12 @@ class UserContext(BaseModel):
             first_name=user.first_name,
             last_name=user.last_name,
             roles=[role.role_name for role in user.roles],
+            must_change_password=user.must_change_password,
         )
+
+    @property
+    def is_engineer(self) -> bool:
+        return RoleName.ENGINEER.value in self.roles
 
     @property
     def is_super_admin(self) -> bool:
@@ -59,5 +68,24 @@ class UserContext(BaseModel):
         return RoleName.FULL_ACCESS.value in self.roles
 
     @property
+    def is_student(self) -> bool:
+        return RoleName.STUDENT.value in self.roles
+
+    @property
     def is_view_only(self) -> bool:
         return RoleName.VIEW_ONLY.value in self.roles
+
+    @property
+    def can_edit_alumni(self) -> bool:
+        """True for any role permitted to edit an existing alumnus and their
+        nested records: engineer, super_admin, full_access, or student. Mirrors
+        the ``require_alumni_edit`` guard. Does NOT imply create/archive/import
+        rights (those are ``full_access`` and up)."""
+        return bool(
+            {
+                RoleName.ENGINEER.value,
+                RoleName.SUPER_ADMIN.value,
+                RoleName.FULL_ACCESS.value,
+                RoleName.STUDENT.value,
+            }.intersection(self.roles)
+        )

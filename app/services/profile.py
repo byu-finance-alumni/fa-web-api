@@ -8,6 +8,7 @@ the dashboard/profile performance budget.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 
 from sqlalchemy import func, select
@@ -31,7 +32,7 @@ from app.models.engagement import (
 from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import User
-from app.schemas.alumni import AlumniRead
+from app.schemas.alumni import AlumniRead, minimize_alumni_read
 from app.schemas.profile import (
     AttachmentRead,
     AuditEntryRead,
@@ -85,10 +86,32 @@ async def _actor_name(session: AsyncSession, user_id: int | None) -> str | None:
 
 
 async def get_profile(
-    session: AsyncSession, alumni_id: int, *, include_tasks: bool = True
+    session: AsyncSession,
+    alumni_id: int,
+    *,
+    include_tasks: bool = True,
+    include_archived: bool = False,
+    can_edit: bool = True,
+    actor_user_id: int | None = None,
 ) -> ProfileRead:
+    """Assemble the full profile aggregate for one alumnus.
+
+    FERPA scoping:
+      * Archived records 404 on direct read unless ``include_archived`` (a
+        full_access edit flow). They were removed from the directory and must
+        not resurface via this read.
+      * ``can_edit=False`` (view_only "Professor") gets a MINIMIZED aggregate:
+        sensitive PII/notes are nulled on the core record, free-text interaction
+        / survey / engagement notes are stripped, and the embedded audit trail
+        is omitted. Implemented in ``_minimize_profile_for_view_only``.
+      * When ``actor_user_id`` is known, a single ``view_profile`` audit row is
+        written for the disclosure (the profile aggregate is the sensitive read;
+        the lightweight single-record GET is left unlogged to avoid noise).
+    """
     alumnus = await session.get(Alumni, alumni_id)
     if alumnus is None:
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    if alumnus.archived and not include_archived:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
 
     # Resolve the linked spouse's current display name (for the profile link
@@ -244,7 +267,7 @@ async def get_profile(
         ).all():
             names[u.user_id] = _full_name(u.first_name, u.last_name, u.email)
 
-    return ProfileRead(
+    profile = ProfileRead(
         alumni=AlumniRead.model_validate(alumnus),
         spouse_alumni_name=spouse_alumni_name,
         contact=ContactRead.model_validate(contact) if contact else None,
@@ -288,6 +311,101 @@ async def get_profile(
             for ev, status in event_rows
         ],
         audit=[AuditEntryRead.model_validate(a) for a in audit],
+    )
+
+    if not can_edit:
+        profile = _minimize_profile_for_view_only(profile)
+
+    # Disclosure logging: a single audit row records that the actor viewed this
+    # alumnus's full profile. The payload itself is never stored — only the
+    # action + actor + entity. No-op when the actor is unknown.
+    if actor_user_id is not None:
+        # Best-effort: disclosure logging must never break the read itself.
+        try:
+            _audit_alumni(session, actor_user_id, "view_profile", alumni_id)
+            await session.commit()
+        except Exception:  # noqa: BLE001 - audit is best-effort
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    return profile
+
+
+async def export_profile(
+    session: AsyncSession, alumni_id: int, *, actor_user_id: int | None
+) -> dict:
+    """Server-side, audited export of one alumnus's profile (full_access).
+
+    Returns the full profile aggregate as a MINIMIZED JSON-able dict:
+      * the embedded ``audit`` trail is excluded entirely, and
+      * internal user PKs are never present (``InteractionRead`` /
+        ``TaskRead`` no longer carry ``user_id`` / ``assigned_to_user_id``).
+    Writes an ``export_profile`` audit row BEFORE returning so every export is
+    attributable. Archived records 404.
+
+    This is the contract the frontend calls instead of doing a client-side
+    export: ``GET /alumni/{id}/export`` -> JSON body of the minimized profile.
+    """
+    # Build the full aggregate (full_access caller -> can_edit=True, so no
+    # view_only field-stripping; we do our own minimization below). No view
+    # audit here — the export audit row is the disclosure record.
+    profile = await get_profile(
+        session, alumni_id, include_tasks=True, can_edit=True
+    )
+    # Drop the audit trail; internal user PKs are already absent from the read
+    # schemas. exclude is belt-and-suspenders for the PK fields.
+    data = profile.model_dump(
+        mode="json",
+        exclude={
+            "audit": True,
+            "interactions": {"__all__": {"user_id"}},
+            "tasks": {"__all__": {"assigned_to_user_id"}},
+        },
+    )
+
+    if actor_user_id is not None:
+        try:
+            _audit_alumni(session, actor_user_id, "export_profile", alumni_id)
+            await session.commit()
+        except Exception:  # noqa: BLE001 - audit is best-effort
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    return data
+
+
+def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
+    """Strip the FERPA-sensitive parts of a profile for a ``view_only`` caller.
+
+    Nulls the sensitive core PII (via ``minimize_alumni_read``), strips all
+    free-text notes (interaction / survey / engagement / program-engagement
+    notes), and omits the embedded audit trail entirely. Returns a new
+    ``ProfileRead``; the input is left untouched.
+    """
+    interactions = [
+        i.model_copy(update={"interaction_notes": None})
+        for i in profile.interactions
+    ]
+    surveys = [s.model_copy(update={"survey_notes": None}) for s in profile.surveys]
+    engagement_notes = [
+        en.model_copy(update={"engagement_notes": None})
+        for en in profile.engagement_notes
+    ]
+    program_engagement = (
+        profile.program_engagement.model_copy(update={"engagement_notes": None})
+        if profile.program_engagement is not None
+        else None
+    )
+    return profile.model_copy(
+        update={
+            "alumni": minimize_alumni_read(profile.alumni, can_edit=False),
+            "interactions": interactions,
+            "surveys": surveys,
+            "engagement_notes": engagement_notes,
+            "program_engagement": program_engagement,
+            # Drop the audit trail entirely for view_only (old/new values can
+            # echo sensitive prior data).
+            "audit": [],
+        }
     )
 
 

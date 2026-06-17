@@ -5,6 +5,7 @@ into the app, so it stays within the dashboard performance budget at scale.
 """
 
 import datetime
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -15,17 +16,54 @@ from sqlalchemy.orm import aliased
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
 from app.models.alumni import Alumni
+from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.crm import FollowUpTask, Interaction
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
+from app.schemas.auth import UserContext
 from app.utils.sql import escape_like
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+async def _audit_view(
+    session: AsyncSession,
+    actor: UserContext,
+    *,
+    action_type: str,
+    entity_type: str,
+    field_name: str | None = None,
+) -> None:
+    """Best-effort disclosure/read audit for an alumni-bearing drill-down.
+
+    FERPA: viewing individual alumni / CRM data is a disclosure, so the access is
+    recorded (actor + which view, never the returned PII). Inlined ``AuditLog``
+    like admin.py. Deliberately defensive — if the audit write fails it must
+    never break the read, so any error is swallowed and rolled back.
+    """
+    try:
+        session.add(
+            AuditLog(
+                user_id=actor.user_id,
+                action_type=action_type,
+                entity_type=entity_type,
+                field_name=field_name,
+            )
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - best-effort; never fail the read
+        logger.warning("Failed to write view audit for %s", entity_type, exc_info=True)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _full_name(first: str | None, last: str | None, email: str | None) -> str | None:
@@ -246,7 +284,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
 
 
 @router.get("/birthdays")
-async def birthdays(_: RequireViewAccess, session: SessionDep) -> list[dict]:
+async def birthdays(
+    actor: RequireViewAccess, session: SessionDep
+) -> list[dict]:
     """Active alumni whose birthday falls in the current calendar month, ordered
     by day-of-month ascending (earliest in the month first). Each row carries
     the alumnus's current/most-recent employer via the same correlated scalar
@@ -255,10 +295,15 @@ async def birthdays(_: RequireViewAccess, session: SessionDep) -> list[dict]:
     Filters on the month component of ``birth_date`` (the year is irrelevant for
     a recurring birthday). Aggregation/derivation happens in PostgreSQL.
 
+    FERPA: the full date of birth (incl. year) is sensitive PII and is NOT needed
+    to wish someone a happy birthday — so this view-only endpoint returns only the
+    recurring month+day (``birth_month`` / ``birth_day``), never the birth year,
+    so view_only users can't harvest full DOBs. The disclosure is audited.
+
     Returns, e.g.
     [{"id": 7, "first_name": "Jane", "last_name": "Doe",
       "current_employer": "Goldman Sachs", "graduation_year": 2019,
-      "birth_date": "1997-06-03"}, ...]."""
+      "birth_month": 6, "birth_day": 3}, ...]."""
     active = Alumni.archived.is_(False)
     current_month = datetime.datetime.now(datetime.UTC).date().month
 
@@ -286,6 +331,9 @@ async def birthdays(_: RequireViewAccess, session: SessionDep) -> list[dict]:
             )
         )
     ).all()
+    await _audit_view(
+        session, actor, action_type="view", entity_type="dashboard:birthdays"
+    )
     return [
         {
             "id": a.alumni_id,
@@ -293,7 +341,9 @@ async def birthdays(_: RequireViewAccess, session: SessionDep) -> list[dict]:
             "last_name": a.last_name,
             "current_employer": employer,
             "graduation_year": a.graduation_year,
-            "birth_date": a.birth_date.isoformat() if a.birth_date else None,
+            # Recurring month+day only — never the birth year (FERPA: full DOB).
+            "birth_month": a.birth_date.month if a.birth_date else None,
+            "birth_day": a.birth_date.day if a.birth_date else None,
         }
         for a, employer in rows
     ]
@@ -367,7 +417,7 @@ async def event_participation(
 
 @router.get("/activity")
 async def activity_feed(
-    _: RequireViewAccess,
+    actor: RequireFullAccess,
     session: SessionDep,
     q: Annotated[
         str | None,
@@ -400,7 +450,11 @@ async def activity_feed(
     """Paginated all-time interaction feed (newest first) — the full version
     of the dashboard's old recent-activity panel, now on its own page. Supports
     optional server-side filtering by free-text search, interaction type, and an
-    inclusive date range; all filtering happens in PostgreSQL."""
+    inclusive date range; all filtering happens in PostgreSQL.
+
+    FERPA: this is a searchable feed of individual-alumni CRM interactions, so it
+    is gated to full_access (view_only gets 403) and the search/disclosure is
+    audited (actor + that a search happened, never the returned rows)."""
     # Build the shared filter predicates once so the count and the page agree.
     conditions = []
     if q and q.strip():
@@ -471,6 +525,13 @@ async def activity_feed(
             .order_by(Interaction.interaction_type)
         )
     ).all()
+    await _audit_view(
+        session,
+        actor,
+        action_type="search",
+        entity_type="dashboard:activity",
+        field_name="interaction_feed",
+    )
     return {
         "items": [_serialize_interaction(i, a, u) for i, a, u in rows],
         "types": [r[0] for r in type_rows],
@@ -514,11 +575,15 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
 
 @router.get("/contacted-this-month")
 async def contacted_this_month_list(
-    _: RequireViewAccess, session: SessionDep
+    actor: RequireFullAccess, session: SessionDep
 ) -> list[dict]:
     """The alumni behind the "Contacted this month" KPI — one row per distinct
     alumnus contacted in the last 30 days, carrying their most recent
-    interaction in the window (DISTINCT ON matches the KPI's distinct count)."""
+    interaction in the window (DISTINCT ON matches the KPI's distinct count).
+
+    FERPA: exposes individual alumni + CRM interaction data, so it is gated to
+    full_access (view_only gets 403) and the disclosure is audited; only the
+    aggregate count KPI on /summary stays view-accessible."""
     now = datetime.datetime.now(datetime.UTC)
     month_ago = now - datetime.timedelta(days=30)
     latest = (
@@ -540,6 +605,12 @@ async def contacted_this_month_list(
             .limit(200)
         )
     ).all()
+    await _audit_view(
+        session,
+        actor,
+        action_type="view",
+        entity_type="dashboard:contacted-this-month",
+    )
     return [
         {
             "interaction_id": i.interaction_id,
@@ -560,10 +631,14 @@ async def contacted_this_month_list(
 
 @router.get("/follow-ups")
 async def upcoming_follow_ups_list(
-    _: RequireViewAccess, session: SessionDep
+    actor: RequireFullAccess, session: SessionDep
 ) -> list[dict]:
     """The open tasks behind the "Upcoming follow-ups" KPI (incomplete, due
-    today or later), soonest due first — same predicate as the KPI count."""
+    today or later), soonest due first — same predicate as the KPI count.
+
+    FERPA: exposes individual alumni + their assigned follow-up tasks, so it is
+    gated to full_access (view_only gets 403) and the disclosure is audited; only
+    the aggregate count KPI on /summary stays view-accessible."""
     today = datetime.datetime.now(datetime.UTC).date()
     rows = (
         await session.execute(
@@ -578,6 +653,9 @@ async def upcoming_follow_ups_list(
             .limit(200)
         )
     ).all()
+    await _audit_view(
+        session, actor, action_type="view", entity_type="dashboard:follow-ups"
+    )
     return [
         {
             "task_id": t.follow_up_task_id,

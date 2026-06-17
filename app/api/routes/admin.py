@@ -1,28 +1,41 @@
 """User administration routes (super_admin only).
 
-Scope today: list provisioned users and manage their roles on EXISTING accounts.
-Creating brand-new auth users with a temporary one-time password (and forced
-first-login reset) is a separate, security-sensitive flow over the Supabase
-Admin API — see docs/PRE-LAUNCH.md — and is intentionally not implemented here.
+Scope: list provisioned users, manage their roles on EXISTING accounts, reset a
+user's password, edit a user's name, and create a brand-new login user. Creating
+a user provisions a Supabase *auth* identity over the Admin API (service-role
+key, server-side only) and returns a one-time temporary password exactly once —
+the same security posture as the password-reset flow (see docs/PRE-LAUNCH.md).
 """
 
+import logging
+import re
 import secrets
-from typing import Annotated
+import unicodedata
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import delete, select
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.dependencies.auth import RequireSuperAdmin
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
+from app.core.rate_limit import (
+    AssignRoleRateLimit,
+    CreateUserRateLimit,
+    ResetPasswordRateLimit,
+)
 from app.core.roles import RoleName
+from app.core.security import AuthorizationError
 from app.models.audit import AuditLog
 from app.models.login_attempt import LoginAttempt
 from app.models.user import Role, User, UserRole
-from app.services.supabase_admin import set_user_password
+from app.services.supabase_admin import create_user as create_auth_user
+from app.services.supabase_admin import delete_auth_user, set_user_password
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -42,9 +55,115 @@ def _generate_temp_password() -> str:
     return "".join(secrets.choice(_TEMP_PW_ALPHABET) for _ in range(_TEMP_PW_LENGTH))
 
 
+# --- Name validation ---------------------------------------------------------
+#
+# Mirror the alumni NAME rules (app/schemas/alumni.py): a permissive deny-list so
+# international/Unicode names pass, rejecting only characters that are meaningless
+# inside a human name but meaningful to a SQL parser, plus control chars. Names
+# are optional and capped at 100 to match ``users.first_name``/``last_name``.
+_NAME_DISALLOWED = set(";=<>|")
+_NAME_MAX = 100
+
+
+def _validate_optional_name(value: object) -> str | None:
+    """Validate/normalize an optional person-name field (or return ``None``)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Must be a string.")
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > _NAME_MAX:
+        raise ValueError(f"Must be at most {_NAME_MAX} characters.")
+    if any(unicodedata.category(ch) == "Cc" for ch in value):
+        raise ValueError("Must not contain control characters.")
+    bad = sorted(_NAME_DISALLOWED & set(value))
+    if bad:
+        raise ValueError("Must not contain these characters: " + " ".join(bad))
+    if value.isdigit():
+        raise ValueError("Must not be only digits.")
+    return value
+
+
+# Email: kept a bounded plain string (no email-validator dependency, matching the
+# rest of the project — see app/api/routes/auth.py). A light shape check rejects
+# obvious non-addresses; the value is stored lowercased and the throttle/auth
+# layers never trust it as a verified identity.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class CreateUserRequest(BaseModel):
+    """Provision a new login user. ``role_name`` is restricted to the
+    non-privileged roles (full_access / student / view_only) — the top roles
+    (engineer, super_admin) are NOT bootstrappable here — so an unknown or
+    disallowed role is a 422 before any query runs; names follow the alumni NAME
+    rules (≤100 chars). ``extra='forbid'`` rejects unknown keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=255)
+    first_name: str | None = None
+    last_name: str | None = None
+    # The top roles (engineer, super_admin) must NOT be bootstrappable via
+    # account creation — they can only be granted to an EXISTING user through
+    # the assign-role endpoint. Restrict the create payload to the non-privileged
+    # roles (full_access / student / view_only); anything else (incl. engineer
+    # and super_admin) is a clean 422.
+    role_name: Literal[
+        RoleName.FULL_ACCESS, RoleName.STUDENT, RoleName.VIEW_ONLY
+    ] = RoleName.VIEW_ONLY
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _validate_email(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = value.strip().lower()
+        if not _EMAIL_RE.match(value):
+            raise ValueError("Must be a valid email address.")
+        return value
+
+    @field_validator("first_name", "last_name", mode="before")
+    @classmethod
+    def _validate_name(cls, value: object) -> str | None:
+        return _validate_optional_name(value)
+
+
+class UpdateUserNameRequest(BaseModel):
+    """Edit a user's name. Both fields optional; same NAME rules (≤100 chars).
+    Only keys present in the body (``exclude_unset``) are applied — so a client
+    can clear a name by sending ``null``, or leave it untouched by omitting it.
+    ``extra='forbid'`` rejects unknown keys (notably ``active``, which has its own
+    endpoint)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    first_name: str | None = None
+    last_name: str | None = None
+
+    @field_validator("first_name", "last_name", mode="before")
+    @classmethod
+    def _validate_name(cls, value: object) -> str | None:
+        return _validate_optional_name(value)
+
+
 class ResetPasswordResponse(BaseModel):
     """The one-time temporary password, shown to the super_admin exactly once."""
 
+    temp_password: str
+
+
+class CreateUserResponse(BaseModel):
+    """The created user plus the one-time temporary password (shown exactly once,
+    like the reset flow). The password is NEVER persisted or audited."""
+
+    user_id: int
+    email: str
+    first_name: str | None = None
+    last_name: str | None = None
+    active: bool
+    roles: list[str]
     temp_password: str
 
 
@@ -82,6 +201,8 @@ def _serialize(u: User) -> dict:
         # the timestamp; locked_at is exposed for display/sorting.
         "locked": u.locked_at is not None,
         "locked_at": u.locked_at,
+        # When the account was provisioned — shown in the Users tab.
+        "created_at": u.created_at,
         "roles": [r.role_name for r in u.roles],
     }
 
@@ -96,14 +217,51 @@ async def _load_user(session: AsyncSession, user_id: int) -> User:
 
 
 @router.get("/users")
-async def list_users(_: RequireSuperAdmin, session: SessionDep) -> list[dict]:
-    """List all users with their assigned roles."""
+async def list_users(
+    actor: RequireSuperAdmin,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    """List provisioned users with their assigned roles (paginated).
+
+    Paginated (default 50, hard cap 200 — mirrors the audit endpoint) so a single
+    request can't enumerate the entire user directory at once, and each call is
+    audited (``list_users``) so reads of the user list leave a forensic trail.
+    The ``total`` count lets the UI page through. The access itself is recorded
+    (actor + applied limit/offset); the returned rows are NOT logged.
+    """
+    total = await session.scalar(select(func.count()).select_from(User))
     rows = await session.scalars(
-        select(User).options(selectinload(User.roles)).order_by(User.email)
+        select(User)
+        .options(selectinload(User.roles))
+        .order_by(User.email)
+        .limit(limit)
+        .offset(offset)
     )
-    return [_serialize(u) for u in rows.all()]
+    items = [_serialize(u) for u in rows.all()]
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="list_users",
+            entity_type="user",
+            field_name=f"limit={limit};offset={offset}",
+        )
+    )
+    await session.commit()
+
+    return {
+        "items": items,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
+# ``{user_id}`` is declared ``int`` (below), so string sub-paths like
+# ``/users/{user_id}/name`` are unambiguous and never shadowed by this route —
+# a non-numeric segment can't match an int path param.
 @router.patch("/users/{user_id}")
 async def set_user_active(
     user_id: int,
@@ -147,10 +305,21 @@ async def set_user_active(
 async def assign_role(
     user_id: int,
     payload: RoleAssign,
-    actor: RequireSuperAdmin,
+    actor: AssignRoleRateLimit,
     session: SessionDep,
 ) -> dict:
-    """Grant a role to an existing user (idempotent). super_admin only."""
+    """Grant a role to an existing user (idempotent). super_admin and up.
+
+    Rate-limited per actor (best-effort, in-process) to brake bulk privilege
+    changes. Privilege ceiling: only an ``engineer`` may grant the ``engineer``
+    role. A
+    ``super_admin`` (who is below engineer) cannot mint an account that outranks
+    them — that would be a privilege escalation above the actor's own ceiling.
+    """
+    if payload.role_name == RoleName.ENGINEER and not actor.is_engineer:
+        raise AuthorizationError(
+            "Only an engineer can grant the engineer role."
+        )
     user = await _load_user(session, user_id)
     role = await session.scalar(
         select(Role).where(Role.role_name == payload.role_name.value)
@@ -181,11 +350,20 @@ async def remove_role(
     actor: RequireSuperAdmin,
     session: SessionDep,
 ) -> dict:
-    """Revoke a role from an existing user (idempotent). super_admin only.
+    """Revoke a role from an existing user (idempotent). super_admin and up.
 
-    Guards against a super_admin removing their own last super_admin role, which
-    would lock user administration out of the system.
+    Privilege ceiling (symmetric with assign_role): only an ``engineer`` may
+    remove the ``engineer`` role. A ``super_admin`` cannot demote an engineer —
+    the engineer tier is managed exclusively by engineers.
+
+    Guards against an admin removing their OWN top role (super_admin or
+    engineer), which would lock user administration (or, for engineer, vocab /
+    database administration) out of the system if they were the last holder.
     """
+    if role_name == RoleName.ENGINEER and not actor.is_engineer:
+        raise AuthorizationError(
+            "Only an engineer can remove the engineer role."
+        )
     await _load_user(session, user_id)  # 404 if the user doesn't exist
     role = await session.scalar(
         select(Role).where(Role.role_name == role_name.value)
@@ -199,11 +377,27 @@ async def remove_role(
         )
     )
     if link is not None:
-        if (
-            role.role_name == RoleName.SUPER_ADMIN.value
-            and user_id == actor.user_id
-        ):
-            raise ConflictError("You cannot remove your own super_admin role.")
+        if role.role_name in {
+            RoleName.SUPER_ADMIN.value,
+            RoleName.ENGINEER.value,
+        }:
+            if user_id == actor.user_id:
+                raise ConflictError(
+                    f"You cannot remove your own {role.role_name} role."
+                )
+            # System-wide last-holder guard: never let the final holder of a top
+            # role (super_admin / engineer) be stripped, which would lock user
+            # (or, for engineer, vocab/database) administration out of the system
+            # for everyone — not just the actor. One COUNT over the role's links.
+            holders = await session.scalar(
+                select(func.count())
+                .select_from(UserRole)
+                .where(UserRole.role_id == role.role_id)
+            )
+            if (holders or 0) <= 1:
+                raise ConflictError(
+                    f"Cannot remove the last {role.role_name}."
+                )
         await session.delete(link)
         session.add(
             AuditLog(
@@ -222,7 +416,7 @@ async def remove_role(
 @router.post("/users/{user_id}/reset-password", response_model=ResetPasswordResponse)
 async def reset_password(
     user_id: int,
-    actor: RequireSuperAdmin,
+    actor: ResetPasswordRateLimit,
     session: SessionDep,
 ) -> ResetPasswordResponse:
     """Set a strong one-time temporary password on a user. super_admin only.
@@ -254,6 +448,9 @@ async def reset_password(
     was_locked = user.locked_at is not None
     user.locked_at = None
     user.locked_reason = None
+    # The user is now on a temp password — force them to set their own on next
+    # login (cleared via POST /auth/password/complete).
+    user.must_change_password = True
 
     # Drop the rolling failed-login counter for this email so a prior cooldown
     # doesn't immediately re-block the freshly-reset user. Match the throttle's
@@ -278,3 +475,153 @@ async def reset_password(
     await session.commit()
 
     return ResetPasswordResponse(temp_password=temp_password)
+
+
+@router.post("/users", response_model=CreateUserResponse, status_code=201)
+async def create_user(
+    payload: CreateUserRequest,
+    actor: CreateUserRateLimit,
+    session: SessionDep,
+) -> CreateUserResponse:
+    """Provision a brand-new login user. super_admin only.
+
+    Flow:
+      1. Reject up front if a ``users`` row with that email already exists. The
+         message is generic (anti-enumeration, consistent with the rest of the
+         codebase) — a 409 either way.
+      2. Generate a CSPRNG temp password and create the Supabase *auth* user over
+         the Admin API (server-side, service-role key, ``email_confirm=True`` so
+         the user can sign in immediately). A transport/non-2xx failure raises
+         ServiceError (502) WITHOUT leaking the upstream response, and BEFORE we
+         touch our DB — so a failed provision never leaves an orphaned row.
+      3. Insert the ``users`` row (linked by ``auth_user_id``) and a
+         ``user_roles`` row for the chosen role. If this DB write fails after the
+         auth identity was created, the auth user is deleted (compensating
+         action) so no orphaned identity with a known temp password is left.
+      4. Audit the action (``create_user``; actor = the super_admin, entity = the
+         new user; ``new_value`` = email). The password is NEVER logged, audited,
+         or returned in any channel other than this one-time response body.
+
+    The temp password is returned ONCE for the super_admin to hand to the user;
+    the user should change it on next login.
+    """
+    # Anti-enumeration: a duplicate email is a generic conflict, not a "user
+    # already exists" disclosure beyond the 409 itself.
+    existing = await session.scalar(
+        select(User.user_id).where(User.email == payload.email)
+    )
+    if existing is not None:
+        raise ConflictError("A user with that email already exists.")
+
+    role = await session.scalar(
+        select(Role).where(Role.role_name == payload.role_name.value)
+    )
+    if role is None:
+        raise NotFoundError(f"Role {payload.role_name.value} is not seeded.")
+
+    temp_password = _generate_temp_password()
+
+    # Create the auth identity FIRST. If this fails we raise (502) before writing
+    # any row, so we never persist a user without a matching auth account.
+    auth_user_id = await create_auth_user(payload.email, temp_password)
+
+    # The auth identity now exists with a known temp password. If the DB write
+    # below fails for ANY reason, that identity would be orphaned — so we
+    # compensate by best-effort deleting it, then re-raise the original error.
+    try:
+        user = User(
+            auth_user_id=auth_user_id,
+            email=payload.email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            active=True,
+            # New users start on a one-time temp password and must set their own
+            # on first login (cleared via POST /auth/password/complete).
+            must_change_password=True,
+        )
+        session.add(user)
+        await session.flush()  # populate user.user_id for the role link + audit
+
+        session.add(UserRole(user_id=user.user_id, role_id=role.role_id))
+        session.add(
+            AuditLog(
+                user_id=actor.user_id,
+                action_type="create_user",
+                entity_type="user",
+                entity_id=user.user_id,
+                field_name="email",
+                # The email is the safe identifier to record; the password is
+                # NEVER stored or audited.
+                new_value=payload.email,
+            )
+        )
+        await session.commit()
+    except Exception:
+        # Compensating delete of the just-created auth user so we don't leave an
+        # orphaned identity with a known temp password. Best-effort: if cleanup
+        # also fails, log the orphaned UUID at ERROR (never the password) so it
+        # can be reconciled manually, then re-raise the ORIGINAL error.
+        try:
+            await delete_auth_user(auth_user_id)
+        except Exception:
+            logger.error(
+                "Orphaned Supabase auth user %s: DB write failed and the "
+                "compensating delete also failed; reconcile manually.",
+                auth_user_id,
+            )
+        raise
+
+    created = await _load_user(session, user.user_id)
+    return CreateUserResponse(
+        user_id=created.user_id,
+        email=created.email,
+        first_name=created.first_name,
+        last_name=created.last_name,
+        active=created.active,
+        roles=[r.role_name for r in created.roles],
+        temp_password=temp_password,
+    )
+
+
+@router.patch("/users/{user_id}/name")
+async def update_user_name(
+    user_id: int,
+    payload: UpdateUserNameRequest,
+    actor: RequireSuperAdmin,
+    session: SessionDep,
+) -> dict:
+    """Edit a user's first/last name. super_admin only.
+
+    Only fields present in the body are applied (``exclude_unset``); each field
+    that actually changes is audited separately (``update_user``; ``field_name``
+    = ``first_name``/``last_name``; old + new value). A no-op (same value, or no
+    fields sent) is idempotent and not audited. 404 if the user doesn't exist.
+    """
+    user = await _load_user(session, user_id)
+
+    changes = payload.model_dump(exclude_unset=True)
+    audited = False
+    for field_name in ("first_name", "last_name"):
+        if field_name not in changes:
+            continue
+        new_value = changes[field_name]
+        old_value = getattr(user, field_name)
+        if old_value == new_value:
+            continue
+        setattr(user, field_name, new_value)
+        session.add(
+            AuditLog(
+                user_id=actor.user_id,
+                action_type="update_user",
+                entity_type="user",
+                entity_id=user_id,
+                field_name=field_name,
+                old_value=old_value,
+                new_value=new_value,
+            )
+        )
+        audited = True
+
+    if audited:
+        await session.commit()
+    return _serialize(await _load_user(session, user_id))

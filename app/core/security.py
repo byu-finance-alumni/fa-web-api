@@ -63,6 +63,27 @@ class DeactivatedAccountError(AuthorizationError):
         super().__init__(message)
 
 
+class MustChangePasswordError(AuthorizationError):
+    """Raised when a valid token belongs to a user who must change their
+    (admin-issued temp) password before doing anything else.
+
+    A subclass of AuthorizationError so it still maps to 403, but distinct so it
+    surfaces with the machine code ``password_change_required`` and is recorded
+    as its own ``password_change_required`` security event. Enforced on EVERY
+    authenticated route except the two needed to complete the change itself, so a
+    user holding a valid session can't bypass the forced change by calling the
+    backend directly.
+    """
+
+    def __init__(
+        self,
+        message: str = (
+            "You must change your password before continuing."
+        ),
+    ) -> None:
+        super().__init__(message)
+
+
 @lru_cache
 def _jwk_client(jwks_url: str) -> PyJWKClient:
     return PyJWKClient(jwks_url)
@@ -102,6 +123,15 @@ def verify_supabase_jwt(token: str) -> dict[str, Any]:
     settings = get_settings()
     key, alg = _resolve_key_and_alg(token)
 
+    # Issuer validation: when supabase_url is configured we PIN the issuer so a
+    # correctly-signed token minted by a DIFFERENT Supabase project is rejected.
+    # The asymmetric (RS256/ES256) path already hard-requires supabase_url (it is
+    # needed to fetch the JWKS, see _resolve_key_and_alg), so an asymmetric token
+    # can never reach here with issuer=None. The HS256 path is the documented
+    # offline mode (shared secret, no project URL) and intentionally still
+    # verifies signature + audience + exp without an issuer pin.
+    if alg in _SUPPORTED_ASYMMETRIC and not settings.supabase_url:
+        raise AuthError("Server is not configured to verify tokens.")
     issuer = (
         f"{settings.supabase_url.rstrip('/')}/auth/v1"
         if settings.supabase_url

@@ -1,0 +1,95 @@
+"""Best-effort, in-process per-actor rate limiting for destructive admin routes.
+
+This is a simple fixed-window counter keyed by ``(bucket, actor_id)`` held in a
+module-level dict. It is intentionally lightweight and dependency-free.
+
+SERVERLESS CAVEAT: the counter lives in process memory, so on a serverless /
+multi-instance deployment (e.g. Vercel) each instance keeps its OWN window and a
+determined caller spread across instances could exceed the nominal limit. It is
+therefore a best-effort brake against accidental floods and casual abuse from a
+single warm instance — NOT a hard security boundary. The real guard rails are
+the super_admin authz gate, the audit log, and the platform WAF rate limiting.
+A shared store (Redis/Postgres) would be required for a strict global limit.
+
+Each limiter is exposed as a FastAPI dependency factory (``rate_limiter(...)``)
+that is added directly to a route signature; it resolves the acting user via the
+same ``require_super_admin`` guard the routes already use, so it never trusts a
+client-supplied identity. Exceeding the limit raises HTTP 429.
+"""
+
+import time
+from collections import defaultdict
+from typing import Annotated
+
+from fastapi import Depends, HTTPException, status
+
+from app.api.dependencies.auth import RequireSuperAdmin
+from app.schemas.auth import UserContext
+
+# Module-level state: {bucket_name: {actor_id: [timestamp, timestamp, ...]}}.
+# Timestamps are monotonic seconds; aged-out entries are pruned lazily on each
+# check so the dict can't grow without bound for a steady caller.
+_WINDOWS: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+
+_TOO_MANY_REQUESTS = {
+    "error": {
+        "code": "rate_limited",
+        "message": "Too many requests; please slow down and retry later.",
+    }
+}
+
+
+def _check(bucket: str, actor_id: int, *, limit: int, window_seconds: float) -> None:
+    """Record one hit for ``actor_id`` in ``bucket`` and raise 429 if over ``limit``.
+
+    Fixed-window: count the actor's hits inside the trailing ``window_seconds``;
+    if that count (including this one) would exceed ``limit``, raise 429 WITHOUT
+    recording the hit (so a blocked caller can't push their own window forward).
+    """
+    now = time.monotonic()
+    cutoff = now - window_seconds
+    hits = _WINDOWS[bucket][actor_id]
+    # Prune timestamps that have aged out of the window.
+    hits[:] = [t for t in hits if t > cutoff]
+    if len(hits) >= limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=_TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(int(window_seconds))},
+        )
+    hits.append(now)
+
+
+def reset() -> None:
+    """Clear all rate-limit state. For tests only."""
+    _WINDOWS.clear()
+
+
+def rate_limiter(bucket: str, *, limit: int, window_seconds: float):
+    """Build a FastAPI dependency enforcing ``limit`` hits per ``window_seconds``
+    per actor for the named ``bucket``.
+
+    The dependency resolves the actor through ``require_super_admin`` (so the
+    route is still gated and the identity is server-trusted), records the hit,
+    and raises HTTP 429 when the actor is over budget.
+    """
+
+    async def _dependency(actor: RequireSuperAdmin) -> UserContext:
+        _check(bucket, actor.user_id, limit=limit, window_seconds=window_seconds)
+        return actor
+
+    return _dependency
+
+
+# Destructive-admin limits. Reset-password is the most sensitive (it mints a
+# usable credential), so it gets the tightest budget; create_user and
+# assign_role are throttled a little more loosely.
+RESET_PASSWORD_LIMITER = rate_limiter(
+    "admin:reset_password", limit=5, window_seconds=600
+)
+CREATE_USER_LIMITER = rate_limiter("admin:create_user", limit=10, window_seconds=600)
+ASSIGN_ROLE_LIMITER = rate_limiter("admin:assign_role", limit=30, window_seconds=600)
+
+ResetPasswordRateLimit = Annotated[UserContext, Depends(RESET_PASSWORD_LIMITER)]
+CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
+AssignRoleRateLimit = Annotated[UserContext, Depends(ASSIGN_ROLE_LIMITER)]

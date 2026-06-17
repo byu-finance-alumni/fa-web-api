@@ -6,6 +6,7 @@ Owns the rules that aren't just data access:
     later imports won't clobber it (manual edits win)
 """
 
+import contextlib
 import datetime
 
 from sqlalchemy import select
@@ -82,9 +83,24 @@ async def _validate_spouse_link(
         raise NotFoundError(f"Spouse alumni {spouse_alumni_id} not found.")
 
 
-async def get_alumni(session: AsyncSession, alumni_id: int) -> Alumni:
+async def get_alumni(
+    session: AsyncSession,
+    alumni_id: int,
+    *,
+    include_archived: bool = False,
+) -> Alumni:
+    """Fetch one alumnus by id.
+
+    Archived (soft-deleted) records are treated as absent (404) for normal
+    reads — a direct ``GET /alumni/{id}`` must not surface a record that was
+    removed from the directory. ``include_archived=True`` (full_access edit
+    flows: preview/update/archive/restore) bypasses that so those paths keep
+    working on archived rows.
+    """
     alumnus = await repo.get(session, alumni_id)
     if alumnus is None:
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    if alumnus.archived and not include_archived:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
     return alumnus
 
@@ -100,6 +116,68 @@ async def list_alumni(
     (see ``build_alumni_query``: q, graduation_year, grad_year_min/max,
     deceased, include_archived)."""
     return await repo.list_page(session, limit=limit, offset=offset, **filters)
+
+
+async def log_search(
+    session: AsyncSession,
+    *,
+    actor_user_id: int | None,
+    filters: dict[str, object],
+) -> None:
+    """Record a disclosure-audit row for an alumni search/list (FERPA).
+
+    Stores the actor + a short summary of the ACTIVE filters (only the
+    non-empty ones) in ``new_value`` — never the result payload. One lightweight
+    row per search. No-op when the actor is unknown.
+    """
+    if actor_user_id is None:
+        return
+    active = {k: v for k, v in filters.items() if v not in (None, "", False)}
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(active.items())) or "(no filters)"
+    # Best-effort: a disclosure-audit failure must NEVER break the read itself.
+    try:
+        session.add(
+            AuditLog(
+                user_id=actor_user_id,
+                action_type="search",
+                entity_type="alumni",
+                entity_id=None,
+                new_value=summary[:1000],
+            )
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - audit is best-effort
+        with contextlib.suppress(Exception):
+            await session.rollback()
+
+
+async def log_preview(
+    session: AsyncSession,
+    *,
+    actor_user_id: int | None,
+    alumni_id: int | None = None,
+) -> None:
+    """Record an audit row for a data-hygiene preview (FERPA).
+
+    Previews read the DB (duplicate detection) and surface stored data, so they
+    are a disclosure worth attributing. ``alumni_id`` is set for an EDIT preview
+    and ``None`` for a CREATE preview. No-op when the actor is unknown.
+    """
+    if actor_user_id is None:
+        return
+    try:
+        session.add(
+            AuditLog(
+                user_id=actor_user_id,
+                action_type="preview",
+                entity_type="alumni",
+                entity_id=alumni_id,
+            )
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - audit is best-effort
+        with contextlib.suppress(Exception):
+            await session.rollback()
 
 
 async def create_alumni(
@@ -198,7 +276,7 @@ async def update_alumni(
     payload: AlumniUpdateFull,
     actor_user_id: int | None = None,
 ) -> Alumni:
-    alumnus = await get_alumni(session, alumni_id)
+    alumnus = await get_alumni(session, alumni_id, include_archived=True)
     # Data-hygiene pass: clean the provided fields (write the CLEANED values) and
     # block exact duplicates against everyone *except* this record. Fuzzy
     # warnings never block. jsonable=False keeps dates as date objects for the
@@ -290,7 +368,7 @@ async def archive_alumni(
     session: AsyncSession, alumni_id: int, actor_user_id: int | None = None
 ) -> Alumni:
     """Soft-delete: flag the record archived. Idempotent."""
-    alumnus = await get_alumni(session, alumni_id)
+    alumnus = await get_alumni(session, alumni_id, include_archived=True)
     if not alumnus.archived:
         alumnus.archived = True
         alumnus.manually_edited_at = _now()
@@ -304,7 +382,7 @@ async def restore_alumni(
     session: AsyncSession, alumni_id: int, actor_user_id: int | None = None
 ) -> Alumni:
     """Reverse a soft-delete (unarchive). Idempotent."""
-    alumnus = await get_alumni(session, alumni_id)
+    alumnus = await get_alumni(session, alumni_id, include_archived=True)
     if alumnus.archived:
         alumnus.archived = False
         alumnus.manually_edited_at = _now()

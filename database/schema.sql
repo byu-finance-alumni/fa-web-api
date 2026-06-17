@@ -27,6 +27,10 @@ CREATE TABLE users (
     active          boolean NOT NULL DEFAULT true,
     auth_provider   varchar(50),
     last_login_at   timestamptz,
+    -- Force a password change on next login. Set true on account creation (temp
+    -- password) or a super_admin password reset; cleared by the user themselves
+    -- via POST /auth/password/complete. See app/api/routes/auth.py.
+    must_change_password boolean NOT NULL DEFAULT false,
     -- Hard account lock after too many failed logins (see login_attempts and
     -- app/services/login_lockout.py). Cleared by a super_admin password reset.
     locked_at       timestamptz,
@@ -306,6 +310,21 @@ CREATE TABLE alumni_status_labels (
     CONSTRAINT fk_alumni_status_labels_status_label_id FOREIGN KEY (status_label_id) REFERENCES status_labels (status_label_id) ON DELETE CASCADE,
     CONSTRAINT uq_alumni_status_labels UNIQUE (alumni_id, status_label_id)
 );
+
+-- Editable controlled vocabulary (#82): one row per dropdown option in a
+-- category (industry, event_type, attendance_status, interaction_type).
+-- Engineer/super_admin manage these at runtime; active=false soft-hides a term.
+CREATE TABLE vocabulary_terms (
+    term_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    category    varchar(50) NOT NULL,
+    value       varchar(100) NOT NULL,
+    sort_order  integer NOT NULL DEFAULT 0,
+    active      boolean NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT uq_vocabulary_terms_category_value UNIQUE (category, value)
+);
+CREATE INDEX ix_vocabulary_terms_category_active ON vocabulary_terms (category, active);
 
 -- -----------------------------------------------------------------------------
 -- CRM activity: interactions, tasks, events, surveys, attachments

@@ -6,11 +6,13 @@ Run locally with:
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app import __version__
 from app.api.routes import (
@@ -23,11 +25,17 @@ from app.api.routes import (
     geography,
     health,
     tasks,
+    vocabulary,
 )
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.errors import ConflictError, NotFoundError, ServiceError
-from app.core.security import AuthError, AuthorizationError, DeactivatedAccountError
+from app.core.security import (
+    AuthError,
+    AuthorizationError,
+    DeactivatedAccountError,
+    MustChangePasswordError,
+)
 from app.core.security_log import log_security_event
 
 logging.basicConfig(level=logging.INFO)
@@ -52,16 +60,67 @@ async def lifespan(app: FastAPI):
 # debug tracebacks in production — the schema is a recon map of the full API.
 _is_prod = settings.environment == "production"
 
+# Brand favicon (gear mark) served from the package; distinguishes the API tab
+# from the web app's network mark. Loaded once at import so the route is a cheap
+# in-memory send rather than a per-request disk read.
+_FAVICON_PATH = Path(__file__).resolve().parent / "static" / "favicon.svg"
+_FAVICON_SVG = _FAVICON_PATH.read_bytes()
+_FAVICON_URL = "/favicon.svg"
+
 app = FastAPI(
     title="BYU Finance Alumni Database API",
     description="Backend API and database layer for the BYU Finance Alumni Database.",
     version=__version__,
     debug=settings.debug and not _is_prod,
-    docs_url=None if _is_prod else "/docs",
-    redoc_url=None if _is_prod else "/redoc",
+    # Disable the built-in docs routes so we can re-register them below with our
+    # own favicon; the OpenAPI schema route stays on FastAPI's default.
+    docs_url=None,
+    redoc_url=None,
     openapi_url=None if _is_prod else "/openapi.json",
     lifespan=lifespan,
 )
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+async def favicon_svg() -> Response:
+    """Serve the brand gear favicon (SVG, crisp at every size)."""
+    return Response(
+        content=_FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_ico() -> FileResponse:
+    """Legacy ``/favicon.ico`` path — browsers that request it get the SVG.
+
+    No binary .ico is shipped; modern browsers honor the SVG served with an
+    image media type. Generate a real multi-size .ico later if legacy IE/older
+    Safari support is ever needed (see the favicon notes).
+    """
+    return FileResponse(_FAVICON_PATH, media_type="image/svg+xml")
+
+
+# Custom docs routes (only when docs are exposed, i.e. non-prod) so Swagger UI
+# and ReDoc show the brand favicon instead of FastAPI's default.
+if not _is_prod:
+
+    @app.get("/docs", include_in_schema=False)
+    async def swagger_ui_html() -> Response:
+        return get_swagger_ui_html(
+            openapi_url=app.openapi_url,
+            title=f"{app.title} — Swagger UI",
+            swagger_favicon_url=_FAVICON_URL,
+        )
+
+    @app.get("/redoc", include_in_schema=False)
+    async def redoc_html() -> Response:
+        return get_redoc_html(
+            openapi_url=app.openapi_url,
+            title=f"{app.title} — ReDoc",
+            redoc_favicon_url=_FAVICON_URL,
+        )
 
 # Allow the configured frontend origins to call the API from the browser.
 app.add_middleware(
@@ -81,6 +140,8 @@ app.include_router(events.router)
 app.include_router(audit.router)
 app.include_router(geography.router)
 app.include_router(tasks.router)
+app.include_router(vocabulary.router)
+app.include_router(vocabulary.admin_router)
 
 
 @app.exception_handler(AuthError)
@@ -113,6 +174,33 @@ async def deactivated_account_handler(
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={"error": {"code": "forbidden", "message": exc.message}},
+    )
+
+
+@app.exception_handler(MustChangePasswordError)
+async def must_change_password_handler(
+    request: Request, exc: MustChangePasswordError
+) -> JSONResponse:
+    """Return 403 / ``password_change_required`` for a user who still holds the
+    force-password-change flag.
+
+    Registered ahead of (and distinctly from) the generic AuthorizationError
+    handler so the subclass is dispatched here: a user on an admin-issued temp
+    password is blocked on EVERY authenticated route except the two that let them
+    complete the change, and the block is recorded as its own
+    ``password_change_required`` security event.
+    """
+    log_security_event(
+        request, "password_change_required", status_code=403, detail=exc.message
+    )
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={
+            "error": {
+                "code": "password_change_required",
+                "message": exc.message,
+            }
+        },
     )
 
 

@@ -343,7 +343,15 @@ async def get_city_detail(session, state: str, city: str, filters: dict) -> dict
     }
 
 
-async def _distinct(session, column) -> list:
+# Cap the per-dimension filter-option lists returned by /geography/summary. These
+# feed dropdowns, not analytics, so a sane top-N is plenty — and it stops the
+# endpoint from dumping the entire enumerable set (every employer / city / etc.)
+# in one unauthenticated-by-aggregate response. The 'View all' breakdown still
+# offers the full ranked list when explicitly requested.
+_OPTIONS_CAP = 200
+
+
+async def _distinct(session, column, *, limit: int = _OPTIONS_CAP) -> list:
     rows = (
         await session.execute(
             select(column)
@@ -359,6 +367,7 @@ async def _distinct(session, column) -> list:
             .where(Alumni.archived.is_(False), column.is_not(None))
             .distinct()
             .order_by(column)
+            .limit(limit)
         )
     ).all()
     return [r[0] for r in rows]
@@ -500,7 +509,9 @@ async def get_summary(session, filters: dict) -> dict:
                 r[0]
                 for r in (
                     await session.execute(
-                        select(Tag.tag_name).order_by(Tag.tag_name)
+                        select(Tag.tag_name)
+                        .order_by(Tag.tag_name)
+                        .limit(_OPTIONS_CAP)
                     )
                 ).all()
             ],

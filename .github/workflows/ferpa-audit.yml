@@ -1,0 +1,48 @@
+name: FERPA / privacy review
+
+# Runs the FERPA/privacy auditor over a PR's diff whenever data-handling code
+# changes, and posts findings as a PR review comment. Requires the repo secret
+# ANTHROPIC_API_KEY. See .github/ferpa/prompt.md for the review rubric.
+
+on:
+  pull_request:
+    branches: [dev, prod]
+    paths:
+      - "app/api/**"
+      - "app/services/**"
+      - "app/models/**"
+      - "app/schemas/**"
+      - "app/repositories/**"
+      - "app/core/**"
+      - "database/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ferpa-review:
+    name: FERPA / privacy review
+    runs-on: ubuntu-latest
+    # Skip on fork PRs (no access to the API key secret) so they don't hard-fail.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Audit the PR diff for FERPA / privacy compliance
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Read .github/ferpa/prompt.md and follow it exactly. Audit ONLY the
+            changes in this pull request — run
+            `git diff origin/${{ github.base_ref }}...HEAD` to see them — for FERPA
+            and data-privacy compliance, then post your findings as a single PR
+            review comment in the severity format that file defines. If the diff is
+            clean, post a short comment saying so and what you verified.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 15
+            --allowedTools Bash,Read,Grep,Glob

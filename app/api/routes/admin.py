@@ -25,6 +25,7 @@ from app.core.errors import ConflictError, NotFoundError
 from app.core.rate_limit import (
     AssignRoleRateLimit,
     CreateUserRateLimit,
+    DeleteUserRateLimit,
     ResetPasswordRateLimit,
 )
 from app.core.roles import RoleName
@@ -167,6 +168,16 @@ class CreateUserResponse(BaseModel):
     temp_password: str
 
 
+class DeleteUserResponse(BaseModel):
+    """Confirmation of a permanent user deletion (the row is gone, so there is
+    nothing left to serialize). The deleted user's id + email are echoed back so
+    the UI can confirm exactly which account was removed."""
+
+    deleted: bool
+    user_id: int
+    email: str
+
+
 class RoleAssign(BaseModel):
     """Assign a canonical role to a user. ``role_name`` is validated against the
     RoleName enum, so an unknown role is a 422 before any query runs."""
@@ -179,9 +190,11 @@ class RoleAssign(BaseModel):
 class UserActiveUpdate(BaseModel):
     """Activate or deactivate an existing user account.
 
-    The project never hard-deletes users; deactivation flips ``users.active`` to
-    false, which the auth dependency layer enforces — a deactivated user is
-    blocked (403) on every authenticated route.
+    Deactivation is the REVERSIBLE way to remove access: it flips
+    ``users.active`` to false, which the auth dependency layer enforces — a
+    deactivated user is blocked (403) on every authenticated route but keeps
+    their row, roles, and history and can be reactivated later. To remove an
+    account permanently instead, use DELETE ``/users/{id}``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -271,12 +284,13 @@ async def set_user_active(
 ) -> dict:
     """Deactivate or reactivate an existing user. super_admin only.
 
-    Deactivation is the project's stand-in for removing access (users are never
-    hard-deleted): once ``active`` is false the auth dependency rejects every
-    authenticated request from that user. A super_admin cannot deactivate their
-    own account — that could lock administration out of the system. Every change
-    is audited; a no-op (already in the requested state) is idempotent and not
-    re-audited.
+    Deactivation is the REVERSIBLE way to remove access: once ``active`` is false
+    the auth dependency rejects every authenticated request from that user, but
+    the row/roles/history are kept and access can be restored later. (Permanent
+    removal is the separate DELETE ``/users/{id}`` endpoint.) A super_admin cannot
+    deactivate their own account — that could lock administration out of the
+    system. Every change is audited; a no-op (already in the requested state) is
+    idempotent and not re-audited.
     """
     if payload.active is False and user_id == actor.user_id:
         raise ConflictError("You cannot deactivate your own account.")
@@ -299,6 +313,103 @@ async def set_user_active(
         )
         await session.commit()
     return _serialize(await _load_user(session, user_id))
+
+
+@router.delete("/users/{user_id}", response_model=DeleteUserResponse)
+async def delete_user(
+    user_id: int,
+    actor: DeleteUserRateLimit,
+    session: SessionDep,
+) -> DeleteUserResponse:
+    """Permanently delete a user — both the ``users`` row and the Supabase auth
+    identity. super_admin and engineer only (engineer satisfies the guard).
+
+    This is the irreversible counterpart to deactivation: use PATCH
+    ``/users/{id}`` (``active=false``) to suspend access reversibly; use this to
+    remove the account entirely (e.g. a wrong/duplicate provision).
+
+    Integrity is handled by the schema's foreign keys, NOT by cascading our own
+    deletes: ``user_roles`` is ``ON DELETE CASCADE`` (role grants are removed
+    with the user), and every other reference — audit logs, interactions, tasks,
+    events, attachments, import batches — is ``ON DELETE SET NULL``. So the
+    FERPA audit trail and all alumni-side history are preserved; only the actor
+    pointer on those rows becomes null.
+
+    Guards (mirroring remove_role):
+      * You cannot delete your own account.
+      * Privilege ceiling: only an engineer may delete a user who holds the
+        engineer role.
+      * Last-holder guard: you cannot delete the final holder of a top role
+        (super_admin / engineer), which would lock administration out for
+        everyone.
+
+    Order of operations: the DB row (plus a ``delete_user`` audit entry,
+    attributed to the actor and recording the deleted user's email) is committed
+    FIRST, then the Supabase auth identity is best-effort deleted. If that last
+    step fails the account is already gone from the app (the auth layer requires
+    a matching ``users`` row), so we log the orphaned auth UUID for manual
+    reconciliation rather than failing the request.
+    """
+    if user_id == actor.user_id:
+        raise ConflictError("You cannot delete your own account.")
+
+    user = await _load_user(session, user_id)
+    target_roles = {r.role_name for r in user.roles}
+
+    # Privilege ceiling: the engineer tier is managed exclusively by engineers.
+    if RoleName.ENGINEER.value in target_roles and not actor.is_engineer:
+        raise AuthorizationError("Only an engineer can delete an engineer.")
+
+    # System-wide last-holder guard: never delete the final holder of a top role,
+    # which would lock user (or engineer-only vocab/database) administration out
+    # of the system for everyone.
+    for top_role in (RoleName.SUPER_ADMIN.value, RoleName.ENGINEER.value):
+        if top_role in target_roles:
+            role = await session.scalar(
+                select(Role).where(Role.role_name == top_role)
+            )
+            holders = await session.scalar(
+                select(func.count())
+                .select_from(UserRole)
+                .where(UserRole.role_id == role.role_id)
+            )
+            if (holders or 0) <= 1:
+                raise ConflictError(f"Cannot delete the last {top_role}.")
+
+    auth_user_id = user.auth_user_id
+    email = user.email
+
+    # Audit BEFORE the delete: the actor still exists, and we capture the deleted
+    # user's email/id (entity_id has no FK, so it survives the row removal).
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="delete_user",
+            entity_type="user",
+            entity_id=user_id,
+            field_name="email",
+            old_value=email,
+        )
+    )
+    await session.delete(user)  # cascades user_roles; SET NULL on every other ref
+    await session.commit()
+
+    # Best-effort removal of the auth identity (compensating-style, like
+    # create_user's cleanup). A failure here leaves an orphaned Supabase identity
+    # that can no longer use the app; log the UUID (never any secret) so it can be
+    # reconciled manually.
+    try:
+        await delete_auth_user(auth_user_id)
+    except Exception:
+        logger.error(
+            "User %s (%s) deleted from the database, but the Supabase auth "
+            "identity %s could not be deleted; reconcile manually.",
+            user_id,
+            email,
+            auth_user_id,
+        )
+
+    return DeleteUserResponse(deleted=True, user_id=user_id, email=email)
 
 
 @router.post("/users/{user_id}/roles")

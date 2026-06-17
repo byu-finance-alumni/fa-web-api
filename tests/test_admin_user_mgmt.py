@@ -490,3 +490,211 @@ def test_update_name_rejects_active_field():
         )
     app.dependency_overrides.clear()
     assert resp.status_code == 422
+
+
+# --- delete user (permanent) -------------------------------------------------
+
+
+def _del_user(user_id=5, *, email=None, roles=("view_only",)):
+    return SimpleNamespace(
+        user_id=user_id,
+        email=email or f"user{user_id}@byu.edu",
+        first_name="Del",
+        last_name="Ete",
+        active=True,
+        auth_user_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+        locked_at=None,
+        created_at=None,
+        roles=[SimpleNamespace(role_name=r) for r in roles],
+    )
+
+
+class _DeleteSession:
+    """Fake session for the delete-user route.
+
+    ``scalar`` is call-order driven: call 1 is ``_load_user`` (the target). If
+    the target holds a top role, the last-holder guard then issues a Role lookup
+    followed by a holders COUNT per top role — modelled here as alternating
+    role/``holders`` returns. ``delete`` and ``add``/``commit`` are recorded.
+    """
+
+    def __init__(self, user, *, role=None, holders=2):
+        self.user = user
+        self._role = role
+        self._holders = holders
+        self.added: list = []
+        self.deleted: list = []
+        self.commits = 0
+        self._calls = 0
+
+    async def scalar(self, _stmt):
+        self._calls += 1
+        if self._calls == 1:
+            return self.user  # _load_user
+        # guard pairs: even call -> Role lookup, odd call -> holders COUNT
+        return self._role if self._calls % 2 == 0 else self._holders
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def delete(self, obj):
+        self.deleted.append(obj)
+
+    async def commit(self):
+        self.commits += 1
+
+
+def test_delete_user_requires_auth():
+    app.dependency_overrides[get_session] = _no_db_session
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("role", ["view_only", "full_access", "student"])
+def test_delete_user_forbidden_below_super_admin(role):
+    app.dependency_overrides[get_session] = _no_db_session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+
+
+def test_delete_user_happy_path(monkeypatch):
+    """super_admin deletes a view_only user: DB row deleted + audited, and the
+    Supabase auth identity is removed."""
+    user = _del_user(5, email="gone@byu.edu")
+    session = _DeleteSession(user)
+
+    deleted_auth: list = []
+
+    async def _fake_delete_auth_user(auth_user_id):
+        deleted_auth.append(auth_user_id)
+
+    monkeypatch.setattr(admin_routes, "delete_auth_user", _fake_delete_auth_user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"deleted": True, "user_id": 5, "email": "gone@byu.edu"}
+    # The user row was deleted, the auth identity removed, and a delete_user
+    # audit (recording the email) was written attributed to the actor.
+    assert session.deleted == [user]
+    assert deleted_auth == [user.auth_user_id]
+    audit = next(a for a in session.added if a.action_type == "delete_user")
+    assert audit.user_id == 1
+    assert audit.entity_id == 5
+    assert audit.old_value == "gone@byu.edu"
+
+
+def test_delete_user_cannot_delete_self():
+    session = _DeleteSession(_del_user(1))
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/1")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 409
+    assert session.deleted == []  # nothing removed
+
+
+def test_delete_user_engineer_requires_engineer():
+    """A super_admin cannot delete a user who holds the engineer role."""
+    user = _del_user(5, roles=("engineer",))
+    session = _DeleteSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    assert session.deleted == []
+
+
+def test_delete_user_last_super_admin_blocked():
+    """Deleting the final super_admin is refused (would lock admin out)."""
+    user = _del_user(5, roles=("super_admin",))
+    role = SimpleNamespace(role_id=2, role_name="super_admin")
+    session = _DeleteSession(user, role=role, holders=1)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "engineer", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 409
+    assert session.deleted == []
+
+
+def test_delete_user_404_when_missing():
+    session = _DeleteSession(None)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 404
+
+
+def test_delete_user_auth_failure_still_succeeds(monkeypatch):
+    """If the DB row is gone but the Supabase delete fails, the request still
+    succeeds (best-effort) — the account is already removed from the app."""
+    user = _del_user(5)
+    session = _DeleteSession(user)
+
+    async def _failing_delete_auth_user(auth_user_id):
+        raise ServiceError("auth down")
+
+    monkeypatch.setattr(
+        admin_routes, "delete_auth_user", _failing_delete_auth_user
+    )
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert session.deleted == [user]  # DB delete committed despite auth failure

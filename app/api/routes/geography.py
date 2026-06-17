@@ -15,6 +15,14 @@ from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
 from app.models.audit import AuditLog
 from app.schemas.auth import UserContext
+from app.schemas.geography import (
+    Breakdown,
+    CityDetail,
+    GeoAlumniPage,
+    GeoSummary,
+    StateCount,
+    StateDetail,
+)
 from app.services import geography as svc
 
 logger = logging.getLogger(__name__)
@@ -70,23 +78,23 @@ def filter_params(
 FiltersDep = Annotated[dict, Depends(filter_params)]
 
 
-@router.get("/summary")
+@router.get("/summary", response_model=GeoSummary)
 async def summary(
     _: RequireViewAccess, session: SessionDep, filters: FiltersDep
-) -> dict:
+) -> GeoSummary:
     """Analytics cards + the available filter options."""
     return await svc.get_summary(session, filters)
 
 
-@router.get("/states")
+@router.get("/states", response_model=list[StateCount])
 async def states(
     _: RequireViewAccess, session: SessionDep, filters: FiltersDep
-) -> list[dict]:
+) -> list[StateCount]:
     """Per-state alumni counts for the choropleth map and Top States ranking."""
     return await svc.get_states(session, filters)
 
 
-@router.get("/breakdown")
+@router.get("/breakdown", response_model=Breakdown)
 async def breakdown(
     _: RequireViewAccess,
     session: SessionDep,
@@ -94,20 +102,20 @@ async def breakdown(
     dimension: Annotated[
         str, Query(pattern="^(states|cities|employers|industries)$")
     ],
-) -> dict:
+) -> Breakdown:
     """Full ranked list for a dimension (the 'View all' breakdown table)."""
     return await svc.get_breakdown(session, dimension, filters)
 
 
-@router.get("/states/{state}")
+@router.get("/states/{state}", response_model=StateDetail)
 async def state_detail(
     state: str, _: RequireViewAccess, session: SessionDep, filters: FiltersDep
-) -> dict:
+) -> StateDetail:
     """Count + top cities / employers / industries for one state."""
     return await svc.get_state_detail(session, state, filters)
 
 
-@router.get("/states/{state}/alumni")
+@router.get("/states/{state}/alumni", response_model=GeoAlumniPage)
 async def state_alumni(
     state: str,
     actor: RequireFullAccess,
@@ -116,7 +124,7 @@ async def state_alumni(
     sort: Annotated[str, Query(pattern="^(name|year|city)$")] = "name",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> dict:
+) -> GeoAlumniPage:
     """Paginated, sortable alumni list for a state.
 
     FERPA: this lists the individual alumni behind a state count, so it is gated
@@ -131,14 +139,14 @@ async def state_alumni(
     return result
 
 
-@router.get("/cities")
+@router.get("/cities", response_model=CityDetail)
 async def city_detail(
     actor: RequireFullAccess,
     session: SessionDep,
     filters: FiltersDep,
     state: Annotated[str, Query(min_length=1)],
     city: Annotated[str, Query(min_length=1)],
-) -> dict:
+) -> CityDetail:
     """City drill-down: count + employer / industry / grad-year distribution
     AND the individual alumni in that city.
 

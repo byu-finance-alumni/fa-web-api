@@ -424,9 +424,36 @@ CREATE TABLE audit_logs (
     field_name   varchar(255),
     old_value    text,
     new_value    text,
+    -- Actor identity snapshotted at INSERT time (trigger below) so it survives
+    -- the actor's later deletion (user_id -> NULL). See migration
+    -- 2026-06-17_audit_actor_snapshot.sql.
+    actor_email  varchar(255),
+    actor_name   varchar(255),
     created_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_audit_logs_user_id FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
+
+-- Snapshot the acting user's email/name onto each audit row at write time, so a
+-- later user deletion (user_id -> NULL) never erases who performed the action.
+CREATE OR REPLACE FUNCTION audit_logs_snapshot_actor()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.actor_email IS NULL AND NEW.user_id IS NOT NULL THEN
+        SELECT u.email,
+               NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '')
+          INTO NEW.actor_email, NEW.actor_name
+          FROM users u
+         WHERE u.user_id = NEW.user_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_audit_logs_snapshot_actor ON audit_logs;
+CREATE TRIGGER trg_audit_logs_snapshot_actor
+    BEFORE INSERT ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION audit_logs_snapshot_actor();
 
 CREATE TABLE duplicate_candidates (
     duplicate_candidate_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

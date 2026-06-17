@@ -21,6 +21,11 @@ class AuditLog(Base):
     field_name: Mapped[str | None] = mapped_column(String(255))
     old_value: Mapped[str | None] = mapped_column(Text)
     new_value: Mapped[str | None] = mapped_column(Text)
+    # Actor identity snapshotted at INSERT time by a DB trigger (see migration
+    # 2026-06-17_audit_actor_snapshot.sql). Survives the actor's later deletion
+    # (user_id -> NULL), so the trail never loses who performed an action.
+    actor_email: Mapped[str | None] = mapped_column(String(255))
+    actor_name: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

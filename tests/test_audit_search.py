@@ -75,6 +75,21 @@ def test_filters_combine():
     assert "audit_logs.created_at >=" in sql
 
 
+def test_select_coalesces_actor_email_snapshot():
+    # The actor email prefers the live users join but falls back to the per-row
+    # snapshot, so a deleted actor's email still shows in the trail (#93).
+    sql = _sql(build_audit_query()).lower()
+    assert "coalesce(users.email, audit_logs.actor_email)" in sql
+
+
+def test_user_filter_matches_snapshot_too():
+    # Filtering by a (possibly deleted) actor's email matches the live email OR
+    # the snapshot, so deleted users remain searchable.
+    sql = _sql(build_audit_query(user="ghost")).lower()
+    assert "users.email ilike" in sql
+    assert "audit_logs.actor_email ilike" in sql
+
+
 # --- GET /audit/options route -------------------------------------------------
 
 

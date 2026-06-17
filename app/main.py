@@ -24,6 +24,7 @@ from app.api.routes import (
     events,
     geography,
     health,
+    support,
     tasks,
     vocabulary,
 )
@@ -142,6 +143,8 @@ app.include_router(geography.router)
 app.include_router(tasks.router)
 app.include_router(vocabulary.router)
 app.include_router(vocabulary.admin_router)
+app.include_router(support.router)
+app.include_router(support.admin_router)
 
 
 @app.exception_handler(AuthError)

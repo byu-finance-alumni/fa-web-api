@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS support_contacts (
     updated_at         timestamptz NOT NULL DEFAULT now()
 );
 
+-- Deny-all RLS like every other public table (Supabase auto-exposes the public
+-- schema via its Data API; the backend bypasses RLS with a privileged role).
+-- Mirrors database/rls_lockdown.sql. Idempotent.
+ALTER TABLE support_contacts ENABLE ROW LEVEL SECURITY;
+
 -- One-time seed from current role holders (only when the table is empty, so a
 -- re-run never duplicates). first_name+last_name, falling back to the email.
 INSERT INTO support_contacts (role_label, name, email, sort_order)

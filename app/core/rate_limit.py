@@ -89,7 +89,12 @@ RESET_PASSWORD_LIMITER = rate_limiter(
 )
 CREATE_USER_LIMITER = rate_limiter("admin:create_user", limit=10, window_seconds=600)
 ASSIGN_ROLE_LIMITER = rate_limiter("admin:assign_role", limit=30, window_seconds=600)
+# Permanent user deletion is destructive and irreversible. A generous cap (bulk
+# cleanup may be legitimate) that still brakes a runaway loop / compromised
+# session from wiping the directory in one burst.
+DELETE_USER_LIMITER = rate_limiter("admin:delete_user", limit=20, window_seconds=600)
 
 ResetPasswordRateLimit = Annotated[UserContext, Depends(RESET_PASSWORD_LIMITER)]
 CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
 AssignRoleRateLimit = Annotated[UserContext, Depends(ASSIGN_ROLE_LIMITER)]
+DeleteUserRateLimit = Annotated[UserContext, Depends(DELETE_USER_LIMITER)]

@@ -183,12 +183,17 @@ class DeleteUserResponse(BaseModel):
 class LoginEventRow(BaseModel):
     """One recorded sign-in for the engineer Logins tab. ``user_id`` is null once
     the user has been deleted; ``email`` is the snapshot taken at sign-in, so the
-    row still shows who it was."""
+    row still shows who it was. ``ip_address`` + ``city``/``region``/``country``
+    are the approximate (IP-based) origin captured at sign-in; any may be null."""
 
     login_event_id: int
     user_id: int | None = None
     email: str
     occurred_at: datetime.datetime
+    ip_address: str | None = None
+    city: str | None = None
+    region: str | None = None
+    country: str | None = None
 
 
 class LoginEventPage(BaseModel):
@@ -323,6 +328,10 @@ async def list_logins(
             user_id=e.user_id,
             email=e.email,
             occurred_at=e.occurred_at,
+            ip_address=e.ip_address,
+            city=e.city,
+            region=e.region,
+            country=e.country,
         )
         for e in rows.all()
     ]

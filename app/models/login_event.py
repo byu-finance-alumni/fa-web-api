@@ -31,3 +31,10 @@ class LoginEvent(Base):
     occurred_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Client IP + approximate (IP-based) location, forwarded by the Next.js login
+    # action from the incoming request. All nullable (absent in local dev / on
+    # rows recorded before this was added).
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+    city: Mapped[str | None] = mapped_column(String(128))
+    region: Mapped[str | None] = mapped_column(String(128))
+    country: Mapped[str | None] = mapped_column(String(64))

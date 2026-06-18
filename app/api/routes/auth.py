@@ -84,6 +84,31 @@ async def context(user: CurrentDBUserAllowMustChange) -> UserContext:
     return user
 
 
+def _clean(value: str | None) -> str | None:
+    """Trim and collapse an empty/whitespace string to ``None`` (so a missing
+    geo header doesn't store as ``""``)."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+class LoginContext(BaseModel):
+    """Optional client context for a sign-in, forwarded by the frontend login
+    action from the incoming request — the client IP (``x-forwarded-for``) and
+    Vercel's IP-geolocation headers. All optional and length-bounded; purely
+    informational (never trusted for authorization), stored on the
+    ``login_events`` row for the engineer Logins tab. ``extra='forbid'`` rejects
+    unknown keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ip_address: str | None = Field(default=None, max_length=64)
+    city: str | None = Field(default=None, max_length=128)
+    region: str | None = Field(default=None, max_length=128)
+    country: str | None = Field(default=None, max_length=64)
+
+
 class LoginRecordedResponse(BaseModel):
     """Acknowledgement that a successful sign-in was recorded, echoing the
     stamped time so a client could display it."""
@@ -94,7 +119,9 @@ class LoginRecordedResponse(BaseModel):
 
 @router.post("/login", response_model=LoginRecordedResponse)
 async def record_login(
-    user: CurrentDBUserAllowMustChange, session: SessionDep
+    user: CurrentDBUserAllowMustChange,
+    session: SessionDep,
+    context: LoginContext | None = None,
 ) -> LoginRecordedResponse:
     """Record a successful sign-in for the AUTHENTICATED caller.
 
@@ -123,7 +150,17 @@ async def record_login(
     )
     if db_user is not None:
         db_user.last_login_at = now
-        session.add(LoginEvent(user_id=db_user.user_id, email=db_user.email, occurred_at=now))
+        session.add(
+            LoginEvent(
+                user_id=db_user.user_id,
+                email=db_user.email,
+                occurred_at=now,
+                ip_address=_clean(context.ip_address) if context else None,
+                city=_clean(context.city) if context else None,
+                region=_clean(context.region) if context else None,
+                country=_clean(context.country) if context else None,
+            )
+        )
         await session.commit()
     return LoginRecordedResponse(last_login_at=now)
 

@@ -23,6 +23,7 @@ from app.models.engagement import (
 )
 from app.models.event import Event, EventAttendance
 from app.models.login_attempt import LoginAttempt
+from app.models.login_event import LoginEvent
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import Role, User, UserRole
 from app.models.vocabulary import VocabularyTerm
@@ -47,6 +48,7 @@ __all__ = [
     "FollowUpTask",
     "Interaction",
     "LoginAttempt",
+    "LoginEvent",
     "Role",
     "StatusLabel",
     "Survey",

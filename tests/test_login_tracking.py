@@ -95,6 +95,57 @@ def test_record_login_stamps_last_login_and_writes_event():
     assert session.commits == 1
 
 
+def test_record_login_stores_forwarded_ip_and_location():
+    """The frontend forwards client IP + Vercel geo headers; they land on the
+    login_events row (trimmed, empties -> null)."""
+    user = SimpleNamespace(user_id=7, email="boss@byu.edu", last_login_at=None)
+    session = _RecordSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user_allow_must_change] = lambda: _ctx(
+        "super_admin", user_id=7
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/auth/login",
+            json={
+                "ip_address": "203.0.113.7",
+                "city": "Provo",
+                "region": "Utah",
+                "country": "US",
+            },
+        )
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    event = next(a for a in session.added if isinstance(a, LoginEvent))
+    assert event.ip_address == "203.0.113.7"
+    assert event.city == "Provo"
+    assert event.region == "Utah"
+    assert event.country == "US"
+
+
+def test_record_login_rejects_unknown_context_field():
+    """extra='forbid' on the context body rejects unexpected keys (422)."""
+    user = SimpleNamespace(user_id=7, email="boss@byu.edu", last_login_at=None)
+    session = _RecordSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user_allow_must_change] = lambda: _ctx(
+        "view_only", user_id=7
+    )
+    with TestClient(app) as client:
+        resp = client.post("/auth/login", json={"latitude": "40.2"})
+    app.dependency_overrides.clear()
+    assert resp.status_code == 422
+
+
 def test_record_login_allowed_on_temp_password():
     """A user on a temp password (must_change_password) has still signed in, so
     the login records — the route uses the force-change-EXEMPT resolver."""
@@ -172,10 +223,24 @@ def test_list_logins_returns_page_and_audits_read():
     now = datetime.datetime(2026, 6, 18, 16, 19, tzinfo=datetime.UTC)
     events = [
         SimpleNamespace(
-            login_event_id=2, user_id=7, email="boss@byu.edu", occurred_at=now
+            login_event_id=2,
+            user_id=7,
+            email="boss@byu.edu",
+            occurred_at=now,
+            ip_address="203.0.113.7",
+            city="Provo",
+            region="Utah",
+            country="US",
         ),
         SimpleNamespace(
-            login_event_id=1, user_id=None, email="gone@byu.edu", occurred_at=now
+            login_event_id=1,
+            user_id=None,
+            email="gone@byu.edu",
+            occurred_at=now,
+            ip_address=None,
+            city=None,
+            region=None,
+            country=None,
         ),
     ]
     session = _ListSession(events)

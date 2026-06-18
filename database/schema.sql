@@ -62,6 +62,13 @@ CREATE TABLE login_events (
     user_id        bigint,
     email          varchar(255) NOT NULL,
     occurred_at    timestamptz NOT NULL DEFAULT now(),
+    -- Client IP + approximate (IP-based) location captured by the Next.js login
+    -- action from the incoming request (x-forwarded-for + Vercel geo headers).
+    -- Nullable: absent in local dev / on logins recorded before this was added.
+    ip_address     varchar(64),
+    city           varchar(128),
+    region         varchar(128),
+    country        varchar(64),
     CONSTRAINT fk_login_events_user_id FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
 CREATE INDEX idx_login_events_occurred_at ON login_events (occurred_at DESC);

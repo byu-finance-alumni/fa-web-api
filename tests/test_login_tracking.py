@@ -237,10 +237,10 @@ def test_list_logins_returns_page_and_audits_read():
             user_id=None,
             email="gone@byu.edu",
             occurred_at=now,
-            ip_address=None,
-            city=None,
-            region=None,
-            country=None,
+            ip_address="198.51.100.9",
+            city="Salt Lake City",
+            region="UT",
+            country="US",
         ),
     ]
     session = _ListSession(events)

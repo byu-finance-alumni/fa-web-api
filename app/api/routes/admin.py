@@ -314,10 +314,19 @@ async def list_logins(
     cap 200 — mirrors the users/audit endpoints) so one request can't enumerate
     the whole history. Reading the log is itself audited (``read_login_log``;
     actor + applied limit/offset) — the returned rows are not logged.
+
+    Only logins WITH a captured IP are returned (so the tab is consistent — every
+    row has IP + location). Logins recorded before IP capture, and local-dev
+    sign-ins with no Vercel geo headers, have a null ``ip_address`` and are
+    omitted; ``total`` reflects the filtered set so pagination stays correct.
     """
-    total = await session.scalar(select(func.count()).select_from(LoginEvent))
+    has_ip = LoginEvent.ip_address.isnot(None)
+    total = await session.scalar(
+        select(func.count()).select_from(LoginEvent).where(has_ip)
+    )
     rows = await session.scalars(
         select(LoginEvent)
+        .where(has_ip)
         .order_by(LoginEvent.occurred_at.desc(), LoginEvent.login_event_id.desc())
         .limit(limit)
         .offset(offset)

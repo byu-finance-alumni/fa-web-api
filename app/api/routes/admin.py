@@ -7,6 +7,7 @@ key, server-side only) and returns a one-time temporary password exactly once �
 the same security posture as the password-reset flow (see docs/PRE-LAUNCH.md).
 """
 
+import datetime
 import logging
 import re
 import secrets
@@ -19,7 +20,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.dependencies.auth import RequireSuperAdmin
+from app.api.dependencies.auth import RequireEngineer, RequireSuperAdmin
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.rate_limit import (
@@ -32,6 +33,7 @@ from app.core.roles import RoleName
 from app.core.security import AuthorizationError
 from app.models.audit import AuditLog
 from app.models.login_attempt import LoginAttempt
+from app.models.login_event import LoginEvent
 from app.models.user import Role, User, UserRole
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
@@ -178,6 +180,26 @@ class DeleteUserResponse(BaseModel):
     email: str
 
 
+class LoginEventRow(BaseModel):
+    """One recorded sign-in for the engineer Logins tab. ``user_id`` is null once
+    the user has been deleted; ``email`` is the snapshot taken at sign-in, so the
+    row still shows who it was."""
+
+    login_event_id: int
+    user_id: int | None = None
+    email: str
+    occurred_at: datetime.datetime
+
+
+class LoginEventPage(BaseModel):
+    """A page of login events, newest first, with the total for pagination."""
+
+    items: list[LoginEventRow]
+    total: int
+    limit: int
+    offset: int
+
+
 class RoleAssign(BaseModel):
     """Assign a canonical role to a user. ``role_name`` is validated against the
     RoleName enum, so an unknown role is a 422 before any query runs."""
@@ -270,6 +292,54 @@ async def list_users(
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.get("/logins", response_model=LoginEventPage)
+async def list_logins(
+    actor: RequireEngineer,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> LoginEventPage:
+    """List recorded sign-ins, newest first (paginated). Engineer only.
+
+    Backs the Admin -> Logins tab. Rows come from ``login_events`` (written by
+    POST /auth/login on each successful sign-in); the snapshotted email means a
+    deleted user's past logins remain attributable. Paginated (default 50, hard
+    cap 200 — mirrors the users/audit endpoints) so one request can't enumerate
+    the whole history. Reading the log is itself audited (``read_login_log``;
+    actor + applied limit/offset) — the returned rows are not logged.
+    """
+    total = await session.scalar(select(func.count()).select_from(LoginEvent))
+    rows = await session.scalars(
+        select(LoginEvent)
+        .order_by(LoginEvent.occurred_at.desc(), LoginEvent.login_event_id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    items = [
+        LoginEventRow(
+            login_event_id=e.login_event_id,
+            user_id=e.user_id,
+            email=e.email,
+            occurred_at=e.occurred_at,
+        )
+        for e in rows.all()
+    ]
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_login_log",
+            entity_type="login_event",
+            field_name=f"limit={limit};offset={offset}",
+        )
+    )
+    await session.commit()
+
+    return LoginEventPage(
+        items=items, total=int(total or 0), limit=limit, offset=offset
+    )
 
 
 # ``{user_id}`` is declared ``int`` (below), so string sub-paths like

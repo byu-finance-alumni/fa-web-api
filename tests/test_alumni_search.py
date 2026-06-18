@@ -4,6 +4,8 @@ Pure unit tests: ``build_alumni_query`` is compiled to Postgres SQL and the
 clauses are asserted — no database needed.
 """
 
+import datetime
+
 from sqlalchemy.dialects import postgresql
 
 from app.repositories.alumni import build_alumni_query
@@ -157,3 +159,90 @@ def test_missing_filters_combine_with_archived_default():
     assert "archived IS false" in sql
     assert "alumni_contact_info" in sql
     assert "current_employment" in sql
+
+
+# --- #37 advanced filters: multi-select + new fields -------------------------
+
+
+def test_employer_multi_value_is_or_of_ilikes():
+    sql = _sql(build_alumni_query(employer=["Goldman", "JPMorgan"]))
+    # Two values -> OR of two case-insensitive matches inside one EXISTS.
+    assert sql.count("current_employer ILIKE") == 2
+    assert " OR " in sql
+
+
+def test_employer_single_string_still_works():
+    # Back-compat: a scalar (legacy deep-link) degrades to one match.
+    sql = _sql(build_alumni_query(employer="Goldman Sachs"))
+    assert sql.count("current_employer ILIKE") == 1
+
+
+def test_past_employer_filter():
+    sql = _sql(build_alumni_query(past_employer=["Bain"]))
+    assert "employment_history" in sql
+    assert "employer_name ILIKE" in sql
+
+
+def test_title_filter():
+    sql = _sql(build_alumni_query(title=["Analyst"]))
+    assert "current_title ILIKE" in sql
+
+
+def test_seniority_filter():
+    sql = _sql(build_alumni_query(seniority=["VP"]))
+    assert "seniority_level ILIKE" in sql
+
+
+def test_state_filter():
+    sql = _sql(build_alumni_query(state=["UT", "CA"]))
+    assert sql.count("alumni_contact_info.state ILIKE") == 2
+
+
+def test_status_label_filter():
+    sql = _sql(build_alumni_query(status_label=["Prospect"]))
+    assert "alumni_status_labels" in sql
+    assert "status_label_name ILIKE" in sql
+
+
+def test_leadership_role_filter():
+    sql = _sql(build_alumni_query(leadership_role=["President"]))
+    assert "finance_society_leadership" in sql
+    assert "leadership_role ILIKE" in sql
+
+
+def test_survey_status_filter():
+    sql = _sql(build_alumni_query(survey_status=["Complete"]))
+    assert "surveys" in sql
+    assert "survey_status ILIKE" in sql
+
+
+def test_contacted_after_is_exists_on_interactions():
+    sql = _sql(build_alumni_query(contacted_after=datetime.date(2025, 1, 1)))
+    assert "interactions" in sql
+    assert "interaction_date_time >=" in sql
+    assert "NOT (EXISTS" not in sql
+
+
+def test_contacted_before_is_not_exists_stale():
+    sql = _sql(build_alumni_query(contacted_before=datetime.date(2025, 1, 1)))
+    assert "interactions" in sql
+    assert "NOT (EXISTS" in sql
+
+
+def test_never_contacted_is_not_exists_any():
+    sql = _sql(build_alumni_query(never_contacted=True))
+    assert "interactions" in sql
+    assert "NOT (EXISTS" in sql
+
+
+def test_advanced_filters_absent_by_default():
+    # None of the new tables appear unless their filter is set.
+    sql = _sql(build_alumni_query())
+    for tbl in (
+        "employment_history",
+        "finance_society_leadership",
+        "surveys",
+        "interactions",
+        "alumni_status_labels",
+    ):
+        assert tbl not in sql

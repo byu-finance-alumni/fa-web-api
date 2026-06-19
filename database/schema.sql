@@ -52,6 +52,32 @@ CREATE TABLE login_attempts (
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
+-- Login history (security log). One row per successful sign-in, written by
+-- POST /auth/login (which also stamps users.last_login_at). Kept separate from
+-- audit_logs: sign-in events are a security log, not the record-change audit
+-- trail. email is snapshotted and user_id is ON DELETE SET NULL so the history
+-- survives a later user deletion with attribution intact.
+CREATE TABLE login_events (
+    login_event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id        bigint,
+    email          varchar(255) NOT NULL,
+    occurred_at    timestamptz NOT NULL DEFAULT now(),
+    -- Client IP + approximate (IP-based) location captured by the Next.js login
+    -- action from the incoming request (x-forwarded-for + Vercel geo headers).
+    -- Nullable: absent in local dev / on logins recorded before this was added.
+    ip_address     varchar(64),
+    city           varchar(128),
+    region         varchar(128),
+    country        varchar(64),
+    CONSTRAINT fk_login_events_user_id FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+CREATE INDEX idx_login_events_occurred_at ON login_events (occurred_at DESC);
+CREATE INDEX idx_login_events_user_id ON login_events (user_id);
+CREATE INDEX idx_login_events_email ON login_events (email);
+-- Retention: a pg_cron job ('purge-login-events-90d') deletes rows older than
+-- 90 days daily — IP + location are personal data and shouldn't be kept forever.
+-- See migration 2026-06-18_login_events_retention.sql.
+
 CREATE TABLE roles (
     role_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     role_name        varchar(100) NOT NULL UNIQUE,

@@ -9,6 +9,7 @@ deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
 (archive), never a hard delete — audit history depends on retained records.
 """
 
+import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
@@ -30,6 +31,7 @@ from app.schemas.alumni import (
     AlumniUpdateFull,
     minimize_alumni_read,
 )
+from app.schemas.filters import FilterOptions
 from app.schemas.profile import (
     EducationCreate,
     EducationRead,
@@ -75,31 +77,62 @@ async def list_alumni(
         bool | None, Query(description="Filter by deceased flag.")
     ] = None,
     employer: Annotated[
-        str | None,
-        Query(description="Current employer (case-insensitive exact match)."),
+        list[str] | None,
+        Query(description="Current employer(s) — repeatable (OR), exact match."),
+    ] = None,
+    past_employer: Annotated[
+        list[str] | None,
+        Query(description="Prior employer(s) from employment history — repeatable."),
     ] = None,
     industry: Annotated[
-        str | None,
-        Query(
-            description=(
-                "Current industry / work area, primary or secondary "
-                "(case-insensitive exact match)."
-            )
-        ),
+        list[str] | None,
+        Query(description="Industry / work area (primary or secondary) — repeatable."),
+    ] = None,
+    title: Annotated[
+        list[str] | None,
+        Query(description="Current job title(s) — repeatable, exact match."),
+    ] = None,
+    seniority: Annotated[
+        list[str] | None,
+        Query(description="Seniority level(s) — repeatable, exact match."),
     ] = None,
     city: Annotated[
-        str | None,
-        Query(description="Current city (case-insensitive exact match)."),
+        list[str] | None,
+        Query(description="Current city/cities — repeatable, exact match."),
+    ] = None,
+    state: Annotated[
+        list[str] | None,
+        Query(description="Current state(s) — repeatable, exact match."),
     ] = None,
     tag: Annotated[
-        str | None,
+        list[str] | None,
+        Query(description="Engagement tag(s) — repeatable, exact match."),
+    ] = None,
+    status_label: Annotated[
+        list[str] | None,
+        Query(description="Status label(s) — repeatable, exact match."),
+    ] = None,
+    leadership_role: Annotated[
+        list[str] | None,
+        Query(description="Finance Society leadership role(s) — repeatable."),
+    ] = None,
+    survey_status: Annotated[
+        list[str] | None,
+        Query(description="Survey status value(s) — repeatable, exact match."),
+    ] = None,
+    contacted_after: Annotated[
+        datetime.date | None,
+        Query(description="Only alumni with an interaction on/after this date."),
+    ] = None,
+    contacted_before: Annotated[
+        datetime.date | None,
         Query(
-            description=(
-                "Engagement tag label, e.g. 'Speaker' or 'Highly Engaged' "
-                "(case-insensitive exact match). Accepts any tag value."
-            )
+            description="Only alumni NOT contacted since this date (stale)."
         ),
     ] = None,
+    never_contacted: Annotated[
+        bool, Query(description="Only alumni with no logged interactions.")
+    ] = False,
     attended_event: Annotated[
         bool, Query(description="Only alumni who attended at least one event.")
     ] = False,
@@ -148,9 +181,19 @@ async def list_alumni(
         grad_year_max=grad_year_max,
         deceased=deceased,
         employer=employer,
+        past_employer=past_employer,
         industry=industry,
+        title=title,
+        seniority=seniority,
         city=city,
+        state=state,
         tag=tag,
+        status_label=status_label,
+        leadership_role=leadership_role,
+        survey_status=survey_status,
+        contacted_after=contacted_after,
+        contacted_before=contacted_before,
+        never_contacted=never_contacted,
         attended_event=attended_event,
         donor=donor,
         mentor_willing=mentor_willing,
@@ -171,10 +214,22 @@ async def list_alumni(
             "graduation_year": graduation_year,
             "grad_year_min": grad_year_min,
             "grad_year_max": grad_year_max,
-            "employer": employer,
-            "industry": industry,
-            "city": city,
-            "tag": tag,
+            "employer": "|".join(employer) if employer else None,
+            "past_employer": "|".join(past_employer) if past_employer else None,
+            "industry": "|".join(industry) if industry else None,
+            "title": "|".join(title) if title else None,
+            "seniority": "|".join(seniority) if seniority else None,
+            "city": "|".join(city) if city else None,
+            "state": "|".join(state) if state else None,
+            "tag": "|".join(tag) if tag else None,
+            "status_label": "|".join(status_label) if status_label else None,
+            "leadership_role": "|".join(leadership_role) if leadership_role else None,
+            "survey_status": "|".join(survey_status) if survey_status else None,
+            "contacted_after": contacted_after.isoformat() if contacted_after else None,
+            "contacted_before": (
+                contacted_before.isoformat() if contacted_before else None
+            ),
+            "never_contacted": never_contacted or None,
             "limit": limit,
             "offset": offset,
             "sort": sort,
@@ -187,6 +242,18 @@ async def list_alumni(
         for item in items
     ]
     return AlumniPage(items=rows, total=total, limit=limit, offset=offset)
+
+
+@router.get("/filter-options", response_model=FilterOptions)
+async def alumni_filter_options(
+    _: RequireViewAccess, session: SessionDep
+) -> FilterOptions:
+    """Distinct option lists for the advanced-filter panel's multi-selects.
+
+    Declared before the ``/{alumni_id}`` routes so the literal path always wins
+    (``alumni_id`` is int-typed, so a non-numeric segment can't match it anyway).
+    """
+    return FilterOptions.model_validate(await service.filter_options(session))
 
 
 # --- Bulk CSV import (full_access) -------------------------------------------

@@ -1,5 +1,6 @@
 """Authentication routes."""
 
+import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -9,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import CurrentDBUserAllowMustChange, CurrentUser
 from app.core.database import get_session
+from app.core.rate_limit import RecordLoginRateLimit
 from app.models.audit import AuditLog
+from app.models.login_event import LoginEvent
 from app.models.user import User
 from app.schemas.auth import AuthenticatedUser, UserContext
 from app.services import login_lockout
@@ -80,6 +83,87 @@ async def context(user: CurrentDBUserAllowMustChange) -> UserContext:
     exempt resolver, not the gated ``get_current_db_user``.
     """
     return user
+
+
+def _clean(value: str | None) -> str | None:
+    """Trim and collapse an empty/whitespace string to ``None`` (so a missing
+    geo header doesn't store as ``""``)."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+class LoginContext(BaseModel):
+    """Optional client context for a sign-in, forwarded by the frontend login
+    action from the incoming request — the client IP (``x-forwarded-for``) and
+    Vercel's IP-geolocation headers. All optional and length-bounded; purely
+    informational (never trusted for authorization), stored on the
+    ``login_events`` row for the engineer Logins tab. ``extra='forbid'`` rejects
+    unknown keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ip_address: str | None = Field(default=None, max_length=64)
+    city: str | None = Field(default=None, max_length=128)
+    region: str | None = Field(default=None, max_length=128)
+    country: str | None = Field(default=None, max_length=64)
+
+
+class LoginRecordedResponse(BaseModel):
+    """Acknowledgement that a successful sign-in was recorded, echoing the
+    stamped time so a client could display it."""
+
+    status: str = "ok"
+    last_login_at: datetime.datetime
+
+
+@router.post("/login", response_model=LoginRecordedResponse)
+async def record_login(
+    user: RecordLoginRateLimit,
+    session: SessionDep,
+    context: LoginContext | None = None,
+) -> LoginRecordedResponse:
+    """Record a successful sign-in for the AUTHENTICATED caller.
+
+    Logins happen client-side via Supabase, so the backend has no native login
+    hook — the frontend calls this exactly once, right after a successful
+    password sign-in, with the freshly-issued token. It does two things:
+
+      1. Stamps ``users.last_login_at`` = now (the column existed but nothing
+         ever wrote it, so it was always NULL).
+      2. Inserts a ``login_events`` row (the security log backing the engineer
+         "Logins" tab; email is snapshotted so the history survives the user's
+         later deletion).
+
+    Uses the force-password-change-EXEMPT resolver: a user on an admin-issued
+    temp password has still genuinely signed in, so their login must be recorded
+    even before they clear the flag. Takes no body and keys only on the token's
+    own identity, so a caller can only ever record their OWN login.
+
+    Best-effort by contract: the frontend never blocks the post-login redirect
+    on this call. It is deliberately NOT written to ``audit_logs`` — sign-in
+    events are a security log, not the record-change audit trail.
+    """
+    now = datetime.datetime.now(datetime.UTC)
+    db_user = await session.scalar(
+        select(User).where(User.user_id == user.user_id)
+    )
+    if db_user is not None:
+        db_user.last_login_at = now
+        session.add(
+            LoginEvent(
+                user_id=db_user.user_id,
+                email=db_user.email,
+                occurred_at=now,
+                ip_address=_clean(context.ip_address) if context else None,
+                city=_clean(context.city) if context else None,
+                region=_clean(context.region) if context else None,
+                country=_clean(context.country) if context else None,
+            )
+        )
+        await session.commit()
+    return LoginRecordedResponse(last_login_at=now)
 
 
 class PasswordCompleteResponse(BaseModel):

@@ -16,11 +16,67 @@ from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
-from app.models.employment import CurrentEmployment, EducationHistory
-from app.models.engagement import AlumniProgramEngagement
+from app.models.crm import Survey
+from app.models.employment import (
+    CurrentEmployment,
+    EducationHistory,
+    EmploymentHistory,
+)
+from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
+from app.models.tags import StatusLabel, Tag
 from app.repositories import alumni as repo
 from app.schemas.alumni import AlumniCreateFull, AlumniUpdateFull
 from app.services import hygiene
+
+# Cap each filter-option list so the panel can't request an unbounded distinct
+# set (mirrors the geography options cap).
+_OPTIONS_CAP = 200
+
+
+async def _distinct_values(session: AsyncSession, column, *, desc: bool = False) -> list:
+    """Distinct, non-null, sorted values for one column (capped)."""
+    order = column.desc() if desc else column
+    rows = (
+        await session.execute(
+            select(column)
+            .where(column.is_not(None))
+            .distinct()
+            .order_by(order)
+            .limit(_OPTIONS_CAP)
+        )
+    ).all()
+    return [r[0] for r in rows]
+
+
+async def filter_options(session: AsyncSession) -> dict:
+    """Distinct option lists for the advanced-filter panel's multi-selects.
+
+    Pulled live from the data so new employers / titles / etc. appear without a
+    code change. Each list is capped."""
+    return {
+        "employers": await _distinct_values(session, CurrentEmployment.current_employer),
+        "past_employers": await _distinct_values(
+            session, EmploymentHistory.employer_name
+        ),
+        "titles": await _distinct_values(session, CurrentEmployment.current_title),
+        "seniority_levels": await _distinct_values(
+            session, CurrentEmployment.seniority_level
+        ),
+        "industries": await _distinct_values(
+            session, CurrentEmployment.current_industry
+        ),
+        "cities": await _distinct_values(session, AlumniContactInfo.city),
+        "states": await _distinct_values(session, AlumniContactInfo.state),
+        "tags": await _distinct_values(session, Tag.tag_name),
+        "status_labels": await _distinct_values(session, StatusLabel.status_label_name),
+        "leadership_roles": await _distinct_values(
+            session, FinanceSocietyLeadership.leadership_role
+        ),
+        "survey_statuses": await _distinct_values(session, Survey.survey_status),
+        "graduation_years": await _distinct_values(
+            session, Alumni.graduation_year, desc=True
+        ),
+    }
 
 # Nested write sections handled via related tables, not the alumni core row.
 SECTION_KEYS = frozenset({"contact", "career", "education", "engagement"})

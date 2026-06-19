@@ -23,7 +23,10 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
 
-from app.api.dependencies.auth import RequireSuperAdmin
+from app.api.dependencies.auth import (
+    get_current_db_user_allow_must_change,
+    require_super_admin,
+)
 from app.schemas.auth import UserContext
 
 # Module-level state: {bucket_name: {actor_id: [timestamp, timestamp, ...]}}.
@@ -65,16 +68,23 @@ def reset() -> None:
     _WINDOWS.clear()
 
 
-def rate_limiter(bucket: str, *, limit: int, window_seconds: float):
+def rate_limiter(
+    bucket: str, *, limit: int, window_seconds: float, actor_guard=require_super_admin
+):
     """Build a FastAPI dependency enforcing ``limit`` hits per ``window_seconds``
     per actor for the named ``bucket``.
 
-    The dependency resolves the actor through ``require_super_admin`` (so the
-    route is still gated and the identity is server-trusted), records the hit,
-    and raises HTTP 429 when the actor is over budget.
+    The dependency resolves the actor through ``actor_guard`` (default
+    ``require_super_admin``, so the route stays gated and the identity is
+    server-trusted), records the hit, and raises HTTP 429 when the actor is over
+    budget. Pass a different guard (e.g. ``get_current_db_user_allow_must_change``)
+    to throttle a route open to any authenticated user — the actor is still
+    resolved server-side, never from client input.
     """
 
-    async def _dependency(actor: RequireSuperAdmin) -> UserContext:
+    async def _dependency(
+        actor: Annotated[UserContext, Depends(actor_guard)],
+    ) -> UserContext:
         _check(bucket, actor.user_id, limit=limit, window_seconds=window_seconds)
         return actor
 
@@ -93,8 +103,19 @@ ASSIGN_ROLE_LIMITER = rate_limiter("admin:assign_role", limit=30, window_seconds
 # cleanup may be legitimate) that still brakes a runaway loop / compromised
 # session from wiping the directory in one burst.
 DELETE_USER_LIMITER = rate_limiter("admin:delete_user", limit=20, window_seconds=600)
+# Login recording is open to ANY authenticated user (they can only record their
+# OWN login), so it's gated by the force-change-exempt resolver rather than an
+# admin guard. No human logs in 10 times in 10 minutes; this just brakes a
+# compromised/looping session from flooding login_events.
+RECORD_LOGIN_LIMITER = rate_limiter(
+    "auth:record_login",
+    limit=10,
+    window_seconds=600,
+    actor_guard=get_current_db_user_allow_must_change,
+)
 
 ResetPasswordRateLimit = Annotated[UserContext, Depends(RESET_PASSWORD_LIMITER)]
 CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
 AssignRoleRateLimit = Annotated[UserContext, Depends(ASSIGN_ROLE_LIMITER)]
 DeleteUserRateLimit = Annotated[UserContext, Depends(DELETE_USER_LIMITER)]
+RecordLoginRateLimit = Annotated[UserContext, Depends(RECORD_LOGIN_LIMITER)]

@@ -11,17 +11,39 @@ here is structured so those conditions can be added as joins without reshaping
 callers.
 """
 
+import datetime
+
 from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
+from app.models.crm import Interaction, Survey
 from app.models.duplicate import DuplicateCandidate
-from app.models.employment import CurrentEmployment
-from app.models.engagement import AlumniProgramEngagement
+from app.models.employment import CurrentEmployment, EmploymentHistory
+from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
 from app.models.event import EventAttendance
-from app.models.tags import AlumniTag, Tag
+from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.utils.sql import escape_like
+
+
+def _as_values(value: "str | list[str] | None") -> list[str]:
+    """Normalize a filter input to a clean list of non-empty strings.
+
+    Accepts a single string (legacy / single deep-link), a list (multi-select),
+    or None. Lets every text filter support multi-select via one repeated query
+    param while a single-value link (``?employer=X``) keeps working unchanged.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    return [v for v in value if v and v.strip()]
+
+
+def _ilike_any(column, values: list[str]):
+    """OR of case-insensitive exact matches (literal %/_ escaped) for `values`."""
+    return or_(*[column.ilike(escape_like(v), escape="\\") for v in values])
 
 
 async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
@@ -35,10 +57,24 @@ def build_alumni_query(
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
     deceased: bool | None = None,
-    employer: str | None = None,
-    industry: str | None = None,
-    city: str | None = None,
-    tag: str | None = None,
+    # Text facets accept a single value (legacy / deep-link) OR a list
+    # (multi-select). Each is matched case-insensitively, exact, literal-escaped.
+    employer: "str | list[str] | None" = None,
+    past_employer: "str | list[str] | None" = None,
+    industry: "str | list[str] | None" = None,
+    title: "str | list[str] | None" = None,
+    seniority: "str | list[str] | None" = None,
+    city: "str | list[str] | None" = None,
+    state: "str | list[str] | None" = None,
+    tag: "str | list[str] | None" = None,
+    status_label: "str | list[str] | None" = None,
+    leadership_role: "str | list[str] | None" = None,
+    survey_status: "str | list[str] | None" = None,
+    # Last-contacted (derived from interactions): contacted on/after a date,
+    # NOT contacted since a date (stale), or never contacted at all.
+    contacted_after: datetime.date | None = None,
+    contacted_before: datetime.date | None = None,
+    never_contacted: bool = False,
     attended_event: bool = False,
     donor: bool = False,
     mentor_willing: bool = False,
@@ -82,56 +118,153 @@ def build_alumni_query(
         conditions.append(Alumni.graduation_year <= grad_year_max)
     if deceased is not None:
         conditions.append(Alumni.deceased.is_(deceased))
-    if employer:
-        at_employer = (
+    employers = _as_values(employer)
+    if employers:
+        conditions.append(
             select(CurrentEmployment.current_employment_id)
             .where(
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
-                CurrentEmployment.current_employer.ilike(
-                    escape_like(employer), escape="\\"
-                ),
+                _ilike_any(CurrentEmployment.current_employer, employers),
             )
             .exists()
         )
-        conditions.append(at_employer)
-    if industry:
-        in_industry = (
+    past_employers = _as_values(past_employer)
+    if past_employers:
+        conditions.append(
+            select(EmploymentHistory.employment_history_id)
+            .where(
+                EmploymentHistory.alumni_id == Alumni.alumni_id,
+                _ilike_any(EmploymentHistory.employer_name, past_employers),
+            )
+            .exists()
+        )
+    industries = _as_values(industry)
+    if industries:
+        conditions.append(
             select(CurrentEmployment.current_employment_id)
             .where(
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
                 or_(
-                    CurrentEmployment.current_industry.ilike(
-                        escape_like(industry), escape="\\"
-                    ),
-                    CurrentEmployment.current_industry_secondary.ilike(
-                        escape_like(industry), escape="\\"
+                    _ilike_any(CurrentEmployment.current_industry, industries),
+                    _ilike_any(
+                        CurrentEmployment.current_industry_secondary, industries
                     ),
                 ),
             )
             .exists()
         )
-        conditions.append(in_industry)
-    if city:
-        in_city = (
-            select(AlumniContactInfo.contact_info_id)
+    titles = _as_values(title)
+    if titles:
+        conditions.append(
+            select(CurrentEmployment.current_employment_id)
             .where(
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
-                AlumniContactInfo.city.ilike(escape_like(city), escape="\\"),
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                _ilike_any(CurrentEmployment.current_title, titles),
             )
             .exists()
         )
-        conditions.append(in_city)
-    if tag:
-        has_tag = (
+    seniorities = _as_values(seniority)
+    if seniorities:
+        conditions.append(
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                _ilike_any(CurrentEmployment.seniority_level, seniorities),
+            )
+            .exists()
+        )
+    cities = _as_values(city)
+    if cities:
+        conditions.append(
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                _ilike_any(AlumniContactInfo.city, cities),
+            )
+            .exists()
+        )
+    states = _as_values(state)
+    if states:
+        conditions.append(
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                _ilike_any(AlumniContactInfo.state, states),
+            )
+            .exists()
+        )
+    tags = _as_values(tag)
+    if tags:
+        conditions.append(
             select(AlumniTag.alumni_tag_id)
             .join(Tag, Tag.tag_id == AlumniTag.tag_id)
             .where(
                 AlumniTag.alumni_id == Alumni.alumni_id,
-                Tag.tag_name.ilike(escape_like(tag), escape="\\"),
+                _ilike_any(Tag.tag_name, tags),
             )
             .exists()
         )
-        conditions.append(has_tag)
+    status_labels = _as_values(status_label)
+    if status_labels:
+        conditions.append(
+            select(AlumniStatusLabel.alumni_status_label_id)
+            .join(
+                StatusLabel,
+                StatusLabel.status_label_id == AlumniStatusLabel.status_label_id,
+            )
+            .where(
+                AlumniStatusLabel.alumni_id == Alumni.alumni_id,
+                _ilike_any(StatusLabel.status_label_name, status_labels),
+            )
+            .exists()
+        )
+    leadership_roles = _as_values(leadership_role)
+    if leadership_roles:
+        conditions.append(
+            select(FinanceSocietyLeadership.finance_society_leadership_id)
+            .where(
+                FinanceSocietyLeadership.alumni_id == Alumni.alumni_id,
+                _ilike_any(
+                    FinanceSocietyLeadership.leadership_role, leadership_roles
+                ),
+            )
+            .exists()
+        )
+    survey_statuses = _as_values(survey_status)
+    if survey_statuses:
+        conditions.append(
+            select(Survey.survey_id)
+            .where(
+                Survey.alumni_id == Alumni.alumni_id,
+                _ilike_any(Survey.survey_status, survey_statuses),
+            )
+            .exists()
+        )
+    if contacted_after is not None:
+        conditions.append(
+            select(Interaction.interaction_id)
+            .where(
+                Interaction.alumni_id == Alumni.alumni_id,
+                Interaction.interaction_date_time >= contacted_after,
+            )
+            .exists()
+        )
+    if contacted_before is not None:
+        # "Not contacted since": no interaction on/after the date (i.e. stale).
+        conditions.append(
+            ~select(Interaction.interaction_id)
+            .where(
+                Interaction.alumni_id == Alumni.alumni_id,
+                Interaction.interaction_date_time >= contacted_before,
+            )
+            .exists()
+        )
+    if never_contacted:
+        conditions.append(
+            ~select(Interaction.interaction_id)
+            .where(Interaction.alumni_id == Alumni.alumni_id)
+            .exists()
+        )
     if attended_event:
         has_attended = (
             select(EventAttendance.event_attendance_id)

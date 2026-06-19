@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import CurrentDBUserAllowMustChange, CurrentUser
 from app.core.database import get_session
+from app.core.rate_limit import RecordLoginRateLimit
 from app.models.audit import AuditLog
 from app.models.login_event import LoginEvent
 from app.models.user import User
@@ -119,7 +120,7 @@ class LoginRecordedResponse(BaseModel):
 
 @router.post("/login", response_model=LoginRecordedResponse)
 async def record_login(
-    user: CurrentDBUserAllowMustChange,
+    user: RecordLoginRateLimit,
     session: SessionDep,
     context: LoginContext | None = None,
 ) -> LoginRecordedResponse:

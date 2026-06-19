@@ -146,6 +146,31 @@ def test_record_login_rejects_unknown_context_field():
     assert resp.status_code == 422
 
 
+def test_record_login_rate_limited_after_burst():
+    """A burst of >10 record-login calls from one actor in the window gets 429,
+    braking a looping/compromised session from flooding login_events."""
+    from app.core import rate_limit
+
+    rate_limit.reset()
+    user = SimpleNamespace(user_id=77, email="burst@byu.edu", last_login_at=None)
+    session = _RecordSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user_allow_must_change] = lambda: _ctx(
+        "view_only", user_id=77
+    )
+    with TestClient(app) as client:
+        codes = [client.post("/auth/login").status_code for _ in range(11)]
+    app.dependency_overrides.clear()
+    rate_limit.reset()
+
+    assert codes[:10] == [200] * 10
+    assert codes[10] == 429
+
+
 def test_record_login_allowed_on_temp_password():
     """A user on a temp password (must_change_password) has still signed in, so
     the login records — the route uses the force-change-EXEMPT resolver."""

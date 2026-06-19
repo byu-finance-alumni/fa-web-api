@@ -73,6 +73,10 @@ CREATE TABLE login_events (
 );
 CREATE INDEX idx_login_events_occurred_at ON login_events (occurred_at DESC);
 CREATE INDEX idx_login_events_user_id ON login_events (user_id);
+CREATE INDEX idx_login_events_email ON login_events (email);
+-- Retention: a pg_cron job ('purge-login-events-90d') deletes rows older than
+-- 90 days daily — IP + location are personal data and shouldn't be kept forever.
+-- See migration 2026-06-18_login_events_retention.sql.
 
 CREATE TABLE roles (
     role_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

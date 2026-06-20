@@ -49,6 +49,7 @@ from app.schemas.profile import (
     EventAttendedRead,
     InteractionCreate,
     InteractionRead,
+    InteractionUpdate,
     LeadershipCreate,
     LeadershipRead,
     LeadershipUpdate,
@@ -446,6 +447,47 @@ async def add_interaction(
     return InteractionRead.model_validate(interaction).model_copy(
         update={"logged_by": await _actor_name(session, interaction.user_id)}
     )
+
+
+async def update_interaction(
+    session: AsyncSession,
+    alumni_id: int,
+    interaction_id: int,
+    payload: InteractionUpdate,
+    actor_user_id: int | None,
+) -> InteractionRead:
+    """Edit an interaction on an alumni's timeline (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(Interaction, interaction_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(f"Interaction {interaction_id} not found.")
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(row, field, value)
+    _audit_alumni(session, actor_user_id, "update_interaction", alumni_id)
+    await session.commit()
+    await session.refresh(row)
+    return InteractionRead.model_validate(row).model_copy(
+        update={"logged_by": await _actor_name(session, row.user_id)}
+    )
+
+
+async def delete_interaction(
+    session: AsyncSession,
+    alumni_id: int,
+    interaction_id: int,
+    actor_user_id: int | None,
+) -> None:
+    """Delete an interaction from an alumni's timeline (full_access).
+
+    404 if the row is missing or belongs to a different alumnus."""
+    row = await session.get(Interaction, interaction_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(f"Interaction {interaction_id} not found.")
+    await session.delete(row)
+    _audit_alumni(session, actor_user_id, "delete_interaction", alumni_id)
+    await session.commit()
 
 
 async def add_task(

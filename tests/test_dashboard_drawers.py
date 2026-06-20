@@ -297,11 +297,12 @@ def test_summary_includes_this_month_kpis(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     # Scalars consumed in handler order: total, archived, deceased,
     # missing_email, missing_employer, contacted_this_month,
+    # not_contacted_6mo, not_contacted_12mo, not_contacted_24mo,
     # upcoming_follow_ups, duplicate_count, attended_event_this_month,
     # upcoming_events, events_this_month, guest_speakers_this_month,
     # piff_donors, willing_mentors. The three execute() calls (cohort /
     # top_employers / by_state) fall back to the empty rows list.
-    scalars = [100, 5, 2, 12, 9, 8, 4, 3, 6, 7, 11, 2, 1, 0]
+    scalars = [100, 5, 2, 12, 9, 8, 60, 30, 10, 4, 3, 6, 7, 11, 2, 1, 0]
     app.dependency_overrides[get_session] = _with_session(
         _FakeSession([], scalars=scalars)
     )
@@ -315,14 +316,15 @@ def test_summary_includes_this_month_kpis(client):
 
 def test_summary_guest_speaker_signal_uses_attendance_status_ilike(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 14)
+    session = _FakeSession([], scalars=[0] * 17)
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/summary")
     assert response.status_code == 200
-    # The 12th scalar query (index 11) is the guest-speaker KPI; assert it
-    # filters event attendance by a "speaker" status (the chosen signal).
-    speaker_sql = _compiled(session.scalar_args[11])
+    # The guest-speaker KPI is scalar #15 (index 14) after the 3 not-contacted
+    # counts were inserted earlier in the handler; assert it filters event
+    # attendance by a "speaker" status (the chosen signal).
+    speaker_sql = _compiled(session.scalar_args[14])
     assert "attendance_status ILIKE" in speaker_sql
     assert "event_date" in speaker_sql
 
@@ -417,3 +419,26 @@ def test_follow_ups_serializes_rows_and_handles_missing_user(client):
             "assigned_to": None,
         }
     ]
+
+
+# --- summary: not-contacted-in-N-months counts (#42) --------------------------
+
+
+def test_summary_requires_auth(client):
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 401
+
+
+def test_summary_includes_not_contacted_counts(client):
+    # Empty scalar queue -> every count resolves to 0; we only assert the new
+    # keys are wired into the response as ints (exact values are DB semantics).
+    session = _FakeSession(rows=[])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.get("/dashboard/summary")
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    body = response.json()
+    for key in ("not_contacted_6mo", "not_contacted_12mo", "not_contacted_24mo"):
+        assert key in body
+        assert isinstance(body[key], int)

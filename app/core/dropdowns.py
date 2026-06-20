@@ -67,6 +67,11 @@ TAGS: tuple[str, ...] = (
     "Speaker",
     "Recruiter",
     "Donor",
+    "Warm Contact",
+    "High Value",
+    "Club/Recruiting",
+    "Finance Orgs",
+    "Advisory Boards",
 )
 
 # Status labels — the fixed, canonical record-status flags (alumni_status_labels
@@ -75,6 +80,7 @@ STATUS_LABELS: tuple[str, ...] = (
     "Inactive",
     "Deceased",
     "Lost Contact",
+    "Retired",
     "Do Not Contact",
 )
 

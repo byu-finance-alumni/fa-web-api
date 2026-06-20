@@ -4,6 +4,7 @@ All aggregation happens in PostgreSQL (counts / group-bys), never by loading row
 into the app, so it stays within the dashboard performance budget at scale.
 """
 
+import calendar
 import datetime
 import logging
 from typing import Annotated
@@ -98,6 +99,30 @@ def _has_employer_exists():
     )
 
 
+def _contacted_since_exists(cutoff: datetime.datetime):
+    """Correlated EXISTS: the alumnus has an interaction on/after ``cutoff``.
+    Negated, it selects the "not contacted since" cohort — which correctly
+    includes never-contacted alumni (no interaction satisfies the predicate)."""
+    return (
+        select(Interaction.interaction_id)
+        .where(
+            Interaction.alumni_id == Alumni.alumni_id,
+            Interaction.interaction_date_time >= cutoff,
+        )
+        .exists()
+    )
+
+
+def _months_before(d: datetime.date, months: int) -> datetime.date:
+    """Calendar-month subtraction with end-of-month day clamping (matches the
+    frontend tile's date math so the count and the deep-linked list agree)."""
+    total = (d.year * 12 + (d.month - 1)) - months
+    year, month0 = divmod(total, 12)
+    month = month0 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return datetime.date(year, month, day)
+
+
 def _serialize_interaction(i, a, u) -> dict:
     return {
         "interaction_id": i.interaction_id,
@@ -162,6 +187,21 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             Interaction.interaction_date_time >= month_ago
         )
     )
+
+    # "Not contacted in N months" cohorts (active alumni whose newest interaction
+    # is older than the cutoff — never-contacted alumni are included). Each tile
+    # deep-links to /alumni?contacted_before=<cutoff>, which uses the same NOT
+    # EXISTS predicate, so the count matches the resulting list.
+    not_contacted = {}
+    for months in (6, 12, 24):
+        cutoff = datetime.datetime.combine(
+            _months_before(today, months), datetime.time.min, tzinfo=datetime.UTC
+        )
+        not_contacted[months] = await session.scalar(
+            select(func.count())
+            .select_from(Alumni)
+            .where(active, ~_contacted_since_exists(cutoff))
+        )
     upcoming_follow_ups = await session.scalar(
         select(func.count())
         .select_from(FollowUpTask)
@@ -267,6 +307,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
         "contacted_this_month": int(contacted_this_month or 0),
+        "not_contacted_6mo": int(not_contacted[6] or 0),
+        "not_contacted_12mo": int(not_contacted[12] or 0),
+        "not_contacted_24mo": int(not_contacted[24] or 0),
         "upcoming_follow_ups": int(upcoming_follow_ups or 0),
         "duplicate_count": int(duplicate_count or 0),
         "attended_event_this_month": int(attended_event_this_month or 0),

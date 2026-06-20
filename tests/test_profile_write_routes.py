@@ -251,6 +251,25 @@ def test_update_interaction_rejects_empty_type(client):
     assert response.json()["error"]["code"] == "validation_error"
 
 
+def test_update_interaction_rejects_null_type(client):
+    # Explicit null must NOT silently clear the type (it bypassed min_length).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.patch(
+        "/alumni/1/interactions/9", json={"interaction_type": None}
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_update_interaction_rejects_whitespace_type(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.patch(
+        "/alumni/1/interactions/9", json={"interaction_type": "   "}
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
 def test_update_interaction_happy_path(client):
     session = _FakeSession(interaction=_interaction(alumni_id=1), user=_actor())
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
@@ -270,7 +289,15 @@ def test_update_interaction_happy_path(client):
         "logged_by": "Tanya Harmon",
     }
     assert session.committed
-    assert session.audit_actions == ["update_interaction"]
+    # One audit row per CHANGED field, each capturing old -> new (FERPA trail).
+    audits = [a for a in session.added if isinstance(a, AuditLog)]
+    assert [a.action_type for a in audits] == [
+        "update_interaction",
+        "update_interaction",
+    ]
+    by_field = {a.field_name: (a.old_value, a.new_value) for a in audits}
+    assert by_field["interaction_type"] == ("Call", "Email")
+    assert by_field["interaction_notes"] == ("Caught up.", "Followed up.")
 
 
 def test_update_interaction_404_for_other_alumni(client):
@@ -309,6 +336,11 @@ def test_delete_interaction_happy_path(client):
     assert session.deleted == [row]
     assert session.committed
     assert session.audit_actions == ["delete_interaction"]
+    # The deleted content is snapshotted into the audit row (hard delete would
+    # otherwise lose the note text irrecoverably).
+    audit = next(a for a in session.added if isinstance(a, AuditLog))
+    assert audit.field_name == "interaction"
+    assert "Caught up." in (audit.old_value or "")
 
 
 def test_delete_interaction_404_when_missing(client):

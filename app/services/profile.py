@@ -411,10 +411,21 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
 
 
 def _audit_alumni(
-    session: AsyncSession, actor_user_id: int | None, action: str, alumni_id: int
+    session: AsyncSession,
+    actor_user_id: int | None,
+    action: str,
+    alumni_id: int,
+    *,
+    field_name: str | None = None,
+    old_value: str | None = None,
+    new_value: str | None = None,
 ) -> None:
     """Record a profile-activity audit event against the alumni entity, so it
-    surfaces in the profile Audit tab. No-op when the actor is unknown."""
+    surfaces in the profile Audit tab. No-op when the actor is unknown.
+
+    The optional field/old/new args capture WHAT changed (used by interaction
+    edit/delete so the FERPA trail can reconstruct altered/removed relationship
+    notes, not just that a change happened)."""
     if actor_user_id is not None:
         session.add(
             AuditLog(
@@ -422,8 +433,16 @@ def _audit_alumni(
                 action_type=action,
                 entity_type="alumni",
                 entity_id=alumni_id,
+                field_name=field_name,
+                old_value=old_value,
+                new_value=new_value,
             )
         )
+
+
+def _audit_str(value: object) -> str | None:
+    """Stringify a value for an audit old/new column (None stays None)."""
+    return None if value is None else str(value)
 
 
 async def add_interaction(
@@ -463,9 +482,23 @@ async def update_interaction(
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Interaction {interaction_id} not found.")
     data = payload.model_dump(exclude_unset=True)
+    # Audit each field that actually changes with its old + new value, so a later
+    # FERPA review can see exactly what a note edit altered — not just that an
+    # edit occurred. A true no-op writes no audit row.
     for field, value in data.items():
+        old = getattr(row, field)
+        if old == value:
+            continue
         setattr(row, field, value)
-    _audit_alumni(session, actor_user_id, "update_interaction", alumni_id)
+        _audit_alumni(
+            session,
+            actor_user_id,
+            "update_interaction",
+            alumni_id,
+            field_name=field,
+            old_value=_audit_str(old),
+            new_value=_audit_str(value),
+        )
     await session.commit()
     await session.refresh(row)
     return InteractionRead.model_validate(row).model_copy(
@@ -485,8 +518,22 @@ async def delete_interaction(
     row = await session.get(Interaction, interaction_id)
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Interaction {interaction_id} not found.")
+    # Snapshot the content BEFORE deleting so the FERPA trail retains what was
+    # removed (a hard delete otherwise loses the note text irrecoverably).
+    snapshot = (
+        f"type={row.interaction_type!r}; "
+        f"when={row.interaction_date_time}; "
+        f"notes={row.interaction_notes!r}"
+    )
     await session.delete(row)
-    _audit_alumni(session, actor_user_id, "delete_interaction", alumni_id)
+    _audit_alumni(
+        session,
+        actor_user_id,
+        "delete_interaction",
+        alumni_id,
+        field_name="interaction",
+        old_value=snapshot,
+    )
     await session.commit()
 
 

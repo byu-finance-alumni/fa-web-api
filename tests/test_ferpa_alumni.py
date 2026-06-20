@@ -104,6 +104,33 @@ def test_minimize_applies_to_list_item():
     assert scoped.current_employer == "Goldman"
 
 
+def test_minimize_strips_interaction_notes_and_logged_by_for_view_only():
+    from app.schemas.profile import InteractionRead, ProfileRead
+    from app.services.profile import _minimize_profile_for_view_only
+
+    interaction = InteractionRead(
+        interaction_id=1,
+        interaction_type="Phone Call",
+        interaction_date_time=datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC),
+        interaction_notes="sensitive note",
+        logged_by="Tanya Harmon",
+    )
+    profile = ProfileRead.model_construct(
+        alumni=AlumniRead.model_validate(_alumni_model()),
+        interactions=[interaction],
+        surveys=[],
+        engagement_notes=[],
+        program_engagement=None,
+        audit=[],
+    )
+    scoped = _minimize_profile_for_view_only(profile)
+    # Notes AND the logging staff name are stripped; non-sensitive type/date stay.
+    assert scoped.interactions[0].interaction_notes is None
+    assert scoped.interactions[0].logged_by is None
+    assert scoped.interactions[0].interaction_type == "Phone Call"
+    assert scoped.interactions[0].interaction_date_time is not None
+
+
 # --- Fake session for service-level profile/export tests ---------------------
 
 

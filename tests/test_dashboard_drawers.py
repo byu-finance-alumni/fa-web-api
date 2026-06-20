@@ -442,3 +442,16 @@ def test_summary_includes_not_contacted_counts(client):
     for key in ("not_contacted_6mo", "not_contacted_12mo", "not_contacted_24mo"):
         assert key in body
         assert isinstance(body[key], int)
+
+
+def test_summary_contacted_this_month_excludes_archived(client):
+    # The contacted-this-month KPI (scalar #6, index 5) must join Alumni and
+    # filter archived, matching every other count on the endpoint (#112).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 17)
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.get("/dashboard/summary")
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    sql = _compiled(session.scalar_args[5])
+    assert "archived" in sql

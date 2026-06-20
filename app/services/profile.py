@@ -379,11 +379,15 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
 
     Nulls the sensitive core PII (via ``minimize_alumni_read``), strips all
     free-text notes (interaction / survey / engagement / program-engagement
-    notes), and omits the embedded audit trail entirely. Returns a new
-    ``ProfileRead``; the input is left untouched.
+    notes), drops the logging staff member's name from interactions, and omits
+    the embedded audit trail entirely. Returns a new ``ProfileRead``; the input
+    is left untouched.
     """
+    # Drop interaction notes AND logged_by: a view_only caller (e.g. faculty)
+    # should not see which staff member contacted an alumnus, only that/when
+    # contact happened. Stripped at the API boundary, not just hidden in the UI.
     interactions = [
-        i.model_copy(update={"interaction_notes": None})
+        i.model_copy(update={"interaction_notes": None, "logged_by": None})
         for i in profile.interactions
     ]
     surveys = [s.model_copy(update={"survey_notes": None}) for s in profile.surveys]

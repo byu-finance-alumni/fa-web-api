@@ -140,7 +140,13 @@ def _serialize_interaction(i, a, u) -> dict:
 @router.get("/summary")
 async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     """KPIs, distributions (cohort / top employers / by state), and recent
-    activity for the dashboard."""
+    activity for the dashboard.
+
+    Aggregate counts only — no per-alumnus identity is returned, so (unlike the
+    per-row drill-downs in this module) it deliberately writes no record-of-
+    disclosure audit row. Drill-downs reached from the tiles audit their own
+    reads.
+    """
     active = Alumni.archived.is_(False)
     now = datetime.datetime.now(datetime.UTC)
     month_ago = now - datetime.timedelta(days=30)
@@ -183,9 +189,10 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     )
 
     contacted_this_month = await session.scalar(
-        select(func.count(func.distinct(Interaction.alumni_id))).where(
-            Interaction.interaction_date_time >= month_ago
-        )
+        select(func.count(func.distinct(Interaction.alumni_id)))
+        .select_from(Interaction)
+        .join(Alumni, Alumni.alumni_id == Interaction.alumni_id)
+        .where(Interaction.interaction_date_time >= month_ago, active)
     )
 
     # "Not contacted in N months" cohorts (active alumni whose newest interaction

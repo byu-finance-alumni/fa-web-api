@@ -699,7 +699,7 @@ async def add_tag(
     )
 
 
-@router.delete("/{alumni_id}/tags/{tag}", response_model=list[str])
+@router.delete("/{alumni_id}/tags/{tag:path}", response_model=list[str])
 async def remove_tag(
     alumni_id: int,
     tag: str,
@@ -731,7 +731,7 @@ async def add_status_label(
     )
 
 
-@router.delete("/{alumni_id}/status-labels/{label}", response_model=list[str])
+@router.delete("/{alumni_id}/status-labels/{label:path}", response_model=list[str])
 async def remove_status_label(
     alumni_id: int,
     label: str,

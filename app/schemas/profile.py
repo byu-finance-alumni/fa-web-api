@@ -212,6 +212,16 @@ class InteractionCreate(BaseModel):
     interaction_notes: str | None = None
 
 
+class InteractionUpdate(BaseModel):
+    """Edit fields on an existing interaction (all optional)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interaction_type: str | None = Field(default=None, min_length=1, max_length=100)
+    interaction_date_time: datetime.datetime | None = None
+    interaction_notes: str | None = None
+
+
 class TaskCreate(BaseModel):
     """Create a follow-up task (Tasks tab)."""
 

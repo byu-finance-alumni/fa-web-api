@@ -43,6 +43,7 @@ from app.schemas.profile import (
     EventAttendedRead,
     InteractionCreate,
     InteractionRead,
+    InteractionUpdate,
     LeadershipCreate,
     LeadershipRead,
     LeadershipUpdate,
@@ -440,6 +441,45 @@ async def add_interaction(
     """Log an interaction on an alumni's timeline (full_access)."""
     return await profile_service.add_interaction(
         session, alumni_id, payload, actor_user_id=user.user_id
+    )
+
+
+@router.patch(
+    "/{alumni_id}/interactions/{interaction_id}",
+    response_model=InteractionRead,
+)
+async def update_interaction(
+    alumni_id: int,
+    interaction_id: int,
+    payload: InteractionUpdate,
+    user: RequireAlumniEdit,
+    session: SessionDep,
+) -> InteractionRead:
+    """Edit an interaction on an alumni's timeline (full_access). 404 if the row
+    is missing or belongs to another alumnus."""
+    return await profile_service.update_interaction(
+        session,
+        alumni_id,
+        interaction_id,
+        payload,
+        actor_user_id=user.user_id,
+    )
+
+
+@router.delete(
+    "/{alumni_id}/interactions/{interaction_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_interaction(
+    alumni_id: int,
+    interaction_id: int,
+    user: RequireAlumniEdit,
+    session: SessionDep,
+) -> None:
+    """Delete an interaction from an alumni's timeline (full_access). 404 if the
+    row is missing or belongs to another alumnus."""
+    await profile_service.delete_interaction(
+        session, alumni_id, interaction_id, actor_user_id=user.user_id
     )
 
 

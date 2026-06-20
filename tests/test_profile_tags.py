@@ -120,3 +120,24 @@ def test_add_status_label_rejects_noncanonical_value(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     resp = client.post("/alumni/1/status-labels", json={"label": "Nope"})
     assert resp.status_code == 422
+
+
+def test_remove_tag_with_slash_route_matches(client):
+    # {tag:path} so a slash-bearing vocab value ("Club/Recruiting") is
+    # removable: the route MATCHES and reaches auth (401) rather than producing
+    # a routing 404 (which is what a plain {tag} param did, leaving the tag
+    # un-removable).
+    resp = client.delete("/alumni/1/tags/Club/Recruiting")
+    assert resp.status_code == 401
+
+
+def test_remove_tag_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    resp = client.delete("/alumni/1/tags/Mentor")
+    assert resp.status_code == 403
+
+
+def test_remove_status_label_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    resp = client.delete("/alumni/1/status-labels/Retired")
+    assert resp.status_code == 403

@@ -31,6 +31,7 @@ from app.schemas.alumni import (
     AlumniUpdateFull,
     minimize_alumni_read,
 )
+from app.schemas.alumni_export import AlumniExportRequest, ExportColumnCatalog
 from app.schemas.filters import FilterOptions
 from app.schemas.profile import (
     EducationCreate,
@@ -55,7 +56,7 @@ from app.schemas.profile import (
     TaskRead,
 )
 from app.services import alumni as service
-from app.services import hygiene, import_csv
+from app.services import alumni_export, hygiene, import_csv
 from app.services import profile as profile_service
 
 router = APIRouter(prefix="/alumni", tags=["alumni"])
@@ -74,9 +75,7 @@ async def list_alumni(
     graduation_year: int | None = None,
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
-    deceased: Annotated[
-        bool | None, Query(description="Filter by deceased flag.")
-    ] = None,
+    deceased: Annotated[bool | None, Query(description="Filter by deceased flag.")] = None,
     employer: Annotated[
         list[str] | None,
         Query(description="Current employer(s) — repeatable (OR), exact match."),
@@ -127,9 +126,7 @@ async def list_alumni(
     ] = None,
     contacted_before: Annotated[
         datetime.date | None,
-        Query(
-            description="Only alumni NOT contacted since this date (stale)."
-        ),
+        Query(description="Only alumni NOT contacted since this date (stale)."),
     ] = None,
     never_contacted: Annotated[
         bool, Query(description="Only alumni with no logged interactions.")
@@ -137,12 +134,8 @@ async def list_alumni(
     attended_event: Annotated[
         bool, Query(description="Only alumni who attended at least one event.")
     ] = False,
-    donor: Annotated[
-        bool, Query(description="Only PIFF donors.")
-    ] = False,
-    mentor_willing: Annotated[
-        bool, Query(description="Only alumni willing to mentor.")
-    ] = False,
+    donor: Annotated[bool, Query(description="Only PIFF donors.")] = False,
+    mentor_willing: Annotated[bool, Query(description="Only alumni willing to mentor.")] = False,
     guest_speaker_willing: Annotated[
         bool, Query(description="Only alumni willing to guest speak.")
     ] = False,
@@ -168,9 +161,7 @@ async def list_alumni(
 ) -> AlumniPage:
     # Archived rows are full_access-and-up only: a view_only / student caller
     # passing ``include_archived=true`` must NOT receive soft-deleted records.
-    has_full_access = (
-        user.is_full_access or user.is_super_admin or user.is_engineer
-    )
+    has_full_access = user.is_full_access or user.is_super_admin or user.is_engineer
     effective_include_archived = include_archived and has_full_access
     items, total = await service.list_alumni(
         session,
@@ -227,9 +218,7 @@ async def list_alumni(
             "leadership_role": "|".join(leadership_role) if leadership_role else None,
             "survey_status": "|".join(survey_status) if survey_status else None,
             "contacted_after": contacted_after.isoformat() if contacted_after else None,
-            "contacted_before": (
-                contacted_before.isoformat() if contacted_before else None
-            ),
+            "contacted_before": (contacted_before.isoformat() if contacted_before else None),
             "never_contacted": never_contacted or None,
             "limit": limit,
             "offset": offset,
@@ -237,18 +226,14 @@ async def list_alumni(
         },
     )
     rows = [
-        minimize_alumni_read(
-            AlumniListItem.model_validate(item), can_edit=user.can_edit_alumni
-        )
+        minimize_alumni_read(AlumniListItem.model_validate(item), can_edit=user.can_edit_alumni)
         for item in items
     ]
     return AlumniPage(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.get("/filter-options", response_model=FilterOptions)
-async def alumni_filter_options(
-    _: RequireViewAccess, session: SessionDep
-) -> FilterOptions:
+async def alumni_filter_options(_: RequireViewAccess, session: SessionDep) -> FilterOptions:
     """Distinct option lists for the advanced-filter panel's multi-selects.
 
     Declared before the ``/{alumni_id}`` routes so the literal path always wins
@@ -284,10 +269,7 @@ def _too_large_response() -> JSONResponse:
         content={
             "error": {
                 "code": "payload_too_large",
-                "message": (
-                    f"File exceeds the {mib} MB upload limit. Split into "
-                    "smaller batches."
-                ),
+                "message": (f"File exceeds the {mib} MB upload limit. Split into smaller batches."),
             }
         },
     )
@@ -300,11 +282,7 @@ async def alumni_import_template(_: RequireFullAccess) -> Response:
     return Response(
         content=import_csv.build_template_csv(),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                'attachment; filename="alumni_import_template.csv"'
-            )
-        },
+        headers={"Content-Disposition": ('attachment; filename="alumni_import_template.csv"')},
     )
 
 
@@ -323,9 +301,7 @@ async def preview_import_alumni(
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
-    rows, header_errors = import_csv.parse_and_map(
-        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
-    )
+    rows, header_errors = import_csv.parse_and_map(file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS)
     if header_errors:
         return {
             "columns_ok": False,
@@ -354,28 +330,77 @@ async def import_alumni(
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
-    rows, header_errors = import_csv.parse_and_map(
-        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
-    )
+    rows, header_errors = import_csv.parse_and_map(file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS)
     if header_errors:
         return {
             "imported": 0,
             "skipped": 0,
             "created_ids": [],
-            "rejects": [
-                {"row": 0, "name": "(header)", "reason": msg}
-                for msg in header_errors
-            ],
+            "rejects": [{"row": 0, "name": "(header)", "reason": msg} for msg in header_errors],
         }
-    return await import_csv.commit_import(
-        session, rows, actor_user_id=user.user_id
+    return await import_csv.commit_import(session, rows, actor_user_id=user.user_id)
+
+
+# --- Customizable CSV export (full_access) -----------------------------------
+#
+# Declared BEFORE the ``/{alumni_id}`` routes so the literal ``/export/...`` paths
+# win over the ``/{alumni_id}`` pattern (route matching is declaration-ordered).
+
+
+@router.get("/export/columns", response_model=ExportColumnCatalog)
+async def alumni_export_columns(_: RequireFullAccess) -> ExportColumnCatalog:
+    """The catalog of exportable columns + the default-checked selection, for the
+    export column picker (full_access)."""
+    return alumni_export.build_catalog()
+
+
+@router.post("/export", response_model=None)
+async def export_alumni(
+    payload: AlumniExportRequest,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> Response | JSONResponse:
+    """Export the filtered alumni list as CSV with the chosen columns
+    (full_access). Hits the SAME population the list view shows (same filters).
+    An unknown column key is a 422; a result set larger than the export cap is a
+    413 asking the caller to narrow filters. Audit-logged (``export_alumni``)."""
+    try:
+        columns = alumni_export.validate_columns(payload.columns)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "validation_error", "message": str(exc)}},
+        )
+    total = await alumni_export.count_matching(session, payload.filters)
+    if total > alumni_export.MAX_EXPORT_ROWS:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "error": {
+                    "code": "payload_too_large",
+                    "message": (
+                        f"This export matches {total:,} alumni, over the "
+                        f"{alumni_export.MAX_EXPORT_ROWS:,}-row limit. Narrow the "
+                        "filters and try again."
+                    ),
+                }
+            },
+        )
+    csv_text = await alumni_export.export_csv(
+        session,
+        columns=columns,
+        filters=payload.filters,
+        actor_user_id=user.user_id,
+    )
+    return Response(
+        content=csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="alumni_export.csv"'},
     )
 
 
 @router.get("/{alumni_id}", response_model=AlumniRead)
-async def get_alumni(
-    alumni_id: int, user: RequireViewAccess, session: SessionDep
-) -> AlumniRead:
+async def get_alumni(alumni_id: int, user: RequireViewAccess, session: SessionDep) -> AlumniRead:
     """Single lightweight alumni core record.
 
     Archived records 404 (they were removed from the directory). view_only
@@ -383,9 +408,7 @@ async def get_alumni(
     notes, and import provenance are nulled. This lightweight read is not
     audit-logged (the full profile aggregate is)."""
     alumnus = await service.get_alumni(session, alumni_id)
-    return minimize_alumni_read(
-        AlumniRead.model_validate(alumnus), can_edit=user.can_edit_alumni
-    )
+    return minimize_alumni_read(AlumniRead.model_validate(alumnus), can_edit=user.can_edit_alumni)
 
 
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
@@ -422,9 +445,7 @@ async def export_alumni_profile(
     task ``assigned_to_user_id``) are never present. Writes an ``export_profile``
     audit row before returning. Archived records 404. The frontend calls this
     instead of doing a client-side export."""
-    return await profile_service.export_profile(
-        session, alumni_id, actor_user_id=user.user_id
-    )
+    return await profile_service.export_profile(session, alumni_id, actor_user_id=user.user_id)
 
 
 @router.post(
@@ -495,9 +516,7 @@ async def add_task(
     session: SessionDep,
 ) -> TaskRead:
     """Create a follow-up task for an alumni (full_access)."""
-    return await profile_service.add_task(
-        session, alumni_id, payload, actor_user_id=user.user_id
-    )
+    return await profile_service.add_task(session, alumni_id, payload, actor_user_id=user.user_id)
 
 
 @router.patch("/{alumni_id}/tasks/{task_id}", response_model=TaskRead)
@@ -694,9 +713,7 @@ async def add_tag(
 ) -> list[str]:
     """Attach a canonical engagement tag to an alumni (full_access). Returns the
     resulting tag list. Idempotent."""
-    return await profile_service.add_tag(
-        session, alumni_id, payload, actor_user_id=user.user_id
-    )
+    return await profile_service.add_tag(session, alumni_id, payload, actor_user_id=user.user_id)
 
 
 @router.delete("/{alumni_id}/tags/{tag:path}", response_model=list[str])
@@ -708,9 +725,7 @@ async def remove_tag(
 ) -> list[str]:
     """Detach a tag from an alumni (full_access). Returns the resulting tag list.
     404 if the alumni doesn't have that tag."""
-    return await profile_service.remove_tag(
-        session, alumni_id, tag, actor_user_id=user.user_id
-    )
+    return await profile_service.remove_tag(session, alumni_id, tag, actor_user_id=user.user_id)
 
 
 @router.post(
@@ -792,17 +807,13 @@ async def preview_update_alumni(
     against the EFFECTIVE record (the cleaned partial overlaid on the stored
     values) so duplicate + completeness checks reflect the resulting state. The
     preview reads stored data, so it is audit-logged (``preview``)."""
-    existing = await service.get_alumni(
-        session, alumni_id, include_archived=True
-    )
+    existing = await service.get_alumni(session, alumni_id, include_archived=True)
     if existing.archived:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
     result = await hygiene.build_preview(
         session, payload, existing=existing, exclude_alumni_id=alumni_id
     )
-    await service.log_preview(
-        session, actor_user_id=user.user_id, alumni_id=alumni_id
-    )
+    await service.log_preview(session, actor_user_id=user.user_id, alumni_id=alumni_id)
     return result
 
 
@@ -820,9 +831,7 @@ async def update_alumni(
     user: RequireAlumniEdit,
     session: SessionDep,
 ) -> AlumniRead:
-    return await service.update_alumni(
-        session, alumni_id, payload, actor_user_id=user.user_id
-    )
+    return await service.update_alumni(session, alumni_id, payload, actor_user_id=user.user_id)
 
 
 @router.delete("/{alumni_id}", response_model=AlumniRead)
@@ -830,9 +839,7 @@ async def archive_alumni(
     alumni_id: int, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
     """Soft-delete (archive) an alumni record."""
-    return await service.archive_alumni(
-        session, alumni_id, actor_user_id=user.user_id
-    )
+    return await service.archive_alumni(session, alumni_id, actor_user_id=user.user_id)
 
 
 @router.post("/{alumni_id}/restore", response_model=AlumniRead)
@@ -840,6 +847,4 @@ async def restore_alumni(
     alumni_id: int, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
     """Restore (unarchive) a previously archived alumni record."""
-    return await service.restore_alumni(
-        session, alumni_id, actor_user_id=user.user_id
-    )
+    return await service.restore_alumni(session, alumni_id, actor_user_id=user.user_id)

@@ -24,6 +24,7 @@ from app.api.routes import (
     events,
     geography,
     health,
+    notes,
     support,
     tasks,
     vocabulary,
@@ -140,6 +141,7 @@ app.include_router(admin.router)
 app.include_router(events.router)
 app.include_router(audit.router)
 app.include_router(geography.router)
+app.include_router(notes.router)
 app.include_router(tasks.router)
 app.include_router(vocabulary.router)
 app.include_router(vocabulary.admin_router)

@@ -313,6 +313,48 @@ def test_never_contacted_is_not_exists_any():
     assert "NOT (EXISTS" in sql
 
 
+# --- #160 "needs surveying" (DUE for the biennial survey) --------------------
+
+
+def test_needs_survey_is_not_exists_recent_completion():
+    # DUE = no survey COMPLETED on/after the server-computed cutoff. Expressed as
+    # a correlated NOT EXISTS over surveys.completed_at >= threshold, which in one
+    # predicate covers never-surveyed (no qualifying row) AND stale (>2yr old).
+    cutoff = datetime.datetime(2024, 6, 23, tzinfo=datetime.UTC)
+    sql = _sql(build_alumni_query(needs_survey=True, survey_due_before=cutoff))
+    assert "surveys" in sql
+    assert "NOT (EXISTS" in sql
+    assert "completed_at IS NOT NULL" in sql
+    assert "completed_at >=" in sql
+
+
+def test_needs_survey_noop_without_threshold():
+    # Defense-in-depth: the flag does nothing unless the caller supplied a
+    # server-computed cutoff (the route owns "now"; the builder never invents it).
+    sql = _sql(build_alumni_query(needs_survey=True))
+    assert "surveys" not in sql
+
+
+def test_needs_survey_off_by_default():
+    sql = _sql(build_alumni_query())
+    assert "completed_at" not in sql
+
+
+def test_needs_survey_combines_with_other_filters_as_and():
+    cutoff = datetime.datetime(2024, 6, 23, tzinfo=datetime.UTC)
+    sql = _sql(
+        build_alumni_query(
+            needs_survey=True,
+            survey_due_before=cutoff,
+            graduation_year=2018,
+        )
+    )
+    # AND-combined with the rest, and still archived-gated by default.
+    assert "graduation_year =" in sql
+    assert "completed_at >=" in sql
+    assert "archived IS false" in sql
+
+
 def test_advanced_filters_absent_by_default():
     # None of the new tables appear unless their filter is set.
     sql = _sql(build_alumni_query())

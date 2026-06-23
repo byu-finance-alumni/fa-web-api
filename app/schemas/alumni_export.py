@@ -55,6 +55,11 @@ class AlumniExportFilters(BaseModel):
     status_label: list[str] | None = None
     leadership_role: list[str] | None = None
     survey_status: list[str] | None = None
+    # "Needs surveying" view (#160). The export route is full_access-and-up
+    # (admin tier), which is exactly the role set allowed to use this filter, so
+    # no extra gating is needed here; the service derives the 2-year cutoff
+    # server-side from this flag.
+    needs_survey: bool = False
     contacted_after: datetime.date | None = None
     contacted_before: datetime.date | None = None
     never_contacted: bool = False

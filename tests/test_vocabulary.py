@@ -1,8 +1,9 @@
 """Tests for the editable controlled-vocabulary feature (#82).
 
 Two layers, both offline (no database):
-- Route authorization: the /admin/vocabulary CRUD is vocab-admin only
-  (engineer / super_admin); lesser roles get 403, unknown categories 422.
+- Route authorization: the /admin/vocabulary CRUD is engineer-only (the
+  controlled-vocabulary admin role); every lesser role, INCLUDING super_admin,
+  gets 403, unknown categories 422.
 - Service logic: create/update/deactivate semantics (duplicate -> 409,
   reactivate-inactive, rename-collision -> 409, soft delete) driven against a
   tiny fake session.
@@ -47,8 +48,12 @@ def client():
 # --- route authorization ------------------------------------------------------
 
 
-@pytest.mark.parametrize("role", ["view_only", "student", "full_access"])
-def test_create_vocab_forbidden_below_vocab_admin(client, role):
+# Vocab admin is engineer-only: super_admin is now forbidden alongside the
+# lesser roles (defense-in-depth match to the engineer-only frontend gate).
+@pytest.mark.parametrize(
+    "role", ["view_only", "student", "full_access", "super_admin"]
+)
+def test_create_vocab_forbidden_below_engineer(client, role):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     resp = client.post(
         "/admin/vocabulary", json={"category": "event_type", "value": "Gala"}
@@ -57,17 +62,37 @@ def test_create_vocab_forbidden_below_vocab_admin(client, role):
     assert resp.json()["error"]["code"] == "forbidden"
 
 
-@pytest.mark.parametrize("role", ["view_only", "student", "full_access"])
-def test_list_vocab_admin_forbidden_below_vocab_admin(client, role):
+@pytest.mark.parametrize(
+    "role", ["view_only", "student", "full_access", "super_admin"]
+)
+def test_list_vocab_admin_forbidden_below_engineer(client, role):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     resp = client.get("/admin/vocabulary/event_type")
     assert resp.status_code == 403
 
 
-@pytest.mark.parametrize("role", ["view_only", "student", "full_access"])
-def test_delete_vocab_forbidden_below_vocab_admin(client, role):
+@pytest.mark.parametrize(
+    "role", ["view_only", "student", "full_access", "super_admin"]
+)
+def test_delete_vocab_forbidden_below_engineer(client, role):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     assert client.delete("/admin/vocabulary/5").status_code == 403
+
+
+def test_engineer_may_list_vocab_admin(client, monkeypatch):
+    # The engineer (controlled-vocabulary admin) passes the guard: the request
+    # reaches the handler (200), proving the route is engineer-allowed and not
+    # blocked at authorization. The service is patched to return no terms, so the
+    # body is an empty list.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("engineer")
+
+    async def _empty(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(svc, "list_terms", _empty)
+    resp = client.get("/admin/vocabulary/event_type")
+    assert resp.status_code == 200
+    assert resp.json() == []
 
 
 def test_public_vocab_unknown_category_is_422(client):

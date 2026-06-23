@@ -3,8 +3,8 @@
 Two surfaces:
 - ``GET /vocabulary/{category}`` — the active option strings for a dropdown.
   Readable by any provisioned role (the app needs options to render forms).
-- ``/admin/vocabulary`` CRUD — add / edit / deactivate terms. Restricted to the
-  vocab-admin roles (engineer / super_admin) via ``RequireVocabAdmin``. Every
+- ``/admin/vocabulary`` CRUD — add / edit / deactivate terms. Engineer-only
+  (the controlled-vocabulary admin role) via ``RequireVocabAdmin``. Every
   mutation writes an audit row (who changed what), like the user-admin routes.
 
 Deletes are soft (active=false): a value still on existing records stays valid,
@@ -31,7 +31,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 # Public-read router: dropdown options for the app's forms.
 router = APIRouter(prefix="/vocabulary", tags=["vocabulary"])
-# Admin CRUD router: manage the vocabulary (engineer / super_admin).
+# Admin CRUD router: manage the vocabulary (engineer-only).
 admin_router = APIRouter(prefix="/admin/vocabulary", tags=["vocabulary-admin"])
 
 

@@ -5,6 +5,7 @@ DATABASE_URL is configured, so the API can still start without a database
 (the DB health endpoint will report it as unavailable).
 """
 
+import os
 from collections.abc import AsyncGenerator
 
 from sqlalchemy import text
@@ -40,6 +41,14 @@ if settings.async_database_url:
     # Vercel should use. In that mode we must disable asyncpg's prepared-
     # statement cache and not hold a connection pool across invocations.
     _is_transaction_pooler = ":6543" in _url
+    # Are we running on a serverless platform (Vercel)? Vercel sets VERCEL=1.
+    # On serverless, the process is frozen between invocations, so a persistent
+    # connection pool will hand out connections the upstream pooler/network has
+    # since dropped — the FIRST query then fails intermittently (surfacing as a
+    # 500 "An unexpected error occurred" that a refresh "fixes" by landing on a
+    # fresh connection). The fix is to NOT pool across invocations: open a fresh
+    # connection per checkout and dispose it at request end (NullPool).
+    _is_serverless = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
 
     if _is_transaction_pooler:
         engine = create_async_engine(
@@ -48,13 +57,29 @@ if settings.async_database_url:
             poolclass=NullPool,
             connect_args={"statement_cache_size": 0},
         )
+    elif _is_serverless:
+        # Session-pooler (:5432) on serverless. Don't pool across frozen
+        # invocations — that's the root of the intermittent stale-connection
+        # 500s on the alumni list (and every other read). NullPool gives each
+        # request a brand-new connection and closes it when the request ends, so
+        # there's never a recycled-but-dead connection to trip over. asyncpg's
+        # prepared-statement cache is also disabled because the session pooler
+        # can route reconnects through pgbouncer-style multiplexing where cached
+        # statement names won't exist.
+        engine = create_async_engine(
+            _url,
+            echo=_echo,
+            poolclass=NullPool,
+            connect_args={"statement_cache_size": 0},
+        )
     else:
-        # Session-pooler (:5432) path. Supabase's session-mode pooler caps the
-        # TOTAL number of clients across ALL connectors to 15. SQLAlchemy's
-        # default QueuePool (pool_size=5 + max_overflow=10 = up to 15) can alone
-        # exhaust that cap, leaving no headroom for one-off scripts/migrations
-        # and triggering asyncpg EMAXCONNSESSION ("max clients reached"). So we
-        # keep a deliberately SMALL pool (default 5 + 2 overflow = hard cap 7),
+        # Session-pooler (:5432) path for a LONG-LIVED process (local dev / a
+        # persistent server). Supabase's session-mode pooler caps the TOTAL
+        # number of clients across ALL connectors to 15. SQLAlchemy's default
+        # QueuePool (pool_size=5 + max_overflow=10 = up to 15) can alone exhaust
+        # that cap, leaving no headroom for one-off scripts/migrations and
+        # triggering asyncpg EMAXCONNSESSION ("max clients reached"). So we keep
+        # a deliberately SMALL pool (default 5 + 2 overflow = hard cap 7),
         # recycle stale connections, and pre-ping. Sizes are overridable via env
         # (DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_POOL_TIMEOUT, DB_POOL_RECYCLE).
         #

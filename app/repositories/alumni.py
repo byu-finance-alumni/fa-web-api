@@ -50,6 +50,28 @@ async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
     return await session.get(Alumni, alumni_id)
 
 
+# Sort options exposed by the list UI, mapped to their ORDER BY columns. Kept as
+# a pure module-level function (no IO) so the mapping can be unit-tested by
+# compiling the clause — this is the one place the grad-year direction is decided
+# and it MUST stay: grad_desc = most-recent grad year FIRST (DESC, nulls last),
+# grad_asc = oldest FIRST (ASC, nulls last). The frontend dropdown labels
+# ("newest" -> grad_desc, "oldest" -> grad_asc) and the route's `sort` enum stay
+# in lockstep with these tokens. Unknown/legacy values fall back to name.
+def alumni_order_by(sort: str | None) -> tuple:
+    """Return the ORDER BY tuple for a list ``sort`` token (name | grad_desc | grad_asc)."""
+    return {
+        "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
+        "grad_desc": (
+            Alumni.graduation_year.desc().nulls_last(),
+            Alumni.last_name.asc(),
+        ),
+        "grad_asc": (
+            Alumni.graduation_year.asc().nulls_last(),
+            Alumni.last_name.asc(),
+        ),
+    }.get(sort or "name", (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
+
+
 def build_alumni_query(
     *,
     q: str | None = None,
@@ -378,19 +400,9 @@ async def list_page(
     if base.whereclause is not None:
         rows_stmt = rows_stmt.where(base.whereclause)
 
-    # Sort options exposed by the list UI. Unknown values fall back to name.
-    order_by = {
-        "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
-        "grad_desc": (
-            Alumni.graduation_year.desc().nulls_last(),
-            Alumni.last_name.asc(),
-        ),
-        "grad_asc": (
-            Alumni.graduation_year.asc().nulls_last(),
-            Alumni.last_name.asc(),
-        ),
-    }.get(sort, (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
-    rows_stmt = rows_stmt.order_by(*order_by).limit(limit).offset(offset)
+    # Sort options exposed by the list UI (see alumni_order_by). Unknown values
+    # fall back to name.
+    rows_stmt = rows_stmt.order_by(*alumni_order_by(sort)).limit(limit).offset(offset)
     result = await session.execute(rows_stmt)
     items: list[Alumni] = []
     for alumnus, employer, industry in result.all():

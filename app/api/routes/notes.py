@@ -34,8 +34,15 @@ async def list_notes(
     entity_id: Annotated[int, Query(gt=0, description="Id of the alumni / interaction / event.")],
 ) -> list[NoteRead]:
     """List the notes on one entity, newest first (any view-access role). 404 if
-    the parent entity doesn't exist. The disclosure is audit-logged."""
-    return await service.list_notes(session, entity_type, entity_id, actor_user_id=user.user_id)
+    the parent entity doesn't exist. The disclosure is audit-logged. A view_only
+    caller sees note authors by first name only; editors see full names."""
+    return await service.list_notes(
+        session,
+        entity_type,
+        entity_id,
+        actor_user_id=user.user_id,
+        full_author_name=user.can_edit_alumni,
+    )
 
 
 @router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)

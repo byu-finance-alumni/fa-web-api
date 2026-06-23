@@ -15,6 +15,7 @@ verified end to end without Postgres.
 import asyncio
 import datetime
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,6 +26,8 @@ from app.core.errors import NotFoundError
 from app.main import app
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
+from app.models.crm import Interaction
+from app.models.user import User
 from app.schemas.alumni import (
     VIEW_ONLY_HIDDEN_FIELDS,
     AlumniListItem,
@@ -104,16 +107,18 @@ def test_minimize_applies_to_list_item():
     assert scoped.current_employer == "Goldman"
 
 
-def test_minimize_strips_interaction_notes_and_logged_by_for_view_only():
+def test_minimize_strips_interaction_notes_but_preserves_logged_by():
     from app.schemas.profile import InteractionRead, ProfileRead
     from app.services.profile import _minimize_profile_for_view_only
 
+    # logged_by is set to the first name upstream in get_profile; minimization
+    # must strip the free-text notes but leave logged_by untouched.
     interaction = InteractionRead(
         interaction_id=1,
         interaction_type="Phone Call",
         interaction_date_time=datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC),
         interaction_notes="sensitive note",
-        logged_by="Tanya Harmon",
+        logged_by="Tanya",
     )
     profile = ProfileRead.model_construct(
         alumni=AlumniRead.model_validate(_alumni_model()),
@@ -124,9 +129,8 @@ def test_minimize_strips_interaction_notes_and_logged_by_for_view_only():
         audit=[],
     )
     scoped = _minimize_profile_for_view_only(profile)
-    # Notes AND the logging staff name are stripped; non-sensitive type/date stay.
-    assert scoped.interactions[0].interaction_notes is None
-    assert scoped.interactions[0].logged_by is None
+    assert scoped.interactions[0].interaction_notes is None  # notes stripped
+    assert scoped.interactions[0].logged_by == "Tanya"  # first name preserved
     assert scoped.interactions[0].interaction_type == "Phone Call"
     assert scoped.interactions[0].interaction_date_time is not None
 
@@ -249,6 +253,69 @@ def test_profile_edit_caller_full_fidelity():
     )
     assert profile.alumni.byu_id == "123456789"
     assert profile.alumni.notes == "private note"
+
+
+class _ProfileInteractionFakeSession(_ProfileFakeSession):
+    """Like ``_ProfileFakeSession`` but returns one interaction (logged by
+    ``user``) and resolves that user, so ``logged_by`` name-building is covered."""
+
+    def __init__(self, alumnus, interaction, user):
+        super().__init__(alumnus)
+        self._interaction = interaction
+        self._user = user
+
+    async def get(self, model, pk):
+        if model is User and pk == self._user.user_id:
+            return self._user
+        return await super().get(model, pk)
+
+    async def scalars(self, stmt):
+        entity = stmt.column_descriptions[0]["entity"]
+        if entity is Interaction:
+            return _Scalars([self._interaction])
+        if entity is User:
+            return _Scalars([self._user])
+        return _Scalars([])
+
+
+def _logger_user():
+    return SimpleNamespace(
+        user_id=42, first_name="Tanya", last_name="Harmon", email="th@byu.edu"
+    )
+
+
+def _one_interaction():
+    return SimpleNamespace(
+        interaction_id=1,
+        user_id=42,
+        interaction_type="Phone Call",
+        interaction_date_time=datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC),
+        interaction_notes="sensitive note",
+    )
+
+
+def test_profile_view_only_logged_by_is_first_name():
+    session = _ProfileInteractionFakeSession(
+        _alumni_model(), _one_interaction(), _logger_user()
+    )
+    profile = asyncio.run(
+        profile_service.get_profile(session, 1, can_edit=False, actor_user_id=7)
+    )
+    # view_only sees WHO made contact by first name, but not the full name or
+    # the free-text notes.
+    assert profile.interactions[0].logged_by == "Tanya"
+    assert profile.interactions[0].interaction_notes is None
+
+
+def test_profile_editor_logged_by_is_full_name():
+    session = _ProfileInteractionFakeSession(
+        _alumni_model(), _one_interaction(), _logger_user()
+    )
+    profile = asyncio.run(
+        profile_service.get_profile(session, 1, can_edit=True, actor_user_id=7)
+    )
+    assert profile.interactions[0].logged_by == "Tanya Harmon"
+    assert profile.interactions[0].interaction_notes == "sensitive note"
 
 
 # --- Finding 1: export ---------------------------------------------------------

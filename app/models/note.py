@@ -25,6 +25,10 @@ class Note(TimestampMixin, Base):
             "num_nonnulls(alumni_id, interaction_id, event_id) = 1",
             name="ck_notes_single_target",
         ),
+        CheckConstraint(
+            "char_length(body) <= 10000",
+            name="ck_notes_body_length",
+        ),
     )
 
     note_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

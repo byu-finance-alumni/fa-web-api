@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS notes (
     updated_at         timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT ck_notes_single_target
         CHECK (num_nonnulls(alumni_id, interaction_id, event_id) = 1),
+    -- Defence-in-depth cap mirroring the API's 10k char limit, so a direct DB
+    -- write can't store an unbounded blob the list endpoint would return whole.
+    CONSTRAINT ck_notes_body_length CHECK (char_length(body) <= 10000),
     CONSTRAINT fk_notes_alumni_id
         FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_notes_interaction_id

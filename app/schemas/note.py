@@ -13,7 +13,7 @@ from __future__ import annotations
 import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Defence-in-depth cap so a client cannot push unbounded free text into the
 # column or the audit snapshot. Matches the event/interaction notes cap.
@@ -43,7 +43,7 @@ class NoteCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     entity_type: NoteEntityType
-    entity_id: int
+    entity_id: int = Field(gt=0)
     body: str
 
     @field_validator("body")

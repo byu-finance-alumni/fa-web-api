@@ -265,6 +265,34 @@ def test_list_notes_happy_path(client):
     assert [n["note_id"] for n in body] == [7, 6]
     assert all(n["entity_type"] == "alumni" for n in body)
     assert body[0]["author"] == "Tanya Harmon"
+    # FERPA: reading sensitive note bodies is a disclosure — audited (view_notes).
+    assert [a.action_type for a in session.audits] == ["view_notes"]
+    assert (session.audits[0].entity_type, session.audits[0].entity_id) == ("alumni", 1)
+
+
+def test_update_note_no_op_writes_no_audit(client):
+    # Editing a note with its current body must not bump the row or log an audit.
+    note = Note(
+        alumni_id=1,
+        interaction_id=None,
+        event_id=None,
+        body="Same text",
+        created_by_user_id=1,
+    )
+    note.note_id = 7
+    # A persisted note always has timestamps; the no-op path returns without a
+    # refresh, so stamp the transient fixture row.
+    stamp = datetime.datetime(2026, 6, 1, 9, 0, tzinfo=datetime.UTC)
+    note.created_at = stamp
+    note.updated_at = stamp
+    session = _FakeSession(alumni=SimpleNamespace(alumni_id=1), user=_actor(), note=note)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.patch("/notes/7", json={"body": "Same text"})
+    assert response.status_code == 200
+    assert response.json()["body"] == "Same text"
+    assert session.audits == []
 
 
 def test_update_note_happy_path(client):

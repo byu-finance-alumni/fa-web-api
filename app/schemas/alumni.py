@@ -501,6 +501,10 @@ VIEW_ONLY_HIDDEN_FIELDS: frozenset[str] = frozenset(
         "spouse_first_name",
         "spouse_last_name",
         "spouse_birth_date",
+        # NOTE: this is the alumni record's import-provenance "Notes" column
+        # (CSV intake), hidden from view_only. It is DISTINCT from the unified
+        # CRM `notes` table (#39), whose engagement/interaction/event notes are
+        # intentionally visible to view_only per the unified-notes spec.
         "notes",
         "manually_edited_at",
         "last_imported_at",

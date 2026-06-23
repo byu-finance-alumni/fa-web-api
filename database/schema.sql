@@ -437,6 +437,7 @@ CREATE TABLE notes (
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT ck_notes_single_target CHECK (num_nonnulls(alumni_id, interaction_id, event_id) = 1),
+    CONSTRAINT ck_notes_body_length CHECK (char_length(body) <= 10000),
     CONSTRAINT fk_notes_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_notes_interaction_id FOREIGN KEY (interaction_id) REFERENCES interactions (interaction_id) ON DELETE CASCADE,
     CONSTRAINT fk_notes_event_id FOREIGN KEY (event_id) REFERENCES events (event_id) ON DELETE CASCADE,

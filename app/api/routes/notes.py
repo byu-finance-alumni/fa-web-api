@@ -25,17 +25,17 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("", response_model=list[NoteRead])
 async def list_notes(
-    _: RequireViewAccess,
+    user: RequireViewAccess,
     session: SessionDep,
     entity_type: Annotated[
         NoteEntityType,
         Query(description="Which level the notes are attached to."),
     ],
-    entity_id: Annotated[int, Query(description="Id of the alumni / interaction / event.")],
+    entity_id: Annotated[int, Query(gt=0, description="Id of the alumni / interaction / event.")],
 ) -> list[NoteRead]:
     """List the notes on one entity, newest first (any view-access role). 404 if
-    the parent entity doesn't exist."""
-    return await service.list_notes(session, entity_type, entity_id)
+    the parent entity doesn't exist. The disclosure is audit-logged."""
+    return await service.list_notes(session, entity_type, entity_id, actor_user_id=user.user_id)
 
 
 @router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)

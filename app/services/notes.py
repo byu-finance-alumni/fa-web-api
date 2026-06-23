@@ -14,7 +14,9 @@ notes do.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import logging
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +28,8 @@ from app.models.event import Event
 from app.models.note import Note
 from app.models.user import User
 from app.schemas.note import NoteCreate, NoteEntityType, NoteRead, NoteUpdate
+
+log = logging.getLogger(__name__)
 
 
 def _now() -> datetime.datetime:
@@ -108,8 +112,19 @@ def _audit(
     old_value: str | None = None,
     new_value: str | None = None,
 ) -> None:
-    """Record a note write in the audit trail. No-op when the actor is unknown."""
+    """Record a note write in the audit trail.
+
+    The actor is always present on the API path (writes go through
+    ``RequireFullAccess``). Guard anyway: if a future non-HTTP caller supplies no
+    actor, log a warning (never the note body) rather than silently producing an
+    unaudited write."""
     if actor_user_id is None:
+        log.warning(
+            "Note audit skipped: no actor for action=%s entity=%s/%s",
+            action,
+            audit_entity_type,
+            audit_entity_id,
+        )
         return
     session.add(
         AuditLog(
@@ -128,12 +143,19 @@ async def list_notes(
     session: AsyncSession,
     entity_type: NoteEntityType,
     entity_id: int,
+    actor_user_id: int | None = None,
 ) -> list[NoteRead]:
     """Return the notes attached to one entity, newest first.
 
+    Reads are intentionally open to every view-access role (incl. view_only /
+    Professor) per the unified-notes spec — there is no per-record ownership
+    scoping. Because note bodies are sensitive free text, the disclosure is
+    audit-logged (``view_notes``) so a FERPA review can answer "who read the
+    notes on this record?", mirroring the ``view_profile`` / ``search`` trail.
+
     404s if the parent entity does not exist (so a bad id is distinguishable
     from an entity that simply has no notes yet)."""
-    await _resolve_target(session, entity_type, entity_id)
+    _, audit_type, audit_id = await _resolve_target(session, entity_type, entity_id)
     column = {
         NoteEntityType.ALUMNI: Note.alumni_id,
         NoteEntityType.INTERACTION: Note.interaction_id,
@@ -148,7 +170,23 @@ async def list_notes(
         .scalars()
         .all()
     )
-    return [_to_read(n, await _actor_name(session, n.created_by_user_id)) for n in rows]
+    result = [_to_read(n, await _actor_name(session, n.created_by_user_id)) for n in rows]
+    # Best-effort disclosure audit — a logging failure must never break the read.
+    if actor_user_id is not None:
+        try:
+            _audit(
+                session,
+                actor_user_id,
+                "view_notes",
+                audit_type,
+                audit_id,
+                new_value=f"{len(result)} note(s)",
+            )
+            await session.commit()
+        except Exception:  # noqa: BLE001 - audit is best-effort
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    return result
 
 
 async def create_note(
@@ -185,24 +223,30 @@ async def update_note(
     payload: NoteUpdate,
     actor_user_id: int | None,
 ) -> NoteRead:
+    """Edit a note's body. Any ``full_access`` user may edit any note (notes are
+    a shared institutional record, mirroring how interactions are edited) — the
+    change is fully audited (old + new value) so the FERPA trail attributes it. A
+    no-op edit (identical body) writes nothing and emits no audit row."""
     note = await session.get(Note, note_id)
     if note is None:
         raise NotFoundError(f"Note {note_id} not found.")
-    if note.body != payload.body:
-        old = note.body
-        note.body = payload.body
-        note.updated_by_user_id = actor_user_id
-        note.updated_at = _now()
-        audit_type, audit_id = await _audit_target_for_note(session, note)
-        _audit(
-            session,
-            actor_user_id,
-            "update_note",
-            audit_type,
-            audit_id,
-            old_value=old,
-            new_value=payload.body,
-        )
+    if note.body == payload.body:
+        # Genuine no-op: don't bump the row, don't write a spurious audit entry.
+        return _to_read(note, await _actor_name(session, note.created_by_user_id))
+    old = note.body
+    note.body = payload.body
+    note.updated_by_user_id = actor_user_id
+    note.updated_at = _now()
+    audit_type, audit_id = await _audit_target_for_note(session, note)
+    _audit(
+        session,
+        actor_user_id,
+        "update_note",
+        audit_type,
+        audit_id,
+        old_value=old,
+        new_value=payload.body,
+    )
     await session.commit()
     await session.refresh(note)
     return _to_read(note, await _actor_name(session, note.created_by_user_id))

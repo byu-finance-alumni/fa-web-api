@@ -26,6 +26,13 @@ from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.utils.sql import escape_like
 
+# Biennial survey cadence (#160): an alumnus is DUE for surveying when their
+# most-recent completed survey is older than this, or they have never completed
+# one. Expressed in days so the cutoff arithmetic stays in stdlib; a 2-year
+# staleness window is insensitive to leap-year calendar drift. Callers compute
+# the cutoff as ``now() - SURVEY_CADENCE`` and pass it as ``survey_due_before``.
+SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
+
 
 def _as_values(value: "str | list[str] | None") -> list[str]:
     """Normalize a filter input to a clean list of non-empty strings.
@@ -92,6 +99,12 @@ def build_alumni_query(
     status_label: "str | list[str] | None" = None,
     leadership_role: "str | list[str] | None" = None,
     survey_status: "str | list[str] | None" = None,
+    # "Needs surveying" (#160): alumni who are DUE for the biennial survey —
+    # never completed one, or whose most-recent completion is older than the
+    # survey cadence. The threshold is computed server-side and passed in (the
+    # route owns "now"); a ``None`` threshold disables the filter.
+    needs_survey: bool = False,
+    survey_due_before: datetime.datetime | None = None,
     # Last-contacted (derived from interactions): contacted on/after a date,
     # NOT contacted since a date (stale), or never contacted at all.
     contacted_after: datetime.date | None = None,
@@ -269,6 +282,26 @@ def build_alumni_query(
             .where(
                 Survey.alumni_id == Alumni.alumni_id,
                 _ilike_any(Survey.survey_status, survey_statuses),
+            )
+            .exists()
+        )
+    if needs_survey and survey_due_before is not None:
+        # DUE = no survey COMPLETED within the cadence window. A correlated NOT
+        # EXISTS over a recent completion captures both cases in one predicate:
+        #   * never surveyed (no survey rows, or rows with a NULL completed_at)
+        #     -> nothing satisfies the inner EXISTS -> DUE, and
+        #   * most-recent completion older than the threshold -> still no row
+        #     with completed_at >= threshold -> DUE.
+        # ``survey_due_before`` is the server-computed cutoff (now - cadence);
+        # comparing completed_at to it avoids re-deriving "most recent" — any
+        # completion on/after the cutoff means NOT due. Stays in PostgreSQL with
+        # a stable plan (indexable on surveys.alumni_id, completed_at).
+        conditions.append(
+            ~select(Survey.survey_id)
+            .where(
+                Survey.alumni_id == Alumni.alumni_id,
+                Survey.completed_at.is_not(None),
+                Survey.completed_at >= survey_due_before,
             )
             .exists()
         )

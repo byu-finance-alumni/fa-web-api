@@ -23,6 +23,8 @@ from app.api.dependencies.auth import (
 )
 from app.core.database import get_session
 from app.core.errors import NotFoundError
+from app.core.security import AuthorizationError
+from app.repositories.alumni import SURVEY_CADENCE
 from app.schemas.alumni import (
     AlumniCreateFull,
     AlumniListItem,
@@ -120,6 +122,18 @@ async def list_alumni(
         list[str] | None,
         Query(description="Survey status value(s) — repeatable, exact match."),
     ] = None,
+    needs_survey: Annotated[
+        bool,
+        Query(
+            description=(
+                "'Needs surveying' view (admin tier and up only): alumni DUE for "
+                "the biennial survey — never completed one, or whose most-recent "
+                "completion is older than 2 years. The 2-year threshold is "
+                "computed server-side. Forbidden for student / view_only roles "
+                "(403)."
+            )
+        ),
+    ] = False,
     contacted_after: Annotated[
         datetime.date | None,
         Query(description="Only alumni with an interaction on/after this date."),
@@ -188,6 +202,17 @@ async def list_alumni(
     # passing ``include_archived=true`` must NOT receive soft-deleted records.
     has_full_access = user.is_full_access or user.is_super_admin or user.is_engineer
     effective_include_archived = include_archived and has_full_access
+    # "Needs surveying" is an admin-tier view (engineer / super_admin /
+    # full_access = "admin"). student and view_only ("professor") are denied
+    # server-side — a 403, not a silent ignore, so the access decision is
+    # explicit and audit-visible rather than relying on the UI to hide the tile.
+    survey_due_before: datetime.datetime | None = None
+    if needs_survey:
+        if not has_full_access:
+            raise AuthorizationError(
+                "The 'needs surveying' view is restricted to admin users."
+            )
+        survey_due_before = datetime.datetime.now(datetime.UTC) - SURVEY_CADENCE
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -208,6 +233,8 @@ async def list_alumni(
         status_label=status_label,
         leadership_role=leadership_role,
         survey_status=survey_status,
+        needs_survey=needs_survey,
+        survey_due_before=survey_due_before,
         contacted_after=contacted_after,
         contacted_before=contacted_before,
         never_contacted=never_contacted,
@@ -246,6 +273,7 @@ async def list_alumni(
             "status_label": "|".join(status_label) if status_label else None,
             "leadership_role": "|".join(leadership_role) if leadership_role else None,
             "survey_status": "|".join(survey_status) if survey_status else None,
+            "needs_survey": needs_survey or None,
             "contacted_after": contacted_after.isoformat() if contacted_after else None,
             "contacted_before": (contacted_before.isoformat() if contacted_before else None),
             "never_contacted": never_contacted or None,

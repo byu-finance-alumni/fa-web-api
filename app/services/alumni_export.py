@@ -31,7 +31,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment, EducationHistory
 from app.models.engagement import AlumniProgramEngagement
-from app.repositories.alumni import build_alumni_query
+from app.repositories.alumni import SURVEY_CADENCE, build_alumni_query
 from app.schemas.alumni_export import (
     AlumniExportFilters,
     ExportColumn,
@@ -296,8 +296,16 @@ def validate_columns(keys: list[str]) -> list[_Col]:
 
 def _filters_dict(filters: AlumniExportFilters) -> dict:
     """The filter kwargs for ``build_alumni_query`` — only the fields the caller
-    actually set, so unset fields keep the query builder's defaults."""
-    return filters.model_dump(exclude_unset=True, exclude={"sort"})
+    actually set, so unset fields keep the query builder's defaults.
+
+    When ``needs_survey`` is requested, derive the biennial-survey cutoff
+    server-side (the body never carries a trusted "now") so the export hits the
+    same DUE population the list view shows. The export route is full_access and
+    up, which is exactly the admin tier allowed to use this filter."""
+    out = filters.model_dump(exclude_unset=True, exclude={"sort"})
+    if out.get("needs_survey"):
+        out["survey_due_before"] = datetime.datetime.now(datetime.UTC) - SURVEY_CADENCE
+    return out
 
 
 async def count_matching(session: AsyncSession, filters: AlumniExportFilters) -> int:

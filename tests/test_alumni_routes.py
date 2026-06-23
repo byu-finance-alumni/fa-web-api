@@ -91,6 +91,75 @@ def test_create_rejects_unknown_field(client):
     assert response.status_code == 422
 
 
+# --- #160 "needs surveying" view: admin-tier role gating ---------------------
+#
+# The filter rides on the shared GET /alumni list (all roles can read the list),
+# so it is gated INSIDE the handler: admin tier (engineer / super_admin /
+# full_access) may use it; student and view_only ("professor") get a 403 that
+# fires before any query. The allowed path is exercised by capturing the service
+# kwargs so we can confirm both that it was NOT denied and that the 2-year cutoff
+# is computed server-side and forwarded.
+
+
+@pytest.mark.parametrize("role", ["student", "view_only"])
+def test_needs_survey_forbidden_for_non_admin(client, role):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    response = client.get("/alumni", params={"needs_survey": "true"})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+@pytest.mark.parametrize("role", ["engineer", "super_admin", "full_access"])
+def test_needs_survey_allowed_for_admin_tier(client, monkeypatch, role):
+    from app.api.routes import alumni as alumni_routes
+
+    captured: dict = {}
+
+    async def fake_list_alumni(session, **kwargs):
+        captured.update(kwargs)
+        return [], 0
+
+    async def fake_log_search(session, **kwargs):
+        return None
+
+    monkeypatch.setattr(alumni_routes.service, "list_alumni", fake_list_alumni)
+    monkeypatch.setattr(alumni_routes.service, "log_search", fake_log_search)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+
+    response = client.get("/alumni", params={"needs_survey": "true"})
+    assert response.status_code == 200
+    # Not denied, AND the server computed + forwarded a 2-year staleness cutoff.
+    assert captured["needs_survey"] is True
+    cutoff = captured["survey_due_before"]
+    assert isinstance(cutoff, datetime.datetime)
+    expected = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=365 * 2)
+    assert abs((cutoff - expected).total_seconds()) < 60
+
+
+def test_needs_survey_omitted_does_not_forward_threshold(client, monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    captured: dict = {}
+
+    async def fake_list_alumni(session, **kwargs):
+        captured.update(kwargs)
+        return [], 0
+
+    async def fake_log_search(session, **kwargs):
+        return None
+
+    monkeypatch.setattr(alumni_routes.service, "list_alumni", fake_list_alumni)
+    monkeypatch.setattr(alumni_routes.service, "log_search", fake_log_search)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+
+    # No needs_survey param: a plain list read is allowed for view_only and the
+    # threshold is never computed (stays None).
+    response = client.get("/alumni")
+    assert response.status_code == 200
+    assert captured["needs_survey"] is False
+    assert captured["survey_due_before"] is None
+
+
 # --- Hygiene / preview / duplicate-blocking (fake session) -------------------
 
 

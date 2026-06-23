@@ -9,6 +9,7 @@
 """
 
 import csv
+import datetime
 import io
 import uuid
 from types import SimpleNamespace
@@ -21,7 +22,9 @@ from app.core.database import get_session
 from app.main import app
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
+from app.schemas.alumni_export import AlumniExportFilters
 from app.schemas.auth import UserContext
+from app.services.alumni_export import _filters_dict
 
 
 def _ctx(*roles: str) -> UserContext:
@@ -42,6 +45,25 @@ def client():
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+# --- #160 "needs surveying" export filter ------------------------------------
+
+
+def test_filters_dict_derives_survey_cutoff_when_needs_survey():
+    # The export body carries only the flag; the service derives the 2-year
+    # cutoff server-side (the body never supplies a trusted "now").
+    out = _filters_dict(AlumniExportFilters(needs_survey=True))
+    assert out["needs_survey"] is True
+    cutoff = out["survey_due_before"]
+    assert isinstance(cutoff, datetime.datetime)
+    expected = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=365 * 2)
+    assert abs((cutoff - expected).total_seconds()) < 60
+
+
+def test_filters_dict_no_survey_cutoff_when_flag_unset():
+    out = _filters_dict(AlumniExportFilters())
+    assert "survey_due_before" not in out
 
 
 class _FakeResult:

@@ -134,6 +134,25 @@ async def list_alumni(
     attended_event: Annotated[
         bool, Query(description="Only alumni who attended at least one event.")
     ] = False,
+    spoke_after: Annotated[
+        datetime.date | None,
+        Query(
+            description=(
+                "Only alumni who served as a guest speaker at an event held "
+                "on/after this date (matches the dashboard 'Guest speakers this "
+                "month' KPI)."
+            )
+        ),
+    ] = None,
+    spoke_before: Annotated[
+        datetime.date | None,
+        Query(
+            description=(
+                "Only alumni who served as a guest speaker at an event held "
+                "on/before this date."
+            )
+        ),
+    ] = None,
     donor: Annotated[bool, Query(description="Only PIFF donors.")] = False,
     mentor_willing: Annotated[bool, Query(description="Only alumni willing to mentor.")] = False,
     guest_speaker_willing: Annotated[
@@ -187,6 +206,8 @@ async def list_alumni(
         contacted_before=contacted_before,
         never_contacted=never_contacted,
         attended_event=attended_event,
+        spoke_after=spoke_after,
+        spoke_before=spoke_before,
         donor=donor,
         mentor_willing=mentor_willing,
         guest_speaker_willing=guest_speaker_willing,
@@ -220,6 +241,8 @@ async def list_alumni(
             "contacted_after": contacted_after.isoformat() if contacted_after else None,
             "contacted_before": (contacted_before.isoformat() if contacted_before else None),
             "never_contacted": never_contacted or None,
+            "spoke_after": spoke_after.isoformat() if spoke_after else None,
+            "spoke_before": spoke_before.isoformat() if spoke_before else None,
             "limit": limit,
             "offset": offset,
             "sort": sort,

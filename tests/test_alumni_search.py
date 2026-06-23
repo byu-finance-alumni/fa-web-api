@@ -136,6 +136,32 @@ def test_attended_event_filter():
     assert "event_attendance" in sql
 
 
+def test_spoke_window_filter_matches_dashboard_kpi():
+    # The "Guest speakers this month" deep-link: alumni who served as a speaker
+    # at an event in the window. Must mirror the dashboard KPI's predicate
+    # (attendance_status ILIKE '%speaker%' joined to events on event_date), NOT
+    # the alumnus-level guest_speaker_willing flag.
+    sql = _sql(
+        build_alumni_query(
+            spoke_after=datetime.date(2026, 6, 1),
+            spoke_before=datetime.date(2026, 6, 30),
+        )
+    )
+    assert "EXISTS" in sql
+    assert "event_attendance" in sql
+    assert "events" in sql
+    assert "attendance_status ILIKE" in sql
+    assert "event_date >=" in sql
+    assert "event_date <=" in sql
+    # It is the event-participation predicate, not the willing flag.
+    assert "guest_speaker_willing" not in sql
+
+
+def test_spoke_filter_absent_by_default():
+    sql = _sql(build_alumni_query())
+    assert "attendance_status" not in sql
+
+
 def test_donor_filter():
     sql = _sql(build_alumni_query(donor=True))
     assert "EXISTS" in sql

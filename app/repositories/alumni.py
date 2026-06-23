@@ -107,6 +107,10 @@ def build_alumni_query(
     donor: bool = False,
     mentor_willing: bool = False,
     guest_speaker_willing: bool = False,
+    # Professional-certification flags on the program-engagement profile. Each
+    # narrows to alumni who hold that designation (correlated EXISTS).
+    cfa: bool = False,
+    cpa: bool = False,
     missing_email: bool = False,
     missing_employer: bool = False,
     duplicate: bool = False,
@@ -349,6 +353,26 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(is_speaker)
+    if cfa:
+        is_cfa = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                AlumniProgramEngagement.cfa_designation.is_(True),
+            )
+            .exists()
+        )
+        conditions.append(is_cfa)
+    if cpa:
+        is_cpa = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                AlumniProgramEngagement.cpa_designation.is_(True),
+            )
+            .exists()
+        )
+        conditions.append(is_cpa)
     if missing_email:
         has_email = (
             select(AlumniContactInfo.contact_info_id)

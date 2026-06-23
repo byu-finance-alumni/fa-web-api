@@ -399,6 +399,7 @@ class EngagementCreate(_Section):
     piff_donor: bool = False
     cfp_designation: bool = False
     cfa_designation: bool = False
+    cpa_designation: bool = False
     engagement_notes: str | None = None
 
 

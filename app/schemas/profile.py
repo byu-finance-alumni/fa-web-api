@@ -349,6 +349,7 @@ class ProgramEngagementRead(_Orm):
     piff_donor: bool
     cfp_designation: bool
     cfa_designation: bool
+    cpa_designation: bool
     engagement_notes: str | None = None
 
 

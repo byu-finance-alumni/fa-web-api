@@ -158,6 +158,12 @@ async def list_alumni(
     guest_speaker_willing: Annotated[
         bool, Query(description="Only alumni willing to guest speak.")
     ] = False,
+    cfa: Annotated[
+        bool, Query(description="Only alumni holding the CFA designation.")
+    ] = False,
+    cpa: Annotated[
+        bool, Query(description="Only alumni holding the CPA designation.")
+    ] = False,
     missing_email: Annotated[
         bool,
         Query(description="Only alumni with no contact-info email on file."),
@@ -211,6 +217,8 @@ async def list_alumni(
         donor=donor,
         mentor_willing=mentor_willing,
         guest_speaker_willing=guest_speaker_willing,
+        cfa=cfa,
+        cpa=cpa,
         missing_email=missing_email,
         missing_employer=missing_employer,
         duplicate=duplicate,
@@ -241,6 +249,8 @@ async def list_alumni(
             "contacted_after": contacted_after.isoformat() if contacted_after else None,
             "contacted_before": (contacted_before.isoformat() if contacted_before else None),
             "never_contacted": never_contacted or None,
+            "cfa": cfa or None,
+            "cpa": cpa or None,
             "spoke_after": spoke_after.isoformat() if spoke_after else None,
             "spoke_before": spoke_before.isoformat() if spoke_before else None,
             "limit": limit,

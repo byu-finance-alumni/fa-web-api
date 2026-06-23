@@ -177,6 +177,51 @@ def test_mentor_and_speaker_filters():
     assert "guest_speaker_willing IS true" in sql
 
 
+def test_cfa_filter():
+    # CFA designation: correlated EXISTS on the program-engagement profile.
+    sql = _sql(build_alumni_query(cfa=True))
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_program_engagement" in sql
+    assert "cfa_designation IS true" in sql
+    # Only the CFA flag is referenced, not the CPA flag.
+    assert "cpa_designation" not in sql
+
+
+def test_cpa_filter():
+    sql = _sql(build_alumni_query(cpa=True))
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_program_engagement" in sql
+    assert "cpa_designation IS true" in sql
+    assert "cfa_designation" not in sql
+
+
+def test_cfa_combines_with_other_filter_via_and():
+    # CFA holders graduating 2018 — both predicates present, ANDed with the
+    # archived-default guard.
+    sql = _sql(build_alumni_query(cfa=True, graduation_year=2018))
+    assert "cfa_designation IS true" in sql
+    assert "graduation_year =" in sql
+    assert "archived IS false" in sql
+
+
+def test_cfa_and_cpa_combine():
+    # Both certifications requested -> two correlated EXISTS, ANDed (an alumnus
+    # must hold both).
+    sql = _sql(build_alumni_query(cfa=True, cpa=True))
+    assert "cfa_designation IS true" in sql
+    assert "cpa_designation IS true" in sql
+    # Two separate correlated EXISTS, one per designation.
+    assert sql.count("EXISTS (SELECT") == 2
+
+
+def test_cert_filters_absent_by_default():
+    sql = _sql(build_alumni_query())
+    assert "cfa_designation" not in sql
+    assert "cpa_designation" not in sql
+
+
 def test_missing_filters_default_off():
     # Default query must not reference the related tables at all.
     sql = _sql(build_alumni_query())

@@ -6,13 +6,20 @@ clauses are asserted — no database needed.
 
 import datetime
 
+from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
-from app.repositories.alumni import build_alumni_query
+from app.models.alumni import Alumni
+from app.repositories.alumni import alumni_order_by, build_alumni_query
 
 
 def _sql(stmt) -> str:
     return str(stmt.compile(dialect=postgresql.dialect()))
+
+
+def _order_sql(sort: str | None) -> str:
+    """Compile just the ORDER BY clause for a list ``sort`` token."""
+    return _sql(select(Alumni).order_by(*alumni_order_by(sort)))
 
 
 def test_default_excludes_archived():
@@ -246,3 +253,49 @@ def test_advanced_filters_absent_by_default():
         "alumni_status_labels",
     ):
         assert tbl not in sql
+
+
+# --- grad-year sort direction (E3 regression guard) --------------------------
+#
+# The reported bug: "Grad year (oldest)" returned newest-first and vice-versa.
+# These lock the ONE place the direction is decided: grad_desc must be DESC
+# (newest grad year first), grad_asc must be ASC (oldest first), nulls last in
+# both. If the .desc()/.asc() ever get swapped, these fail.
+
+
+def test_grad_desc_is_year_descending_nulls_last():
+    # "Grad year (newest)" -> most-recent graduation_year FIRST.
+    sql = _order_sql("grad_desc")
+    assert "ORDER BY alumni.graduation_year DESC NULLS LAST" in sql
+    # Name is the deterministic tiebreaker.
+    assert "last_name ASC" in sql
+
+
+def test_grad_asc_is_year_ascending_nulls_last():
+    # "Grad year (oldest)" -> oldest graduation_year FIRST.
+    sql = _order_sql("grad_asc")
+    assert "ORDER BY alumni.graduation_year ASC NULLS LAST" in sql
+    assert "last_name ASC" in sql
+
+
+def test_grad_sorts_are_not_swapped():
+    # Belt-and-suspenders: the two directions must differ, and each must carry
+    # the direction its token names (guards against a future copy-paste swap).
+    # Scope the assertions to the ORDER BY clause — graduation_year also appears
+    # in the SELECT column list.
+    desc_order = _order_sql("grad_desc").split("ORDER BY", 1)[1]
+    asc_order = _order_sql("grad_asc").split("ORDER BY", 1)[1]
+    assert desc_order != asc_order
+    assert "graduation_year DESC" in desc_order
+    assert "graduation_year ASC" not in desc_order
+    assert "graduation_year ASC" in asc_order
+    assert "graduation_year DESC" not in asc_order
+
+
+def test_default_and_name_sort_by_last_name():
+    for token in (None, "name", "bogus", "grad_desc_typo"):
+        sql = _order_sql(token)
+        # Unknown/legacy tokens fall back to name; never to a grad-year order.
+        order_by = sql.split("ORDER BY", 1)[1]
+        assert order_by.startswith(" alumni.last_name ASC")
+        assert "graduation_year" not in order_by

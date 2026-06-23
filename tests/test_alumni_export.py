@@ -254,6 +254,22 @@ def test_export_includes_side_table_column(client):
     assert rows[1] == ["Jane", "jane@example.com"]
 
 
+def test_export_neutralizes_csv_formula_injection(client):
+    # A free-text field starting with = / + / - / @ must be tab-prefixed so Excel
+    # doesn't execute it as a formula on open.
+    session = _FakeSession(
+        count=1,
+        execute_results=[[_alum(first_name='=HYPERLINK("http://evil")')]],
+    )
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.post("/alumni/export", json={"columns": ["first_name"]})
+    assert response.status_code == 200
+    rows = _parse_csv(response.text)
+    assert rows[1][0].startswith("\t=HYPERLINK")  # neutralized, value preserved
+
+
 def test_export_over_cap_returns_413(client):
     from app.services import alumni_export
 

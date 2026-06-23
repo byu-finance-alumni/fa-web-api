@@ -308,6 +308,13 @@ async def count_matching(session: AsyncSession, filters: AlumniExportFilters) ->
     return int(total or 0)
 
 
+# Leading characters Excel / LibreOffice treat as the start of a formula. A
+# free-text field (employer, notes, linkedin_url, ...) starting with one of these
+# would execute on open — classic CSV/formula injection. We neutralize by
+# prefixing a tab (invisible, keeps the cell plain text) before such a value.
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _fmt(value: object, kind: str) -> str:
     if value is None:
         return ""
@@ -315,17 +322,27 @@ def _fmt(value: object, kind: str) -> str:
         return "Yes" if value else "No"
     if kind == "date" and isinstance(value, datetime.date):
         return value.isoformat()
-    return str(value)
+    text = str(value)
+    # Only free-text (str-kind) cells can carry a formula payload; bool/date/int
+    # are already normalized to safe tokens above.
+    if text and text[0] in _FORMULA_LEAD:
+        return "\t" + text
+    return text
 
 
 async def _load_side(
-    session: AsyncSession, model, alumni_ids: list[int], *, latest_by: str | None = None
+    session: AsyncSession,
+    model,
+    alumni_ids: list[int],
+    *,
+    latest_by: str | None = None,
+    pk_attr: str | None = None,
 ) -> dict[int, object]:
     """Bulk-load one side table keyed by ``alumni_id``.
 
     With ``latest_by`` (education), keep the row with the greatest value of that
-    column (then greatest PK) per alumnus. Otherwise keep the first row seen
-    (the 1:1 tables have a single row per alumnus)."""
+    column, breaking ties by the greatest ``pk_attr`` (newest). Otherwise keep
+    the first row seen (the 1:1 tables have a single row per alumnus)."""
     if not alumni_ids:
         return {}
     rows = (
@@ -339,15 +356,15 @@ async def _load_side(
             out.setdefault(row.alumni_id, row)
             continue
         current = out.get(row.alumni_id)
-        if current is None or _rank(row, latest_by) > _rank(current, latest_by):
+        if current is None or _rank(row, latest_by, pk_attr) > _rank(current, latest_by, pk_attr):
             out[row.alumni_id] = row
     return out
 
 
-def _rank(row: object, latest_by: str) -> tuple:
+def _rank(row: object, latest_by: str, pk_attr: str | None) -> tuple:
     # Sort key for "latest" — Nones sort lowest. PK breaks ties newest-first.
     primary = getattr(row, latest_by, None)
-    pk = getattr(row, "education_id", 0) or 0
+    pk = (getattr(row, pk_attr, 0) or 0) if pk_attr else 0
     return (primary is not None, primary or 0, pk)
 
 
@@ -362,11 +379,12 @@ async def export_csv(
 
     Capped at :data:`MAX_EXPORT_ROWS`; callers should ``count_matching`` first to
     reject an over-cap export with a clear message."""
+    # Reuse the exact filtered statement (correlated EXISTS conditions and all)
+    # so the export population is identical to count_matching's — just ordered
+    # and capped. Don't rebuild from .whereclause; that risks dropping query
+    # structure for join/EXISTS-based filters.
     base = build_alumni_query(**_filters_dict(filters))
-    stmt = (
-        select(Alumni).where(base.whereclause) if base.whereclause is not None else select(Alumni)
-    )
-    stmt = stmt.order_by(Alumni.last_name.asc(), Alumni.alumni_id.asc()).limit(MAX_EXPORT_ROWS)
+    stmt = base.order_by(Alumni.last_name.asc(), Alumni.alumni_id.asc()).limit(MAX_EXPORT_ROWS)
     alumni = (await session.execute(stmt)).scalars().all()
     ids = [a.alumni_id for a in alumni]
 
@@ -377,7 +395,9 @@ async def export_csv(
         await _load_side(session, AlumniProgramEngagement, ids) if _ENGAGEMENT in groups else {}
     )
     education = (
-        await _load_side(session, EducationHistory, ids, latest_by="degree_year")
+        await _load_side(
+            session, EducationHistory, ids, latest_by="degree_year", pk_attr="education_id"
+        )
         if _EDUCATION in groups
         else {}
     )
@@ -414,8 +434,12 @@ def _audit_export(
 ) -> None:
     """Disclosure audit for a bulk export — actor + a summary of WHAT left the
     system (active filters, chosen columns, row count). Never the data itself.
-    Best-effort: an audit failure must not break the export."""
+
+    The actor is always present on the API path (export is full_access). Guard
+    anyway: a non-HTTP caller with no actor is logged as a warning rather than
+    producing a silent, unaudited disclosure."""
     if actor_user_id is None:
+        log.warning("Alumni export audit skipped: no actor (rows=%s)", row_count)
         return
     active = {
         k: v

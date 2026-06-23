@@ -16,6 +16,11 @@ name: Board → In Review
 # cross-repo) — which works no matter the base branch. GitHub's own closing
 # references are also folded in (covers manual Development-panel links).
 #
+# This also moves any issue referenced by bare #NN or owner/repo#NN in the PR
+# title/body, not only closing-keyword references — many of our PRs reference the
+# issue they implement by a bare number (e.g. "feat(export): … (#33)" or
+# "Follow-up #1 for #39"), and those should land in In Review too.
+#
 # Requires an org/repo secret PROJECTS_TOKEN: a PAT with `project` + `repo` scope,
 # because the default GITHUB_TOKEN cannot write org-level Projects v2. Until that
 # secret is added the job is a graceful no-op (it will not fail PRs).
@@ -69,6 +74,19 @@ jobs:
             printf '%s\n%s\n' "${PR_TITLE:-}" "${PR_BODY:-}" \
               | grep -oiE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' \
               | grep -oiE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' \
+              | while read -r ref; do
+                  case "$ref" in
+                    */*) echo "$ref" ;;
+                    *)   echo "${OWNER}/${REPO}${ref}" ;;
+                  esac
+                done >> "$refs"
+          } || true
+
+          # (c) bare references (#N or owner/repo#N) anywhere in the PR title/body,
+          #     even without a closing keyword — mentioning an issue moves it too.
+          {
+            printf '%s\n%s\n' "${PR_TITLE:-}" "${PR_BODY:-}" \
+              | grep -oiE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+\b' \
               | while read -r ref; do
                   case "$ref" in
                     */*) echo "$ref" ;;

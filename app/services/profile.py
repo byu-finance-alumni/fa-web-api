@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, NotFoundError
+from app.core.security import AuthorizationError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -84,6 +85,24 @@ async def _actor_name(session: AsyncSession, user_id: int | None) -> str | None:
         return None
     user = await session.get(User, user_id)
     return _full_name(user.first_name, user.last_name, user.email) if user else None
+
+
+def _require_interaction_ownership(
+    interaction: Interaction, actor_user_id: int | None, can_edit_others: bool
+) -> None:
+    """Gate edit/delete of an interaction by ownership for non-edit-tier actors.
+
+    Edit-tier roles (``can_edit_others=True``) may mutate any interaction. A
+    view_only "Professor" (``can_edit_others=False``) may mutate only the
+    interactions they logged themselves; anything else raises
+    ``AuthorizationError`` (403). A row with no ``user_id`` (e.g. a legacy /
+    system row) has no owner, so a non-edit-tier actor can never claim it."""
+    if can_edit_others:
+        return
+    if actor_user_id is None or interaction.user_id != actor_user_id:
+        raise AuthorizationError(
+            "You can only edit or delete interactions you logged."
+        )
 
 
 async def get_profile(
@@ -492,13 +511,22 @@ async def update_interaction(
     interaction_id: int,
     payload: InteractionUpdate,
     actor_user_id: int | None,
+    can_edit_others: bool = True,
 ) -> InteractionRead:
-    """Edit an interaction on an alumni's timeline (full_access).
+    """Edit an interaction on an alumni's timeline.
 
-    404 if the row is missing or belongs to a different alumnus."""
+    404 if the row is missing or belongs to a different alumnus.
+
+    ``can_edit_others`` is the actor's edit-tier flag (engineer / super_admin /
+    full_access / student). When False (a view_only "Professor"), the actor may
+    edit only an interaction they logged themselves; editing another user's row
+    raises ``AuthorizationError`` (403). The ownership check runs AFTER the
+    existence/parent check so it never reveals whether some other alumnus's
+    interaction exists."""
     row = await session.get(Interaction, interaction_id)
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Interaction {interaction_id} not found.")
+    _require_interaction_ownership(row, actor_user_id, can_edit_others)
     data = payload.model_dump(exclude_unset=True)
     # Audit each field that actually changes with its old + new value, so a later
     # FERPA review can see exactly what a note edit altered — not just that an
@@ -529,13 +557,22 @@ async def delete_interaction(
     alumni_id: int,
     interaction_id: int,
     actor_user_id: int | None,
+    can_edit_others: bool = True,
 ) -> None:
-    """Delete an interaction from an alumni's timeline (full_access).
+    """Delete an interaction from an alumni's timeline.
 
-    404 if the row is missing or belongs to a different alumnus."""
+    404 if the row is missing or belongs to a different alumnus.
+
+    ``can_edit_others`` is the actor's edit-tier flag (engineer / super_admin /
+    full_access / student). When False (a view_only "Professor"), the actor may
+    delete only an interaction they logged themselves; deleting another user's
+    row raises ``AuthorizationError`` (403). The ownership check runs AFTER the
+    existence/parent check so it never reveals whether some other alumnus's
+    interaction exists."""
     row = await session.get(Interaction, interaction_id)
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Interaction {interaction_id} not found.")
+    _require_interaction_ownership(row, actor_user_id, can_edit_others)
     # Snapshot the content BEFORE deleting so the FERPA trail retains what was
     # removed (a hard delete otherwise loses the note text irrecoverably).
     snapshot = (

@@ -94,6 +94,9 @@ class AlumniProgramEngagement(TimestampMixin, Base):
     cfa_designation: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    cpa_designation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     engagement_notes: Mapped[str | None] = mapped_column(Text)
 
 

@@ -556,6 +556,7 @@ CREATE TABLE alumni_program_engagement (
     piff_donor                      boolean NOT NULL DEFAULT false,
     cfp_designation                 boolean NOT NULL DEFAULT false,
     cfa_designation                 boolean NOT NULL DEFAULT false,
+    cpa_designation                 boolean NOT NULL DEFAULT false,
     engagement_notes                text,
     created_at                      timestamptz NOT NULL DEFAULT now(),
     updated_at                      timestamptz NOT NULL DEFAULT now(),

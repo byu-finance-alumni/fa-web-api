@@ -62,6 +62,8 @@ class AlumniExportFilters(BaseModel):
     donor: bool = False
     mentor_willing: bool = False
     guest_speaker_willing: bool = False
+    cfa: bool = False
+    cpa: bool = False
     missing_email: bool = False
     missing_employer: bool = False
     duplicate: bool = False

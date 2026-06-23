@@ -422,6 +422,29 @@ CREATE TABLE event_attendance (
     CONSTRAINT uq_event_attendance UNIQUE (event_id, alumni_id)
 );
 
+-- Unified notes (#39): free-text notes attached to exactly one of an alumni,
+-- an interaction, or an event. The CHECK enforces single-target; each FK
+-- cascades so a note never outlives its parent. See migration
+-- 2026-06-22_unified_notes.sql.
+CREATE TABLE notes (
+    note_id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id          bigint,
+    interaction_id     bigint,
+    event_id           bigint,
+    body               text NOT NULL,
+    created_by_user_id bigint,
+    updated_by_user_id bigint,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_notes_single_target CHECK (num_nonnulls(alumni_id, interaction_id, event_id) = 1),
+    CONSTRAINT ck_notes_body_length CHECK (char_length(body) <= 10000),
+    CONSTRAINT fk_notes_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_notes_interaction_id FOREIGN KEY (interaction_id) REFERENCES interactions (interaction_id) ON DELETE CASCADE,
+    CONSTRAINT fk_notes_event_id FOREIGN KEY (event_id) REFERENCES events (event_id) ON DELETE CASCADE,
+    CONSTRAINT fk_notes_created_by FOREIGN KEY (created_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_notes_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 CREATE TABLE surveys (
     survey_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id       bigint NOT NULL,
@@ -633,5 +656,8 @@ CREATE INDEX idx_nettrek_hosting_alumni_id            ON nettrek_hosting (alumni
 CREATE INDEX idx_conference_participation_alumni_id   ON conference_participation (alumni_id);
 CREATE INDEX idx_finance_society_leadership_alumni_id ON finance_society_leadership (alumni_id);
 CREATE INDEX idx_bbq_attendance_alumni_id             ON bbq_attendance (alumni_id);
+CREATE INDEX idx_notes_alumni_id                      ON notes (alumni_id);
+CREATE INDEX idx_notes_interaction_id                 ON notes (interaction_id);
+CREATE INDEX idx_notes_event_id                       ON notes (event_id);
 
 COMMIT;

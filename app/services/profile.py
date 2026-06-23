@@ -262,11 +262,16 @@ async def get_profile(
         t.assigned_to_user_id for t in tasks if t.assigned_to_user_id
     }
     names: dict[int, str | None] = {}
+    # First names only, for the view_only redaction below. Intentionally NO email
+    # fallback: a nameless account must surface as "—" to a view_only caller, not
+    # leak an email address.
+    first_names: dict[int, str | None] = {}
     if user_ids:
         for u in (
             await session.scalars(select(User).where(User.user_id.in_(user_ids)))
         ).all():
             names[u.user_id] = _full_name(u.first_name, u.last_name, u.email)
+            first_names[u.user_id] = u.first_name or None
 
     profile = ProfileRead(
         alumni=AlumniRead.model_validate(alumnus),
@@ -287,7 +292,15 @@ async def get_profile(
         surveys=[SurveyRead.model_validate(s) for s in surveys],
         interactions=[
             InteractionRead.model_validate(i).model_copy(
-                update={"logged_by": names.get(i.user_id) if i.user_id else None}
+                # full_access/student see the logger's full name; view_only sees
+                # the first name only (recomputed from source, no email fallback).
+                update={
+                    "logged_by": (
+                        (names if can_edit else first_names).get(i.user_id)
+                        if i.user_id
+                        else None
+                    )
+                }
             )
             for i in interactions
         ],
@@ -379,15 +392,16 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
 
     Nulls the sensitive core PII (via ``minimize_alumni_read``), strips all
     free-text notes (interaction / survey / engagement / program-engagement
-    notes), drops the logging staff member's name from interactions, and omits
-    the embedded audit trail entirely. Returns a new ``ProfileRead``; the input
-    is left untouched.
+    notes), and omits the embedded audit trail entirely. Returns a new
+    ``ProfileRead``; the input is left untouched.
+
+    Note: ``logged_by`` is already reduced to the logger's FIRST NAME upstream in
+    ``get_profile`` (full name only for editors), so it is intentionally left
+    untouched here — a view_only caller sees who made contact by first name.
     """
-    # Drop interaction notes AND logged_by: a view_only caller (e.g. faculty)
-    # should not see which staff member contacted an alumnus, only that/when
-    # contact happened. Stripped at the API boundary, not just hidden in the UI.
+    # Drop interaction notes only; logged_by is already first-name for view_only.
     interactions = [
-        i.model_copy(update={"interaction_notes": None, "logged_by": None})
+        i.model_copy(update={"interaction_notes": None})
         for i in profile.interactions
     ]
     surveys = [s.model_copy(update={"survey_notes": None}) for s in profile.surveys]

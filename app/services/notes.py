@@ -48,6 +48,16 @@ async def _actor_name(session: AsyncSession, user_id: int | None) -> str | None:
     return _full_name(user.first_name, user.last_name, user.email) if user else None
 
 
+async def _actor_first_name(session: AsyncSession, user_id: int | None) -> str | None:
+    """The author's FIRST NAME only — for view_only readers, who see who wrote a
+    note but not their full identity. Intentionally NO email fallback: a nameless
+    account surfaces as ``None`` ("—") rather than leaking an email address."""
+    if user_id is None:
+        return None
+    user = await session.get(User, user_id)
+    return (user.first_name or None) if user else None
+
+
 def _to_read(note: Note, author: str | None) -> NoteRead:
     """Project a ``Note`` ORM row onto the unified read shape."""
     if note.alumni_id is not None:
@@ -144,6 +154,8 @@ async def list_notes(
     entity_type: NoteEntityType,
     entity_id: int,
     actor_user_id: int | None = None,
+    *,
+    full_author_name: bool = True,
 ) -> list[NoteRead]:
     """Return the notes attached to one entity, newest first.
 
@@ -152,6 +164,11 @@ async def list_notes(
     scoping. Because note bodies are sensitive free text, the disclosure is
     audit-logged (``view_notes``) so a FERPA review can answer "who read the
     notes on this record?", mirroring the ``view_profile`` / ``search`` trail.
+
+    ``full_author_name`` controls author disclosure: editors (full_access and up,
+    incl. student) see the author's full name; a ``view_only`` caller sees the
+    first name only — matching how interactions' ``logged_by`` is reduced for
+    view_only. The caller (route) decides this from the authenticated role.
 
     404s if the parent entity does not exist (so a bad id is distinguishable
     from an entity that simply has no notes yet)."""
@@ -170,7 +187,8 @@ async def list_notes(
         .scalars()
         .all()
     )
-    result = [_to_read(n, await _actor_name(session, n.created_by_user_id)) for n in rows]
+    resolve_author = _actor_name if full_author_name else _actor_first_name
+    result = [_to_read(n, await resolve_author(session, n.created_by_user_id)) for n in rows]
     # Best-effort disclosure audit — a logging failure must never break the read.
     if actor_user_id is not None:
         try:

@@ -253,7 +253,7 @@ def test_create_event_note_audits_against_event(client):
     assert (audit.entity_type, audit.entity_id) == ("event", 5)
 
 
-def test_list_notes_happy_path(client):
+def test_list_notes_happy_path_view_only_sees_first_name(client):
     rows = [_note(note_id=7, body="Newest"), _note(note_id=6, body="Older")]
     session = _FakeSession(alumni=SimpleNamespace(alumni_id=1), user=_actor(), rows=rows)
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
@@ -264,10 +264,23 @@ def test_list_notes_happy_path(client):
     body = response.json()
     assert [n["note_id"] for n in body] == [7, 6]
     assert all(n["entity_type"] == "alumni" for n in body)
-    assert body[0]["author"] == "Tanya Harmon"
+    # view_only sees the author by FIRST NAME only, not the full name.
+    assert body[0]["author"] == "Tanya"
     # FERPA: reading sensitive note bodies is a disclosure — audited (view_notes).
     assert [a.action_type for a in session.audits] == ["view_notes"]
     assert (session.audits[0].entity_type, session.audits[0].entity_id) == ("alumni", 1)
+
+
+def test_list_notes_editor_sees_full_author_name(client):
+    rows = [_note(note_id=7, body="Newest")]
+    session = _FakeSession(alumni=SimpleNamespace(alumni_id=1), user=_actor(), rows=rows)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/notes", params={"entity_type": "alumni", "entity_id": 1})
+    assert response.status_code == 200
+    # An editor (full_access) sees the author's full name.
+    assert response.json()[0]["author"] == "Tanya Harmon"
 
 
 def test_update_note_no_op_writes_no_audit(client):

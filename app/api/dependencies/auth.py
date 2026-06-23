@@ -204,8 +204,9 @@ require_view_only = require_roles(
     RoleName.VIEW_ONLY,
 )
 # Database / controlled-vocabulary administration (editable dropdowns, #82).
-# Restricted to the top two roles.
-require_vocab_admin = require_roles(RoleName.ENGINEER, RoleName.SUPER_ADMIN)
+# Engineer-only: per the roles model, the engineer is the controlled-vocabulary
+# (and DB) admin. super_admin is intentionally NOT permitted here.
+require_vocab_admin = require_roles(RoleName.ENGINEER)
 # Engineer-only: the top role exclusively (e.g. managing the support contacts
 # shown on the in-app error screen).
 require_engineer = require_roles(RoleName.ENGINEER)

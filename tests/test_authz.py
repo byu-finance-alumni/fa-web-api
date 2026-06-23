@@ -139,8 +139,15 @@ def test_view_only_cannot_edit_existing():
         asyncio.run(auth_deps.require_alumni_edit(ctx))
 
 
-def test_vocab_admin_rejects_non_top_roles():
-    for role in ("full_access", "student", "view_only"):
+# --- vocab admin (engineer-only) ----------------------------------------------
+
+
+def test_vocab_admin_is_engineer_only():
+    # Controlled-vocabulary administration is the engineer's domain. The engineer
+    # is allowed; super_admin (and every lesser role) is forbidden.
+    eng = _ctx("engineer")
+    assert asyncio.run(auth_deps.require_vocab_admin(eng)) is eng
+    for role in ("super_admin", "full_access", "student", "view_only"):
         with pytest.raises(AuthorizationError):
             asyncio.run(auth_deps.require_vocab_admin(_ctx(role)))
 

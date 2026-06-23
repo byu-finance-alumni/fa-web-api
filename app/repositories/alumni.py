@@ -22,7 +22,7 @@ from app.models.crm import Interaction, Survey
 from app.models.duplicate import DuplicateCandidate
 from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
-from app.models.event import EventAttendance
+from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.utils.sql import escape_like
 
@@ -76,6 +76,12 @@ def build_alumni_query(
     contacted_before: datetime.date | None = None,
     never_contacted: bool = False,
     attended_event: bool = False,
+    # Guest-speaker-AT-AN-EVENT window (drives the dashboard "Guest speakers this
+    # month" tile's deep-link). Distinct from ``guest_speaker_willing`` (the
+    # alumnus-level willing flag, no date) — these select alumni who actually
+    # served as a speaker at an event whose date falls in the window.
+    spoke_after: datetime.date | None = None,
+    spoke_before: datetime.date | None = None,
     donor: bool = False,
     mentor_willing: bool = False,
     guest_speaker_willing: bool = False,
@@ -272,6 +278,25 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(has_attended)
+    if spoke_after is not None or spoke_before is not None:
+        # Alumni who served as a guest speaker at an event in the window. Mirrors
+        # the dashboard ``guest_speakers_this_month`` KPI exactly (same
+        # attendance_status ILIKE '%speaker%' + event_date bounds) so the tile's
+        # count equals this deep-linked list's length. Correlated EXISTS over the
+        # attendance→event join keeps it in PostgreSQL with a stable plan.
+        spoke = (
+            select(EventAttendance.event_attendance_id)
+            .join(Event, Event.event_id == EventAttendance.event_id)
+            .where(
+                EventAttendance.alumni_id == Alumni.alumni_id,
+                EventAttendance.attendance_status.ilike("%speaker%"),
+            )
+        )
+        if spoke_after is not None:
+            spoke = spoke.where(Event.event_date >= spoke_after)
+        if spoke_before is not None:
+            spoke = spoke.where(Event.event_date <= spoke_before)
+        conditions.append(spoke.exists())
     if donor:
         is_donor = (
             select(AlumniProgramEngagement.engagement_profile_id)

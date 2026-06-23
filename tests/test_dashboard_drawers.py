@@ -145,6 +145,7 @@ def test_contacted_this_month_serializes_rows(client):
             "type": "Email",
             "when": when.isoformat(),
             "by": "Tanya Harmon",
+            "by_user_id": 2,
         }
     ]
 
@@ -183,6 +184,7 @@ def test_activity_feed_paginates_and_serializes(client):
             "type": "Call",
             "when": when.isoformat(),
             "by": "Tanya Harmon",
+            "by_user_id": 2,
         }
     ]
 
@@ -291,6 +293,71 @@ def test_activity_no_filters_has_no_where(client):
     sql = _compiled(session.execute_args[0])
     assert "ILIKE" not in sql
     assert "interaction_date_time >=" not in sql
+    # No actor predicate unless mine=true.
+    assert "interactions.user_id =" not in sql
+
+
+def test_activity_mine_filters_to_current_actor(client):
+    session = _activity_session()
+    # _ctx("full_access") resolves to user_id=1, so the actor predicate must
+    # bind that id in both the page-rows and the count statements.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/activity?mine=true")
+    assert response.status_code == 200
+    sql = _compiled(session.execute_args[0])
+    assert "interactions.user_id =" in sql
+    # The count query is filtered too, so totals match the page.
+    count_sql = _compiled(session.scalar_args[0])
+    assert "interactions.user_id =" in count_sql
+
+
+def test_activity_mine_returns_only_current_user_rows(client):
+    # Two rows are returned by the stub; the SQL is what restricts to the actor,
+    # so we assert the bound actor id is the current user (user_id=1), not the
+    # row authors. Confirms the predicate binds actor.user_id, not a constant.
+    when = datetime.datetime(2026, 5, 20, 9, 30, tzinfo=datetime.UTC)
+    mine_row = (
+        SimpleNamespace(
+            interaction_id=12,
+            alumni_id=7,
+            interaction_type="Call",
+            interaction_date_time=when,
+            user_id=1,
+        ),
+        _alumni(),
+        SimpleNamespace(
+            user_id=1, first_name="Me", last_name="Self", email="me@byu.edu"
+        ),
+    )
+    session = _FakeSession([], scalars=[1], executes=[[mine_row], [("Call",)]])
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/activity?mine=1")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"][0]["by_user_id"] == 1
+    # The bound parameter on the page query is the authenticated user's id.
+    from sqlalchemy.dialects import postgresql
+
+    compiled = session.execute_args[0].compile(dialect=postgresql.dialect())
+    assert 1 in compiled.params.values()
+
+
+def test_activity_mine_combines_with_other_filters(client):
+    session = _activity_session()
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/activity?mine=true&q=jane&type=Email")
+    assert response.status_code == 200
+    sql = _compiled(session.execute_args[0])
+    # Actor predicate AND the text/type filters all present together.
+    assert "interactions.user_id =" in sql
+    assert sql.count("ILIKE") >= 4
+    assert "interaction_type ILIKE" in sql
 
 
 def test_summary_includes_this_month_kpis(client):

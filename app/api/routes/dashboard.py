@@ -133,7 +133,14 @@ def _serialize_interaction(i, a, u) -> dict:
         "when": (
             i.interaction_date_time.isoformat() if i.interaction_date_time else None
         ),
+        # The actor who logged the interaction ("edited by"). ``by`` is the
+        # display name (email fallback), resolved exactly like profile.py's
+        # _actor_name; ``by_user_id`` is the actor's user_id so the frontend
+        # can match the current user (e.g. highlight / "mine") without parsing
+        # the name. Both are None when the actor user was removed (user_id was
+        # SET NULL) — no extra PII beyond the name/email already exposed here.
         "by": _full_name(u.first_name, u.last_name, u.email) if u else None,
+        "by_user_id": i.user_id,
     }
 
 
@@ -494,6 +501,15 @@ async def activity_feed(
         str,
         Query(description="Sort order: recent (newest first) | oldest."),
     ] = "recent",
+    mine: Annotated[
+        bool,
+        Query(
+            description=(
+                "When true, restrict to interactions logged by the current "
+                "authenticated user (the actor / 'interacted by me')."
+            )
+        ),
+    ] = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
@@ -539,6 +555,11 @@ async def activity_feed(
                 date_to, datetime.time.max, tzinfo=datetime.UTC
             )
         )
+    # "Interacted by me": only rows whose actor is the current user. Applied as
+    # just another predicate so it composes with q / type / date range / sort,
+    # and is reflected in both the count and the page (shared ``conditions``).
+    if mine:
+        conditions.append(Interaction.user_id == actor.user_id)
 
     total = await session.scalar(
         select(func.count())
@@ -661,22 +682,9 @@ async def contacted_this_month_list(
         action_type="view",
         entity_type="dashboard:contacted-this-month",
     )
-    return [
-        {
-            "interaction_id": i.interaction_id,
-            "alumni_id": i.alumni_id,
-            "alumni_name": _full_name(a.first_name, a.last_name, None)
-            or f"Alumni #{a.alumni_id}",
-            "type": i.interaction_type,
-            "when": (
-                i.interaction_date_time.isoformat()
-                if i.interaction_date_time
-                else None
-            ),
-            "by": _full_name(u.first_name, u.last_name, u.email) if u else None,
-        }
-        for i, a, u in rows
-    ]
+    # Same interaction-row shape (incl. actor "by"/"by_user_id") as the activity
+    # feed — reuse the shared serializer so the two stay in lockstep.
+    return [_serialize_interaction(i, a, u) for i, a, u in rows]
 
 
 @router.get("/follow-ups")

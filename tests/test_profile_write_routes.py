@@ -15,15 +15,16 @@ from fastapi.testclient import TestClient
 from app.api.dependencies.auth import get_current_db_user
 from app.core.database import get_session
 from app.main import app
+from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.crm import Interaction
 from app.models.user import User
 from app.schemas.auth import UserContext
 
 
-def _ctx(*roles: str) -> UserContext:
+def _ctx(*roles: str, user_id: int = 1) -> UserContext:
     return UserContext(
-        user_id=1,
+        user_id=user_id,
         auth_user_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
         roles=list(roles),
     )
@@ -49,9 +50,10 @@ class _FakeSession:
     Mutations are recorded so tests can assert the audit row was written and the
     row was deleted."""
 
-    def __init__(self, interaction=None, user=None):
+    def __init__(self, interaction=None, user=None, alumni=None):
         self._interaction = interaction
         self._user = user
+        self._alumni = alumni
         self.added = []
         self.deleted = []
         self.committed = False
@@ -61,9 +63,15 @@ class _FakeSession:
             return self._interaction
         if model is User:
             return self._user
+        if model is Alumni:
+            return self._alumni
         return None
 
     def add(self, obj):
+        # Mimic the DB assigning a primary key on insert so the response model
+        # (which requires interaction_id) can validate without a real refresh.
+        if isinstance(obj, Interaction) and obj.interaction_id is None:
+            obj.interaction_id = 100
         self.added.append(obj)
 
     async def delete(self, obj):
@@ -112,11 +120,14 @@ def test_add_interaction_requires_auth(client):
     assert response.json()["error"]["code"] == "unauthorized"
 
 
-def test_add_interaction_forbidden_for_view_only(client):
+def test_add_interaction_allowed_for_view_only(client):
+    # #129: a view_only ("Professor") may ADD interactions. The guard lets the
+    # request through; an empty type then fails validation (422, not 403),
+    # proving the role gate passed without needing a database.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    response = client.post("/alumni/1/interactions", json={"interaction_type": "Call"})
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "forbidden"
+    response = client.post("/alumni/1/interactions", json={"interaction_type": ""})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
 
 
 def test_add_task_forbidden_for_view_only(client):
@@ -235,15 +246,6 @@ def test_update_interaction_requires_auth(client):
     assert response.json()["error"]["code"] == "unauthorized"
 
 
-def test_update_interaction_forbidden_for_view_only(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    response = client.patch(
-        "/alumni/1/interactions/9", json={"interaction_type": "Email"}
-    )
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "forbidden"
-
-
 def test_update_interaction_rejects_empty_type(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     response = client.patch("/alumni/1/interactions/9", json={"interaction_type": ""})
@@ -318,13 +320,6 @@ def test_delete_interaction_requires_auth(client):
     assert response.status_code == 401
 
 
-def test_delete_interaction_forbidden_for_view_only(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    response = client.delete("/alumni/1/interactions/9")
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "forbidden"
-
-
 def test_delete_interaction_happy_path(client):
     row = _interaction(alumni_id=1)
     session = _FakeSession(interaction=row, user=_actor())
@@ -351,4 +346,147 @@ def test_delete_interaction_404_when_missing(client):
     response = client.delete("/alumni/1/interactions/9")
     assert response.status_code == 404
     assert session.deleted == []
+    assert session.audit_actions == []
+
+
+# --- view_only ("Professor") interaction permissions (#129) -------------------
+#
+# Permission matrix:
+#   * view_only may ADD interactions and EDIT/DELETE only their OWN rows.
+#   * Editing/deleting another user's interaction is 403.
+#   * Edit-tier roles (engineer/super_admin/full_access/student) stay
+#     unrestricted (may edit/delete ANY interaction) — covered by the happy-path
+#     tests above plus the student case below.
+
+
+def test_add_interaction_happy_path_for_view_only(client):
+    # A professor adds an interaction; the row is stamped with THEIR user id so
+    # ownership can later gate edit/delete.
+    session = _FakeSession(
+        alumni=SimpleNamespace(alumni_id=1, archived=False), user=_actor()
+    )
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "view_only", user_id=2
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.post(
+        "/alumni/1/interactions",
+        json={"interaction_type": "Call", "interaction_notes": "Reached out."},
+    )
+    assert response.status_code == 201
+    assert session.committed
+    assert session.audit_actions == ["add_interaction"]
+    created = next(a for a in session.added if isinstance(a, Interaction))
+    assert created.user_id == 2  # stamped with the professor's id
+
+
+def test_update_own_interaction_allowed_for_view_only(client):
+    # Professor (user_id=2) owns the interaction (user_id=2) -> may edit it.
+    session = _FakeSession(interaction=_interaction(alumni_id=1), user=_actor())
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "view_only", user_id=2
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.patch(
+        "/alumni/1/interactions/9", json={"interaction_type": "Email"}
+    )
+    assert response.status_code == 200
+    assert session.committed
+    assert "update_interaction" in session.audit_actions
+
+
+def test_update_others_interaction_forbidden_for_view_only(client):
+    # Professor (user_id=7) does NOT own the interaction (user_id=2) -> 403, and
+    # nothing is committed.
+    session = _FakeSession(interaction=_interaction(alumni_id=1), user=_actor())
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "view_only", user_id=7
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.patch(
+        "/alumni/1/interactions/9", json={"interaction_type": "Email"}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+    assert session.audit_actions == []
+    assert not session.committed
+
+
+def test_delete_own_interaction_allowed_for_view_only(client):
+    row = _interaction(alumni_id=1)  # user_id=2
+    session = _FakeSession(interaction=row, user=_actor())
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "view_only", user_id=2
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.delete("/alumni/1/interactions/9")
+    assert response.status_code == 204
+    assert session.deleted == [row]
+    assert session.audit_actions == ["delete_interaction"]
+
+
+def test_delete_others_interaction_forbidden_for_view_only(client):
+    row = _interaction(alumni_id=1)  # user_id=2
+    session = _FakeSession(interaction=row, user=_actor())
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "view_only", user_id=7
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.delete("/alumni/1/interactions/9")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+    assert session.deleted == []
+    assert session.audit_actions == []
+    assert not session.committed
+
+
+def test_update_others_interaction_allowed_for_edit_tier(client):
+    # An edit-tier role (student, user_id=7) may edit an interaction logged by a
+    # DIFFERENT user (user_id=2) -> unrestricted, no ownership gate.
+    session = _FakeSession(interaction=_interaction(alumni_id=1), user=_actor())
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "student", user_id=7
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.patch(
+        "/alumni/1/interactions/9", json={"interaction_type": "Email"}
+    )
+    assert response.status_code == 200
+    assert session.committed
+
+
+def test_delete_others_interaction_allowed_for_edit_tier(client):
+    # An edit-tier role (full_access, user_id=7) may delete another user's row.
+    row = _interaction(alumni_id=1)  # user_id=2
+    session = _FakeSession(interaction=row, user=_actor())
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=7
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.delete("/alumni/1/interactions/9")
+    assert response.status_code == 204
+    assert session.deleted == [row]
+
+
+def test_update_interaction_404_takes_precedence_over_ownership(client):
+    # A view_only user editing a row that belongs to a DIFFERENT alumnus gets a
+    # 404 (existence/parent check first), never a 403 — so the error can't be
+    # used to probe for interactions on other alumni.
+    session = _FakeSession(interaction=_interaction(alumni_id=99), user=_actor())
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "view_only", user_id=2
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.patch(
+        "/alumni/1/interactions/9", json={"interaction_type": "Email"}
+    )
+    assert response.status_code == 404
     assert session.audit_actions == []

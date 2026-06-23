@@ -489,10 +489,15 @@ async def export_alumni_profile(
 async def add_interaction(
     alumni_id: int,
     payload: InteractionCreate,
-    user: RequireAlumniEdit,
+    user: RequireViewAccess,
     session: SessionDep,
 ) -> InteractionRead:
-    """Log an interaction on an alumni's timeline (full_access)."""
+    """Log an interaction on an alumni's timeline.
+
+    Open to every authenticated role, including view_only ("Professor"): adding
+    an interaction is the one timeline write a professor may perform (#129). The
+    row is stamped with the actor's user id so ownership can later gate edit /
+    delete for view_only users."""
     return await profile_service.add_interaction(
         session, alumni_id, payload, actor_user_id=user.user_id
     )
@@ -506,17 +511,22 @@ async def update_interaction(
     alumni_id: int,
     interaction_id: int,
     payload: InteractionUpdate,
-    user: RequireAlumniEdit,
+    user: RequireViewAccess,
     session: SessionDep,
 ) -> InteractionRead:
-    """Edit an interaction on an alumni's timeline (full_access). 404 if the row
-    is missing or belongs to another alumnus."""
+    """Edit an interaction on an alumni's timeline. 404 if the row is missing or
+    belongs to another alumnus.
+
+    Edit-tier roles (engineer / super_admin / full_access / student) may edit ANY
+    interaction. A view_only ("Professor") user may edit only the interactions
+    they logged themselves; editing another user's interaction is 403 (#129)."""
     return await profile_service.update_interaction(
         session,
         alumni_id,
         interaction_id,
         payload,
         actor_user_id=user.user_id,
+        can_edit_others=user.can_edit_alumni,
     )
 
 
@@ -527,13 +537,22 @@ async def update_interaction(
 async def delete_interaction(
     alumni_id: int,
     interaction_id: int,
-    user: RequireAlumniEdit,
+    user: RequireViewAccess,
     session: SessionDep,
 ) -> None:
-    """Delete an interaction from an alumni's timeline (full_access). 404 if the
-    row is missing or belongs to another alumnus."""
+    """Delete an interaction from an alumni's timeline. 404 if the row is missing
+    or belongs to another alumnus.
+
+    Edit-tier roles (engineer / super_admin / full_access / student) may delete
+    ANY interaction. A view_only ("Professor") user may delete only the
+    interactions they logged themselves; deleting another user's interaction is
+    403 (#129)."""
     await profile_service.delete_interaction(
-        session, alumni_id, interaction_id, actor_user_id=user.user_id
+        session,
+        alumni_id,
+        interaction_id,
+        actor_user_id=user.user_id,
+        can_edit_others=user.can_edit_alumni,
     )
 
 

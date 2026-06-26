@@ -137,6 +137,40 @@ async def get_states(session: AsyncSession, filters: dict) -> list[dict]:
     )
 
 
+async def get_counties(session: AsyncSession, filters: dict) -> list[dict]:
+    """Per-county alumni counts (5-digit FIPS) for the national county map.
+
+    Location is city-level: an alumnus is attributed to the county of their city
+    via the ``city_geo`` crosswalk (the only geographic signal stored). Uses
+    ``COUNT(DISTINCT alumni_id)`` so a duplicate contact/employment row can't
+    inflate a county."""
+    city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
+    state_up = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
+    rows = (
+        await session.execute(
+            select(
+                CityGeo.county_fips.label("county_fips"), _ALUMNI.label("count")
+            )
+            .select_from(Alumni)
+            .join(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+            )
+            .join(
+                CityGeo,
+                and_(CityGeo.city_norm == city_norm, CityGeo.state == state_up),
+            )
+            .outerjoin(
+                CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
+            )
+            .where(*_filter_conditions(filters), CityGeo.county_fips.is_not(None))
+            .group_by(CityGeo.county_fips)
+            .order_by(desc("count"))
+        )
+    ).all()
+    return [{"county_fips": fips, "count": int(c)} for fips, c in rows]
+
+
 async def _top(session, filters, column, label, *, extra=None, limit=10):
     """Generic top-N GROUP BY over the filtered, located alumni set."""
     conds = list(_filter_conditions(filters))

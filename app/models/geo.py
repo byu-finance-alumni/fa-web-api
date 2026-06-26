@@ -20,3 +20,7 @@ class CityGeo(Base):
     state: Mapped[str] = mapped_column(String(2), primary_key=True)
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lng: Mapped[float] = mapped_column(Float, nullable=False)
+    # 5-digit county FIPS the city sits in (for /geography/counties shading).
+    # Populated by 2026-06-26_city_geo_county_fips.sql; nullable for any future
+    # city_geo row added before its FIPS is backfilled.
+    county_fips: Mapped[str | None] = mapped_column(String(5), nullable=True)

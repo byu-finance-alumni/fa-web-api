@@ -55,6 +55,19 @@ class StateCount(BaseModel):
     alumni_count: int
 
 
+# --- /geography/counties -----------------------------------------------------
+
+
+class CountyCount(BaseModel):
+    """Per-county alumni count for the national county choropleth.
+
+    ``county_fips`` is the 5-digit FIPS code (matching the us-atlas county ids
+    the map renders)."""
+
+    county_fips: str
+    count: int
+
+
 # --- /geography/summary ------------------------------------------------------
 
 

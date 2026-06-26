@@ -113,6 +113,30 @@ class GeoAlumniPage(BaseModel):
     offset: int
 
 
+# --- /geography/radius (proximity search) -----------------------------------
+
+
+class RadiusAlumniRow(BaseModel):
+    alumni_id: int
+    name: str
+    city: str | None
+    state: str | None
+    graduation_year: int | None
+    current_employer: str | None
+    current_title: str | None
+    distance_miles: float
+
+
+class RadiusPage(BaseModel):
+    items: list[RadiusAlumniRow]
+    total: int
+    limit: int
+    offset: int
+    center_lat: float
+    center_lng: float
+    radius_miles: float
+
+
 # --- /geography/breakdown ----------------------------------------------------
 
 

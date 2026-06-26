@@ -21,6 +21,7 @@ from app.api.routes import (
     audit,
     auth,
     dashboard,
+    dashboard_presets,
     events,
     geography,
     health,
@@ -137,6 +138,8 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(alumni.router)
 app.include_router(dashboard.router)
+app.include_router(dashboard_presets.router)
+app.include_router(dashboard_presets.admin_router)
 app.include_router(admin.router)
 app.include_router(events.router)
 app.include_router(audit.router)

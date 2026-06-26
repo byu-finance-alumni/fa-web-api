@@ -34,6 +34,7 @@ def client():
         "/geography/states/UT",
         "/geography/states/UT/alumni",
         "/geography/cities?state=UT&city=Provo",
+        "/geography/radius?lat=40.25&lng=-111.65&miles=50",
     ],
 )
 def test_geography_requires_auth(client, path):

@@ -20,6 +20,7 @@ from app.schemas.geography import (
     CityDetail,
     GeoAlumniPage,
     GeoSummary,
+    RadiusPage,
     StateCount,
     StateDetail,
 )
@@ -135,6 +136,35 @@ async def state_alumni(
     )
     await _audit_view(
         session, actor, entity_type="geography:state_alumni", field_name=state
+    )
+    return result
+
+
+@router.get("/radius", response_model=RadiusPage)
+async def radius_alumni(
+    actor: RequireFullAccess,
+    session: SessionDep,
+    filters: FiltersDep,
+    lat: Annotated[float, Query(ge=-90, le=90)],
+    lng: Annotated[float, Query(ge=-180, le=180)],
+    miles: Annotated[float, Query(gt=0, le=500)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> RadiusPage:
+    """Alumni within ``miles`` of (lat, lng), nearest first.
+
+    Distance is city-level (an alumnus's location is their city's coordinates,
+    via the city_geo crosswalk — the only geographic signal stored). FERPA: this
+    lists the individual alumni behind a location, so it is gated to full_access
+    (view_only gets 403) and the disclosure is audited."""
+    result = await svc.get_radius_alumni(
+        session, lat, lng, miles, filters, limit=limit, offset=offset
+    )
+    await _audit_view(
+        session,
+        actor,
+        entity_type="geography:radius_search",
+        field_name=f"{lat:.4f},{lng:.4f},{miles}mi",
     )
     return result
 

@@ -39,6 +39,34 @@ def test_q_searches_six_columns_with_ilike():
     assert sql.count("ILIKE") == 6
 
 
+def test_per_field_search_filters_each_field():
+    # Each provided field adds its own partial-match condition; blanks are ignored.
+    sql = _sql(
+        build_alumni_query(
+            first_name="jane",
+            last_name="doe",
+            net_id="jd123",
+            preferred_name="janie",
+            email="jane@example.com",
+        )
+    )
+    assert "first_name ILIKE" in sql
+    assert "last_name ILIKE" in sql
+    assert "net_id ILIKE" in sql
+    assert "preferred_first_name ILIKE" in sql
+    # Email matches personal OR work email via an EXISTS on the contact table.
+    assert "personal_email ILIKE" in sql
+    assert "work_email ILIKE" in sql
+
+
+def test_per_field_blank_values_ignored():
+    # Empty/whitespace-only field values must not add a WHERE clause.
+    sql = _sql(build_alumni_query(first_name="", last_name="   ", net_id=None))
+    assert "first_name ILIKE" not in sql
+    assert "last_name ILIKE" not in sql
+    assert "net_id ILIKE" not in sql
+
+
 def test_graduation_year_exact():
     sql = _sql(build_alumni_query(graduation_year=2018))
     assert "graduation_year =" in sql

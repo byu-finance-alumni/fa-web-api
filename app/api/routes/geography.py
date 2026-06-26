@@ -18,6 +18,7 @@ from app.schemas.auth import UserContext
 from app.schemas.geography import (
     Breakdown,
     CityDetail,
+    CountyCount,
     GeoAlumniPage,
     GeoSummary,
     RadiusPage,
@@ -93,6 +94,16 @@ async def states(
 ) -> list[StateCount]:
     """Per-state alumni counts for the choropleth map and Top States ranking."""
     return await svc.get_states(session, filters)
+
+
+@router.get("/counties", response_model=list[CountyCount])
+async def counties(
+    _: RequireViewAccess, session: SessionDep, filters: FiltersDep
+) -> list[CountyCount]:
+    """Per-county alumni counts (5-digit FIPS) for the national county choropleth.
+
+    Aggregate counts only (no PII), so view-accessible like ``/states``."""
+    return await svc.get_counties(session, filters)
 
 
 @router.get("/breakdown", response_model=Breakdown)

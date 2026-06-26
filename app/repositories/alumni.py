@@ -82,6 +82,14 @@ def alumni_order_by(sort: str | None) -> tuple:
 def build_alumni_query(
     *,
     q: str | None = None,
+    # Per-field search (dashboard Quick / Advanced search). Each is a
+    # case-insensitive PARTIAL match, AND-combined with the others, and ignored
+    # when blank — so an empty box never narrows the results.
+    net_id: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    preferred_name: str | None = None,
+    email: str | None = None,
     graduation_year: int | None = None,
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
@@ -154,6 +162,30 @@ def build_alumni_query(
                 Alumni.byu_id.ilike(like, escape="\\"),
                 Alumni.net_id.ilike(like, escape="\\"),
             )
+        )
+    # Per-field partial matches (AND-combined; blanks ignored).
+    def _field_like(value: str | None, column) -> None:
+        if value and value.strip():
+            conditions.append(
+                column.ilike(f"%{escape_like(value.strip())}%", escape="\\")
+            )
+
+    _field_like(net_id, Alumni.net_id)
+    _field_like(first_name, Alumni.first_name)
+    _field_like(last_name, Alumni.last_name)
+    _field_like(preferred_name, Alumni.preferred_first_name)
+    if email and email.strip():
+        like = f"%{escape_like(email.strip())}%"
+        conditions.append(
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                or_(
+                    AlumniContactInfo.personal_email.ilike(like, escape="\\"),
+                    AlumniContactInfo.work_email.ilike(like, escape="\\"),
+                ),
+            )
+            .exists()
         )
     if graduation_year is not None:
         conditions.append(Alumni.graduation_year == graduation_year)

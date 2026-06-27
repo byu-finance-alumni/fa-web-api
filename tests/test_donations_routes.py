@@ -1,0 +1,260 @@
+"""Tests for the Pay It Forward Fund donation routes (#161).
+
+The CRITICAL property here is FIELD-LEVEL amount gating: donor identity is
+view-access, but dollar amounts must be nulled server-side for any caller
+without the ``alumni.full`` capability (full_access+). These tests assert that
+``/donors`` and ``/summary`` return ``None`` for every amount field to a
+view-only / student caller and real numbers to a full_access caller — proving
+the gate lives in the response, not just the UI. Writes are super_admin-only.
+
+No real DATABASE_URL is required (CI has none); sessions are stubbed.
+"""
+
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.api.dependencies.auth import get_current_db_user
+from app.core.database import get_session
+from app.main import app
+from app.schemas.auth import UserContext
+
+
+def _ctx(*roles: str) -> UserContext:
+    return UserContext(
+        user_id=1,
+        auth_user_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        roles=list(roles),
+    )
+
+
+@pytest.fixture
+def client():
+    async def _no_db():
+        yield None
+
+    app.dependency_overrides[get_session] = _no_db
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+class _Result:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _SeqSession:
+    """Returns queued ``execute().all()`` results and ``scalar()`` values in
+    call order; ``get`` returns a fixed object. Records added rows."""
+
+    def __init__(self, *, results=None, scalars=None, get_obj=None):
+        self._results = list(results or [])
+        self._scalars = list(scalars or [])
+        self._get_obj = get_obj
+        self.added: list = []
+        self.committed = False
+        self.deleted: list = []
+
+    async def execute(self, _stmt):
+        return _Result(self._results.pop(0) if self._results else [])
+
+    async def scalar(self, _stmt):
+        return self._scalars.pop(0) if self._scalars else 0
+
+    async def get(self, _model, _pk):
+        return self._get_obj
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def flush(self):
+        for obj in self.added:
+            if hasattr(obj, "donation_id") and getattr(obj, "donation_id", None) is None:
+                obj.donation_id = 555
+
+    async def commit(self):
+        self.committed = True
+
+    async def refresh(self, _obj):
+        pass
+
+    async def delete(self, obj):
+        self.deleted.append(obj)
+
+
+def _with_session(session):
+    async def _override():
+        yield session
+
+    return _override
+
+
+# --- auth gating --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/donations/donors", "/donations/summary"])
+def test_donor_reads_require_auth(client, path):
+    assert client.get(path).status_code == 401
+
+
+# --- amount gating (the FERPA-critical property) ------------------------------
+
+
+def _donor_session():
+    # base aggregate row + per-year rows for one donor.
+    return _SeqSession(
+        results=[
+            [(42, "Jane", None, "Doe", 2018, 3, 1500)],  # base aggregate
+            [(42, 2026, 1000), (42, 2025, 500)],  # per-year
+        ]
+    )
+
+
+def test_donors_hides_amounts_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    app.dependency_overrides[get_session] = _with_session(_donor_session())
+    body = client.get("/donations/donors").json()
+    assert len(body) == 1
+    donor = body[0]
+    # Identity + which years they gave are visible...
+    assert donor["name"] == "Jane Doe"
+    assert donor["donation_count"] == 3
+    assert donor["years"] == [2026, 2025]
+    # ...but every dollar figure is withheld.
+    assert donor["lifetime_total"] is None
+    assert all(py["total"] is None for py in donor["per_year"])
+
+
+def test_donors_hides_amounts_for_student(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
+    app.dependency_overrides[get_session] = _with_session(_donor_session())
+    donor = client.get("/donations/donors").json()[0]
+    assert donor["lifetime_total"] is None
+
+
+def test_donors_shows_amounts_for_full_access(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(_donor_session())
+    donor = client.get("/donations/donors").json()[0]
+    assert donor["lifetime_total"] == 1500.0
+    assert {py["year"]: py["total"] for py in donor["per_year"]} == {
+        2026: 1000.0,
+        2025: 500.0,
+    }
+
+
+def test_summary_hides_amounts_for_view_only_but_shows_counts(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _SeqSession(
+        scalars=[5, 12, 9999],  # donor_count, donation_count, total_raised
+        results=[[(2026, 4, 9999)]],  # per-year (year, donor_count, total)
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+    body = client.get("/donations/summary").json()
+    # Counts are public; dollars are withheld.
+    assert body["donor_count"] == 5
+    assert body["donation_count"] == 12
+    assert body["total_raised"] is None
+    assert body["per_year"][0]["donor_count"] == 4
+    assert body["per_year"][0]["total"] is None
+
+
+def test_summary_shows_amounts_for_super_admin(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    session = _SeqSession(
+        scalars=[5, 12, 9999],
+        results=[[(2026, 4, 9999)]],
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+    body = client.get("/donations/summary").json()
+    assert body["total_raised"] == 9999.0
+    assert body["per_year"][0]["total"] == 9999.0
+
+
+# --- write authorization (super_admin only) -----------------------------------
+
+
+@pytest.mark.parametrize("role", ["view_only", "student", "full_access"])
+def test_add_donation_forbidden_below_super_admin(client, role):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "100.00", "year": 2026}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_add_donation_requires_auth(client):
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "100.00", "year": 2026}
+    )
+    assert response.status_code == 401
+
+
+def test_add_donation_unknown_alumni_is_404(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    app.dependency_overrides[get_session] = _with_session(
+        _SeqSession(get_obj=None)
+    )
+    response = client.post(
+        "/donations/alumni/999", json={"amount": "100.00", "year": 2026}
+    )
+    assert response.status_code == 404
+
+
+def test_add_donation_rejects_negative_amount(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "-5", "year": 2026}
+    )
+    assert response.status_code == 422
+
+
+def test_add_donation_rejects_bad_month(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "5", "year": 2026, "month": 13}
+    )
+    assert response.status_code == 422
+
+
+def test_add_donation_happy_path_creates_and_audits(client):
+    from types import SimpleNamespace
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    alumni = SimpleNamespace(alumni_id=42, archived=False)
+    session = _SeqSession(get_obj=alumni)
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.post(
+        "/donations/alumni/42",
+        json={"amount": "250.50", "year": 2026, "month": 4, "notes": "Spring gift"},
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["donation_id"] == 555
+    assert body["amount"] == 250.5
+    assert body["year"] == 2026
+    assert body["month"] == 4
+    assert session.committed is True
+    donations = [o for o in session.added if hasattr(o, "donation_year")]
+    audits = [o for o in session.added if hasattr(o, "action_type")]
+    assert len(donations) == 1
+    assert donations[0].logged_by_user_id == 1
+    assert len(audits) == 1
+    assert audits[0].entity_type == "donation"
+    assert audits[0].action_type == "create"
+
+
+def test_import_preview_forbidden_for_full_access(client):
+    # Bulk donation import is super_admin-only; full_access is rejected.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post(
+        "/donations/import/preview",
+        files={"file": ("d.csv", b"Net ID,Name,Month,Year,Amount\n", "text/csv")},
+    )
+    assert response.status_code == 403

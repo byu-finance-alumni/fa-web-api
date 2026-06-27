@@ -436,6 +436,28 @@ CREATE TABLE event_attendance (
     CONSTRAINT uq_event_attendance UNIQUE (event_id, alumni_id)
 );
 
+-- Pay It Forward Fund donations (#161): a per-alumnus ledger of gifts, each an
+-- amount tied to a month + year. Dollar amounts are gated to full_access+ in the
+-- API (field-level); donor identity is view-access. See migration
+-- 2026-06-27_donations.sql.
+CREATE TABLE donations (
+    donation_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id         bigint NOT NULL,
+    amount            numeric(12, 2) NOT NULL,
+    donation_month    smallint,
+    donation_year     smallint NOT NULL,
+    notes             text,
+    logged_by_user_id bigint,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_donations_amount_nonneg CHECK (amount >= 0),
+    CONSTRAINT ck_donations_month_range CHECK (donation_month IS NULL OR donation_month BETWEEN 1 AND 12),
+    CONSTRAINT ck_donations_year_range CHECK (donation_year BETWEEN 1900 AND 2200),
+    CONSTRAINT ck_donations_notes_length CHECK (char_length(notes) <= 10000),
+    CONSTRAINT fk_donations_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_donations_user_id FOREIGN KEY (logged_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 -- Unified notes (#39): free-text notes attached to exactly one of an alumni,
 -- an interaction, or an event. The CHECK enforces single-target; each FK
 -- cascades so a note never outlives its parent. See migration
@@ -675,5 +697,7 @@ CREATE INDEX idx_bbq_attendance_alumni_id             ON bbq_attendance (alumni_
 CREATE INDEX idx_notes_alumni_id                      ON notes (alumni_id);
 CREATE INDEX idx_notes_interaction_id                 ON notes (interaction_id);
 CREATE INDEX idx_notes_event_id                       ON notes (event_id);
+CREATE INDEX idx_donations_alumni_id                  ON donations (alumni_id);
+CREATE INDEX idx_donations_year                       ON donations (donation_year);
 
 COMMIT;

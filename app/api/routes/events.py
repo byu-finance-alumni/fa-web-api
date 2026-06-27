@@ -3,7 +3,8 @@
 import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.event import Event, EventAttendance
 from app.schemas.event import AttendeeCreate, EventCreate, EventUpdate
+from app.services import import_events
 from app.utils.sql import escape_like
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -123,6 +125,111 @@ async def event_options(_: RequireViewAccess, session: SessionDep) -> dict:
     return {"types": [r[0] for r in rows if r[0]]}
 
 
+# --- Bulk CSV import (full_access) -------------------------------------------
+#
+# Declared BEFORE the ``/{event_id}`` routes so the literal ``/import/...`` paths
+# win over the ``/{event_id}`` patterns (route matching is declaration-ordered).
+
+
+async def _read_capped(file: UploadFile) -> bytes | None:
+    """Read an upload capped at ``MAX_UPLOAD_BYTES`` (one byte past to detect
+    overage). Returns ``None`` if over the cap so the caller can 413. Bounds
+    memory before any parsing (DoS)."""
+    data = await file.read(import_events.MAX_UPLOAD_BYTES + 1)
+    if len(data) > import_events.MAX_UPLOAD_BYTES:
+        return None
+    return data
+
+
+def _too_large_response() -> JSONResponse:
+    mib = import_events.MAX_UPLOAD_BYTES // (1024 * 1024)
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": {
+                "code": "payload_too_large",
+                "message": (
+                    f"File exceeds the {mib} MB upload limit. Split into "
+                    "smaller batches."
+                ),
+            }
+        },
+    )
+
+
+@router.get("/import/template")
+async def events_import_template(_: RequireFullAccess) -> Response:
+    """Download the events bulk-import CSV template (full_access): the exact
+    columns plus a few example rows (two attendees share one event to show how
+    rows group into a single event)."""
+    return Response(
+        content=import_events.build_template_csv(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="events_import_template.csv"'
+        },
+    )
+
+
+@router.post("/import/preview", response_model=None)
+async def preview_import_events(
+    _: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict | JSONResponse:
+    """Dry-run an events bulk CSV import (full_access, NO writes).
+
+    Groups attendee rows into events, resolves attendees by Net ID, and flags
+    unmatched Net IDs, bad dates, and duplicate events. A bad header set surfaces
+    as ``columns_ok: false`` with ``header_errors``."""
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_events.parse_and_map(file_bytes)
+    if header_errors:
+        return {
+            "columns_ok": False,
+            "header_errors": header_errors,
+            "summary": {
+                "total_rows": 0,
+                "events": 0,
+                "importable_events": 0,
+                "rejected_events": 0,
+                "attendees_matched": 0,
+                "attendees_unmatched": 0,
+            },
+            "events": [],
+        }
+    return await import_events.evaluate(session, rows)
+
+
+@router.post("/import", response_model=None)
+async def import_events_commit(
+    user: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict | JSONResponse:
+    """Commit an events bulk CSV import (full_access). Re-evaluates and inserts
+    every importable event + its matched attendees in one transaction (audit
+    logging fires per event and attendee); rejected events are skipped and
+    reported. A bad header set imports nothing."""
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_events.parse_and_map(file_bytes)
+    if header_errors:
+        return {
+            "imported_events": 0,
+            "imported_attendees": 0,
+            "skipped_events": 0,
+            "rejects": [
+                {"event": "(header)", "date": None, "reason": msg}
+                for msg in header_errors
+            ],
+        }
+    return await import_events.commit_import(session, rows, actor_user_id=user.user_id)
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_event(
     payload: EventCreate, user: RequireFullAccess, session: SessionDep
@@ -220,6 +327,31 @@ async def update_event(
         .where(EventAttendance.event_id == event_id)
     )
     return _serialize(event, int(att or 0))
+
+
+@router.delete("/{event_id}")
+async def delete_event(
+    event_id: int, user: RequireFullAccess, session: SessionDep
+) -> dict:
+    """Delete an event (full_access). Cascades to its attendance rows (and any
+    attached notes) via the FK ``ON DELETE CASCADE``. 404 if the event is
+    unknown. Audits the write (entity_type "event", action "delete")."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    name = event.event_name
+    await session.delete(event)
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="delete",
+            entity_type="event",
+            entity_id=event_id,
+            old_value=name,
+        )
+    )
+    await session.commit()
+    return {"event_id": event_id, "deleted": True}
 
 
 def _attendee_name(a: Alumni) -> str:

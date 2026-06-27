@@ -56,6 +56,7 @@ ALTER TABLE public.events                ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.event_attendance      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.surveys               ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notes                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.donations             ENABLE ROW LEVEL SECURITY;
 
 -- Files, audit, duplicates ---------------------------------------------------
 ALTER TABLE public.attachments           ENABLE ROW LEVEL SECURITY;

@@ -95,6 +95,10 @@ def _validate_headers(headers: list[str]) -> list[str]:
     for extra in headers:
         if extra and extra not in expected:
             errors.append(f"Unexpected column: {extra!r}.")
+    # A duplicated header maps ambiguously (the header->index map is last-wins),
+    # so reject rather than silently read the rightmost column.
+    for dup in sorted({h for h in headers if h and headers.count(h) > 1}):
+        errors.append(f"Duplicate column: {dup!r}.")
     return errors
 
 
@@ -112,8 +116,8 @@ def _parse_amount(raw: str) -> Decimal:
         value = Decimal(cleaned)
     except InvalidOperation as exc:
         raise ValueError(f"{COL_AMOUNT}: expected a number, got {raw!r}.") from exc
-    if value < 0:
-        raise ValueError(f"{COL_AMOUNT}: must not be negative.")
+    if value <= 0:
+        raise ValueError(f"{COL_AMOUNT}: must be greater than 0.")
     if value > _AMOUNT_MAX:
         raise ValueError(f"{COL_AMOUNT}: is too large.")
     return value.quantize(Decimal("0.01"))
@@ -189,6 +193,7 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
     for row in rows:
         blockers: list[dict] = []
         warnings: list[dict] = []
+        alumni_id: int | None = None
 
         if row["error"]:
             blockers.append({"code": "invalid_row", "message": row["error"]})
@@ -234,6 +239,10 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
                 "month": row["month"],
                 "year": row["year"],
                 "amount": float(row["amount"]) if row["amount"] is not None else None,
+                # Resolved alumnus for an importable row (None when rejected) —
+                # commit reuses this instead of re-querying, so the row written is
+                # exactly the row evaluated (no stale second match).
+                "alumni_id": alumni_id if status == "importable" else None,
                 "status": status,
                 "blockers": blockers,
                 "warnings": warnings,
@@ -266,7 +275,6 @@ async def commit_import(
     row. Each insert is audited (``donation``/``create``). Returns:
         ``{"imported": int, "skipped": int, "rejects": [{"row", "name",
            "reason"}]}``"""
-    matched = await match_net_ids(session, [r["net_id"] for r in rows if r["net_id"]])
     report = await evaluate(session, rows)
     parsed_by_row = {r["row"]: r for r in rows}
 
@@ -287,7 +295,9 @@ async def commit_import(
             continue
 
         parsed = parsed_by_row[row_num]
-        alumni_id = matched.get(normalize_net_id(parsed["net_id"]))
+        # Reuse the alumnus resolved during evaluation (single Net-ID match) so
+        # the inserted row matches exactly what was evaluated as importable.
+        alumni_id = evaluated["alumni_id"]
         async with session.begin_nested() as savepoint:
             try:
                 donation = Donation(

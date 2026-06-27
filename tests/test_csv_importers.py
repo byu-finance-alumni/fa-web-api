@@ -148,6 +148,43 @@ def test_donations_parse_rejects_bad_headers():
     assert any("Missing required column" in e for e in header_errors)
 
 
+def test_donations_parse_rejects_zero_amount():
+    rows, _ = import_donations.parse_and_map(
+        _bytes("Net ID,Name,Month,Year,Amount\njdoe,Jane,4,2026,0\n")
+    )
+    assert rows[0]["error"] is not None
+    assert "Amount" in rows[0]["error"]
+
+
+def test_donations_parse_flags_duplicate_header():
+    # Two "Net ID" columns map ambiguously — reject rather than last-wins.
+    rows, header_errors = import_donations.parse_and_map(
+        _bytes("Net ID,Net ID,Name,Month,Year,Amount\njdoe,x,Jane,4,2026,50\n")
+    )
+    assert rows == []
+    assert any("Duplicate column" in e for e in header_errors)
+
+
+def test_donations_evaluate_warns_duplicate_in_file():
+    rows, _ = import_donations.parse_and_map(
+        _bytes(
+            "Net ID,Name,Month,Year,Amount\n"
+            "jdoe,Jane,4,2026,100\n"
+            "jdoe,Jane,4,2026,100\n"
+        )
+    )
+    session = _SeqSession(results=[[(42, "jdoe")]])
+    report = asyncio.run(import_donations.evaluate(session, rows))
+    # Both rows are importable; the second carries a duplicate warning.
+    assert report["summary"]["importable"] == 2
+    assert any(
+        w["code"] == "possible_duplicate_in_file"
+        for w in report["rows"][1]["warnings"]
+    )
+    # alumni_id is propagated for commit reuse (no second match query).
+    assert report["rows"][0]["alumni_id"] == 42
+
+
 def test_donations_evaluate_rejects_unmatched_net_id():
     rows, _ = import_donations.parse_and_map(
         _bytes("Net ID,Name,Month,Year,Amount\nghost,Nobody,4,2026,100\n")

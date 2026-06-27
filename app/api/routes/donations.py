@@ -29,7 +29,7 @@ from app.api.dependencies.auth import (
 )
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
-from app.core.errors import NotFoundError
+from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.donation import Donation
@@ -301,6 +301,12 @@ async def update_donation(
         raise NotFoundError(f"Donation {donation_id} not found.")
 
     changes = payload.model_dump(exclude_unset=True)
+    # amount/year back NOT NULL columns. An explicit ``null`` survives
+    # exclude_unset, so reject it as a 422 rather than letting setattr push NULL
+    # to the DB and surface as an opaque 500. (month/notes are nullable.)
+    for required in ("amount", "year"):
+        if required in changes and changes[required] is None:
+            raise InvalidRequestError(f"{required} cannot be set to null.")
     applied = False
     for field, value in changes.items():
         column = _FIELD_MAP[field]

@@ -47,6 +47,9 @@ class _Result:
     def all(self):
         return self._rows
 
+    def scalars(self):
+        return _Result(self._rows)
+
 
 class _SeqSession:
     """Returns queued ``execute().all()`` results and ``scalar()`` values in
@@ -258,3 +261,97 @@ def test_import_preview_forbidden_for_full_access(client):
         files={"file": ("d.csv", b"Net ID,Name,Month,Year,Amount\n", "text/csv")},
     )
     assert response.status_code == 403
+
+
+# --- QA-hardening regressions -------------------------------------------------
+
+
+def test_add_donation_rejects_zero_amount(client):
+    # A $0 gift carries no financial meaning — rejected at the schema layer.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "0", "year": 2026}
+    )
+    assert response.status_code == 422
+
+
+def test_add_donation_archived_alumni_is_404(client):
+    from types import SimpleNamespace
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    archived = SimpleNamespace(alumni_id=42, archived=True)
+    app.dependency_overrides[get_session] = _with_session(
+        _SeqSession(get_obj=archived)
+    )
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "100", "year": 2026}
+    )
+    assert response.status_code == 404
+
+
+def test_update_donation_null_year_is_422_not_500(client):
+    # An explicit {"year": null} must not reach the NOT NULL column (would 500).
+    from types import SimpleNamespace
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    donation = SimpleNamespace(
+        donation_id=5, alumni_id=42, amount=100, donation_year=2026,
+        donation_month=4, notes=None,
+    )
+    app.dependency_overrides[get_session] = _with_session(
+        _SeqSession(get_obj=donation)
+    )
+    response = client.patch("/donations/5", json={"year": None})
+    assert response.status_code == 422
+
+
+def _donation(donation_id, year, month, amount, notes=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        donation_id=donation_id,
+        donation_year=year,
+        donation_month=month,
+        amount=amount,
+        notes=notes,
+    )
+
+
+def test_alumni_donations_hides_amounts_for_view_only(client):
+    from types import SimpleNamespace
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    alumni = SimpleNamespace(
+        alumni_id=42, first_name="Jane", preferred_first_name=None, last_name="Doe"
+    )
+    session = _SeqSession(
+        get_obj=alumni,
+        results=[[_donation(1, 2026, 4, 250, notes="secret")]],
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+    body = client.get("/donations/alumni/42").json()
+    assert body["name"] == "Jane Doe"
+    assert body["lifetime_total"] is None
+    assert body["donations"][0]["amount"] is None
+    # Notes are gated alongside amounts (may contain figures).
+    assert body["donations"][0]["notes"] is None
+    # Period is still visible.
+    assert body["donations"][0]["year"] == 2026
+
+
+def test_alumni_donations_shows_amounts_for_full_access(client):
+    from types import SimpleNamespace
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    alumni = SimpleNamespace(
+        alumni_id=42, first_name="Jane", preferred_first_name=None, last_name="Doe"
+    )
+    session = _SeqSession(
+        get_obj=alumni,
+        results=[[_donation(1, 2026, 4, 250, notes="memo")]],
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+    body = client.get("/donations/alumni/42").json()
+    assert body["lifetime_total"] == 250.0
+    assert body["donations"][0]["amount"] == 250.0
+    assert body["donations"][0]["notes"] == "memo"

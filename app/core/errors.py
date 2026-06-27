@@ -14,6 +14,18 @@ class NotFoundError(Exception):
         super().__init__(message)
 
 
+class InvalidRequestError(Exception):
+    """A semantically invalid request (valid shape, disallowed values/state).
+
+    For rules the request body's schema can't express — e.g. toggling a
+    non-assignable capability or an unknown role. Maps to 422 /
+    ``validation_error`` (the same envelope as request-parsing failures)."""
+
+    def __init__(self, message: str = "Invalid request.") -> None:
+        self.message = message
+        super().__init__(message)
+
+
 class ConflictError(Exception):
     """A request conflicts with current state. Maps to 409 / ``conflict``."""
 

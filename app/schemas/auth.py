@@ -38,6 +38,12 @@ class UserContext(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     roles: list[str] = []
+    # The user's EFFECTIVE capability codes under the live permission config
+    # (#164). Populated by GET /auth/context for the frontend's capability-aware
+    # UI; empty on the internal UserContext that the authorization guards resolve
+    # (guards re-derive capabilities from the config per request — they never
+    # trust this field). See app/core/capabilities.
+    capabilities: list[str] = []
     # True while the user is on an admin-issued temp password and must set their
     # own (the frontend gates them into a set-password screen). Reflects the
     # CURRENT authenticated user's flag; cleared via POST /auth/password/complete.

@@ -16,8 +16,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
-from app.core.roles import RoleName
 from app.core.security import (
     AuthError,
     AuthorizationError,
@@ -26,6 +26,7 @@ from app.core.security import (
     verify_supabase_jwt,
 )
 from app.models.login_attempt import LoginAttempt
+from app.repositories.permissions import load_grants
 from app.repositories.user import get_user_with_roles_by_auth_id
 from app.schemas.auth import AuthenticatedUser, UserContext
 
@@ -155,61 +156,65 @@ CurrentDBUserAllowMustChange = Annotated[
 ]
 
 
-def require_roles(
-    *allowed: RoleName,
-) -> Callable[[UserContext], Awaitable[UserContext]]:
-    """Build a dependency that requires the user to hold one of `allowed`.
+async def get_permission_config(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, frozenset[str]]:
+    """Load the editable role→capabilities grant map for this request.
 
-    Returns the UserContext on success so routes can use it directly; raises
+    FastAPI caches sub-dependencies within a single request, so this runs once
+    per request even when several capability guards depend on it — no stale
+    in-process cache to invalidate, and a revoke takes effect on the very next
+    request. Falls back to the historical defaults if the table is empty (see
+    ``app/repositories/permissions.load_grants``).
+    """
+    return await load_grants(session)
+
+
+PermissionConfig = Annotated[dict[str, frozenset[str]], Depends(get_permission_config)]
+
+
+def require_capability(
+    capability: str,
+) -> Callable[[UserContext, dict[str, frozenset[str]]], Awaitable[UserContext]]:
+    """Build a dependency that requires the user to hold ``capability``.
+
+    The capability is resolved against the LIVE permission config (editable by
+    the engineer), not a frozen role set. The engineer always holds every
+    capability (hard override in ``effective_capabilities``), so the engineer
+    can never lock themselves out. Returns the UserContext on success; raises
     AuthorizationError (403) otherwise.
     """
-    allowed_values = {role.value for role in allowed}
 
-    async def _guard(user: CurrentDBUser) -> UserContext:
-        if allowed_values.isdisjoint(user.roles):
+    async def _guard(
+        user: CurrentDBUser, config: PermissionConfig
+    ) -> UserContext:
+        if capability not in effective_capabilities(config, user.roles):
             raise AuthorizationError()
         return user
 
     return _guard
 
 
-# Role hierarchy: engineer ⊇ super_admin ⊇ full_access ⊇ student ⊇ view_only.
-# `engineer` is the top role and therefore appears in EVERY allow-set (it
-# satisfies every guard, including super_admin's). `super_admin` satisfies
-# every guard except, by design, nothing above it. Guards are allow-lists
-# (set-disjoint), not ranked comparisons, so each new role must be added
-# explicitly to each guard it should satisfy.
+# The historical guards, now expressed as capability checks. The capability →
+# default-role mapping in ``app/core/capabilities.DEFAULT_GRANTS`` reproduces the
+# old hardcoded allow-lists exactly, so behaviour is unchanged until an engineer
+# edits the config. Names and type aliases are preserved so every existing route
+# import keeps working.
 #
-# `student` is a narrow writer: it may EDIT existing alumni records (and their
-# nested data) but may NOT create new alumni, archive/restore, import, or touch
-# user administration. It is therefore added to `require_view_only` (read) and
-# to `require_alumni_edit` (edit existing) ONLY — never to `require_full_access`.
-require_super_admin = require_roles(RoleName.ENGINEER, RoleName.SUPER_ADMIN)
-require_full_access = require_roles(
-    RoleName.ENGINEER, RoleName.SUPER_ADMIN, RoleName.FULL_ACCESS
-)
-# Edit an EXISTING alumnus / their nested records. Adds `student` on top of the
-# full_access set. Does NOT permit create, archive, restore, or import.
-require_alumni_edit = require_roles(
-    RoleName.ENGINEER,
-    RoleName.SUPER_ADMIN,
-    RoleName.FULL_ACCESS,
-    RoleName.STUDENT,
-)
-require_view_only = require_roles(
-    RoleName.ENGINEER,
-    RoleName.SUPER_ADMIN,
-    RoleName.FULL_ACCESS,
-    RoleName.STUDENT,
-    RoleName.VIEW_ONLY,
-)
-# Database / controlled-vocabulary administration (editable dropdowns, #82).
-# Engineer-only: per the roles model, the engineer is the controlled-vocabulary
-# (and DB) admin. super_admin is intentionally NOT permitted here.
-require_vocab_admin = require_roles(RoleName.ENGINEER)
-# Engineer-only: the top role exclusively (e.g. managing the support contacts
-# shown on the in-app error screen).
-require_engineer = require_roles(RoleName.ENGINEER)
+# `engineer` ⊇ `super_admin` ⊇ `full_access` ⊇ `student` ⊇ `view_only`. The
+# engineer holds every capability unconditionally; the other roles hold whatever
+# the config grants them.
+require_super_admin = require_capability(Capability.USER_ADMIN)
+require_full_access = require_capability(Capability.ALUMNI_FULL)
+# Edit an EXISTING alumnus / their nested records — not create/archive/import.
+require_alumni_edit = require_capability(Capability.ALUMNI_EDIT)
+require_view_only = require_capability(Capability.VIEW)
+# Controlled-vocabulary administration (editable dropdowns, #82).
+require_vocab_admin = require_capability(Capability.VOCAB_ADMIN)
+# Engineer console + permission editor. The `engineer` capability is not
+# assignable to any other role, so this stays engineer-exclusive even though it
+# now routes through the config like the others.
+require_engineer = require_capability(Capability.ENGINEER)
 
 RequireSuperAdmin = Annotated[UserContext, Depends(require_super_admin)]
 RequireFullAccess = Annotated[UserContext, Depends(require_full_access)]

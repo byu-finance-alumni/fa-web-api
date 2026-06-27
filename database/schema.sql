@@ -96,6 +96,20 @@ CREATE TABLE user_roles (
     CONSTRAINT uq_user_roles UNIQUE (user_id, role_id)
 );
 
+-- Editable permission config (#164): which capabilities each role holds. A row's
+-- presence grants the capability; capability codes are defined in code
+-- (app/core/capabilities.py). Seeded from the historical guard mapping; the
+-- engineer edits it via the permission editor. See migration
+-- 2026-06-26_role_capabilities.
+CREATE TABLE role_capabilities (
+    role_capability_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    role_id            bigint NOT NULL,
+    capability_code    varchar(100) NOT NULL,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_role_capabilities_role_id FOREIGN KEY (role_id) REFERENCES roles (role_id) ON DELETE CASCADE,
+    CONSTRAINT uq_role_capabilities UNIQUE (role_id, capability_code)
+);
+
 -- -----------------------------------------------------------------------------
 -- Data provenance / imports
 -- -----------------------------------------------------------------------------
@@ -621,6 +635,7 @@ CREATE TABLE bbq_attendance (
 
 CREATE INDEX idx_user_roles_user_id              ON user_roles (user_id);
 CREATE INDEX idx_user_roles_role_id              ON user_roles (role_id);
+CREATE INDEX ix_role_capabilities_role_id        ON role_capabilities (role_id);
 CREATE INDEX idx_import_batches_user_id          ON import_batches (imported_by_user_id);
 CREATE INDEX idx_import_batches_source_id        ON import_batches (source_id);
 CREATE INDEX idx_alumni_source_id                ON alumni (source_id);

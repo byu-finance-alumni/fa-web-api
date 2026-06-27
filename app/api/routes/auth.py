@@ -8,7 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import CurrentDBUserAllowMustChange, CurrentUser
+from app.api.dependencies.auth import (
+    CurrentDBUserAllowMustChange,
+    CurrentUser,
+    PermissionConfig,
+)
+from app.core.capabilities import effective_capabilities
 from app.core.database import get_session
 from app.core.rate_limit import RecordLoginRateLimit
 from app.models.audit import AuditLog
@@ -71,17 +76,22 @@ async def me(current_user: CurrentUser) -> AuthenticatedUser:
 
 
 @router.get("/context", response_model=UserContext)
-async def context(user: CurrentDBUserAllowMustChange) -> UserContext:
+async def context(
+    user: CurrentDBUserAllowMustChange, config: PermissionConfig
+) -> UserContext:
     """Return the signed-in user resolved against the database, with roles.
 
     Used by the frontend for role-aware UI. Returns 403 if the authenticated
     user isn't provisioned (no active `users` row). ``must_change_password``
-    reflects the current user's force-change flag.
+    reflects the current user's force-change flag. ``capabilities`` carries the
+    user's effective capability codes under the live permission config (#164) so
+    the UI can show/hide controls — the backend still re-enforces every request.
 
     EXEMPT from the force-password-change gate: a flagged user must be able to
     read their own context (to learn they're flagged) — so this depends on the
     exempt resolver, not the gated ``get_current_db_user``.
     """
+    user.capabilities = sorted(effective_capabilities(config, user.roles))
     return user
 
 

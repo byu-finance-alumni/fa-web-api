@@ -12,10 +12,13 @@ only. Matching is:
   * **batched** — every distinct Net ID across the file is resolved in ONE query
     so a large import doesn't fan out into per-row round-trips.
 
-An ambiguous Net ID (more than one active alumnus sharing it) cannot happen for
-non-archived rows — the partial-unique index ``uq_alumni_net_id_active`` forbids
-it — so the map keeps the first id deterministically and callers treat a hit as
-unambiguous.
+Note on ambiguity: the active partial-unique index ``uq_alumni_net_id_active`` is
+on the RAW ``net_id`` value, so it forbids two active alumni sharing the exact
+same Net ID but NOT a case-only collision (``"JDoe"`` vs ``"jdoe"``). Matching
+here is case-insensitive, so in the unlikely event such a pair exists this keeps
+the first id by query order via ``setdefault`` — deterministic per call but not
+guaranteed-unique by schema. Hardening the index to ``lower(net_id)`` is tracked
+as a follow-up; in practice Net IDs are stored lowercase.
 """
 
 from __future__ import annotations

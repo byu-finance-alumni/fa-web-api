@@ -30,9 +30,11 @@ class DonationCreate(BaseModel):
 
     @field_validator("amount")
     @classmethod
-    def _amount_nonneg(cls, value: Decimal) -> Decimal:
-        if value < 0:
-            raise ValueError("amount must not be negative.")
+    def _amount_positive(cls, value: Decimal) -> Decimal:
+        # A gift must be a positive amount — $0 (and negative-zero) carries no
+        # financial meaning and would skew lifetime/per-year roll-ups.
+        if value <= 0:
+            raise ValueError("amount must be greater than 0.")
         if value > _AMOUNT_MAX:
             raise ValueError("amount is too large.")
         # Quantize to cents so a 3-decimal input can't silently round in the DB.
@@ -80,10 +82,10 @@ class DonationUpdate(BaseModel):
 
     @field_validator("amount")
     @classmethod
-    def _amount_nonneg(cls, value: Decimal | None) -> Decimal | None:
+    def _amount_positive(cls, value: Decimal | None) -> Decimal | None:
         if value is None:
             return None
-        return DonationCreate._amount_nonneg.__func__(cls, value)  # type: ignore[attr-defined]
+        return DonationCreate._amount_positive.__func__(cls, value)  # type: ignore[attr-defined]
 
     @field_validator("year")
     @classmethod

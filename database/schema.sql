@@ -450,7 +450,7 @@ CREATE TABLE donations (
     logged_by_user_id bigint,
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT ck_donations_amount_nonneg CHECK (amount >= 0),
+    CONSTRAINT ck_donations_amount_positive CHECK (amount > 0),
     CONSTRAINT ck_donations_month_range CHECK (donation_month IS NULL OR donation_month BETWEEN 1 AND 12),
     CONSTRAINT ck_donations_year_range CHECK (donation_year BETWEEN 1900 AND 2200),
     CONSTRAINT ck_donations_notes_length CHECK (char_length(notes) <= 10000),

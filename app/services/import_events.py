@@ -117,6 +117,10 @@ def _validate_headers(headers: list[str]) -> list[str]:
     for extra in headers:
         if extra and extra not in expected:
             errors.append(f"Unexpected column: {extra!r}.")
+    # A duplicated header maps ambiguously (the header->index map is last-wins),
+    # so reject rather than silently read the rightmost column.
+    for dup in sorted({h for h in headers if h and headers.count(h) > 1}):
+        errors.append(f"Duplicate column: {dup!r}.")
     return errors
 
 

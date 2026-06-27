@@ -299,13 +299,19 @@ async def commit_import(
                 )
                 session.add(donation)
                 await session.flush()
+                # Record the actual amount + period (not a fixed sentinel) so the
+                # FERPA disclosure trail can reconstruct exactly what financial
+                # value this bulk row wrote, matching the single-row audit path.
                 session.add(
                     AuditLog(
                         user_id=actor_user_id,
                         action_type="create",
                         entity_type="donation",
                         entity_id=donation.donation_id,
-                        new_value="bulk_import",
+                        new_value=(
+                            f"{parsed['amount']} "
+                            f"({parsed['month'] or '-'}/{parsed['year']}) [bulk_import]"
+                        ),
                     )
                 )
                 imported += 1

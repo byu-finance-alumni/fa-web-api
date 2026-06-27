@@ -20,7 +20,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireEngineer, get_permission_config
+from app.api.dependencies.auth import (
+    RequireEngineer,
+    RequireSuperAdmin,
+    get_permission_config,
+)
 from app.core.capabilities import (
     ALL_CAPABILITY_CODES,
     ASSIGNABLE_CAPABILITY_CODES,
@@ -46,6 +50,10 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 ConfigDep = Annotated[dict, Depends(get_permission_config)]
 
 router = APIRouter(prefix="/engineer", tags=["engineer"])
+# Read-only matrix for the role-capabilities table in the Users section (#163).
+# Visible to user admins (engineer + super_admin) — they curate users, so they
+# see what each role can do — but only the engineer can EDIT it (above).
+admin_router = APIRouter(prefix="/admin", tags=["admin"])
 
 # Capability-code ordering index for stable, registry-ordered output.
 _CAP_INDEX = {c.code: i for i, c in enumerate(CAPABILITIES)}
@@ -86,6 +94,18 @@ def _build_matrix(config: dict[str, frozenset[str]]) -> PermissionMatrix:
 @router.get("/permissions", response_model=PermissionMatrix)
 async def get_permissions(_: RequireEngineer, config: ConfigDep) -> PermissionMatrix:
     """Return the full permission matrix (engineer-only)."""
+    return _build_matrix(config)
+
+
+@admin_router.get("/role-capabilities", response_model=PermissionMatrix)
+async def get_role_capabilities(
+    _: RequireSuperAdmin, config: ConfigDep
+) -> PermissionMatrix:
+    """Read-only permission matrix for the role-capabilities table (#163).
+
+    Same data as the engineer editor but behind the user-admin gate (engineer +
+    super_admin), so a super_admin can SEE what each role can do without being
+    able to change it. The table renders the non-engineer roles."""
     return _build_matrix(config)
 
 

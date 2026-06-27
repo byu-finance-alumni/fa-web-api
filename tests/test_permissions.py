@@ -186,6 +186,37 @@ def test_matrix_returns_full_config_for_engineer():
     assert eng_cap["assignable"] is False
 
 
+# --- GET /admin/role-capabilities (read-only, super_admin) -------------------
+
+
+def test_role_capabilities_read_allows_super_admin():
+    # The capabilities table (#163) lives in the user-admin-gated Users section,
+    # so a super_admin can READ the matrix even though only the engineer edits it.
+    app.dependency_overrides[get_session] = _no_db_session
+    _override_config()
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    with TestClient(app) as client:
+        resp = client.get("/admin/role-capabilities")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert {r["role"] for r in resp.json()["roles"]} >= {
+        "super_admin",
+        "full_access",
+        "student",
+        "view_only",
+    }
+
+
+def test_role_capabilities_read_forbidden_for_full_access():
+    app.dependency_overrides[get_session] = _no_db_session
+    _override_config()
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    with TestClient(app) as client:
+        resp = client.get("/admin/role-capabilities")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+
+
 # --- PATCH /engineer/permissions guards --------------------------------------
 
 

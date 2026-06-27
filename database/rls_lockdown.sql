@@ -23,6 +23,7 @@
 ALTER TABLE public.users                 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.roles                 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_roles            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.role_capabilities     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_attempts        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_events          ENABLE ROW LEVEL SECURITY;
 

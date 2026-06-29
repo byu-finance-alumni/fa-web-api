@@ -96,6 +96,20 @@ CREATE TABLE user_roles (
     CONSTRAINT uq_user_roles UNIQUE (user_id, role_id)
 );
 
+-- Editable permission config (#164): which capabilities each role holds. A row's
+-- presence grants the capability; capability codes are defined in code
+-- (app/core/capabilities.py). Seeded from the historical guard mapping; the
+-- engineer edits it via the permission editor. See migration
+-- 2026-06-26_role_capabilities.
+CREATE TABLE role_capabilities (
+    role_capability_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    role_id            bigint NOT NULL,
+    capability_code    varchar(100) NOT NULL,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_role_capabilities_role_id FOREIGN KEY (role_id) REFERENCES roles (role_id) ON DELETE CASCADE,
+    CONSTRAINT uq_role_capabilities UNIQUE (role_id, capability_code)
+);
+
 -- -----------------------------------------------------------------------------
 -- Data provenance / imports
 -- -----------------------------------------------------------------------------
@@ -422,6 +436,51 @@ CREATE TABLE event_attendance (
     CONSTRAINT uq_event_attendance UNIQUE (event_id, alumni_id)
 );
 
+-- Pay It Forward Fund donations (#161): a per-alumnus ledger of gifts, each an
+-- amount tied to a month + year. Dollar amounts are gated to full_access+ in the
+-- API (field-level); donor identity is view-access. See migration
+-- 2026-06-27_donations.sql.
+CREATE TABLE donations (
+    donation_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id         bigint NOT NULL,
+    amount            numeric(12, 2) NOT NULL,
+    donation_month    smallint,
+    donation_year     smallint NOT NULL,
+    notes             text,
+    logged_by_user_id bigint,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_donations_amount_positive CHECK (amount > 0),
+    CONSTRAINT ck_donations_month_range CHECK (donation_month IS NULL OR donation_month BETWEEN 1 AND 12),
+    CONSTRAINT ck_donations_year_range CHECK (donation_year BETWEEN 1900 AND 2200),
+    CONSTRAINT ck_donations_notes_length CHECK (char_length(notes) <= 10000),
+    CONSTRAINT fk_donations_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_donations_user_id FOREIGN KEY (logged_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
+-- Unified notes (#39): free-text notes attached to exactly one of an alumni,
+-- an interaction, or an event. The CHECK enforces single-target; each FK
+-- cascades so a note never outlives its parent. See migration
+-- 2026-06-22_unified_notes.sql.
+CREATE TABLE notes (
+    note_id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id          bigint,
+    interaction_id     bigint,
+    event_id           bigint,
+    body               text NOT NULL,
+    created_by_user_id bigint,
+    updated_by_user_id bigint,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_notes_single_target CHECK (num_nonnulls(alumni_id, interaction_id, event_id) = 1),
+    CONSTRAINT ck_notes_body_length CHECK (char_length(body) <= 10000),
+    CONSTRAINT fk_notes_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_notes_interaction_id FOREIGN KEY (interaction_id) REFERENCES interactions (interaction_id) ON DELETE CASCADE,
+    CONSTRAINT fk_notes_event_id FOREIGN KEY (event_id) REFERENCES events (event_id) ON DELETE CASCADE,
+    CONSTRAINT fk_notes_created_by FOREIGN KEY (created_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_notes_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 CREATE TABLE surveys (
     survey_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id       bigint NOT NULL,
@@ -533,6 +592,7 @@ CREATE TABLE alumni_program_engagement (
     piff_donor                      boolean NOT NULL DEFAULT false,
     cfp_designation                 boolean NOT NULL DEFAULT false,
     cfa_designation                 boolean NOT NULL DEFAULT false,
+    cpa_designation                 boolean NOT NULL DEFAULT false,
     engagement_notes                text,
     created_at                      timestamptz NOT NULL DEFAULT now(),
     updated_at                      timestamptz NOT NULL DEFAULT now(),
@@ -597,6 +657,7 @@ CREATE TABLE bbq_attendance (
 
 CREATE INDEX idx_user_roles_user_id              ON user_roles (user_id);
 CREATE INDEX idx_user_roles_role_id              ON user_roles (role_id);
+CREATE INDEX ix_role_capabilities_role_id        ON role_capabilities (role_id);
 CREATE INDEX idx_import_batches_user_id          ON import_batches (imported_by_user_id);
 CREATE INDEX idx_import_batches_source_id        ON import_batches (source_id);
 CREATE INDEX idx_alumni_source_id                ON alumni (source_id);
@@ -633,5 +694,10 @@ CREATE INDEX idx_nettrek_hosting_alumni_id            ON nettrek_hosting (alumni
 CREATE INDEX idx_conference_participation_alumni_id   ON conference_participation (alumni_id);
 CREATE INDEX idx_finance_society_leadership_alumni_id ON finance_society_leadership (alumni_id);
 CREATE INDEX idx_bbq_attendance_alumni_id             ON bbq_attendance (alumni_id);
+CREATE INDEX idx_notes_alumni_id                      ON notes (alumni_id);
+CREATE INDEX idx_notes_interaction_id                 ON notes (interaction_id);
+CREATE INDEX idx_notes_event_id                       ON notes (event_id);
+CREATE INDEX idx_donations_alumni_id                  ON donations (alumni_id);
+CREATE INDEX idx_donations_year                       ON donations (donation_year);
 
 COMMIT;

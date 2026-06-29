@@ -211,6 +211,53 @@ class InteractionCreate(BaseModel):
     interaction_date_time: datetime.datetime | None = None
     interaction_notes: str | None = None
 
+    @field_validator("interaction_type", mode="before")
+    @classmethod
+    def _type_trim(cls, value: str) -> str:
+        # Trim and reject whitespace-only (min_length=1 alone lets "   " through).
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("Interaction type cannot be blank.")
+            return stripped
+        return value
+
+    @field_validator("interaction_notes", mode="before")
+    @classmethod
+    def _notes_blank_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class InteractionUpdate(BaseModel):
+    """Edit fields on an existing interaction (all optional)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interaction_type: str | None = Field(default=None, min_length=1, max_length=100)
+    interaction_date_time: datetime.datetime | None = None
+    interaction_notes: str | None = None
+
+    @field_validator("interaction_type", mode="before")
+    @classmethod
+    def _type_trim(cls, value: str | None) -> str:
+        # Only runs when the field is PRESENT in the payload (omitted → default,
+        # not validated). So an explicit null or blank is a real attempt to clear
+        # the type, which isn't allowed — reject it rather than nulling the row.
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise ValueError("Interaction type cannot be blank.")
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("interaction_notes", mode="before")
+    @classmethod
+    def _notes_blank_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
 
 class TaskCreate(BaseModel):
     """Create a follow-up task (Tasks tab)."""
@@ -302,6 +349,7 @@ class ProgramEngagementRead(_Orm):
     piff_donor: bool
     cfp_designation: bool
     cfa_designation: bool
+    cpa_designation: bool
     engagement_notes: str | None = None
 
 

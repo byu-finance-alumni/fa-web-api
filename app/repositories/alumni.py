@@ -22,9 +22,16 @@ from app.models.crm import Interaction, Survey
 from app.models.duplicate import DuplicateCandidate
 from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
-from app.models.event import EventAttendance
+from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.utils.sql import escape_like
+
+# Biennial survey cadence (#160): an alumnus is DUE for surveying when their
+# most-recent completed survey is older than this, or they have never completed
+# one. Expressed in days so the cutoff arithmetic stays in stdlib; a 2-year
+# staleness window is insensitive to leap-year calendar drift. Callers compute
+# the cutoff as ``now() - SURVEY_CADENCE`` and pass it as ``survey_due_before``.
+SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
 
 
 def _as_values(value: "str | list[str] | None") -> list[str]:
@@ -50,9 +57,39 @@ async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
     return await session.get(Alumni, alumni_id)
 
 
+# Sort options exposed by the list UI, mapped to their ORDER BY columns. Kept as
+# a pure module-level function (no IO) so the mapping can be unit-tested by
+# compiling the clause — this is the one place the grad-year direction is decided
+# and it MUST stay: grad_desc = most-recent grad year FIRST (DESC, nulls last),
+# grad_asc = oldest FIRST (ASC, nulls last). The frontend dropdown labels
+# ("newest" -> grad_desc, "oldest" -> grad_asc) and the route's `sort` enum stay
+# in lockstep with these tokens. Unknown/legacy values fall back to name.
+def alumni_order_by(sort: str | None) -> tuple:
+    """Return the ORDER BY tuple for a list ``sort`` token (name | grad_desc | grad_asc)."""
+    return {
+        "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
+        "grad_desc": (
+            Alumni.graduation_year.desc().nulls_last(),
+            Alumni.last_name.asc(),
+        ),
+        "grad_asc": (
+            Alumni.graduation_year.asc().nulls_last(),
+            Alumni.last_name.asc(),
+        ),
+    }.get(sort or "name", (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
+
+
 def build_alumni_query(
     *,
     q: str | None = None,
+    # Per-field search (dashboard Quick / Advanced search). Each is a
+    # case-insensitive PARTIAL match, AND-combined with the others, and ignored
+    # when blank — so an empty box never narrows the results.
+    net_id: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    preferred_name: str | None = None,
+    email: str | None = None,
     graduation_year: int | None = None,
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
@@ -70,15 +107,31 @@ def build_alumni_query(
     status_label: "str | list[str] | None" = None,
     leadership_role: "str | list[str] | None" = None,
     survey_status: "str | list[str] | None" = None,
+    # "Needs surveying" (#160): alumni who are DUE for the biennial survey —
+    # never completed one, or whose most-recent completion is older than the
+    # survey cadence. The threshold is computed server-side and passed in (the
+    # route owns "now"); a ``None`` threshold disables the filter.
+    needs_survey: bool = False,
+    survey_due_before: datetime.datetime | None = None,
     # Last-contacted (derived from interactions): contacted on/after a date,
     # NOT contacted since a date (stale), or never contacted at all.
     contacted_after: datetime.date | None = None,
     contacted_before: datetime.date | None = None,
     never_contacted: bool = False,
     attended_event: bool = False,
+    # Guest-speaker-AT-AN-EVENT window (drives the dashboard "Guest speakers this
+    # month" tile's deep-link). Distinct from ``guest_speaker_willing`` (the
+    # alumnus-level willing flag, no date) — these select alumni who actually
+    # served as a speaker at an event whose date falls in the window.
+    spoke_after: datetime.date | None = None,
+    spoke_before: datetime.date | None = None,
     donor: bool = False,
     mentor_willing: bool = False,
     guest_speaker_willing: bool = False,
+    # Professional-certification flags on the program-engagement profile. Each
+    # narrows to alumni who hold that designation (correlated EXISTS).
+    cfa: bool = False,
+    cpa: bool = False,
     missing_email: bool = False,
     missing_employer: bool = False,
     duplicate: bool = False,
@@ -109,6 +162,30 @@ def build_alumni_query(
                 Alumni.byu_id.ilike(like, escape="\\"),
                 Alumni.net_id.ilike(like, escape="\\"),
             )
+        )
+    # Per-field partial matches (AND-combined; blanks ignored).
+    def _field_like(value: str | None, column) -> None:
+        if value and value.strip():
+            conditions.append(
+                column.ilike(f"%{escape_like(value.strip())}%", escape="\\")
+            )
+
+    _field_like(net_id, Alumni.net_id)
+    _field_like(first_name, Alumni.first_name)
+    _field_like(last_name, Alumni.last_name)
+    _field_like(preferred_name, Alumni.preferred_first_name)
+    if email and email.strip():
+        like = f"%{escape_like(email.strip())}%"
+        conditions.append(
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                or_(
+                    AlumniContactInfo.personal_email.ilike(like, escape="\\"),
+                    AlumniContactInfo.work_email.ilike(like, escape="\\"),
+                ),
+            )
+            .exists()
         )
     if graduation_year is not None:
         conditions.append(Alumni.graduation_year == graduation_year)
@@ -240,6 +317,26 @@ def build_alumni_query(
             )
             .exists()
         )
+    if needs_survey and survey_due_before is not None:
+        # DUE = no survey COMPLETED within the cadence window. A correlated NOT
+        # EXISTS over a recent completion captures both cases in one predicate:
+        #   * never surveyed (no survey rows, or rows with a NULL completed_at)
+        #     -> nothing satisfies the inner EXISTS -> DUE, and
+        #   * most-recent completion older than the threshold -> still no row
+        #     with completed_at >= threshold -> DUE.
+        # ``survey_due_before`` is the server-computed cutoff (now - cadence);
+        # comparing completed_at to it avoids re-deriving "most recent" — any
+        # completion on/after the cutoff means NOT due. Stays in PostgreSQL with
+        # a stable plan (indexable on surveys.alumni_id, completed_at).
+        conditions.append(
+            ~select(Survey.survey_id)
+            .where(
+                Survey.alumni_id == Alumni.alumni_id,
+                Survey.completed_at.is_not(None),
+                Survey.completed_at >= survey_due_before,
+            )
+            .exists()
+        )
     if contacted_after is not None:
         conditions.append(
             select(Interaction.interaction_id)
@@ -272,6 +369,25 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(has_attended)
+    if spoke_after is not None or spoke_before is not None:
+        # Alumni who served as a guest speaker at an event in the window. Mirrors
+        # the dashboard ``guest_speakers_this_month`` KPI exactly (same
+        # attendance_status ILIKE '%speaker%' + event_date bounds) so the tile's
+        # count equals this deep-linked list's length. Correlated EXISTS over the
+        # attendance→event join keeps it in PostgreSQL with a stable plan.
+        spoke = (
+            select(EventAttendance.event_attendance_id)
+            .join(Event, Event.event_id == EventAttendance.event_id)
+            .where(
+                EventAttendance.alumni_id == Alumni.alumni_id,
+                EventAttendance.attendance_status.ilike("%speaker%"),
+            )
+        )
+        if spoke_after is not None:
+            spoke = spoke.where(Event.event_date >= spoke_after)
+        if spoke_before is not None:
+            spoke = spoke.where(Event.event_date <= spoke_before)
+        conditions.append(spoke.exists())
     if donor:
         is_donor = (
             select(AlumniProgramEngagement.engagement_profile_id)
@@ -302,6 +418,26 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(is_speaker)
+    if cfa:
+        is_cfa = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                AlumniProgramEngagement.cfa_designation.is_(True),
+            )
+            .exists()
+        )
+        conditions.append(is_cfa)
+    if cpa:
+        is_cpa = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                AlumniProgramEngagement.cpa_designation.is_(True),
+            )
+            .exists()
+        )
+        conditions.append(is_cpa)
     if missing_email:
         has_email = (
             select(AlumniContactInfo.contact_info_id)
@@ -378,19 +514,9 @@ async def list_page(
     if base.whereclause is not None:
         rows_stmt = rows_stmt.where(base.whereclause)
 
-    # Sort options exposed by the list UI. Unknown values fall back to name.
-    order_by = {
-        "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
-        "grad_desc": (
-            Alumni.graduation_year.desc().nulls_last(),
-            Alumni.last_name.asc(),
-        ),
-        "grad_asc": (
-            Alumni.graduation_year.asc().nulls_last(),
-            Alumni.last_name.asc(),
-        ),
-    }.get(sort, (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
-    rows_stmt = rows_stmt.order_by(*order_by).limit(limit).offset(offset)
+    # Sort options exposed by the list UI (see alumni_order_by). Unknown values
+    # fall back to name.
+    rows_stmt = rows_stmt.order_by(*alumni_order_by(sort)).limit(limit).offset(offset)
     result = await session.execute(rows_stmt)
     items: list[Alumni] = []
     for alumnus, employer, industry in result.all():

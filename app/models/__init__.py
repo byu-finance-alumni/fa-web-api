@@ -10,6 +10,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Attachment, FollowUpTask, Interaction, Survey
 from app.models.data_source import DataSource
+from app.models.donation import Donation
 from app.models.duplicate import DuplicateCandidate
 from app.models.employment import (
     CurrentEmployment,
@@ -24,6 +25,8 @@ from app.models.engagement import (
 from app.models.event import Event, EventAttendance
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
+from app.models.note import Note
+from app.models.role_capability import RoleCapability
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import Role, User, UserRole
 from app.models.vocabulary import VocabularyTerm
@@ -39,6 +42,7 @@ __all__ = [
     "AuditLog",
     "CurrentEmployment",
     "DataSource",
+    "Donation",
     "DuplicateCandidate",
     "EducationHistory",
     "EmploymentHistory",
@@ -49,7 +53,9 @@ __all__ = [
     "Interaction",
     "LoginAttempt",
     "LoginEvent",
+    "Note",
     "Role",
+    "RoleCapability",
     "StatusLabel",
     "Survey",
     "Tag",

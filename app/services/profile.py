@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, NotFoundError
+from app.core.security import AuthorizationError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -49,6 +50,7 @@ from app.schemas.profile import (
     EventAttendedRead,
     InteractionCreate,
     InteractionRead,
+    InteractionUpdate,
     LeadershipCreate,
     LeadershipRead,
     LeadershipUpdate,
@@ -83,6 +85,24 @@ async def _actor_name(session: AsyncSession, user_id: int | None) -> str | None:
         return None
     user = await session.get(User, user_id)
     return _full_name(user.first_name, user.last_name, user.email) if user else None
+
+
+def _require_interaction_ownership(
+    interaction: Interaction, actor_user_id: int | None, can_edit_others: bool
+) -> None:
+    """Gate edit/delete of an interaction by ownership for non-edit-tier actors.
+
+    Edit-tier roles (``can_edit_others=True``) may mutate any interaction. A
+    view_only "Professor" (``can_edit_others=False``) may mutate only the
+    interactions they logged themselves; anything else raises
+    ``AuthorizationError`` (403). A row with no ``user_id`` (e.g. a legacy /
+    system row) has no owner, so a non-edit-tier actor can never claim it."""
+    if can_edit_others:
+        return
+    if actor_user_id is None or interaction.user_id != actor_user_id:
+        raise AuthorizationError(
+            "You can only edit or delete interactions you logged."
+        )
 
 
 async def get_profile(
@@ -261,11 +281,16 @@ async def get_profile(
         t.assigned_to_user_id for t in tasks if t.assigned_to_user_id
     }
     names: dict[int, str | None] = {}
+    # First names only, for the view_only redaction below. Intentionally NO email
+    # fallback: a nameless account must surface as "—" to a view_only caller, not
+    # leak an email address.
+    first_names: dict[int, str | None] = {}
     if user_ids:
         for u in (
             await session.scalars(select(User).where(User.user_id.in_(user_ids)))
         ).all():
             names[u.user_id] = _full_name(u.first_name, u.last_name, u.email)
+            first_names[u.user_id] = u.first_name or None
 
     profile = ProfileRead(
         alumni=AlumniRead.model_validate(alumnus),
@@ -286,7 +311,15 @@ async def get_profile(
         surveys=[SurveyRead.model_validate(s) for s in surveys],
         interactions=[
             InteractionRead.model_validate(i).model_copy(
-                update={"logged_by": names.get(i.user_id) if i.user_id else None}
+                # full_access/student see the logger's full name; view_only sees
+                # the first name only (recomputed from source, no email fallback).
+                update={
+                    "logged_by": (
+                        (names if can_edit else first_names).get(i.user_id)
+                        if i.user_id
+                        else None
+                    )
+                }
             )
             for i in interactions
         ],
@@ -380,7 +413,12 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     free-text notes (interaction / survey / engagement / program-engagement
     notes), and omits the embedded audit trail entirely. Returns a new
     ``ProfileRead``; the input is left untouched.
+
+    Note: ``logged_by`` is already reduced to the logger's FIRST NAME upstream in
+    ``get_profile`` (full name only for editors), so it is intentionally left
+    untouched here — a view_only caller sees who made contact by first name.
     """
+    # Drop interaction notes only; logged_by is already first-name for view_only.
     interactions = [
         i.model_copy(update={"interaction_notes": None})
         for i in profile.interactions
@@ -410,10 +448,21 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
 
 
 def _audit_alumni(
-    session: AsyncSession, actor_user_id: int | None, action: str, alumni_id: int
+    session: AsyncSession,
+    actor_user_id: int | None,
+    action: str,
+    alumni_id: int,
+    *,
+    field_name: str | None = None,
+    old_value: str | None = None,
+    new_value: str | None = None,
 ) -> None:
     """Record a profile-activity audit event against the alumni entity, so it
-    surfaces in the profile Audit tab. No-op when the actor is unknown."""
+    surfaces in the profile Audit tab. No-op when the actor is unknown.
+
+    The optional field/old/new args capture WHAT changed (used by interaction
+    edit/delete so the FERPA trail can reconstruct altered/removed relationship
+    notes, not just that a change happened)."""
     if actor_user_id is not None:
         session.add(
             AuditLog(
@@ -421,8 +470,16 @@ def _audit_alumni(
                 action_type=action,
                 entity_type="alumni",
                 entity_id=alumni_id,
+                field_name=field_name,
+                old_value=old_value,
+                new_value=new_value,
             )
         )
+
+
+def _audit_str(value: object) -> str | None:
+    """Stringify a value for an audit old/new column (None stays None)."""
+    return None if value is None else str(value)
 
 
 async def add_interaction(
@@ -446,6 +503,93 @@ async def add_interaction(
     return InteractionRead.model_validate(interaction).model_copy(
         update={"logged_by": await _actor_name(session, interaction.user_id)}
     )
+
+
+async def update_interaction(
+    session: AsyncSession,
+    alumni_id: int,
+    interaction_id: int,
+    payload: InteractionUpdate,
+    actor_user_id: int | None,
+    can_edit_others: bool = True,
+) -> InteractionRead:
+    """Edit an interaction on an alumni's timeline.
+
+    404 if the row is missing or belongs to a different alumnus.
+
+    ``can_edit_others`` is the actor's edit-tier flag (engineer / super_admin /
+    full_access / student). When False (a view_only "Professor"), the actor may
+    edit only an interaction they logged themselves; editing another user's row
+    raises ``AuthorizationError`` (403). The ownership check runs AFTER the
+    existence/parent check so it never reveals whether some other alumnus's
+    interaction exists."""
+    row = await session.get(Interaction, interaction_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(f"Interaction {interaction_id} not found.")
+    _require_interaction_ownership(row, actor_user_id, can_edit_others)
+    data = payload.model_dump(exclude_unset=True)
+    # Audit each field that actually changes with its old + new value, so a later
+    # FERPA review can see exactly what a note edit altered — not just that an
+    # edit occurred. A true no-op writes no audit row.
+    for field, value in data.items():
+        old = getattr(row, field)
+        if old == value:
+            continue
+        setattr(row, field, value)
+        _audit_alumni(
+            session,
+            actor_user_id,
+            "update_interaction",
+            alumni_id,
+            field_name=field,
+            old_value=_audit_str(old),
+            new_value=_audit_str(value),
+        )
+    await session.commit()
+    await session.refresh(row)
+    return InteractionRead.model_validate(row).model_copy(
+        update={"logged_by": await _actor_name(session, row.user_id)}
+    )
+
+
+async def delete_interaction(
+    session: AsyncSession,
+    alumni_id: int,
+    interaction_id: int,
+    actor_user_id: int | None,
+    can_edit_others: bool = True,
+) -> None:
+    """Delete an interaction from an alumni's timeline.
+
+    404 if the row is missing or belongs to a different alumnus.
+
+    ``can_edit_others`` is the actor's edit-tier flag (engineer / super_admin /
+    full_access / student). When False (a view_only "Professor"), the actor may
+    delete only an interaction they logged themselves; deleting another user's
+    row raises ``AuthorizationError`` (403). The ownership check runs AFTER the
+    existence/parent check so it never reveals whether some other alumnus's
+    interaction exists."""
+    row = await session.get(Interaction, interaction_id)
+    if row is None or row.alumni_id != alumni_id:
+        raise NotFoundError(f"Interaction {interaction_id} not found.")
+    _require_interaction_ownership(row, actor_user_id, can_edit_others)
+    # Snapshot the content BEFORE deleting so the FERPA trail retains what was
+    # removed (a hard delete otherwise loses the note text irrecoverably).
+    snapshot = (
+        f"type={row.interaction_type!r}; "
+        f"when={row.interaction_date_time}; "
+        f"notes={row.interaction_notes!r}"
+    )
+    await session.delete(row)
+    _audit_alumni(
+        session,
+        actor_user_id,
+        "delete_interaction",
+        alumni_id,
+        field_name="interaction",
+        old_value=snapshot,
+    )
+    await session.commit()
 
 
 async def add_task(

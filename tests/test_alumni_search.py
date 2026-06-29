@@ -6,13 +6,20 @@ clauses are asserted — no database needed.
 
 import datetime
 
+from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
-from app.repositories.alumni import build_alumni_query
+from app.models.alumni import Alumni
+from app.repositories.alumni import alumni_order_by, build_alumni_query
 
 
 def _sql(stmt) -> str:
     return str(stmt.compile(dialect=postgresql.dialect()))
+
+
+def _order_sql(sort: str | None) -> str:
+    """Compile just the ORDER BY clause for a list ``sort`` token."""
+    return _sql(select(Alumni).order_by(*alumni_order_by(sort)))
 
 
 def test_default_excludes_archived():
@@ -30,6 +37,34 @@ def test_q_searches_six_columns_with_ilike():
     sql = _sql(build_alumni_query(q="smith"))
     # names (4) + byu_id + net_id
     assert sql.count("ILIKE") == 6
+
+
+def test_per_field_search_filters_each_field():
+    # Each provided field adds its own partial-match condition; blanks are ignored.
+    sql = _sql(
+        build_alumni_query(
+            first_name="jane",
+            last_name="doe",
+            net_id="jd123",
+            preferred_name="janie",
+            email="jane@example.com",
+        )
+    )
+    assert "first_name ILIKE" in sql
+    assert "last_name ILIKE" in sql
+    assert "net_id ILIKE" in sql
+    assert "preferred_first_name ILIKE" in sql
+    # Email matches personal OR work email via an EXISTS on the contact table.
+    assert "personal_email ILIKE" in sql
+    assert "work_email ILIKE" in sql
+
+
+def test_per_field_blank_values_ignored():
+    # Empty/whitespace-only field values must not add a WHERE clause.
+    sql = _sql(build_alumni_query(first_name="", last_name="   ", net_id=None))
+    assert "first_name ILIKE" not in sql
+    assert "last_name ILIKE" not in sql
+    assert "net_id ILIKE" not in sql
 
 
 def test_graduation_year_exact():
@@ -129,6 +164,32 @@ def test_attended_event_filter():
     assert "event_attendance" in sql
 
 
+def test_spoke_window_filter_matches_dashboard_kpi():
+    # The "Guest speakers this month" deep-link: alumni who served as a speaker
+    # at an event in the window. Must mirror the dashboard KPI's predicate
+    # (attendance_status ILIKE '%speaker%' joined to events on event_date), NOT
+    # the alumnus-level guest_speaker_willing flag.
+    sql = _sql(
+        build_alumni_query(
+            spoke_after=datetime.date(2026, 6, 1),
+            spoke_before=datetime.date(2026, 6, 30),
+        )
+    )
+    assert "EXISTS" in sql
+    assert "event_attendance" in sql
+    assert "events" in sql
+    assert "attendance_status ILIKE" in sql
+    assert "event_date >=" in sql
+    assert "event_date <=" in sql
+    # It is the event-participation predicate, not the willing flag.
+    assert "guest_speaker_willing" not in sql
+
+
+def test_spoke_filter_absent_by_default():
+    sql = _sql(build_alumni_query())
+    assert "attendance_status" not in sql
+
+
 def test_donor_filter():
     sql = _sql(build_alumni_query(donor=True))
     assert "EXISTS" in sql
@@ -142,6 +203,51 @@ def test_mentor_and_speaker_filters():
     )
     assert "mentor_willing IS true" in sql
     assert "guest_speaker_willing IS true" in sql
+
+
+def test_cfa_filter():
+    # CFA designation: correlated EXISTS on the program-engagement profile.
+    sql = _sql(build_alumni_query(cfa=True))
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_program_engagement" in sql
+    assert "cfa_designation IS true" in sql
+    # Only the CFA flag is referenced, not the CPA flag.
+    assert "cpa_designation" not in sql
+
+
+def test_cpa_filter():
+    sql = _sql(build_alumni_query(cpa=True))
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_program_engagement" in sql
+    assert "cpa_designation IS true" in sql
+    assert "cfa_designation" not in sql
+
+
+def test_cfa_combines_with_other_filter_via_and():
+    # CFA holders graduating 2018 — both predicates present, ANDed with the
+    # archived-default guard.
+    sql = _sql(build_alumni_query(cfa=True, graduation_year=2018))
+    assert "cfa_designation IS true" in sql
+    assert "graduation_year =" in sql
+    assert "archived IS false" in sql
+
+
+def test_cfa_and_cpa_combine():
+    # Both certifications requested -> two correlated EXISTS, ANDed (an alumnus
+    # must hold both).
+    sql = _sql(build_alumni_query(cfa=True, cpa=True))
+    assert "cfa_designation IS true" in sql
+    assert "cpa_designation IS true" in sql
+    # Two separate correlated EXISTS, one per designation.
+    assert sql.count("EXISTS (SELECT") == 2
+
+
+def test_cert_filters_absent_by_default():
+    sql = _sql(build_alumni_query())
+    assert "cfa_designation" not in sql
+    assert "cpa_designation" not in sql
 
 
 def test_missing_filters_default_off():
@@ -235,6 +341,48 @@ def test_never_contacted_is_not_exists_any():
     assert "NOT (EXISTS" in sql
 
 
+# --- #160 "needs surveying" (DUE for the biennial survey) --------------------
+
+
+def test_needs_survey_is_not_exists_recent_completion():
+    # DUE = no survey COMPLETED on/after the server-computed cutoff. Expressed as
+    # a correlated NOT EXISTS over surveys.completed_at >= threshold, which in one
+    # predicate covers never-surveyed (no qualifying row) AND stale (>2yr old).
+    cutoff = datetime.datetime(2024, 6, 23, tzinfo=datetime.UTC)
+    sql = _sql(build_alumni_query(needs_survey=True, survey_due_before=cutoff))
+    assert "surveys" in sql
+    assert "NOT (EXISTS" in sql
+    assert "completed_at IS NOT NULL" in sql
+    assert "completed_at >=" in sql
+
+
+def test_needs_survey_noop_without_threshold():
+    # Defense-in-depth: the flag does nothing unless the caller supplied a
+    # server-computed cutoff (the route owns "now"; the builder never invents it).
+    sql = _sql(build_alumni_query(needs_survey=True))
+    assert "surveys" not in sql
+
+
+def test_needs_survey_off_by_default():
+    sql = _sql(build_alumni_query())
+    assert "completed_at" not in sql
+
+
+def test_needs_survey_combines_with_other_filters_as_and():
+    cutoff = datetime.datetime(2024, 6, 23, tzinfo=datetime.UTC)
+    sql = _sql(
+        build_alumni_query(
+            needs_survey=True,
+            survey_due_before=cutoff,
+            graduation_year=2018,
+        )
+    )
+    # AND-combined with the rest, and still archived-gated by default.
+    assert "graduation_year =" in sql
+    assert "completed_at >=" in sql
+    assert "archived IS false" in sql
+
+
 def test_advanced_filters_absent_by_default():
     # None of the new tables appear unless their filter is set.
     sql = _sql(build_alumni_query())
@@ -246,3 +394,49 @@ def test_advanced_filters_absent_by_default():
         "alumni_status_labels",
     ):
         assert tbl not in sql
+
+
+# --- grad-year sort direction (E3 regression guard) --------------------------
+#
+# The reported bug: "Grad year (oldest)" returned newest-first and vice-versa.
+# These lock the ONE place the direction is decided: grad_desc must be DESC
+# (newest grad year first), grad_asc must be ASC (oldest first), nulls last in
+# both. If the .desc()/.asc() ever get swapped, these fail.
+
+
+def test_grad_desc_is_year_descending_nulls_last():
+    # "Grad year (newest)" -> most-recent graduation_year FIRST.
+    sql = _order_sql("grad_desc")
+    assert "ORDER BY alumni.graduation_year DESC NULLS LAST" in sql
+    # Name is the deterministic tiebreaker.
+    assert "last_name ASC" in sql
+
+
+def test_grad_asc_is_year_ascending_nulls_last():
+    # "Grad year (oldest)" -> oldest graduation_year FIRST.
+    sql = _order_sql("grad_asc")
+    assert "ORDER BY alumni.graduation_year ASC NULLS LAST" in sql
+    assert "last_name ASC" in sql
+
+
+def test_grad_sorts_are_not_swapped():
+    # Belt-and-suspenders: the two directions must differ, and each must carry
+    # the direction its token names (guards against a future copy-paste swap).
+    # Scope the assertions to the ORDER BY clause — graduation_year also appears
+    # in the SELECT column list.
+    desc_order = _order_sql("grad_desc").split("ORDER BY", 1)[1]
+    asc_order = _order_sql("grad_asc").split("ORDER BY", 1)[1]
+    assert desc_order != asc_order
+    assert "graduation_year DESC" in desc_order
+    assert "graduation_year ASC" not in desc_order
+    assert "graduation_year ASC" in asc_order
+    assert "graduation_year DESC" not in asc_order
+
+
+def test_default_and_name_sort_by_last_name():
+    for token in (None, "name", "bogus", "grad_desc_typo"):
+        sql = _order_sql(token)
+        # Unknown/legacy tokens fall back to name; never to a grad-year order.
+        order_by = sql.split("ORDER BY", 1)[1]
+        assert order_by.startswith(" alumni.last_name ASC")
+        assert "graduation_year" not in order_by

@@ -21,16 +21,25 @@ from app.api.routes import (
     audit,
     auth,
     dashboard,
+    dashboard_presets,
+    donations,
+    engineer,
     events,
     geography,
     health,
+    notes,
     support,
     tasks,
     vocabulary,
 )
 from app.core.config import get_settings
 from app.core.database import dispose_engine
-from app.core.errors import ConflictError, NotFoundError, ServiceError
+from app.core.errors import (
+    ConflictError,
+    InvalidRequestError,
+    NotFoundError,
+    ServiceError,
+)
 from app.core.security import (
     AuthError,
     AuthorizationError,
@@ -136,10 +145,16 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(alumni.router)
 app.include_router(dashboard.router)
+app.include_router(dashboard_presets.router)
+app.include_router(dashboard_presets.admin_router)
 app.include_router(admin.router)
+app.include_router(engineer.router)
+app.include_router(engineer.admin_router)
 app.include_router(events.router)
+app.include_router(donations.router)
 app.include_router(audit.router)
 app.include_router(geography.router)
+app.include_router(notes.router)
 app.include_router(tasks.router)
 app.include_router(vocabulary.router)
 app.include_router(vocabulary.admin_router)
@@ -233,6 +248,17 @@ async def not_found_handler(request: Request, exc: NotFoundError) -> JSONRespons
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
         content={"error": {"code": "not_found", "message": exc.message}},
+    )
+
+
+@app.exception_handler(InvalidRequestError)
+async def invalid_request_handler(
+    request: Request, exc: InvalidRequestError
+) -> JSONResponse:
+    """Return 422 for a semantically invalid request (client-safe message)."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": {"code": "validation_error", "message": exc.message}},
     )
 
 

@@ -4,6 +4,7 @@ All aggregation happens in PostgreSQL (counts / group-bys), never by loading row
 into the app, so it stays within the dashboard performance budget at scale.
 """
 
+import calendar
 import datetime
 import logging
 from typing import Annotated
@@ -98,6 +99,30 @@ def _has_employer_exists():
     )
 
 
+def _contacted_since_exists(cutoff: datetime.datetime):
+    """Correlated EXISTS: the alumnus has an interaction on/after ``cutoff``.
+    Negated, it selects the "not contacted since" cohort — which correctly
+    includes never-contacted alumni (no interaction satisfies the predicate)."""
+    return (
+        select(Interaction.interaction_id)
+        .where(
+            Interaction.alumni_id == Alumni.alumni_id,
+            Interaction.interaction_date_time >= cutoff,
+        )
+        .exists()
+    )
+
+
+def _months_before(d: datetime.date, months: int) -> datetime.date:
+    """Calendar-month subtraction with end-of-month day clamping (matches the
+    frontend tile's date math so the count and the deep-linked list agree)."""
+    total = (d.year * 12 + (d.month - 1)) - months
+    year, month0 = divmod(total, 12)
+    month = month0 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return datetime.date(year, month, day)
+
+
 def _serialize_interaction(i, a, u) -> dict:
     return {
         "interaction_id": i.interaction_id,
@@ -108,14 +133,27 @@ def _serialize_interaction(i, a, u) -> dict:
         "when": (
             i.interaction_date_time.isoformat() if i.interaction_date_time else None
         ),
+        # The actor who logged the interaction ("edited by"). ``by`` is the
+        # display name (email fallback), resolved exactly like profile.py's
+        # _actor_name; ``by_user_id`` is the actor's user_id so the frontend
+        # can match the current user (e.g. highlight / "mine") without parsing
+        # the name. Both are None when the actor user was removed (user_id was
+        # SET NULL) — no extra PII beyond the name/email already exposed here.
         "by": _full_name(u.first_name, u.last_name, u.email) if u else None,
+        "by_user_id": i.user_id,
     }
 
 
 @router.get("/summary")
 async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     """KPIs, distributions (cohort / top employers / by state), and recent
-    activity for the dashboard."""
+    activity for the dashboard.
+
+    Aggregate counts only — no per-alumnus identity is returned, so (unlike the
+    per-row drill-downs in this module) it deliberately writes no record-of-
+    disclosure audit row. Drill-downs reached from the tiles audit their own
+    reads.
+    """
     active = Alumni.archived.is_(False)
     now = datetime.datetime.now(datetime.UTC)
     month_ago = now - datetime.timedelta(days=30)
@@ -158,10 +196,26 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     )
 
     contacted_this_month = await session.scalar(
-        select(func.count(func.distinct(Interaction.alumni_id))).where(
-            Interaction.interaction_date_time >= month_ago
-        )
+        select(func.count(func.distinct(Interaction.alumni_id)))
+        .select_from(Interaction)
+        .join(Alumni, Alumni.alumni_id == Interaction.alumni_id)
+        .where(Interaction.interaction_date_time >= month_ago, active)
     )
+
+    # "Not contacted in N months" cohorts (active alumni whose newest interaction
+    # is older than the cutoff — never-contacted alumni are included). Each tile
+    # deep-links to /alumni?contacted_before=<cutoff>, which uses the same NOT
+    # EXISTS predicate, so the count matches the resulting list.
+    not_contacted = {}
+    for months in (6, 12, 24):
+        cutoff = datetime.datetime.combine(
+            _months_before(today, months), datetime.time.min, tzinfo=datetime.UTC
+        )
+        not_contacted[months] = await session.scalar(
+            select(func.count())
+            .select_from(Alumni)
+            .where(active, ~_contacted_since_exists(cutoff))
+        )
     upcoming_follow_ups = await session.scalar(
         select(func.count())
         .select_from(FollowUpTask)
@@ -267,6 +321,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
         "contacted_this_month": int(contacted_this_month or 0),
+        "not_contacted_6mo": int(not_contacted[6] or 0),
+        "not_contacted_12mo": int(not_contacted[12] or 0),
+        "not_contacted_24mo": int(not_contacted[24] or 0),
         "upcoming_follow_ups": int(upcoming_follow_ups or 0),
         "duplicate_count": int(duplicate_count or 0),
         "attended_event_this_month": int(attended_event_this_month or 0),
@@ -444,6 +501,15 @@ async def activity_feed(
         str,
         Query(description="Sort order: recent (newest first) | oldest."),
     ] = "recent",
+    mine: Annotated[
+        bool,
+        Query(
+            description=(
+                "When true, restrict to interactions logged by the current "
+                "authenticated user (the actor / 'interacted by me')."
+            )
+        ),
+    ] = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
@@ -489,6 +555,11 @@ async def activity_feed(
                 date_to, datetime.time.max, tzinfo=datetime.UTC
             )
         )
+    # "Interacted by me": only rows whose actor is the current user. Applied as
+    # just another predicate so it composes with q / type / date range / sort,
+    # and is reflected in both the count and the page (shared ``conditions``).
+    if mine:
+        conditions.append(Interaction.user_id == actor.user_id)
 
     total = await session.scalar(
         select(func.count())
@@ -611,22 +682,9 @@ async def contacted_this_month_list(
         action_type="view",
         entity_type="dashboard:contacted-this-month",
     )
-    return [
-        {
-            "interaction_id": i.interaction_id,
-            "alumni_id": i.alumni_id,
-            "alumni_name": _full_name(a.first_name, a.last_name, None)
-            or f"Alumni #{a.alumni_id}",
-            "type": i.interaction_type,
-            "when": (
-                i.interaction_date_time.isoformat()
-                if i.interaction_date_time
-                else None
-            ),
-            "by": _full_name(u.first_name, u.last_name, u.email) if u else None,
-        }
-        for i, a, u in rows
-    ]
+    # Same interaction-row shape (incl. actor "by"/"by_user_id") as the activity
+    # feed — reuse the shared serializer so the two stay in lockstep.
+    return [_serialize_interaction(i, a, u) for i, a, u in rows]
 
 
 @router.get("/follow-ups")

@@ -31,9 +31,11 @@ def client():
     [
         "/geography/summary",
         "/geography/states",
+        "/geography/counties",
         "/geography/states/UT",
         "/geography/states/UT/alumni",
         "/geography/cities?state=UT&city=Provo",
+        "/geography/radius?lat=40.25&lng=-111.65&miles=50",
     ],
 )
 def test_geography_requires_auth(client, path):
@@ -80,3 +82,14 @@ def test_summary_options_includes_cities_alongside_employers():
     assert "cities" in options
     assert "employers" in options
     assert options["cities"] == ["Provo", "Salt Lake City"]
+
+
+def test_get_counties_maps_fips_to_counts():
+    # get_counties runs one grouped query: (county_fips, count) rows -> dicts with
+    # int counts, ready for the national county choropleth.
+    executes = [[("49049", 12), ("49035", 7)]]
+    result = asyncio.run(svc.get_counties(_FakeSession(executes), {}))
+    assert result == [
+        {"county_fips": "49049", "count": 12},
+        {"county_fips": "49035", "count": 7},
+    ]

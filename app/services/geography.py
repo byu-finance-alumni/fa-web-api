@@ -9,12 +9,13 @@ is applied uniformly. Nothing loads the full alumni set into memory.
 
 from __future__ import annotations
 
-from sqlalchemy import String, and_, cast, desc, exists, func, select
+from sqlalchemy import String, and_, cast, desc, exists, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
+from app.models.geo import CityGeo
 from app.models.tags import AlumniTag, Tag
 
 # US state / territory abbreviation → display name.
@@ -134,6 +135,40 @@ async def get_states(session: AsyncSession, filters: dict) -> list[dict]:
         key=lambda r: r["alumni_count"],
         reverse=True,
     )
+
+
+async def get_counties(session: AsyncSession, filters: dict) -> list[dict]:
+    """Per-county alumni counts (5-digit FIPS) for the national county map.
+
+    Location is city-level: an alumnus is attributed to the county of their city
+    via the ``city_geo`` crosswalk (the only geographic signal stored). Uses
+    ``COUNT(DISTINCT alumni_id)`` so a duplicate contact/employment row can't
+    inflate a county."""
+    city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
+    state_up = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
+    rows = (
+        await session.execute(
+            select(
+                CityGeo.county_fips.label("county_fips"), _ALUMNI.label("count")
+            )
+            .select_from(Alumni)
+            .join(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+            )
+            .join(
+                CityGeo,
+                and_(CityGeo.city_norm == city_norm, CityGeo.state == state_up),
+            )
+            .outerjoin(
+                CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
+            )
+            .where(*_filter_conditions(filters), CityGeo.county_fips.is_not(None))
+            .group_by(CityGeo.county_fips)
+            .order_by(desc("count"))
+        )
+    ).all()
+    return [{"county_fips": fips, "count": int(c)} for fips, c in rows]
 
 
 async def _top(session, filters, column, label, *, extra=None, limit=10):
@@ -267,6 +302,108 @@ async def get_state_alumni(
         "total": int(total or 0),
         "limit": limit,
         "offset": offset,
+    }
+
+
+# --- /geography/radius (proximity search) -----------------------------------
+
+# Mean earth radius in miles, for the great-circle (Haversine via spherical law
+# of cosines) distance below.
+_EARTH_MI = 3958.8
+
+
+def _distance_mi(lat: float, lng: float):
+    """Great-circle distance (miles) from (lat, lng) to each city_geo row.
+
+    Spherical law of cosines, evaluated in PostgreSQL. The acos argument is
+    clamped to [-1, 1] so float rounding can never push it out of domain."""
+    arg = (
+        func.sin(func.radians(literal(lat))) * func.sin(func.radians(CityGeo.lat))
+        + func.cos(func.radians(literal(lat)))
+        * func.cos(func.radians(CityGeo.lat))
+        * func.cos(func.radians(CityGeo.lng - literal(lng)))
+    )
+    clamped = func.least(1.0, func.greatest(-1.0, arg))
+    return _EARTH_MI * func.acos(clamped)
+
+
+def _radius_join(stmt, lat: float, lng: float, miles: float, filters: dict):
+    """Apply the alumni -> contact -> city_geo (+ employment) joins and the
+    radius/filters WHERE used by both the count and the page query."""
+    city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
+    state_up = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
+    return (
+        stmt.select_from(Alumni)
+        .join(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        .join(
+            CityGeo,
+            and_(CityGeo.city_norm == city_norm, CityGeo.state == state_up),
+        )
+        .outerjoin(
+            CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
+        )
+        .where(*_filter_conditions(filters), _distance_mi(lat, lng) <= miles)
+    )
+
+
+async def get_radius_alumni(
+    session, lat: float, lng: float, miles: float, filters: dict, *, limit, offset
+) -> dict:
+    """Alumni whose (city, state) falls within ``miles`` of (lat, lng).
+
+    Location is city-level: an alumnus's distance is their city's distance
+    (the only geographic signal we store). Sorted nearest-first."""
+    total = await session.scalar(
+        _radius_join(
+            select(func.count(func.distinct(Alumni.alumni_id))),
+            lat,
+            lng,
+            miles,
+            filters,
+        )
+    )
+    dist = _distance_mi(lat, lng).label("distance_miles")
+    rows = (
+        await session.execute(
+            _radius_join(
+                select(
+                    Alumni,
+                    AlumniContactInfo.city,
+                    _STATE.label("state"),
+                    CurrentEmployment.current_employer,
+                    CurrentEmployment.current_title,
+                    dist,
+                ),
+                lat,
+                lng,
+                miles,
+                filters,
+            )
+            .order_by(dist, Alumni.last_name)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return {
+        "items": [
+            {
+                "alumni_id": a.alumni_id,
+                "name": _full_name(a),
+                "city": city,
+                "state": state,
+                "graduation_year": a.graduation_year,
+                "current_employer": employer,
+                "current_title": title,
+                "distance_miles": round(float(distance), 1),
+            }
+            for a, city, state, employer, title, distance in rows
+        ],
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+        "center_lat": lat,
+        "center_lng": lng,
+        "radius_miles": miles,
     }
 
 

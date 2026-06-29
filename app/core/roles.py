@@ -27,3 +27,24 @@ class RoleName(StrEnum):
     FULL_ACCESS = "full_access"
     STUDENT = "student"
     VIEW_ONLY = "view_only"
+
+
+# Privilege ladder, most → least privileged. Drives stable ordering of the
+# permission matrix / role-capabilities table.
+ROLE_ORDER: tuple[RoleName, ...] = (
+    RoleName.ENGINEER,
+    RoleName.SUPER_ADMIN,
+    RoleName.FULL_ACCESS,
+    RoleName.STUDENT,
+    RoleName.VIEW_ONLY,
+)
+
+# Display labels (the frontend mirrors these in src/constants/roles.ts). Note
+# `view_only` is surfaced as "Professor"; the machine id stays `view_only`.
+ROLE_LABELS: dict[str, str] = {
+    RoleName.ENGINEER.value: "Engineer",
+    RoleName.SUPER_ADMIN.value: "Super admin",
+    RoleName.FULL_ACCESS.value: "Full access",
+    RoleName.STUDENT.value: "Student",
+    RoleName.VIEW_ONLY.value: "Professor",
+}

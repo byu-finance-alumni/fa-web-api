@@ -23,6 +23,7 @@
 ALTER TABLE public.users                 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.roles                 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_roles            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.role_capabilities     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_attempts        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_events          ENABLE ROW LEVEL SECURITY;
 
@@ -54,6 +55,8 @@ ALTER TABLE public.follow_up_tasks       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events                ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.event_attendance      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.surveys               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notes                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.donations             ENABLE ROW LEVEL SECURITY;
 
 -- Files, audit, duplicates ---------------------------------------------------
 ALTER TABLE public.attachments           ENABLE ROW LEVEL SECURITY;

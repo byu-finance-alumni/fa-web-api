@@ -12,10 +12,16 @@ from types import SimpleNamespace
 import pytest
 
 from app.api.dependencies import auth as auth_deps
+from app.core.capabilities import DEFAULT_GRANTS
 from app.core.security import AuthError, AuthorizationError, DeactivatedAccountError
 from app.schemas.auth import AuthenticatedUser, UserContext
 
 AUTH_UUID = "11111111-1111-1111-1111-111111111111"
+
+# The capability guards now resolve against the permission config; DEFAULT_GRANTS
+# reproduces the historical hardcoded allow-lists, so these tests assert the
+# default (unedited) behaviour.
+CONFIG = DEFAULT_GRANTS
 
 
 def _ctx(*roles: str) -> UserContext:
@@ -62,37 +68,37 @@ def test_user_context_from_orm_user():
 
 def test_full_access_passes_both_guards():
     ctx = _ctx("full_access")
-    assert asyncio.run(auth_deps.require_full_access(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_full_access(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
 
 
 def test_view_only_can_read_but_not_write():
     ctx = _ctx("view_only")
-    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
     with pytest.raises(AuthorizationError):
-        asyncio.run(auth_deps.require_full_access(ctx))
+        asyncio.run(auth_deps.require_full_access(ctx, CONFIG))
 
 
 def test_no_roles_is_denied_everywhere():
     ctx = _ctx()
     with pytest.raises(AuthorizationError):
-        asyncio.run(auth_deps.require_view_only(ctx))
+        asyncio.run(auth_deps.require_view_only(ctx, CONFIG))
     with pytest.raises(AuthorizationError):
-        asyncio.run(auth_deps.require_full_access(ctx))
+        asyncio.run(auth_deps.require_full_access(ctx, CONFIG))
 
 
 def test_super_admin_passes_every_guard():
     ctx = _ctx("super_admin")
     assert ctx.is_super_admin
-    assert asyncio.run(auth_deps.require_super_admin(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_full_access(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_super_admin(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_full_access(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
 
 
 def test_super_admin_guard_rejects_lesser_roles():
     for role in ("full_access", "student", "view_only"):
         with pytest.raises(AuthorizationError):
-            asyncio.run(auth_deps.require_super_admin(_ctx(role)))
+            asyncio.run(auth_deps.require_super_admin(_ctx(role), CONFIG))
 
 
 # --- engineer (top role, above super_admin) -----------------------------------
@@ -101,11 +107,11 @@ def test_super_admin_guard_rejects_lesser_roles():
 def test_engineer_passes_every_guard():
     ctx = _ctx("engineer")
     assert ctx.is_engineer
-    assert asyncio.run(auth_deps.require_super_admin(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_full_access(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_alumni_edit(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_vocab_admin(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_super_admin(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_full_access(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_edit(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_vocab_admin(ctx, CONFIG)) is ctx
 
 
 # --- student (edit existing only) ---------------------------------------------
@@ -115,8 +121,8 @@ def test_student_can_edit_and_read_but_not_create_or_admin():
     ctx = _ctx("student")
     assert ctx.is_student and ctx.can_edit_alumni
     # Read + edit-existing are allowed.
-    assert asyncio.run(auth_deps.require_view_only(ctx)) is ctx
-    assert asyncio.run(auth_deps.require_alumni_edit(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_edit(ctx, CONFIG)) is ctx
     # Create / archive / import (full_access), user admin, and vocab admin are not.
     for guard in (
         auth_deps.require_full_access,
@@ -124,25 +130,32 @@ def test_student_can_edit_and_read_but_not_create_or_admin():
         auth_deps.require_vocab_admin,
     ):
         with pytest.raises(AuthorizationError):
-            asyncio.run(guard(ctx))
+            asyncio.run(guard(ctx, CONFIG))
 
 
 def test_full_access_can_edit_existing():
     ctx = _ctx("full_access")
-    assert asyncio.run(auth_deps.require_alumni_edit(ctx)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_edit(ctx, CONFIG)) is ctx
 
 
 def test_view_only_cannot_edit_existing():
     ctx = _ctx("view_only")
     assert not ctx.can_edit_alumni
     with pytest.raises(AuthorizationError):
-        asyncio.run(auth_deps.require_alumni_edit(ctx))
+        asyncio.run(auth_deps.require_alumni_edit(ctx, CONFIG))
 
 
-def test_vocab_admin_rejects_non_top_roles():
-    for role in ("full_access", "student", "view_only"):
+# --- vocab admin (engineer-only) ----------------------------------------------
+
+
+def test_vocab_admin_is_engineer_only():
+    # Controlled-vocabulary administration is the engineer's domain. The engineer
+    # is allowed; super_admin (and every lesser role) is forbidden.
+    eng = _ctx("engineer")
+    assert asyncio.run(auth_deps.require_vocab_admin(eng, CONFIG)) is eng
+    for role in ("super_admin", "full_access", "student", "view_only"):
         with pytest.raises(AuthorizationError):
-            asyncio.run(auth_deps.require_vocab_admin(_ctx(role)))
+            asyncio.run(auth_deps.require_vocab_admin(_ctx(role), CONFIG))
 
 
 # --- get_current_db_user ------------------------------------------------------

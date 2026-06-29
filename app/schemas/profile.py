@@ -425,7 +425,10 @@ class AttachmentRead(_Orm):
     file_type: str | None = None
     attachment_notes: str | None = None
     uploaded_at: datetime.datetime
-    uploaded_by_user_id: int | None = None
+    # Internal uploader PK is never disclosed; only the resolved display name
+    # ``uploaded_by`` leaves the API (FERPA — minimize internal identifiers),
+    # matching how ``InteractionRead``/``TaskRead`` hide their user PKs.
+    uploaded_by: str | None = None
 
 
 class EventAttendedRead(_Orm):
@@ -444,7 +447,10 @@ class AuditEntryRead(_Orm):
     old_value: str | None = None
     new_value: str | None = None
     created_at: datetime.datetime
-    user_id: int | None = None
+    # Internal actor PK is never disclosed; only the resolved display name
+    # ``performed_by`` leaves the API (FERPA — minimize internal identifiers),
+    # matching how ``InteractionRead``/``TaskRead`` hide their user PKs.
+    performed_by: str | None = None
 
 
 class ProfileRead(BaseModel):

@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.dependencies.auth import get_current_db_user
+from app.core import rate_limit
 from app.core.database import get_session
 from app.main import app
 from app.models.alumni import Alumni
@@ -32,6 +33,15 @@ def _ctx(*roles: str, user_id: int = 1) -> UserContext:
 
 async def _no_db_session():
     yield None
+
+
+@pytest.fixture(autouse=True)
+def _clear_rate_limit():
+    """Each test starts with a clean in-process rate-limit window so the
+    per-endpoint mutation limiters don't leak hits across tests."""
+    rate_limit.reset()
+    yield
+    rate_limit.reset()
 
 
 @pytest.fixture
@@ -490,3 +500,99 @@ def test_update_interaction_404_takes_precedence_over_ownership(client):
     )
     assert response.status_code == 404
     assert session.audit_actions == []
+
+
+# --- #112a: per-endpoint rate limits on mutation routes ----------------------
+#
+# The interaction/task/employment write routes are throttled per actor (30 /
+# minute). We exhaust the budget with cheap requests that PASS the limiter
+# dependency but then fail body validation (422) — the limiter runs first (it's a
+# dependency), so each request still counts. Once the budget is gone the route
+# returns 429 before validation, proving the brake fires.
+
+_MUTATION_LIMIT = rate_limit._MUTATION_LIMIT
+
+
+def test_interaction_write_rate_limited_returns_429(client):
+    # view_only may add interactions (#129); a blank type 422s but the limiter
+    # already counted the hit, so the (limit+1)-th request is 429.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "view_only", user_id=1
+    )
+    seen = [
+        client.post(
+            "/alumni/1/interactions", json={"interaction_type": ""}
+        ).status_code
+        for _ in range(_MUTATION_LIMIT + 1)
+    ]
+    assert seen[:_MUTATION_LIMIT] == [422] * _MUTATION_LIMIT
+    assert seen[-1] == 429
+    # The 429 body carries the rate_limited error code (FastAPI nests a raw
+    # HTTPException detail under "detail").
+    blocked = client.post("/alumni/1/interactions", json={"interaction_type": ""})
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"]["error"]["code"] == "rate_limited"
+    assert blocked.headers.get("Retry-After") == "60"
+
+
+def test_task_write_rate_limited_returns_429(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=1
+    )
+    seen = [
+        client.post("/alumni/1/tasks", json={"task_title": ""}).status_code
+        for _ in range(_MUTATION_LIMIT + 1)
+    ]
+    assert seen[:_MUTATION_LIMIT] == [422] * _MUTATION_LIMIT
+    assert seen[-1] == 429
+
+
+def test_employment_write_rate_limited_returns_429(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=1
+    )
+    # Blank employer_name fails validation (422) but the limiter counts each hit.
+    seen = [
+        client.post("/alumni/1/employment", json={"employer_name": ""}).status_code
+        for _ in range(_MUTATION_LIMIT + 1)
+    ]
+    assert seen[:_MUTATION_LIMIT] == [422] * _MUTATION_LIMIT
+    assert seen[-1] == 429
+
+
+def test_mutation_rate_limit_is_per_actor(client):
+    # Actor 1 exhausts the interaction budget; actor 2 still has a full one.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=1
+    )
+    statuses = [
+        client.post(
+            "/alumni/1/interactions", json={"interaction_type": ""}
+        ).status_code
+        for _ in range(_MUTATION_LIMIT + 1)
+    ]
+    assert statuses[-1] == 429
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=2
+    )
+    assert (
+        client.post(
+            "/alumni/1/interactions", json={"interaction_type": ""}
+        ).status_code
+        != 429
+    )
+
+
+def test_mutation_limiters_have_independent_buckets(client):
+    # Exhausting the interaction bucket must NOT throttle the task route — each
+    # resource has its own per-actor window.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=1
+    )
+    for _ in range(_MUTATION_LIMIT + 1):
+        client.post("/alumni/1/interactions", json={"interaction_type": ""})
+    # Task bucket is still fresh -> validation 422, not 429.
+    assert (
+        client.post("/alumni/1/tasks", json={"task_title": ""}).status_code == 422
+    )

@@ -25,7 +25,9 @@ from fastapi import Depends, HTTPException, status
 
 from app.api.dependencies.auth import (
     get_current_db_user_allow_must_change,
+    require_alumni_edit,
     require_super_admin,
+    require_view_only,
 )
 from app.schemas.auth import UserContext
 
@@ -119,3 +121,47 @@ CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
 AssignRoleRateLimit = Annotated[UserContext, Depends(ASSIGN_ROLE_LIMITER)]
 DeleteUserRateLimit = Annotated[UserContext, Depends(DELETE_USER_LIMITER)]
 RecordLoginRateLimit = Annotated[UserContext, Depends(RECORD_LOGIN_LIMITER)]
+
+# --- Alumni mutation routes (#112a) ------------------------------------------
+#
+# Per-endpoint brakes on the alumni write routes (interactions / tasks /
+# employment create+edit+delete). Without these, only the platform WAF cap
+# applied, so a write-capable role could script bulk edits/deletes. The actor is
+# resolved through the SAME guard the route already uses (so authorization runs
+# once and the identity stays server-trusted): interactions are open to every
+# authenticated role (``require_view_only`` — a professor may log their own), and
+# tasks/employment are edit-tier (``require_alumni_edit``).
+#
+# Limits are tuned for normal human editing: 30 writes / minute is far above a
+# person clicking through a profile, but brakes a runaway loop / compromised
+# session. The same window covers create, edit, and delete on each resource so a
+# burst of mixed mutations is throttled as one stream.
+_MUTATION_LIMIT = 30
+_MUTATION_WINDOW = 60.0
+
+INTERACTION_WRITE_LIMITER = rate_limiter(
+    "alumni:interaction_write",
+    limit=_MUTATION_LIMIT,
+    window_seconds=_MUTATION_WINDOW,
+    actor_guard=require_view_only,
+)
+TASK_WRITE_LIMITER = rate_limiter(
+    "alumni:task_write",
+    limit=_MUTATION_LIMIT,
+    window_seconds=_MUTATION_WINDOW,
+    actor_guard=require_alumni_edit,
+)
+EMPLOYMENT_WRITE_LIMITER = rate_limiter(
+    "alumni:employment_write",
+    limit=_MUTATION_LIMIT,
+    window_seconds=_MUTATION_WINDOW,
+    actor_guard=require_alumni_edit,
+)
+
+InteractionWriteRateLimit = Annotated[
+    UserContext, Depends(INTERACTION_WRITE_LIMITER)
+]
+TaskWriteRateLimit = Annotated[UserContext, Depends(TASK_WRITE_LIMITER)]
+EmploymentWriteRateLimit = Annotated[
+    UserContext, Depends(EMPLOYMENT_WRITE_LIMITER)
+]

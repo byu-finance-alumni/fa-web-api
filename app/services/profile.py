@@ -276,10 +276,18 @@ async def get_profile(
         )
     ).all()
 
-    # Resolve user display names for interactions/tasks in one lookup.
-    user_ids = {i.user_id for i in interactions if i.user_id} | {
-        t.assigned_to_user_id for t in tasks if t.assigned_to_user_id
-    }
+    # Resolve user display names for interactions/tasks/attachments in one
+    # lookup (batched — no N+1). Audit rows carry their own ``actor_name`` /
+    # ``actor_email`` snapshot (set by a DB trigger at insert time, so it
+    # survives the actor's later deletion), so they need no join here.
+    user_ids = (
+        {i.user_id for i in interactions if i.user_id}
+        | {t.assigned_to_user_id for t in tasks if t.assigned_to_user_id}
+        | {a.uploaded_by_user_id for a in attachments if a.uploaded_by_user_id}
+        # Legacy audit rows (pre-snapshot-trigger) have no actor_name/email; their
+        # user_id is included so the fallback name lookup below can resolve them.
+        | {a.user_id for a in audit if a.user_id}
+    )
     names: dict[int, str | None] = {}
     # First names only, for the view_only redaction below. Intentionally NO email
     # fallback: a nameless account must surface as "—" to a view_only caller, not
@@ -336,14 +344,39 @@ async def get_profile(
             )
             for t in tasks
         ],
-        attachments=[AttachmentRead.model_validate(a) for a in attachments],
+        attachments=[
+            AttachmentRead.model_validate(a).model_copy(
+                update={
+                    "uploaded_by": (
+                        names.get(a.uploaded_by_user_id)
+                        if a.uploaded_by_user_id
+                        else None
+                    )
+                }
+            )
+            for a in attachments
+        ],
         events=[
             EventAttendedRead.model_validate(ev).model_copy(
                 update={"attendance_status": status}
             )
             for ev, status in event_rows
         ],
-        audit=[AuditEntryRead.model_validate(a) for a in audit],
+        audit=[
+            AuditEntryRead.model_validate(a).model_copy(
+                # Prefer the snapshotted actor name/email (survives the actor's
+                # deletion); fall back to a live name lookup for legacy rows
+                # written before the snapshot trigger existed.
+                update={
+                    "performed_by": (
+                        a.actor_name
+                        or a.actor_email
+                        or (names.get(a.user_id) if a.user_id else None)
+                    )
+                }
+            )
+            for a in audit
+        ],
     )
 
     if not can_edit:

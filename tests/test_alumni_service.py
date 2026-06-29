@@ -70,6 +70,48 @@ def test_create_alumni_sets_fields():
     assert session.committed == 1
 
 
+def test_create_alumni_persists_secondary_affiliation():
+    # #47: the secondary affiliation / education core columns flow through the
+    # create path onto the Alumni row with no special handling.
+    session = FakeSession()
+    payload = AlumniCreate(
+        first_name="Jane",
+        last_name="Doe",
+        mba_program="BYU Marriott MBA",
+        law_school="Harvard Law",
+        medical_school="Johns Hopkins",
+        graduate_school="MIT",
+        startup_involvement="Co-founded Acme",
+        advisory_roles="Board advisor at Foo Inc.",
+        secondary_employment="Adjunct professor",
+    )
+    obj = asyncio.run(service.create_alumni(session, payload))
+    assert obj.mba_program == "BYU Marriott MBA"
+    assert obj.law_school == "Harvard Law"
+    assert obj.medical_school == "Johns Hopkins"
+    assert obj.graduate_school == "MIT"
+    assert obj.startup_involvement == "Co-founded Acme"
+    assert obj.advisory_roles == "Board advisor at Foo Inc."
+    assert obj.secondary_employment == "Adjunct professor"
+
+
+def test_update_alumni_persists_secondary_affiliation(monkeypatch):
+    existing = Alumni(alumni_id=1, first_name="Jane", last_name="Doe", archived=False)
+    _patch_get(monkeypatch, existing)
+    session = FakeSession()
+    obj = asyncio.run(
+        service.update_alumni(
+            session,
+            1,
+            AlumniUpdate(mba_program="Wharton MBA", advisory_roles="Advisor, X"),
+        )
+    )
+    assert obj.mba_program == "Wharton MBA"
+    assert obj.advisory_roles == "Advisor, X"
+    assert obj.manually_edited_at is not None
+    assert session.committed == 1
+
+
 def test_get_alumni_missing_raises(monkeypatch):
     _patch_get(monkeypatch, None)
     with pytest.raises(NotFoundError):

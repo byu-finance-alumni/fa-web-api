@@ -334,6 +334,43 @@ def test_fuzzy_duplicate_only_warns_create_succeeds():
     assert created.json()["first_name"] == "Jane"
 
 
+def test_create_persists_and_returns_secondary_affiliation():
+    # #47: POST /alumni with the new secondary-affiliation fields persists them
+    # and the AlumniRead response echoes them back. No exact-dup scalars needed
+    # (no byu_id / net_id provided).
+    session = _FakeSession(scalars=[])
+    with _full_access_client(session) as c:
+        resp = c.post(
+            "/alumni",
+            json={
+                "last_name": "Doe",
+                "mba_program": "BYU Marriott MBA",
+                "law_school": "Harvard Law",
+                "medical_school": "Johns Hopkins",
+                "graduate_school": "MIT",
+                "startup_involvement": "Co-founded Acme",
+                "advisory_roles": "Board advisor at Foo Inc.",
+                "secondary_employment": "Adjunct professor",
+            },
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 201
+    body = resp.json()
+    # The written ORM row carries the values...
+    written = session.added[0]
+    assert written.mba_program == "BYU Marriott MBA"
+    assert written.secondary_employment == "Adjunct professor"
+    # ...and the AlumniRead response surfaces every new field (same shape the
+    # GET /{id}/profile read returns, which serializes via AlumniRead too).
+    assert body["mba_program"] == "BYU Marriott MBA"
+    assert body["law_school"] == "Harvard Law"
+    assert body["medical_school"] == "Johns Hopkins"
+    assert body["graduate_school"] == "MIT"
+    assert body["startup_involvement"] == "Co-founded Acme"
+    assert body["advisory_roles"] == "Board advisor at Foo Inc."
+    assert body["secondary_employment"] == "Adjunct professor"
+
+
 def test_update_preview_excludes_self_from_dup_detection():
     # Updating alum 5's byu_id to a value: the only DB row with that id is alum
     # 5 itself, which the query excludes -> no blocker. get_alumni returns the

@@ -9,6 +9,7 @@ covered end to end.
 
 import datetime
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,7 +18,7 @@ from pydantic import ValidationError
 from app.api.dependencies.auth import get_current_db_user
 from app.core.database import get_session
 from app.main import app
-from app.schemas.alumni import AlumniCreate, AlumniUpdate
+from app.schemas.alumni import AlumniCreate, AlumniRead, AlumniUpdate
 from app.schemas.auth import UserContext
 
 
@@ -143,6 +144,80 @@ def test_empty_strings_normalize_to_none():
     assert model.gender is None
     assert model.notes is None
     assert model.linkedin_url is None
+
+
+# --- Secondary affiliation / education fields (#47) --------------------------
+
+
+def test_secondary_affiliation_fields_round_trip():
+    model = AlumniCreate(
+        last_name="Doe",
+        mba_program="  BYU Marriott MBA  ",
+        law_school="Harvard Law",
+        medical_school="Johns Hopkins",
+        graduate_school="MIT",
+        startup_involvement="  Co-founded Acme (2021)  ",
+        advisory_roles="Board advisor at Foo Inc.",
+        secondary_employment="Adjunct professor, evenings",
+    )
+    # Strings are trimmed; values persist on the model.
+    assert model.mba_program == "BYU Marriott MBA"
+    assert model.law_school == "Harvard Law"
+    assert model.medical_school == "Johns Hopkins"
+    assert model.graduate_school == "MIT"
+    assert model.startup_involvement == "Co-founded Acme (2021)"
+    assert model.advisory_roles == "Board advisor at Foo Inc."
+    assert model.secondary_employment == "Adjunct professor, evenings"
+
+
+def test_secondary_affiliation_blank_normalizes_to_none():
+    model = AlumniUpdate(
+        mba_program="",
+        law_school="   ",
+        startup_involvement="",
+        advisory_roles="   ",
+    )
+    assert model.mba_program is None
+    assert model.law_school is None
+    assert model.startup_involvement is None
+    assert model.advisory_roles is None
+
+
+def test_secondary_affiliation_name_too_long_rejected():
+    with pytest.raises(ValidationError):
+        AlumniCreate(last_name="Doe", mba_program="x" * 256)
+
+
+def test_secondary_affiliation_control_char_rejected():
+    with pytest.raises(ValidationError):
+        AlumniCreate(last_name="Doe", law_school="Harvard\x00Law")
+
+
+def test_alumni_read_surfaces_secondary_affiliation():
+    # GET /{id}/profile serializes the alumni core via AlumniRead.model_validate;
+    # confirm the new #47 fields are present on the read model (from_attributes).
+    orm_like = SimpleNamespace(
+        alumni_id=1,
+        deceased=False,
+        archived=False,
+        created_at=datetime.datetime(2026, 6, 12, tzinfo=datetime.UTC),
+        updated_at=datetime.datetime(2026, 6, 12, tzinfo=datetime.UTC),
+        mba_program="Wharton MBA",
+        law_school="Yale Law",
+        medical_school=None,
+        graduate_school="Stanford",
+        startup_involvement="Founder",
+        advisory_roles="Advisor",
+        secondary_employment="Consultant",
+    )
+    read = AlumniRead.model_validate(orm_like)
+    assert read.mba_program == "Wharton MBA"
+    assert read.law_school == "Yale Law"
+    assert read.medical_school is None
+    assert read.graduate_school == "Stanford"
+    assert read.startup_involvement == "Founder"
+    assert read.advisory_roles == "Advisor"
+    assert read.secondary_employment == "Consultant"
 
 
 # --- Route-level tests (422 envelope with per-field details) -----------------

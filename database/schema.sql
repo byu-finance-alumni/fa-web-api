@@ -161,6 +161,16 @@ CREATE TABLE alumni (
     graduation_year      int,
     finance_program_year int,
     graduate_degree      varchar(100),
+    -- Secondary affiliation / education (#47, PRD section 6). Optional/nullable
+    -- additive fields extending the record beyond the core program/employment
+    -- fields. Short single-value fields are varchar; narrative fields are text.
+    mba_program          varchar(255),
+    law_school           varchar(255),
+    medical_school       varchar(255),
+    graduate_school      varchar(255),
+    startup_involvement  text,
+    advisory_roles       text,
+    secondary_employment text,
     spouse_first_name    varchar(100),
     spouse_last_name     varchar(100),
     spouse_birth_date    date,

@@ -382,7 +382,11 @@ def test_add_interaction_happy_path_for_view_only(client):
 
     response = client.post(
         "/alumni/1/interactions",
-        json={"interaction_type": "Call", "interaction_notes": "Reached out."},
+        json={
+            "interaction_type": "Call",
+            "interaction_date_time": "2026-06-01T12:00:00Z",
+            "interaction_notes": "Reached out.",
+        },
     )
     assert response.status_code == 201
     assert session.committed
@@ -596,3 +600,73 @@ def test_mutation_limiters_have_independent_buckets(client):
     assert (
         client.post("/alumni/1/tasks", json={"task_title": ""}).status_code == 422
     )
+
+
+# --- QA hardening: interaction required fields + no future date (H1/H2) -------
+
+
+def test_add_interaction_rejects_empty_payload(client):
+    # H1: an empty body must be a 422, never a silently-defaulted record.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post("/alumni/1/interactions", json={})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_add_interaction_requires_date(client):
+    # H1: type alone is no longer enough — the interaction date is required.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post(
+        "/alumni/1/interactions", json={"interaction_type": "Call"}
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_add_interaction_rejects_future_date(client):
+    # H2: an interaction records the past; a future timestamp is a 422.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    future = (
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=3)
+    ).isoformat()
+    response = client.post(
+        "/alumni/1/interactions",
+        json={"interaction_type": "Call", "interaction_date_time": future},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_update_interaction_rejects_future_date(client):
+    # H2: editing an interaction's date to the future is also rejected. Guard
+    # passes (full_access); validation fires before any DB work.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    future = (
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=3)
+    ).isoformat()
+    response = client.patch(
+        "/alumni/1/interactions/9",
+        json={"interaction_date_time": future},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_add_interaction_accepts_valid_past_date(client):
+    # Sanity: a well-formed past interaction still creates (201).
+    session = _FakeSession(
+        alumni=SimpleNamespace(alumni_id=1, archived=False), user=_actor()
+    )
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=2
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.post(
+        "/alumni/1/interactions",
+        json={
+            "interaction_type": "Call",
+            "interaction_date_time": "2026-06-01T12:00:00Z",
+        },
+    )
+    assert response.status_code == 201
+    assert session.committed

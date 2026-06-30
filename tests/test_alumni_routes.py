@@ -393,3 +393,41 @@ def test_update_preview_excludes_self_from_dup_detection():
     assert resp.status_code == 200
     assert resp.json()["blockers"] == []
     assert resp.json()["cleaned"]["byu_id"] == "123456789"
+
+
+# --- L3: boolean query params accept standard truthy values -------------------
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "True", "TRUE", "yes", "on"])
+def test_list_boolean_filter_accepts_truthy_values(monkeypatch, truthy):
+    """``?missing_email=true`` (and other truthy spellings) must filter exactly
+    like ``=1`` — the API coerces standard boolean strings, not just ``1``."""
+    captured: dict = {}
+
+    async def _fake_list(session, *, limit, offset, **filters):
+        captured.update(filters)
+        return [], 0
+
+    async def _fake_log(session, *, actor_user_id, filters):
+        return None
+
+    from app.api.routes import alumni as alumni_routes
+
+    monkeypatch.setattr(alumni_routes.service, "list_alumni", _fake_list)
+    monkeypatch.setattr(alumni_routes.service, "log_search", _fake_log)
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _no_db_session
+    try:
+        resp = client_get_list(truthy)
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    # Every truthy spelling resolves to the same True the repo would get from "1".
+    assert captured["missing_email"] is True
+    assert captured["cfa"] is True
+
+
+def client_get_list(value: str):
+    with TestClient(app) as c:
+        return c.get(f"/alumni?missing_email={value}&cfa={value}")

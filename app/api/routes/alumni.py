@@ -10,7 +10,7 @@ deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
 """
 
 import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
@@ -216,6 +216,17 @@ async def list_alumni(
         Query(description="Only alumni flagged as duplicate candidates."),
     ] = False,
     include_archived: bool = False,
+    kind: Annotated[
+        Literal["alumni", "friend", "all"],
+        Query(
+            description=(
+                "Which records to return (#218): 'alumni' (default) — only "
+                "graduates (is_alumni=true); 'friend' — only friends of the "
+                "program (is_alumni=false); 'all' — both. Defaults to 'alumni' so "
+                "the Alumni page is unchanged."
+            )
+        ),
+    ] = "alumni",
     sort: Annotated[
         str,
         Query(description="Sort order: name | grad_desc | grad_asc."),
@@ -238,6 +249,9 @@ async def list_alumni(
                 "The 'needs surveying' view is restricted to admin users."
             )
         survey_due_before = datetime.datetime.now(datetime.UTC) - SURVEY_CADENCE
+    # Map the friends/alumni split (#218) to the repository's tri-state filter:
+    # alumni-only (True), friends-only (False), or both (None).
+    is_alumni_filter = {"alumni": True, "friend": False, "all": None}[kind]
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -279,6 +293,7 @@ async def list_alumni(
         missing_email=missing_email,
         missing_employer=missing_employer,
         duplicate=duplicate,
+        is_alumni=is_alumni_filter,
         include_archived=effective_include_archived,
         sort=sort,
     )
@@ -316,6 +331,9 @@ async def list_alumni(
             "cpa": cpa or None,
             "spoke_after": spoke_after.isoformat() if spoke_after else None,
             "spoke_before": spoke_before.isoformat() if spoke_before else None,
+            # Only record the friends/alumni split when it deviates from the
+            # default alumni-only view (keeps the audit summary terse).
+            "kind": kind if kind != "alumni" else None,
             "limit": limit,
             "offset": offset,
             "sort": sort,

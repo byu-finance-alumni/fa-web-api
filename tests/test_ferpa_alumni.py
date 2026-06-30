@@ -64,6 +64,7 @@ def _alumni_model(**kw) -> Alumni:
         spouse_last_name="Doe",
         spouse_birth_date=datetime.date(1989, 1, 1),
         deceased=False,
+        is_alumni=True,
         notes="private note",
         archived=False,
         manually_edited_at=now,

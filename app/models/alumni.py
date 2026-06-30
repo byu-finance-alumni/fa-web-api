@@ -81,6 +81,15 @@ class Alumni(TimestampMixin, Base):
     deceased: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+
+    # Friends of the finance program (#218). ``is_alumni = false`` marks a
+    # non-alumnus contact ("friend") stored in this same table so they reuse all
+    # detail tables, search, and map shading. Defaults to true so every existing
+    # row and any payload that omits the flag stays an alumnus.
+    is_alumni: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+
     linkedin_url: Mapped[str | None] = mapped_column(String(500))
     notes: Mapped[str | None] = mapped_column(Text)
 

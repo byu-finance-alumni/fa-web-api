@@ -79,8 +79,10 @@ def test_alumni_industry_escapes_wildcards():
 
 
 def test_alumni_ilike_count_unchanged():
-    # Escaping must not change which columns are searched.
-    assert _sql(build_alumni_query(q="smith")).count("ILIKE") == 6
+    # Escaping must not change which columns are searched. The free-text q
+    # matches 7 name/id columns: first, last, preferred, birth (maiden #216),
+    # middle, byu_id, net_id.
+    assert _sql(build_alumni_query(q="smith")).count("ILIKE") == 7
 
 
 # --- audit query builder -----------------------------------------------------

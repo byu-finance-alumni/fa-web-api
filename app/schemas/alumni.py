@@ -105,6 +105,10 @@ class AlumniBase(BaseModel):
     spouse_birth_date: datetime.date | None = None
     spouse_alumni_id: int | None = None
     deceased: bool | None = None
+    # Friends of the finance program (#218). Omitted on existing alumni payloads
+    # -> stays None here and the DB ``server_default`` of true applies, so the
+    # record remains an alumnus. Send ``false`` to create/flag a "friend".
+    is_alumni: bool | None = None
     linkedin_url: str | None = None
     notes: str | None = None
 
@@ -524,6 +528,7 @@ class AlumniRead(BaseModel):
     spouse_birth_date: datetime.date | None = None
     spouse_alumni_id: int | None = None
     deceased: bool
+    is_alumni: bool = True
     linkedin_url: str | None = None
     notes: str | None = None
     archived: bool
@@ -535,11 +540,15 @@ class AlumniRead(BaseModel):
 
 class AlumniListItem(AlumniRead):
     """List-row variant: adds the alumnus's current employer + industry (joined
-    from ``current_employment``) for the alumni table. Single-record reads use
-    plain ``AlumniRead``, which omits these."""
+    from ``current_employment``) and current city + state (from
+    ``alumni_contact_info`` — the SAME source the geography map shades by, so the
+    list and the map agree on a record's location) for the alumni table.
+    Single-record reads use plain ``AlumniRead``, which omits these."""
 
     current_employer: str | None = None
     current_industry: str | None = None
+    current_city: str | None = None
+    current_state: str | None = None
 
 
 class AlumniPage(BaseModel):

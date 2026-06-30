@@ -249,6 +249,277 @@ MOCK_DETAIL: dict[str, dict] = {
 }
 
 
+# --- Bulk generation (#152) --------------------------------------------------
+#
+# The 16 hand-crafted records above mirror the Figma demo. To make the alumni
+# list, geography map shading, and profiles look truly populated, we ALSO
+# generate a large batch of unique, complete synthetic records. Generation is
+# deterministic (seeded RNG) so re-running produces the SAME 250 rows — combined
+# with seed_mock()'s remove-then-insert, the result is fully idempotent.
+#
+# Every generated row is COMPLETE: name + unique byu_id/net_id/mst_id, gender,
+# plausible birthday, grad year, a contact row (city/state/region for the map),
+# a current-employment row (employer/title/industry/city/state), one education
+# row, and most carry a tag or two. A realistic minority are deceased/archived
+# or marked as a "friend" (is_alumni=false) so the new friends split has data.
+# Everything is tagged via the same MOCK_DATA source, so --remove wipes it all.
+
+GENERATED_COUNT = 250
+
+_FIRST_NAMES_M = [
+    "Liam", "Noah", "Oliver", "Elijah", "William", "Henry", "Lucas", "Mason",
+    "Logan", "Jackson", "Aiden", "Carter", "Jack", "Owen", "Wyatt", "Caleb",
+    "Hunter", "Connor", "Spencer", "Tyler", "Bryson", "Porter", "Easton",
+    "Tanner", "Cole", "Brigham", "Parker", "Dallin", "Kyle", "Trevor",
+]
+_FIRST_NAMES_F = [
+    "Olivia", "Emma", "Charlotte", "Amelia", "Sophia", "Isabella", "Mia",
+    "Evelyn", "Harper", "Abigail", "Emily", "Ella", "Scarlett", "Grace",
+    "Chloe", "Lily", "Aria", "Brooke", "Hailey", "Paige", "Sydney", "McKenna",
+    "Brynn", "Whitney", "Kennedy", "Savannah", "Taylor", "Morgan", "Reagan",
+    "Eliza",
+]
+_LAST_NAMES = [
+    "Anderson", "Bennett", "Brooks", "Bryant", "Caldwell", "Carlson", "Coleman",
+    "Crawford", "Davies", "Erickson", "Fletcher", "Foster", "Gallagher",
+    "Hansen", "Hawkins", "Higgins", "Holloway", "Ingram", "Jennings", "Knight",
+    "Larsen", "Lawson", "Maxwell", "Mercer", "Nielsen", "Osborne", "Pearson",
+    "Quincy", "Ramsey", "Reeves", "Sanders", "Schwartz", "Sullivan", "Tucker",
+    "Underwood", "Vaughn", "Wallace", "Whitaker", "Young", "Zimmerman",
+    "Abbott", "Barrett", "Castillo", "Donovan", "Everett", "Franklin",
+    "Griffith", "Holt", "Jacobsen", "Kendrick",
+]
+_BIRTH_NAMES = [
+    "Stevenson", "Marsh", "Pope", "Wren", "Holland", "Frost", "Barker",
+    "Dalton", "Mead", "Crane",
+]
+
+# (city, state, region) tuples. Utah-heavy (BYU hub) plus the major financial
+# centers, so the geography map has a realistic, well-shaded distribution.
+_LOCATIONS = [
+    ("Provo", "UT", "Mountain West"),
+    ("Salt Lake City", "UT", "Mountain West"),
+    ("Lehi", "UT", "Mountain West"),
+    ("Orem", "UT", "Mountain West"),
+    ("Draper", "UT", "Mountain West"),
+    ("American Fork", "UT", "Mountain West"),
+    ("New York", "NY", "Northeast"),
+    ("Boston", "MA", "Northeast"),
+    ("Stamford", "CT", "Northeast"),
+    ("Chicago", "IL", "Midwest"),
+    ("Dallas", "TX", "South"),
+    ("Austin", "TX", "South"),
+    ("Houston", "TX", "South"),
+    ("Atlanta", "GA", "South"),
+    ("Charlotte", "NC", "South"),
+    ("San Francisco", "CA", "West"),
+    ("San Jose", "CA", "West"),
+    ("Los Angeles", "CA", "West"),
+    ("Seattle", "WA", "West"),
+    ("Denver", "CO", "Mountain West"),
+    ("Phoenix", "AZ", "West"),
+    ("Las Vegas", "NV", "West"),
+    ("Washington", "DC", "Northeast"),
+    ("Miami", "FL", "South"),
+]
+
+# (employer, industry-from-canonical-INDUSTRIES). Industries here are the
+# canonical vocabulary used by the filters so the advanced-search facets and the
+# real records line up.
+_EMPLOYERS = [
+    ("Goldman Sachs", "Investment Banking"),
+    ("J.P. Morgan", "Investment Banking"),
+    ("Morgan Stanley", "Investment Banking"),
+    ("Bank of America", "Commercial Banking"),
+    ("Wells Fargo", "Commercial Banking"),
+    ("Citi", "Commercial Banking"),
+    ("Bain Capital", "Private Equity"),
+    ("KKR", "Private Equity"),
+    ("Blackstone", "Private Equity"),
+    ("BlackRock", "Asset Management"),
+    ("Fidelity", "Asset Management"),
+    ("Vanguard", "Asset Management"),
+    ("Northern Trust", "Asset Management"),
+    ("PIMCO", "Asset Management"),
+    ("Charles Schwab", "Wealth Management"),
+    ("Edward Jones", "Wealth Management"),
+    ("UBS", "Wealth Management"),
+    ("McKinsey & Company", "Consulting"),
+    ("Bain & Company", "Consulting"),
+    ("Deloitte", "Consulting"),
+    ("KPMG", "Valuation & Advisory"),
+    ("EY", "Valuation & Advisory"),
+    ("Qualtrics", "Corporate Finance"),
+    ("Adobe", "Corporate Finance"),
+    ("Microsoft", "Corporate Finance"),
+    ("Sequoia Capital", "Venture Capital"),
+    ("Andreessen Horowitz", "Venture Capital"),
+    ("CBRE", "Real Estate"),
+    ("Jefferies", "Equity Research"),
+    ("Ares Management", "Private Credit"),
+]
+
+_TITLES_BY_SENIORITY = [
+    ("Analyst", "Analyst"),
+    ("Senior Analyst", "Senior Analyst"),
+    ("Associate", "Associate"),
+    ("Senior Associate", "Senior Associate"),
+    ("Manager", "Manager"),
+    ("Vice President", "Vice President"),
+    ("Director", "Director"),
+    ("Principal", "Principal"),
+    ("Partner", "Partner"),
+]
+
+_UNIVERSITIES = [
+    ("Brigham Young University", "Marriott School of Business", "Finance"),
+]
+_DEGREES = ["BS", "BA"]
+_MAJORS = ["Finance", "Accounting", "Economics", "Entrepreneurship"]
+_GRADUATE_DEGREES = [None, None, None, "MBA", "MAcc"]
+_GENDERS = ["M", "F"]
+
+
+def _generate_records(start_index: int) -> tuple[list[dict], dict[str, dict]]:
+    """Build GENERATED_COUNT unique alumni dicts + their MOCK_DETAIL entries.
+
+    ``start_index`` offsets the byu_id / net_id sequence so generated rows never
+    collide with the hand-crafted block. Deterministic: a fixed RNG seed makes
+    re-runs produce identical data (idempotent with seed_mock's wipe+insert).
+    """
+    import random
+
+    rng = random.Random(20260630)
+    today = datetime.date.today()
+    rows: list[dict] = []
+    detail: dict[str, dict] = {}
+
+    for i in range(GENERATED_COUNT):
+        n = start_index + i  # global sequence number, unique across the batch
+        gender = _GENDERS[i % 2]
+        first = rng.choice(_FIRST_NAMES_M if gender == "M" else _FIRST_NAMES_F)
+        last = _LAST_NAMES[n % len(_LAST_NAMES)]
+        # net_id: lowercase letters + the sequence number -> globally unique and
+        # matches the ^[a-z0-9]{2,12}$ shape. byu_id: 9 digits, unique. mst_id:
+        # a distinct MST-prefixed token.
+        net_id = f"mk{n:05d}"
+        byu_id = f"{100000000 + n:09d}"
+        mst_id = f"MST-{n:06d}"
+
+        grad_year = 2005 + (n % 20)  # 2005..2024
+        finance_year = grad_year - 1
+        # Birthday ~22 years before graduation, jittered so dates vary.
+        birth_year = grad_year - 22 - (i % 3)
+        birth_month = (i % 12) + 1
+        birth_day = (i % 27) + 1
+        birth_date = datetime.date(birth_year, birth_month, birth_day)
+
+        city, state, region = rng.choice(_LOCATIONS)
+        employer, industry = rng.choice(_EMPLOYERS)
+        title, seniority = rng.choice(_TITLES_BY_SENIORITY)
+        degree = rng.choice(_DEGREES)
+        major = rng.choice(_MAJORS)
+        grad_degree = rng.choice(_GRADUATE_DEGREES)
+        university, college, department = _UNIVERSITIES[0]
+
+        # A small, realistic minority of special-case rows.
+        deceased = i % 50 == 7        # ~2% deceased
+        archived = i % 40 == 13       # ~2.5% archived (soft-deleted)
+        is_alumni = not (i % 12 == 5)  # ~8% are "friends" (non-alumni contacts)
+
+        row: dict = {
+            "byu_id": byu_id,
+            "mst_id": mst_id,
+            "net_id": net_id,
+            "first_name": first,
+            "last_name": last,
+            "gender": gender,
+            "birth_date": birth_date,
+            "graduation_year": grad_year,
+            "finance_program_year": finance_year,
+            "is_alumni": is_alumni,
+            "linkedin_url": f"https://www.linkedin.com/in/mock-{net_id}",
+            "notes": "[MOCK] Generated alumni record.",
+        }
+        if grad_degree:
+            row["graduate_degree"] = grad_degree
+        # Some women carry a maiden / birth name (exercises #216 search).
+        if gender == "F" and i % 5 == 0:
+            row["birth_name"] = rng.choice(_BIRTH_NAMES)
+        # ~30% preferred name.
+        if i % 10 < 3:
+            row["preferred_first_name"] = first
+        # A subset married to a free-text (non-alumni) spouse.
+        if i % 4 == 0:
+            sp_gender_pool = _FIRST_NAMES_F if gender == "M" else _FIRST_NAMES_M
+            row["spouse_first_name"] = rng.choice(sp_gender_pool)
+            row["spouse_last_name"] = last
+            row["spouse_birth_date"] = datetime.date(
+                birth_year + (i % 3) - 1, ((i + 4) % 12) + 1, ((i + 7) % 27) + 1
+            )
+        if deceased:
+            row["deceased"] = True
+        if archived:
+            row["archived"] = True
+
+        rows.append(row)
+
+        # Matching COMPLETE detail so the list/map/profile render populated.
+        d: dict = {
+            "contact": {
+                "personal_email": f"{net_id}@example.com",
+                "phone": f"+1 (801) 555-{(1000 + n) % 10000:04d}",
+                "city": city,
+                "state": state,
+                "country": "USA",
+                "region": region,
+            },
+            "career": {
+                "current_employer": employer,
+                "current_title": title,
+                "current_industry": industry,
+                "current_city": city,
+                "current_state": state,
+                "current_country": "USA",
+                "seniority_level": seniority,
+            },
+            "education": [
+                {
+                    "university": university,
+                    "college": college,
+                    "department": department,
+                    "degree": degree,
+                    "major": major,
+                    "degree_status": "Completed",
+                    "degree_year": grad_year,
+                }
+            ],
+        }
+        # Roughly half carry one or two engagement tags so the chips/filters have
+        # variety without every row looking identical.
+        tag_pool = MOCK_TAGS
+        picks = []
+        if i % 2 == 0:
+            picks.append(tag_pool[i % len(tag_pool)])
+        if i % 6 == 0:
+            picks.append(tag_pool[(i + 2) % len(tag_pool)])
+        if picks:
+            d["tags"] = list(dict.fromkeys(picks))  # de-dupe, keep order
+        # A donor/mentor engagement profile for a subset (drives those filters).
+        if i % 7 == 0:
+            d["program"] = {"piff_donor": True, "mentor_willing": True}
+        elif i % 7 == 3:
+            d["program"] = {"mentor_willing": True}
+        # Status labels for the deceased / archived special cases.
+        if deceased:
+            d["status_labels"] = ["Deceased"]
+        elif archived:
+            d["status_labels"] = ["Inactive"]
+        detail[net_id] = d
+
+    return rows, detail
+
+
 async def _get_source(session) -> DataSource | None:
     return await session.scalar(
         select(DataSource).where(DataSource.source_name == MOCK_SOURCE_NAME)
@@ -271,15 +542,24 @@ async def _get_or_create_lookup(session, model, name_attr: str, names: list[str]
     return {name: getattr(row, name_attr.replace("_name", "_id")) for name, row in existing.items()}
 
 
-async def _seed_details(session, alumni_by_net_id: dict[str, int], actor_user_id: int | None) -> None:
-    """Insert the rich per-alumni related rows defined in MOCK_DETAIL."""
+async def _seed_details(
+    session,
+    alumni_by_net_id: dict[str, int],
+    actor_user_id: int | None,
+    detail_map: dict[str, dict] | None = None,
+) -> None:
+    """Insert the rich per-alumni related rows for ``detail_map`` (the
+    hand-crafted MOCK_DETAIL by default, or the combined hand-crafted + generated
+    map passed by seed_mock)."""
+    if detail_map is None:
+        detail_map = MOCK_DETAIL
     tag_ids = await _get_or_create_lookup(session, Tag, "tag_name", MOCK_TAGS)
     status_ids = await _get_or_create_lookup(
         session, StatusLabel, "status_label_name", MOCK_STATUS_LABELS
     )
     now = datetime.datetime.now(datetime.UTC)
 
-    for net_id, detail in MOCK_DETAIL.items():
+    for net_id, detail in detail_map.items():
         aid = alumni_by_net_id.get(net_id)
         if aid is None:
             continue
@@ -357,13 +637,22 @@ async def seed_mock(session) -> int:
     )
     session.add(source)
     await session.flush()  # assign source_id
-    alumni = [Alumni(source_id=source.source_id, **row) for row in MOCK_ALUMNI]
+
+    # Combine the 16 hand-crafted demo records with the 250 generated ones. The
+    # generated batch starts at sequence 1000 so its byu_id / net_id / mst_id can
+    # never collide with the hand-crafted block (001000001..001000016). Both
+    # share the MOCK_DATA source, so --remove wipes everything.
+    generated_rows, generated_detail = _generate_records(start_index=1000)
+    all_rows = MOCK_ALUMNI + generated_rows
+    combined_detail = {**MOCK_DETAIL, **generated_detail}
+
+    alumni = [Alumni(source_id=source.source_id, **row) for row in all_rows]
     session.add_all(alumni)
     await session.flush()  # assign alumni_ids
     alumni_ids = [a.alumni_id for a in alumni]
     alumni_by_net_id = {
         row["net_id"]: a.alumni_id
-        for row, a in zip(MOCK_ALUMNI, alumni, strict=True)
+        for row, a in zip(all_rows, alumni, strict=True)
         if row.get("net_id")
     }
 
@@ -371,10 +660,10 @@ async def seed_mock(session) -> int:
     # name + birthday from the partner's row so the linked records stay in sync.
     alumni_obj_by_net_id = {
         row["net_id"]: a
-        for row, a in zip(MOCK_ALUMNI, alumni, strict=True)
+        for row, a in zip(all_rows, alumni, strict=True)
         if row.get("net_id")
     }
-    row_by_net_id = {r["net_id"]: r for r in MOCK_ALUMNI if r.get("net_id")}
+    row_by_net_id = {r["net_id"]: r for r in all_rows if r.get("net_id")}
     for net_id, spouse_net_id in MOCK_SPOUSE_LINKS.items():
         a = alumni_obj_by_net_id.get(net_id)
         spouse_obj = alumni_obj_by_net_id.get(spouse_net_id)
@@ -393,11 +682,12 @@ async def seed_mock(session) -> int:
     actor_user_id = await session.scalar(
         select(User.user_id).order_by(User.user_id).limit(1)
     )
-    await _seed_details(session, alumni_by_net_id, actor_user_id)
+    await _seed_details(session, alumni_by_net_id, actor_user_id, combined_detail)
 
     # Guarantee every alumnus has a current employer + industry and a LinkedIn
     # so the alumni list never renders blank cells. Fallbacks are deterministic
-    # (indexed) and use the canonical industry vocabulary.
+    # (indexed) and use the canonical industry vocabulary. (Generated rows always
+    # carry a career section, so this only backfills the hand-crafted block.)
     fallback_careers = [
         ("Deloitte", "Consulting"),
         ("Wells Fargo", "Commercial Banking"),
@@ -405,9 +695,9 @@ async def seed_mock(session) -> int:
         ("KPMG", "Valuation & Advisory"),
         ("PIMCO", "Asset Management"),
     ]
-    for idx, (row, a) in enumerate(zip(MOCK_ALUMNI, alumni, strict=True)):
+    for idx, (row, a) in enumerate(zip(all_rows, alumni, strict=True)):
         nid = row.get("net_id")
-        if not MOCK_DETAIL.get(nid or "", {}).get("career"):
+        if not combined_detail.get(nid or "", {}).get("career"):
             employer, industry = fallback_careers[idx % len(fallback_careers)]
             session.add(
                 CurrentEmployment(
@@ -436,7 +726,9 @@ async def seed_mock(session) -> int:
     # explicit additions below can't violate the (event, alumni) unique key).
     attendance: set[tuple[int, int]] = set()
     for i, e in enumerate(events):
-        for aid in alumni_ids[i : i + 4]:
+        # Pull a spread of attendees from across the (now large) population so
+        # each event has a realistic, non-trivial guest list.
+        for aid in alumni_ids[i :: max(1, len(alumni_ids) // 25)][:25]:
             attendance.add((e.event_id, aid))
     # Ensure the demo-rich profile (James Doe) attends three recent events so the
     # profile's Recent events panel is well populated.
@@ -451,7 +743,7 @@ async def seed_mock(session) -> int:
             )
         )
     await session.commit()
-    return len(MOCK_ALUMNI)
+    return len(all_rows)
 
 
 async def main(remove: bool) -> None:

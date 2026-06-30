@@ -8,12 +8,20 @@ fixed ``response_model`` would force the amount keys to always serialize.
 
 from __future__ import annotations
 
+import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
 _NOTES_MAX = 10000
 _AMOUNT_MAX = Decimal("9999999999.99")  # numeric(12,2) ceiling
+_YEAR_MIN = 1900
+
+
+def _year_max() -> int:
+    """Upper bound for a donation year: next calendar year (allows a gift
+    pledged/dated slightly ahead). Computed per-call so it never goes stale."""
+    return datetime.date.today().year + 1
 
 
 class DonationCreate(BaseModel):
@@ -43,8 +51,11 @@ class DonationCreate(BaseModel):
     @field_validator("year")
     @classmethod
     def _year_range(cls, value: int) -> int:
-        if not 1900 <= value <= 2200:
-            raise ValueError("year must be between 1900 and 2200.")
+        year_max = _year_max()
+        if not _YEAR_MIN <= value <= year_max:
+            raise ValueError(
+                f"year must be between {_YEAR_MIN} and {year_max}."
+            )
         return value
 
     @field_validator("month")

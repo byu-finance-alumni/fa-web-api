@@ -135,6 +135,10 @@ def build_alumni_query(
     missing_email: bool = False,
     missing_employer: bool = False,
     duplicate: bool = False,
+    # Friends of the finance program (#218). ``True`` -> alumni only, ``False``
+    # -> friends only, ``None`` -> both. The list route defaults this to ``True``
+    # so the Alumni page is unchanged; friends are opt-in.
+    is_alumni: bool | None = True,
     include_archived: bool = False,
 ) -> Select:
     """Build the filtered ``SELECT alumni`` statement (without limit/offset).
@@ -151,6 +155,9 @@ def build_alumni_query(
     conditions = []
     if not include_archived:
         conditions.append(Alumni.archived.is_(False))
+    # Alumni / friends split (#218). None -> no predicate (return both).
+    if is_alumni is not None:
+        conditions.append(Alumni.is_alumni.is_(is_alumni))
     if q:
         like = f"%{escape_like(q)}%"
         conditions.append(
@@ -158,6 +165,10 @@ def build_alumni_query(
                 Alumni.first_name.ilike(like, escape="\\"),
                 Alumni.last_name.ilike(like, escape="\\"),
                 Alumni.preferred_first_name.ilike(like, escape="\\"),
+                # Maiden / birth name (#216): a last-name search must also find
+                # alumnae listed under their birth name. Matched case-insensitively
+                # like the other name columns.
+                Alumni.birth_name.ilike(like, escape="\\"),
                 Alumni.middle_name.ilike(like, escape="\\"),
                 Alumni.byu_id.ilike(like, escape="\\"),
                 Alumni.net_id.ilike(like, escape="\\"),
@@ -172,7 +183,17 @@ def build_alumni_query(
 
     _field_like(net_id, Alumni.net_id)
     _field_like(first_name, Alumni.first_name)
-    _field_like(last_name, Alumni.last_name)
+    # Last-name field search also matches the maiden / birth name (#216) so an
+    # alumna looked up by her birth name is found even via the dedicated
+    # last-name box, not just the free-text ``q`` search.
+    if last_name and last_name.strip():
+        like = f"%{escape_like(last_name.strip())}%"
+        conditions.append(
+            or_(
+                Alumni.last_name.ilike(like, escape="\\"),
+                Alumni.birth_name.ilike(like, escape="\\"),
+            )
+        )
     _field_like(preferred_name, Alumni.preferred_first_name)
     if email and email.strip():
         like = f"%{escape_like(email.strip())}%"
@@ -490,9 +511,12 @@ async def list_page(
     """Return a filtered page of alumni and the total count for that filter.
 
     Each returned Alumni also gets ``current_employer`` / ``current_industry``
-    set as plain instance attributes (from correlated scalar subqueries against
-    ``current_employment``) so the list view can show them without an N+1 or a
-    row-multiplying join. The single-record schema ignores these.
+    (from ``current_employment``) and ``current_city`` / ``current_state`` (from
+    ``alumni_contact_info`` — the same table the geography map shades by, so the
+    list and the map agree on a record's location) set as plain instance
+    attributes via correlated scalar subqueries, so the list view can show them
+    without an N+1 or a row-multiplying join. The single-record schema ignores
+    these.
     """
     sort = filters.pop("sort", "name") or "name"
     base = build_alumni_query(**filters)
@@ -510,7 +534,24 @@ async def list_page(
         .limit(1)
         .scalar_subquery()
     )
-    rows_stmt = select(Alumni, current_employer, current_industry)
+    # Location for the list's City/State columns. Sourced from the contact-info
+    # row (NOT current_employment.current_city/state) so the list matches the
+    # geography map, which shades exclusively off alumni_contact_info.
+    current_city = (
+        select(AlumniContactInfo.city)
+        .where(AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    current_state = (
+        select(AlumniContactInfo.state)
+        .where(AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    rows_stmt = select(
+        Alumni, current_employer, current_industry, current_city, current_state
+    )
     if base.whereclause is not None:
         rows_stmt = rows_stmt.where(base.whereclause)
 
@@ -519,8 +560,10 @@ async def list_page(
     rows_stmt = rows_stmt.order_by(*alumni_order_by(sort)).limit(limit).offset(offset)
     result = await session.execute(rows_stmt)
     items: list[Alumni] = []
-    for alumnus, employer, industry in result.all():
+    for alumnus, employer, industry, city, state in result.all():
         alumnus.current_employer = employer
         alumnus.current_industry = industry
+        alumnus.current_city = city
+        alumnus.current_state = state
         items.append(alumnus)
     return items, int(total or 0)

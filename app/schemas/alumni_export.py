@@ -72,6 +72,10 @@ class AlumniExportFilters(BaseModel):
     missing_email: bool = False
     missing_employer: bool = False
     duplicate: bool = False
+    # Friends/alumni split (#218). Unset -> the query builder's default
+    # (alumni only), so an export mirrors the default Alumni list view. Send
+    # ``true`` for alumni only, ``false`` for friends only, or ``null`` for both.
+    is_alumni: bool | None = None
     include_archived: bool = False
     sort: str = "name"
 

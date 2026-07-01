@@ -217,6 +217,7 @@ class _FakeSession:
         for attr, default in (
             ("alumni_id", 100),
             ("deceased", False),
+            ("is_alumni", True),
             ("archived", False),
             ("created_at", now),
             ("updated_at", now),
@@ -234,6 +235,7 @@ def _alum(**kw):
         byu_id=None,
         net_id=None,
         archived=False,
+        is_alumni=True,
     )
     base.update(kw)
     return SimpleNamespace(**base)

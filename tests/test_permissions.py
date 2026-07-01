@@ -64,6 +64,9 @@ def test_default_grants_reproduce_historical_guards():
         Capability.ALUMNI_EDIT,
         Capability.ALUMNI_FULL,
         Capability.USER_ADMIN,
+        # profile.completeness is a newer capability (not one of the original
+        # hardcoded guards) whose default grant includes super_admin.
+        Capability.PROFILE_COMPLETENESS,
     }
 
 

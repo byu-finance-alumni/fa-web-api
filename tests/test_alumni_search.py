@@ -28,15 +28,55 @@ def test_default_excludes_archived():
     assert "archived IS false" in sql
 
 
-def test_include_archived_has_no_where():
+def test_include_archived_drops_archived_guard():
+    # include_archived removes the archived predicate, but the default
+    # alumni-only (is_alumni=true) split still applies (#218).
     sql = _sql(build_alumni_query(include_archived=True))
+    assert "archived IS false" not in sql
+    assert "is_alumni IS true" in sql
+
+
+def test_include_archived_and_all_kinds_has_no_where():
+    # Truly no WHERE only when archived is included AND both kinds are returned.
+    sql = _sql(build_alumni_query(include_archived=True, is_alumni=None))
     assert "WHERE" not in sql
 
 
-def test_q_searches_six_columns_with_ilike():
+def test_q_searches_seven_columns_with_ilike():
+    sql = _sql(build_alumni_query(q="smith", is_alumni=None))
+    # names (5: first, last, preferred, birth_name, middle) + byu_id + net_id
+    assert sql.count("ILIKE") == 7
+
+
+def test_q_matches_birth_name():
+    # Maiden / birth name is part of the free-text name search (#216).
     sql = _sql(build_alumni_query(q="smith"))
-    # names (4) + byu_id + net_id
-    assert sql.count("ILIKE") == 6
+    assert "birth_name ILIKE" in sql
+
+
+def test_last_name_field_also_matches_birth_name():
+    # The dedicated last-name box also matches the maiden / birth name (#216).
+    sql = _sql(build_alumni_query(last_name="smith", is_alumni=None))
+    assert "last_name ILIKE" in sql
+    assert "birth_name ILIKE" in sql
+
+
+def test_default_is_alumni_only():
+    # #218: the default query is alumni-only so the Alumni page is unchanged.
+    sql = _sql(build_alumni_query())
+    assert "is_alumni IS true" in sql
+
+
+def test_friends_only_filter():
+    sql = _sql(build_alumni_query(is_alumni=False))
+    assert "is_alumni IS false" in sql
+
+
+def test_both_kinds_omits_is_alumni_predicate():
+    # is_alumni appears in the SELECT column list; assert it's not a WHERE
+    # predicate when both kinds are requested.
+    sql = _sql(build_alumni_query(is_alumni=None))
+    assert "is_alumni IS" not in sql
 
 
 def test_per_field_search_filters_each_field():

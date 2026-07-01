@@ -390,7 +390,6 @@ def _generate_records(start_index: int) -> tuple[list[dict], dict[str, dict]]:
     import random
 
     rng = random.Random(20260630)
-    today = datetime.date.today()
     rows: list[dict] = []
     detail: dict[str, dict] = {}
 

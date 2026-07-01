@@ -10,7 +10,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import extract, func, or_, select, text
+from sqlalchemy import and_, extract, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -154,7 +154,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     disclosure audit row. Drill-downs reached from the tiles audit their own
     reads.
     """
-    active = Alumni.archived.is_(False)
+    # Alumni-only: exclude "friends of the program" (is_alumni=false) from every
+    # alumni KPI so friends never inflate alumni counts (#218 follow-up).
+    active = and_(Alumni.archived.is_(False), Alumni.is_alumni.is_(True))
     now = datetime.datetime.now(datetime.UTC)
     month_ago = now - datetime.timedelta(days=30)
     today = now.date()
@@ -173,7 +175,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         select(func.count()).select_from(Alumni).where(active)
     )
     archived = await session.scalar(
-        select(func.count()).select_from(Alumni).where(Alumni.archived.is_(True))
+        select(func.count())
+        .select_from(Alumni)
+        .where(Alumni.archived.is_(True), Alumni.is_alumni.is_(True))
     )
     deceased = await session.scalar(
         select(func.count())
@@ -361,7 +365,9 @@ async def birthdays(
     [{"id": 7, "first_name": "Jane", "last_name": "Doe",
       "current_employer": "Goldman Sachs", "graduation_year": 2019,
       "birth_month": 6, "birth_day": 3}, ...]."""
-    active = Alumni.archived.is_(False)
+    # Alumni-only: exclude "friends of the program" (is_alumni=false) from every
+    # alumni KPI so friends never inflate alumni counts (#218 follow-up).
+    active = and_(Alumni.archived.is_(False), Alumni.is_alumni.is_(True))
     current_month = datetime.datetime.now(datetime.UTC).date().month
 
     # Same correlated scalar subquery the alumni list uses to surface the
@@ -619,7 +625,9 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
 
     Full-access only (matches the sidebar gate): view_only users get 403, like
     the cross-alumni Tasks list."""
-    active = Alumni.archived.is_(False)
+    # Alumni-only: exclude "friends of the program" (is_alumni=false) from every
+    # alumni KPI so friends never inflate alumni counts (#218 follow-up).
+    active = and_(Alumni.archived.is_(False), Alumni.is_alumni.is_(True))
     total = await session.scalar(
         select(func.count()).select_from(Alumni).where(active)
     )

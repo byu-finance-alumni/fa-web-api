@@ -61,6 +61,8 @@ def _filter_conditions(filters: dict) -> list:
     """Shared WHERE conditions for every geography query."""
     conds = [
         Alumni.archived.is_(False),
+        # Alumni-only map: exclude friends of the program (#218 follow-up).
+        Alumni.is_alumni.is_(True),
         AlumniContactInfo.state.is_not(None),
         func.trim(cast(AlumniContactInfo.state, String)) != "",
     ]
@@ -501,7 +503,11 @@ async def _distinct(session, column, *, limit: int = _OPTIONS_CAP) -> list:
                 CurrentEmployment,
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
             )
-            .where(Alumni.archived.is_(False), column.is_not(None))
+            .where(
+                Alumni.archived.is_(False),
+                Alumni.is_alumni.is_(True),
+                column.is_not(None),
+            )
             .distinct()
             .order_by(column)
             .limit(limit)

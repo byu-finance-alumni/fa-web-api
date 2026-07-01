@@ -55,6 +55,7 @@ class Capability:
     ALUMNI_FULL = "alumni.full"
     USER_ADMIN = "user_admin"
     VOCAB_ADMIN = "vocab_admin"
+    PROFILE_COMPLETENESS = "profile.completeness"
     ENGINEER = "engineer"
 
 
@@ -101,6 +102,15 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         ),
     ),
     CapabilitySpec(
+        code=Capability.PROFILE_COMPLETENESS,
+        label="Profile completeness",
+        description=(
+            "See the per-alumnus profile-completeness checklist and score "
+            "(which required fields are missing) as its own tab on the alumni "
+            "profile."
+        ),
+    ),
+    CapabilitySpec(
         code=Capability.ENGINEER,
         label="Engineer console",
         description=(
@@ -136,6 +146,7 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             Capability.ALUMNI_EDIT,
             Capability.ALUMNI_FULL,
             Capability.USER_ADMIN,
+            Capability.PROFILE_COMPLETENESS,
         }
     ),
     RoleName.FULL_ACCESS.value: frozenset(

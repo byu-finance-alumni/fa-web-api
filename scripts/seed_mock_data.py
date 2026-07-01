@@ -27,6 +27,7 @@ from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Attachment, FollowUpTask, Interaction, Survey
 from app.models.data_source import DataSource
+from app.models.donation import Donation
 from app.models.employment import (
     CurrentEmployment,
     EducationHistory,
@@ -148,6 +149,11 @@ MOCK_DETAIL: dict[str, dict] = {
             "piff_donor": True,
             "engagement_notes": "Hosts NetTrek in NYC; active IB-track mentor.",
         },
+        "donations": [
+            {"amount": 1000, "donation_year": 2024, "donation_month": 12, "notes": "[MOCK] Year-end gift"},
+            {"amount": 500, "donation_year": 2023, "donation_month": 6, "notes": "[MOCK] Spring campaign"},
+            {"amount": 500, "donation_year": 2021, "donation_month": 11, "notes": "[MOCK] Pay It Forward"},
+        ],
         "engagement_notes": [
             {"engagement_interest_type": "Mentorship", "engagement_notes": "Willing to mentor students pursuing investment banking."},
         ],
@@ -179,6 +185,10 @@ MOCK_DETAIL: dict[str, dict] = {
         "contact": {"personal_email": "ava.lee@example.com", "phone": "+1 (415) 555-0199", "city": "San Francisco", "state": "CA", "country": "USA", "region": "West"},
         "career": {"current_employer": "Bain Capital", "current_title": "Associate", "current_industry": "Private Equity", "current_city": "San Francisco", "current_state": "CA", "seniority_level": "Associate"},
         "program": {"piff_donor": True, "mentor_willing": True},
+        "donations": [
+            {"amount": 250, "donation_year": 2025, "donation_month": 3, "notes": "[MOCK] Pay It Forward"},
+            {"amount": 250, "donation_year": 2022, "donation_month": 9, "notes": "[MOCK] Pay It Forward"},
+        ],
         "tags": ["Highly Engaged", "Donor"],
         "interactions": [
             {"interaction_type": "Event Follow-Up", "days_ago": 30, "interaction_notes": "Followed up after Women in Finance mixer."},
@@ -507,6 +517,19 @@ def _generate_records(start_index: int) -> tuple[list[dict], dict[str, dict]]:
         # A donor/mentor engagement profile for a subset (drives those filters).
         if i % 7 == 0:
             d["program"] = {"piff_donor": True, "mentor_willing": True}
+            # Pay It Forward gifts so the ledger + per-year rollups have data.
+            # Whole-dollar amounts (> 0 per the check constraint); 1-4 gifts
+            # across 2018-2024. Cascades on alumni delete, so no separate tag.
+            n_gifts = 1 + (i % 4)
+            d["donations"] = [
+                {
+                    "amount": 50 + ((i * 37 + g * 113) % 80) * 25,
+                    "donation_year": 2018 + ((i + g * 2) % 7),
+                    "donation_month": 1 + ((i + g) % 12),
+                    "notes": "[MOCK] Pay It Forward gift",
+                }
+                for g in range(n_gifts)
+            ]
         elif i % 7 == 3:
             d["program"] = {"mentor_willing": True}
         # Status labels for the deceased / archived special cases.
@@ -574,6 +597,10 @@ async def _seed_details(
             session.add(FinanceSocietyLeadership(alumni_id=aid, **le))
         if program := detail.get("program"):
             session.add(AlumniProgramEngagement(alumni_id=aid, **program))
+        for dn in detail.get("donations", []):
+            session.add(
+                Donation(alumni_id=aid, logged_by_user_id=actor_user_id, **dn)
+            )
         for en in detail.get("engagement_notes", []):
             session.add(AlumniEngagement(alumni_id=aid, **en))
         for tag_name in detail.get("tags", []):

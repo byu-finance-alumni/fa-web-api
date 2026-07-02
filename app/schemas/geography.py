@@ -78,6 +78,19 @@ class CountryCount(BaseModel):
     alumni_count: int
 
 
+class CountryDetail(BaseModel):
+    """Aggregate drill-down for one country (world-view country click-through).
+
+    No cities (international city data isn't populated) — count + top employers /
+    industries + grad-year histogram, mirroring ``StateDetail``."""
+
+    country: str
+    alumni_count: int
+    employers: list[EmployerCount]
+    industries: list[IndustryCount]
+    by_graduation_year: list[YearCount]
+
+
 # --- /geography/summary ------------------------------------------------------
 
 

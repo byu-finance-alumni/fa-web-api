@@ -68,6 +68,16 @@ class CountyCount(BaseModel):
     count: int
 
 
+# --- /geography/countries ----------------------------------------------------
+
+
+class CountryCount(BaseModel):
+    """Per-country alumni count for the world map (international alumni only)."""
+
+    country: str
+    alumni_count: int
+
+
 # --- /geography/summary ------------------------------------------------------
 
 

@@ -18,6 +18,7 @@ from app.schemas.auth import UserContext
 from app.schemas.geography import (
     Breakdown,
     CityDetail,
+    CountryCount,
     CountyCount,
     GeoAlumniPage,
     GeoSummary,
@@ -104,6 +105,16 @@ async def counties(
 
     Aggregate counts only (no PII), so view-accessible like ``/states``."""
     return await svc.get_counties(session, filters)
+
+
+@router.get("/countries", response_model=list[CountryCount])
+async def countries(
+    _: RequireViewAccess, session: SessionDep, filters: FiltersDep
+) -> list[CountryCount]:
+    """Per-country alumni counts (international) for the world-map view.
+
+    Aggregate counts only (no PII), so view-accessible like ``/states``."""
+    return await svc.get_countries(session, filters)
 
 
 @router.get("/breakdown", response_model=Breakdown)

@@ -32,6 +32,7 @@ def client():
         "/geography/summary",
         "/geography/states",
         "/geography/counties",
+        "/geography/countries",
         "/geography/states/UT",
         "/geography/states/UT/alumni",
         "/geography/cities?state=UT&city=Provo",
@@ -92,4 +93,16 @@ def test_get_counties_maps_fips_to_counts():
     assert result == [
         {"county_fips": "49049", "count": 12},
         {"county_fips": "49035", "count": 7},
+    ]
+
+
+def test_get_countries_folds_case_variants_and_sorts():
+    # get_countries runs one grouped query returning (country, count) rows (the
+    # USA is already excluded in SQL). Case/spacing variants of the same country
+    # fold together, and the result is sorted by count desc.
+    executes = [[("United Kingdom", 5), ("Japan", 3), ("united kingdom", 2)]]
+    result = asyncio.run(svc.get_countries(_FakeSession(executes), {}))
+    assert result == [
+        {"country": "United Kingdom", "alumni_count": 7},
+        {"country": "Japan", "alumni_count": 3},
     ]

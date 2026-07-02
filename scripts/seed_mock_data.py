@@ -82,6 +82,14 @@ MOCK_ALUMNI: list[dict] = [
     {"byu_id": "001000014", "net_id": "iclark14", "first_name": "Isabella", "last_name": "Clark", "gender": "F", "birth_date": datetime.date(1992, 7, 3), "graduation_year": 2014, "finance_program_year": 2013, "archived": True, "notes": "[MOCK] Archived — for soft-delete testing."},
     {"byu_id": "001000015", "net_id": "alewis15", "first_name": "Andrew", "last_name": "Lewis", "gender": "M", "birth_date": datetime.date(1988, 1, 22), "graduation_year": 2011, "finance_program_year": 2010, "graduate_degree": "MAcc"},
     {"byu_id": "001000016", "net_id": "shall16", "first_name": "Sophia", "last_name": "Hall", "gender": "F", "birth_date": datetime.date(1998, 5, 16), "graduation_year": 2020, "finance_program_year": 2019, "notes": "[MOCK] Equity research."},
+    # International alumni (#238) — located OUTSIDE the US so the world-map view
+    # has content. No US state; country is a clean ISO English name so it joins
+    # the frontend's country -> centroid lookup.
+    {"byu_id": "001000017", "net_id": "obennett17", "first_name": "Oliver", "last_name": "Bennett", "gender": "M", "birth_date": datetime.date(1990, 6, 4), "graduation_year": 2012, "finance_program_year": 2011, "notes": "[MOCK] London — international."},
+    {"byu_id": "001000018", "net_id": "ytanaka18", "first_name": "Yuki", "last_name": "Tanaka", "gender": "F", "birth_date": datetime.date(1994, 2, 27), "graduation_year": 2016, "finance_program_year": 2015, "notes": "[MOCK] Tokyo — international."},
+    {"byu_id": "001000019", "net_id": "rsouza19", "first_name": "Rafael", "last_name": "Souza", "gender": "M", "birth_date": datetime.date(1992, 9, 18), "graduation_year": 2014, "finance_program_year": 2013, "notes": "[MOCK] Sao Paulo — international."},
+    {"byu_id": "001000020", "net_id": "asingh20", "first_name": "Aria", "last_name": "Singh", "gender": "F", "birth_date": datetime.date(1997, 12, 9), "graduation_year": 2019, "finance_program_year": 2018, "notes": "[MOCK] Toronto — international."},
+    {"byu_id": "001000021", "net_id": "wlim21", "first_name": "Wei", "last_name": "Lim", "gender": "M", "birth_date": datetime.date(1995, 4, 21), "graduation_year": 2017, "finance_program_year": 2016, "notes": "[MOCK] Singapore — international."},
 ]
 
 # Reciprocal spouse links between alumni records (net_id -> spouse net_id).
@@ -256,6 +264,28 @@ MOCK_DETAIL: dict[str, dict] = {
     },
     "nwright11": {"status_labels": ["Deceased"]},
     "iclark14": {"status_labels": ["Lost Contact"]},
+    # International alumni (#238): city + clean country name, no US state/region,
+    # so they surface on the world-map view but not the US state/county maps.
+    "obennett17": {
+        "contact": {"personal_email": "oliver.bennett@example.com", "city": "London", "country": "United Kingdom"},
+        "career": {"current_employer": "Barclays", "current_title": "Vice President", "current_industry": "Investment Banking", "current_city": "London", "current_country": "United Kingdom", "seniority_level": "Vice President"},
+    },
+    "ytanaka18": {
+        "contact": {"personal_email": "yuki.tanaka@example.com", "city": "Tokyo", "country": "Japan"},
+        "career": {"current_employer": "Nomura", "current_title": "Associate", "current_industry": "Asset Management", "current_city": "Tokyo", "current_country": "Japan", "seniority_level": "Associate"},
+    },
+    "rsouza19": {
+        "contact": {"personal_email": "rafael.souza@example.com", "city": "Sao Paulo", "country": "Brazil"},
+        "career": {"current_employer": "Itau BBA", "current_title": "Senior Analyst", "current_industry": "Investment Banking", "current_city": "Sao Paulo", "current_country": "Brazil", "seniority_level": "Senior Analyst"},
+    },
+    "asingh20": {
+        "contact": {"personal_email": "aria.singh@example.com", "city": "Toronto", "country": "Canada"},
+        "career": {"current_employer": "RBC Capital Markets", "current_title": "Analyst", "current_industry": "Investment Banking", "current_city": "Toronto", "current_country": "Canada", "seniority_level": "Analyst"},
+    },
+    "wlim21": {
+        "contact": {"personal_email": "wei.lim@example.com", "city": "Singapore", "country": "Singapore"},
+        "career": {"current_employer": "DBS Bank", "current_title": "Manager", "current_industry": "Wealth Management", "current_city": "Singapore", "current_country": "Singapore", "seniority_level": "Manager"},
+    },
 }
 
 

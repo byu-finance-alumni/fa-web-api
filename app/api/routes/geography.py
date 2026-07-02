@@ -127,6 +127,30 @@ async def country_detail(
     return await svc.get_country_detail(session, country, filters)
 
 
+@router.get("/countries/{country}/alumni", response_model=GeoAlumniPage)
+async def country_alumni(
+    country: str,
+    actor: RequireFullAccess,
+    session: SessionDep,
+    filters: FiltersDep,
+    sort: Annotated[str, Query(pattern="^(name|year|city)$")] = "name",
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> GeoAlumniPage:
+    """Paginated, sortable alumni list for one country (world-view drill-down).
+
+    FERPA: this lists the individual alumni behind a country count, so it is
+    gated to full_access (view_only gets 403) and the disclosure is audited; the
+    aggregate country count/detail stay view-accessible."""
+    result = await svc.get_country_alumni(
+        session, country, filters, limit=limit, offset=offset, sort=sort
+    )
+    await _audit_view(
+        session, actor, entity_type="geography:country_alumni", field_name=country
+    )
+    return result
+
+
 @router.get("/breakdown", response_model=Breakdown)
 async def breakdown(
     _: RequireViewAccess,

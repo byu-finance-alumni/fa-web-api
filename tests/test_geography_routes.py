@@ -33,6 +33,7 @@ def client():
         "/geography/states",
         "/geography/counties",
         "/geography/countries",
+        "/geography/countries/Japan",
         "/geography/states/UT",
         "/geography/states/UT/alumni",
         "/geography/cities?state=UT&city=Provo",
@@ -105,4 +106,47 @@ def test_get_countries_folds_case_variants_and_sorts():
     assert result == [
         {"country": "United Kingdom", "alumni_count": 7},
         {"country": "Japan", "alumni_count": 3},
+    ]
+
+
+def test_get_country_detail_shortcircuits_usa_without_querying():
+    # The world view is international: a US alias must return the empty shape
+    # without running any query (session would raise if execute/scalar ran).
+    class _Boom:
+        async def execute(self, stmt):
+            raise AssertionError("should not query for a US alias")
+
+        async def scalar(self, stmt):
+            raise AssertionError("should not query for a US alias")
+
+    result = asyncio.run(svc.get_country_detail(_Boom(), "USA", {}))
+    assert result == {
+        "country": "USA",
+        "alumni_count": 0,
+        "employers": [],
+        "industries": [],
+        "by_graduation_year": [],
+    }
+
+
+def test_get_country_detail_aggregates_for_a_country():
+    # execute() order in get_country_detail: employers _top, industries _top,
+    # then the grad-year histogram. scalar() (total) returns 0 from the stub, so
+    # feed the three execute() calls their rows.
+    executes = [
+        [("Barclays", 4)],           # employers _top
+        [("Investment Banking", 4)], # industries _top
+        [(2012, 2), (2016, 2)],      # grad-year histogram
+    ]
+    result = asyncio.run(
+        svc.get_country_detail(_FakeSession(executes), "United Kingdom", {})
+    )
+    assert result["country"] == "United Kingdom"
+    assert result["employers"] == [{"employer": "Barclays", "count": 4}]
+    assert result["industries"] == [
+        {"industry": "Investment Banking", "count": 4}
+    ]
+    assert result["by_graduation_year"] == [
+        {"year": 2012, "count": 2},
+        {"year": 2016, "count": 2},
     ]

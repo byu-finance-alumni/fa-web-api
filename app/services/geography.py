@@ -230,9 +230,67 @@ async def get_countries(session: AsyncSession, filters: dict) -> list[dict]:
     )
 
 
-async def _top(session, filters, column, label, *, extra=None, limit=10):
-    """Generic top-N GROUP BY over the filtered, located alumni set."""
-    conds = list(_filter_conditions(filters))
+async def get_country_detail(session, country: str, filters: dict) -> dict:
+    """Aggregate drill-down for one country: count + top employers / industries +
+    grad-year histogram (mirrors ``get_state_detail`` minus cities, since
+    international city data isn't populated). Aggregate only (no PII), so
+    view-accessible like ``get_states``."""
+    key = (country or "").strip().upper()
+    empty = {
+        "country": (country or "").strip(),
+        "alumni_count": 0,
+        "employers": [],
+        "industries": [],
+        "by_graduation_year": [],
+    }
+    # The world view is international; never resolve the US through here.
+    if not key or key in _USA_ALIASES:
+        return empty
+    country_match = _COUNTRY == key
+    base_conds = _filter_conditions(filters, require_state=False)
+    total = await session.scalar(
+        _base().with_only_columns(_ALUMNI).where(*base_conds, country_match)
+    )
+    employers = await _top(
+        session, filters, CurrentEmployment.current_employer, "employer",
+        extra=country_match, require_state=False,
+    )
+    industries = await _top(
+        session, filters, CurrentEmployment.current_industry, "industry",
+        extra=country_match, require_state=False,
+    )
+    year_rows = (
+        await session.execute(
+            _base()
+            .with_only_columns(
+                Alumni.graduation_year.label("year"), _ALUMNI.label("count")
+            )
+            .where(
+                *base_conds, country_match, Alumni.graduation_year.is_not(None)
+            )
+            .group_by(Alumni.graduation_year)
+            .order_by(Alumni.graduation_year)
+        )
+    ).all()
+    return {
+        "country": (country or "").strip(),
+        "alumni_count": int(total or 0),
+        "employers": employers,
+        "industries": industries,
+        "by_graduation_year": [
+            {"year": y, "count": int(c)} for y, c in year_rows
+        ],
+    }
+
+
+async def _top(
+    session, filters, column, label, *, extra=None, limit=10, require_state=True
+):
+    """Generic top-N GROUP BY over the filtered, located alumni set.
+
+    ``require_state`` mirrors ``_filter_conditions`` — the country drill-down
+    passes ``False`` so international alumni (no US state) are counted."""
+    conds = list(_filter_conditions(filters, require_state=require_state))
     if extra is not None:
         conds.append(extra)
     rows = (

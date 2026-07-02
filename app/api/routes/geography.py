@@ -19,6 +19,7 @@ from app.schemas.geography import (
     Breakdown,
     CityDetail,
     CountryCount,
+    CountryDetail,
     CountyCount,
     GeoAlumniPage,
     GeoSummary,
@@ -115,6 +116,15 @@ async def countries(
 
     Aggregate counts only (no PII), so view-accessible like ``/states``."""
     return await svc.get_countries(session, filters)
+
+
+@router.get("/countries/{country}", response_model=CountryDetail)
+async def country_detail(
+    country: str, _: RequireViewAccess, session: SessionDep, filters: FiltersDep
+) -> CountryDetail:
+    """Country drill-down: count + top employers / industries + grad-year
+    histogram (aggregate only, so view-accessible like ``/states/{state}``)."""
+    return await svc.get_country_detail(session, country, filters)
 
 
 @router.get("/breakdown", response_model=Breakdown)

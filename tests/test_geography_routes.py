@@ -34,6 +34,7 @@ def client():
         "/geography/counties",
         "/geography/countries",
         "/geography/countries/Japan",
+        "/geography/countries/Japan/alumni",
         "/geography/states/UT",
         "/geography/states/UT/alumni",
         "/geography/cities?state=UT&city=Provo",
@@ -150,3 +151,21 @@ def test_get_country_detail_aggregates_for_a_country():
         {"year": 2012, "count": 2},
         {"year": 2016, "count": 2},
     ]
+
+
+def test_get_country_alumni_shortcircuits_usa_without_querying():
+    # The world-view alumni list is international: a US alias returns an empty
+    # page without querying (session would raise if execute/scalar ran).
+    class _Boom:
+        async def execute(self, stmt):
+            raise AssertionError("should not query for a US alias")
+
+        async def scalar(self, stmt):
+            raise AssertionError("should not query for a US alias")
+
+    result = asyncio.run(
+        svc.get_country_alumni(
+            _Boom(), "USA", {}, limit=50, offset=0, sort="name"
+        )
+    )
+    assert result == {"items": [], "total": 0, "limit": 50, "offset": 0}

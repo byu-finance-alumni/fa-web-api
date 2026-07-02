@@ -422,6 +422,65 @@ async def get_state_alumni(
     }
 
 
+async def get_country_alumni(
+    session, country: str, filters: dict, *, limit: int, offset: int, sort: str
+) -> dict:
+    """Paginated, sortable alumni list for one country (world-view drill-down).
+
+    Mirrors ``get_state_alumni`` but matches on country with
+    ``require_state=False`` (international alumni have no US state). The world
+    view is international, so a US alias yields an empty page. FERPA: lists the
+    individual alumni behind a country count, so the route gates this to
+    full_access and audits the disclosure."""
+    key = (country or "").strip().upper()
+    if not key or key in _USA_ALIASES:
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
+    conds = [*_filter_conditions(filters, require_state=False), _COUNTRY == key]
+    total = await session.scalar(
+        _base().with_only_columns(_ALUMNI).where(*conds)
+    )
+    order = _SORTS.get(sort, _SORTS["name"])
+    rows = (
+        await session.execute(
+            select(
+                Alumni,
+                AlumniContactInfo.city,
+                CurrentEmployment.current_employer,
+                CurrentEmployment.current_title,
+            )
+            .select_from(Alumni)
+            .join(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+            )
+            .outerjoin(
+                CurrentEmployment,
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+            )
+            .where(*conds)
+            .order_by(*order)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return {
+        "items": [
+            {
+                "alumni_id": a.alumni_id,
+                "name": _full_name(a),
+                "city": city,
+                "graduation_year": a.graduation_year,
+                "current_employer": employer,
+                "current_title": title,
+            }
+            for a, city, employer, title in rows
+        ],
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 # --- /geography/radius (proximity search) -----------------------------------
 
 # Mean earth radius in miles, for the great-circle (Haversine via spherical law

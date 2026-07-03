@@ -133,6 +133,121 @@ def test_event_attendees_unknown_event_is_404(client):
     assert response.json()["error"]["code"] == "not_found"
 
 
+# --- attendee CSV export (GET /events/{id}/attendees/export, #219) ------------
+
+
+class _ExportSession:
+    """Stand-in for the attendee export: ``get`` returns the event, ``execute``
+    returns (alumni, personal_email, work_email) rows, and add/commit record the
+    disclosure audit."""
+
+    def __init__(self, *, event, rows):
+        self._event = event
+        self._rows = rows
+        self.added: list = []
+        self.committed = False
+
+    async def get(self, _model, _pk):
+        return self._event
+
+    async def execute(self, _stmt):
+        return _Result(self._rows)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+
+def _export_alumnus(**over):
+    base = dict(
+        alumni_id=42,
+        first_name="Jane",
+        preferred_first_name=None,
+        last_name="Doe",
+        net_id="jdoe",
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_attendee_export_requires_auth(client):
+    response = client.get("/events/7/attendees/export")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_attendee_export_forbidden_for_view_only(client):
+    # Bulk PII leaves the system here, so it is gated above the view-only roster.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.get("/events/7/attendees/export")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_attendee_export_unknown_event_is_404(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _ExportSession(event=None, rows=[])
+    )
+    response = client.get("/events/999/attendees/export")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_attendee_export_returns_csv_and_audits(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _ExportSession(
+        event=_event(),
+        rows=[
+            (_export_alumnus(), "jane@personal.com", "jane@work.com"),
+            # No personal email -> falls back to the work email.
+            (
+                _export_alumnus(
+                    alumni_id=43, first_name="Mark", last_name="Ash", net_id="mash"
+                ),
+                None,
+                "mark@work.com",
+            ),
+            # No email at all -> empty cell, never a crash.
+            (
+                _export_alumnus(
+                    alumni_id=44, first_name="Amy", last_name="Bee", net_id=None
+                ),
+                None,
+                None,
+            ),
+        ],
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/events/7/attendees/export")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert (
+        'filename="event_7_attendees.csv"'
+        in response.headers["content-disposition"]
+    )
+    lines = response.text.splitlines()
+    assert lines[0] == "Name,Email,Net ID"
+    assert lines[1] == "Jane Doe,jane@personal.com,jdoe"
+    assert lines[2] == "Mark Ash,mark@work.com,mash"  # work-email fallback
+    assert lines[3] == "Amy Bee,,"  # no email, no net_id
+
+    assert session.committed is True
+    audits = [o for o in session.added if hasattr(o, "action_type")]
+    assert len(audits) == 1
+    assert audits[0].action_type == "export_event_attendees"
+    assert audits[0].entity_type == "event"
+    assert audits[0].entity_id == 7
+    assert audits[0].user_id == 1
+    # Disclosure record is self-contained: row count + fixed column set + event.
+    assert audits[0].new_value == (
+        "rows=3; columns=name,email,net_id; event='Spring Networking Night'"
+    )
+
+
 # --- list filters (compiled SQL) ----------------------------------------------
 
 

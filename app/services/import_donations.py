@@ -1,14 +1,25 @@
-"""Bulk CSV donation importer (#161).
+"""Bulk CSV donation importer (#148, #161).
 
-Turns a super-admin-filled CSV (columns ``Net ID``, ``Name``, ``Month``,
-``Year``, ``Amount``) into validated donation rows — matched to existing alumni
-**by Net ID** — and commits the importable ones in one transaction. Same
-parse/evaluate/commit shape as ``import_csv`` / ``import_events``.
+Turns a super-admin-filled CSV into validated donation rows and commits the
+importable ones in one transaction. Same parse/evaluate/commit shape as
+``import_csv`` / ``import_events``.
 
-Policy (confirmed): an **unmatched Net ID**, a **bad/missing year**, a bad month,
-or a **non-numeric / negative amount rejects that row**. Strict integrity — no
-placeholder alumni are created. This endpoint set is super_admin-only, so the
-preview may echo the amount back (the caller is authorized to see it).
+Donor matching (#148): donation records are keyed on **MSTID**, not Net ID. Each
+row is resolved to an active alumnus by:
+
+  * **MSTID** (primary) — trimmed, case-insensitive; then
+  * **last + first name** (fallback) — when the row has no MSTID or its MSTID
+    doesn't resolve.
+
+CSV columns: ``MSTID``, ``First name``, ``Last name``, ``Month``, ``Year``,
+``Amount``. A row must carry an MSTID *or* both names (something to match on).
+
+Policy (confirmed): a row is **rejected** on a bad/missing year, a bad month, a
+non-numeric / non-positive amount, nothing to match on, an **unmatched** donor,
+or an **ambiguous** match (an MSTID or name that resolves to more than one active
+alumnus — surfaced so a human disambiguates rather than mis-attributing a
+donation). Strict integrity — no placeholder alumni are created. This endpoint
+set is super_admin-only, so the preview may echo the amount back.
 """
 
 from __future__ import annotations
@@ -22,7 +33,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AuditLog
 from app.models.donation import Donation
-from app.repositories.net_id import match_net_ids, normalize_net_id
+from app.repositories.donor_match import (
+    match_mstids,
+    match_names,
+    normalize_mstid,
+    normalize_name_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -30,15 +46,24 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB
 MAX_IMPORT_ROWS = 5000
 _AMOUNT_MAX = Decimal("9999999999.99")  # numeric(12,2) ceiling
 
-COL_NET_ID = "Net ID"
-COL_NAME = "Name"
+COL_MSTID = "MSTID"
+COL_FIRST = "First name"
+COL_LAST = "Last name"
 COL_MONTH = "Month"
 COL_YEAR = "Year"
 COL_AMOUNT = "Amount"
-EXPECTED_HEADERS: list[str] = [COL_NET_ID, COL_NAME, COL_MONTH, COL_YEAR, COL_AMOUNT]
+EXPECTED_HEADERS: list[str] = [
+    COL_MSTID,
+    COL_FIRST,
+    COL_LAST,
+    COL_MONTH,
+    COL_YEAR,
+    COL_AMOUNT,
+]
 EXAMPLE_ROWS: list[list[str]] = [
-    ["jdoe", "Jane Doe", "4", "2026", "250.00"],
-    ["msmith", "Mark Smith", "11", "2025", "1000"],
+    ["100200300", "Jane", "Doe", "4", "2026", "250.00"],
+    # No MSTID -> matched on first + last name.
+    ["", "Mark", "Smith", "11", "2025", "1000"],
 ]
 
 
@@ -50,9 +75,10 @@ def parse_and_map(
 ) -> tuple[list[dict], list[str]]:
     """Parse the CSV into per-row dicts + header errors.
 
-    Each row: ``{"row": int, "net_id": str, "name": str, "month": int|None,
-    "year": int|None, "amount": Decimal|None, "error": str|None}``. ``error`` is
-    set for a bad month / year / amount, which rejects the row downstream."""
+    Each row: ``{"row": int, "mstid": str, "first_name": str, "last_name": str,
+    "month": int|None, "year": int|None, "amount": Decimal|None,
+    "error": str|None}``. ``error`` is set for a row with nothing to match on or
+    a bad month / year / amount, which rejects the row downstream."""
     try:
         text = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -124,8 +150,9 @@ def _parse_amount(raw: str) -> Decimal:
 
 
 def _map_row(row_num: int, index: dict[str, int], raw_row: list[str]) -> dict:
-    net_id = _cell(index, raw_row, COL_NET_ID)
-    name = _cell(index, raw_row, COL_NAME)
+    mstid = _cell(index, raw_row, COL_MSTID)
+    first_name = _cell(index, raw_row, COL_FIRST)
+    last_name = _cell(index, raw_row, COL_LAST)
     raw_month = _cell(index, raw_row, COL_MONTH)
     raw_year = _cell(index, raw_row, COL_YEAR)
     raw_amount = _cell(index, raw_row, COL_AMOUNT)
@@ -135,8 +162,12 @@ def _map_row(row_num: int, index: dict[str, int], raw_row: list[str]) -> dict:
     year: int | None = None
     amount: Decimal | None = None
 
-    if not net_id:
-        error = f"{COL_NET_ID}: required."
+    # A row needs SOMETHING to match a donor on: an MSTID, or both names.
+    if not mstid and not (first_name and last_name):
+        error = (
+            f"{COL_MSTID}: required, or provide both {COL_FIRST} and "
+            f"{COL_LAST} to match by name."
+        )
 
     if error is None:
         if not raw_year:
@@ -168,8 +199,9 @@ def _map_row(row_num: int, index: dict[str, int], raw_row: list[str]) -> dict:
 
     return {
         "row": row_num,
-        "net_id": net_id,
-        "name": name,
+        "mstid": mstid,
+        "first_name": first_name,
+        "last_name": last_name,
         "month": month,
         "year": year,
         "amount": amount,
@@ -180,11 +212,79 @@ def _map_row(row_num: int, index: dict[str, int], raw_row: list[str]) -> dict:
 # --- Stage 2: evaluate (dry-run) ---------------------------------------------
 
 
+def _display_name(row: dict) -> str:
+    """Best-effort donor name for a row from its first + last cells."""
+    name = " ".join(p for p in (row["first_name"], row["last_name"]) if p).strip()
+    return name or "(unnamed)"
+
+
+def _resolve(
+    row: dict,
+    by_mstid: dict[str, list[int]],
+    by_name: dict[tuple[str, str], list[int]],
+) -> tuple[int | None, str | None, dict | None]:
+    """Resolve one row to (alumni_id, match_method, blocker).
+
+    Tries MSTID first, then falls back to last+first name. Exactly one match ->
+    (id, method, None); zero -> unmatched blocker; more than one -> ambiguous
+    blocker (never auto-attributed)."""
+    mstid = normalize_mstid(row["mstid"])
+    if mstid:
+        ids = by_mstid.get(mstid, [])
+        if len(ids) == 1:
+            return ids[0], "mstid", None
+        if len(ids) > 1:
+            return None, None, {
+                "code": "ambiguous_mstid",
+                "message": (
+                    f"MSTID {row['mstid']!r} matches {len(ids)} active alumni — "
+                    "resolve the duplicate before importing."
+                ),
+            }
+        # MSTID present but unresolved: fall through to the name fallback.
+
+    key = normalize_name_key(row["last_name"], row["first_name"])
+    if key[0] and key[1]:
+        ids = by_name.get(key, [])
+        if len(ids) == 1:
+            return ids[0], "name", None
+        if len(ids) > 1:
+            return None, None, {
+                "code": "ambiguous_name",
+                "message": (
+                    f"{len(ids)} active alumni are named "
+                    f"{row['first_name']} {row['last_name']} — add the MSTID to "
+                    "pick the right one."
+                ),
+            }
+        return None, None, {
+            "code": "unmatched_donor",
+            "message": (
+                "No active alumnus matched "
+                + (f"MSTID {row['mstid']!r} or " if row["mstid"] else "")
+                + f"the name {row['first_name']} {row['last_name']}."
+            ),
+        }
+
+    # MSTID was given but didn't resolve, and there's no name to fall back on.
+    return None, None, {
+        "code": "unmatched_donor",
+        "message": (
+            f"MSTID {row['mstid']!r} did not match an active alumnus, and no "
+            "name was provided to fall back on."
+        ),
+    }
+
+
 async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
-    """Build the row-level dry-run report. Resolves every Net ID in one batch
-    query and rejects any row with a coercion error or an unmatched Net ID. Exact
-    repeats within the file (same net_id+month+year+amount) get a warning."""
-    matched = await match_net_ids(session, [r["net_id"] for r in rows if r["net_id"]])
+    """Build the row-level dry-run report. Resolves donors by MSTID then name in
+    two batch queries, rejecting any row with a coercion error, nothing to match
+    on, an unmatched donor, or an ambiguous (multi-alumnus) match. Exact repeats
+    within the file (same alumnus + month + year + amount) get a warning."""
+    by_mstid = await match_mstids(session, [r["mstid"] for r in rows if r["mstid"]])
+    by_name = await match_names(
+        session, [(r["last_name"], r["first_name"]) for r in rows]
+    )
 
     seen: dict[tuple, int] = {}
     out_rows: list[dict] = []
@@ -194,24 +294,16 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
         blockers: list[dict] = []
         warnings: list[dict] = []
         alumni_id: int | None = None
+        match_method: str | None = None
 
         if row["error"]:
             blockers.append({"code": "invalid_row", "message": row["error"]})
         else:
-            norm = normalize_net_id(row["net_id"])
-            alumni_id = matched.get(norm)
-            if alumni_id is None:
-                blockers.append(
-                    {
-                        "code": "unmatched_net_id",
-                        "message": (
-                            f"Net ID {row['net_id']!r} did not match an active "
-                            "alumnus."
-                        ),
-                    }
-                )
+            alumni_id, match_method, blocker = _resolve(row, by_mstid, by_name)
+            if blocker is not None:
+                blockers.append(blocker)
             else:
-                key = (norm, row["month"], row["year"], row["amount"])
+                key = (alumni_id, row["month"], row["year"], row["amount"])
                 if key in seen:
                     warnings.append(
                         {
@@ -234,8 +326,11 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
         out_rows.append(
             {
                 "row": row["row"],
-                "net_id": row["net_id"],
-                "name": row["name"],
+                "mstid": row["mstid"],
+                "name": _display_name(row),
+                # How the donor was resolved ("mstid" high-confidence, "name" a
+                # fallback worth a human glance); None when rejected.
+                "match_method": match_method if status == "importable" else None,
                 "month": row["month"],
                 "year": row["year"],
                 "amount": float(row["amount"]) if row["amount"] is not None else None,

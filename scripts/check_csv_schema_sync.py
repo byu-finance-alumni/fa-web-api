@@ -40,7 +40,6 @@ from app.models.contact import AlumniContactInfo
 from app.models.donation import Donation
 from app.models.employment import CurrentEmployment, EducationHistory
 from app.models.engagement import AlumniProgramEngagement
-from app.models.event import Event
 
 # Section keys used by the importers/exporter -> the model whose table columns
 # they must resolve against. ``import_csv`` uses "core"; ``alumni_export`` uses
@@ -129,11 +128,10 @@ def _check_events_import(errors: list[str]) -> None:
     from app.services import import_events as ie
 
     surface = "events import (import_events)"
-    # header -> (model, column), or None for a confirmation-only column that is
-    # never persisted (matched by Net ID, name is for the human reading the CSV).
+    # One CSV = one event's roster (#149): the event identity is entered in the
+    # wizard, so the CSV columns are just the attendee's Net ID (the match key)
+    # and Name (confirmation only, never persisted).
     bindings: dict[str, tuple[object, str] | None] = {
-        ie.COL_TITLE: (Event, "event_name"),
-        ie.COL_DATE: (Event, "event_date"),
         ie.COL_NET_ID: (Alumni, "net_id"),  # attendee match key
         ie.COL_NAME: None,  # confirmation only
     }
@@ -154,8 +152,9 @@ def _check_donations_import(errors: list[str]) -> None:
 
     surface = "donations import (import_donations)"
     bindings: dict[str, tuple[object, str] | None] = {
-        idn.COL_NET_ID: (Alumni, "net_id"),  # donor match key
-        idn.COL_NAME: None,  # confirmation only
+        idn.COL_MSTID: (Alumni, "mst_id"),  # primary donor match key
+        idn.COL_FIRST: (Alumni, "first_name"),  # name-fallback match key
+        idn.COL_LAST: (Alumni, "last_name"),  # name-fallback match key
         idn.COL_MONTH: (Donation, "donation_month"),
         idn.COL_YEAR: (Donation, "donation_year"),
         idn.COL_AMOUNT: (Donation, "amount"),

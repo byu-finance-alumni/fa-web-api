@@ -1,6 +1,8 @@
 """Event listing routes."""
 
+import csv
 import datetime
+import io
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
@@ -13,6 +15,7 @@ from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
+from app.models.contact import AlumniContactInfo
 from app.models.event import Event, EventAttendance
 from app.schemas.event import AttendeeCreate, EventCreate, EventUpdate
 from app.services import import_events
@@ -387,6 +390,68 @@ async def list_event_attendees(
         }
         for a, status in rows
     ]
+
+
+@router.get("/{event_id}/attendees/export")
+async def export_event_attendees(
+    event_id: int, user: RequireFullAccess, session: SessionDep
+) -> Response:
+    """Download an event's attendee list as CSV — columns **Name, Email, Net ID**
+    (#219). Gated at ``full_access`` (a rung above the view-only attendee list)
+    because bulk contact details — alumni PII — leave the system here, and audited
+    as a disclosure (action ``export_event_attendees``, row count only, never the
+    data itself). 404 if the event is unknown.
+
+    Email is the alumnus's personal email, falling back to the work email. Rows
+    are ordered by name, matching the on-screen roster."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    rows = (
+        await session.execute(
+            select(
+                Alumni,
+                AlumniContactInfo.personal_email,
+                AlumniContactInfo.work_email,
+            )
+            .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
+            .outerjoin(
+                AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id
+            )
+            .where(EventAttendance.event_id == event_id)
+            .order_by(Alumni.last_name, Alumni.first_name)
+        )
+    ).all()
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["Name", "Email", "Net ID"])
+    for alumni, personal_email, work_email in rows:
+        writer.writerow(
+            [
+                _attendee_name(alumni),
+                personal_email or work_email or "",
+                alumni.net_id or "",
+            ]
+        )
+
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="export_event_attendees",
+            entity_type="event",
+            entity_id=event_id,
+            new_value=f"rows={len(rows)}",
+        )
+    )
+    await session.commit()
+
+    filename = f"event_{event_id}_attendees.csv"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/{event_id}/attendees", status_code=status.HTTP_201_CREATED)

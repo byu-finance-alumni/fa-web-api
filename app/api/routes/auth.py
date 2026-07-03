@@ -161,6 +161,13 @@ async def record_login(
     )
     if db_user is not None:
         db_user.last_login_at = now
+        # Single active session (#147): claim THIS sign-in as the account's
+        # active session. A newer login overwrites it, so any earlier device's
+        # session no longer matches and is rejected (forced logout) on the data
+        # routes. Only claims when the token carried a session_id.
+        if user.session_id:
+            db_user.active_session_id = user.session_id
+            db_user.active_session_at = now
         session.add(
             LoginEvent(
                 user_id=db_user.user_id,
@@ -174,6 +181,32 @@ async def record_login(
         )
         await session.commit()
     return LoginRecordedResponse(last_login_at=now)
+
+
+class SessionActiveResponse(BaseModel):
+    """Whether the caller's session is still the account's single active one."""
+
+    active: bool
+
+
+@router.get("/session/active", response_model=SessionActiveResponse)
+async def session_active(
+    user: CurrentDBUserAllowMustChange,
+) -> SessionActiveResponse:
+    """Report whether THIS session is still the account's active session (#147).
+
+    Uses the force-change-EXEMPT resolver, which does NOT reject a superseded
+    session (unlike the data routes) — so a superseded device can still ask "am I
+    still signed in?" and get a clean ``{active: false}`` instead of a 401. The
+    frontend polls this and, on ``false``, signs the device out and explains why.
+
+    Fails OPEN (``active: true``) when the account has no claimed session yet
+    (``active_session_id`` NULL — e.g. a session predating this feature) or the
+    token carried no ``session_id``, so nobody is spuriously logged out."""
+    active_id = user.active_session_id
+    current_id = user.session_id
+    is_active = not (active_id and current_id and active_id != current_id)
+    return SessionActiveResponse(active=is_active)
 
 
 class PasswordCompleteResponse(BaseModel):

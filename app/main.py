@@ -45,6 +45,7 @@ from app.core.security import (
     AuthorizationError,
     DeactivatedAccountError,
     MustChangePasswordError,
+    SessionSupersededError,
 )
 from app.core.security_log import log_security_event
 
@@ -160,6 +161,26 @@ app.include_router(vocabulary.router)
 app.include_router(vocabulary.admin_router)
 app.include_router(support.router)
 app.include_router(support.admin_router)
+
+
+@app.exception_handler(SessionSupersededError)
+async def session_superseded_handler(
+    request: Request, exc: SessionSupersededError
+) -> JSONResponse:
+    """Return 401 / ``session_superseded`` for a session the account has replaced
+    by signing in on another device (#147).
+
+    Registered ahead of the generic AuthError handler so the subclass dispatches
+    here with its own machine code — the frontend detects it, signs the device
+    out, and tells the user why. Recorded as its own security event."""
+    log_security_event(
+        request, "session_superseded", status_code=401, detail=exc.message
+    )
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"error": {"code": "session_superseded", "message": exc.message}},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @app.exception_handler(AuthError)

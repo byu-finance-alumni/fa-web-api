@@ -61,6 +61,15 @@ class User(TimestampMixin, Base):
         DateTime(timezone=True)
     )
     locked_reason: Mapped[str | None] = mapped_column(Text)
+    # Single active session per account (#147): the Supabase session_id of the
+    # user's MOST RECENT sign-in, stamped by POST /auth/login. A newer login
+    # overwrites it, so an earlier device's session_id no longer matches and is
+    # rejected on every data route (forced logout). NULL until first sign-in
+    # after this shipped, so existing sessions aren't disturbed retroactively.
+    active_session_id: Mapped[str | None] = mapped_column(Text)
+    active_session_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     user_roles: Mapped[list[UserRole]] = relationship(
         back_populates="user", cascade="all, delete-orphan"

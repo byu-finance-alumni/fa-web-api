@@ -346,6 +346,7 @@ def _orm_user(*, must_change_password: bool, active: bool = True):
         last_name="Worker",
         active=active,
         must_change_password=must_change_password,
+        active_session_id=None,
         roles=[SimpleNamespace(role_name="view_only")],
     )
 

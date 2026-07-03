@@ -84,6 +84,28 @@ class MustChangePasswordError(AuthorizationError):
         super().__init__(message)
 
 
+class SessionSupersededError(AuthError):
+    """Raised when a valid token belongs to a session that has been SUPERSEDED —
+    the account signed in again on another device, so this (older) session is no
+    longer the account's single active session (#147).
+
+    A subclass of AuthError so it still maps to 401, but distinct so it surfaces
+    with the machine code ``session_superseded`` (the frontend signs the device
+    out and explains why) and is recorded as its own security event. Enforced on
+    the data routes (the source of truth); the claiming call itself
+    (POST /auth/login) uses the exempt resolver so a new sign-in is never blocked.
+    """
+
+    def __init__(
+        self,
+        message: str = (
+            "You were signed out because this account signed in on another "
+            "device."
+        ),
+    ) -> None:
+        super().__init__(message)
+
+
 @lru_cache
 def _jwk_client(jwks_url: str) -> PyJWKClient:
     return PyJWKClient(jwks_url)

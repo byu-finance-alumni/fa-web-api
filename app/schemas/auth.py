@@ -23,6 +23,10 @@ class AuthenticatedUser(BaseModel):
     auth_user_id: str
     email: str | None = None
     token_role: str | None = None
+    # Supabase session identifier (``session_id`` claim) — identifies THIS
+    # sign-in/device, so the single-active-session guard (#147) can tell one of
+    # the account's sessions from another. None if the token predates the claim.
+    session_id: str | None = None
 
 
 class UserContext(BaseModel):
@@ -48,6 +52,12 @@ class UserContext(BaseModel):
     # own (the frontend gates them into a set-password screen). Reflects the
     # CURRENT authenticated user's flag; cleared via POST /auth/password/complete.
     must_change_password: bool = False
+    # Single-active-session (#147). ``session_id`` is THIS request's token
+    # session (from the JWT); ``active_session_id`` is the account's current
+    # active session from the DB. When both are set and differ, this session has
+    # been superseded by a newer login. Populated by the auth resolver.
+    session_id: str | None = None
+    active_session_id: str | None = None
 
     @classmethod
     def from_orm_user(cls, user: User) -> UserContext:
@@ -59,6 +69,7 @@ class UserContext(BaseModel):
             last_name=user.last_name,
             roles=[role.role_name for role in user.roles],
             must_change_password=user.must_change_password,
+            active_session_id=user.active_session_id,
         )
 
     @property

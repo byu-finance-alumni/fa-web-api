@@ -258,7 +258,13 @@ def test_import_preview_forbidden_for_full_access(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     response = client.post(
         "/donations/import/preview",
-        files={"file": ("d.csv", b"Net ID,Name,Month,Year,Amount\n", "text/csv")},
+        files={
+            "file": (
+                "d.csv",
+                b"MSTID,First name,Last name,Month,Year,Amount\n",
+                "text/csv",
+            )
+        },
     )
     assert response.status_code == 403
 

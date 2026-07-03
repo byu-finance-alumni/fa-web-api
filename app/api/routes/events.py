@@ -5,7 +5,7 @@ import datetime
 import io
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -174,36 +174,65 @@ async def events_import_template(_: RequireFullAccess) -> Response:
     )
 
 
+# The event's identity is entered in the wizard and posted alongside the file as
+# multipart form fields (the CSV is only the attendee roster — #149).
+EventNameForm = Annotated[str, Form()]
+EventDateForm = Annotated[str | None, Form()]
+EventTypeForm = Annotated[str | None, Form()]
+EventLocationForm = Annotated[str | None, Form()]
+EventNotesForm = Annotated[str | None, Form()]
+
+
+def _headers_bad_preview(header_errors: list[str], meta: dict) -> dict:
+    return {
+        "columns_ok": False,
+        "header_errors": header_errors,
+        "event": {
+            "event_name": meta["event_name"],
+            "event_date": meta["event_date"],
+            "event_type": meta["event_type"],
+            "event_location": meta["event_location"],
+            "event_notes": meta["event_notes"],
+        },
+        "importable": False,
+        "event_errors": [],
+        "summary": {
+            "total_rows": 0,
+            "attendees_matched": 0,
+            "attendees_unmatched": 0,
+        },
+        "attendees": [],
+        "warnings": [],
+    }
+
+
 @router.post("/import/preview", response_model=None)
 async def preview_import_events(
     _: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
+    event_name: EventNameForm,
+    event_date: EventDateForm = None,
+    event_type: EventTypeForm = None,
+    event_location: EventLocationForm = None,
+    event_notes: EventNotesForm = None,
 ) -> dict | JSONResponse:
-    """Dry-run an events bulk CSV import (full_access, NO writes).
+    """Dry-run a single-event attendee CSV import (full_access, NO writes).
 
-    Groups attendee rows into events, resolves attendees by Net ID, and flags
-    unmatched Net IDs, bad dates, and duplicate events. A bad header set surfaces
-    as ``columns_ok: false`` with ``header_errors``."""
+    The event's identity (title/date/type/…) comes from the wizard as form
+    fields; the CSV is the attendee roster. Resolves attendees by Net ID and
+    flags unmatched/duplicate attendees, a bad date, and a pre-existing event. A
+    bad header set surfaces as ``columns_ok: false`` with ``header_errors``."""
+    meta = import_events.normalize_event_meta(
+        event_name, event_date, event_type, event_location, event_notes
+    )
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
     rows, header_errors = import_events.parse_and_map(file_bytes)
     if header_errors:
-        return {
-            "columns_ok": False,
-            "header_errors": header_errors,
-            "summary": {
-                "total_rows": 0,
-                "events": 0,
-                "importable_events": 0,
-                "rejected_events": 0,
-                "attendees_matched": 0,
-                "attendees_unmatched": 0,
-            },
-            "events": [],
-        }
-    return await import_events.evaluate(session, rows)
+        return _headers_bad_preview(header_errors, meta)
+    return await import_events.evaluate(session, rows, meta)
 
 
 @router.post("/import", response_model=None)
@@ -211,26 +240,35 @@ async def import_events_commit(
     user: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
+    event_name: EventNameForm,
+    event_date: EventDateForm = None,
+    event_type: EventTypeForm = None,
+    event_location: EventLocationForm = None,
+    event_notes: EventNotesForm = None,
 ) -> dict | JSONResponse:
-    """Commit an events bulk CSV import (full_access). Re-evaluates and inserts
-    every importable event + its matched attendees in one transaction (audit
-    logging fires per event and attendee); rejected events are skipped and
-    reported. A bad header set imports nothing."""
+    """Commit a single-event attendee CSV import (full_access). Re-evaluates and,
+    if the event identity is valid and new, inserts the event + its matched
+    attendees in one transaction (audit logging fires for the event and each
+    attendee); unmatched attendees are skipped and reported. A bad header set
+    imports nothing."""
+    meta = import_events.normalize_event_meta(
+        event_name, event_date, event_type, event_location, event_notes
+    )
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
     rows, header_errors = import_events.parse_and_map(file_bytes)
     if header_errors:
         return {
-            "imported_events": 0,
+            "imported": False,
+            "event_id": None,
             "imported_attendees": 0,
-            "skipped_events": 0,
-            "rejects": [
-                {"event": "(header)", "date": None, "reason": msg}
-                for msg in header_errors
-            ],
+            "unmatched": [],
+            "event_error": header_errors[0],
         }
-    return await import_events.commit_import(session, rows, actor_user_id=user.user_id)
+    return await import_events.commit_import(
+        session, rows, meta, actor_user_id=user.user_id
+    )
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

@@ -274,6 +274,22 @@ async def evaluate(session: AsyncSession, rows: list[dict], meta: dict) -> dict:
             }
         )
 
+    # A non-empty roster where NOTHING matched almost always means the wrong CSV
+    # was uploaded for this event — warn before it silently creates an empty
+    # event. Importable stays true (per policy) so the operator can proceed if
+    # it's genuinely intended.
+    if attendees and matched_count == 0:
+        warnings.append(
+            {
+                "code": "no_attendees_matched",
+                "message": (
+                    "None of the attendee Net IDs matched an active alumnus — "
+                    "the event would be created with no attendees. Check you "
+                    "uploaded the right CSV."
+                ),
+            }
+        )
+
     return {
         "columns_ok": True,
         "header_errors": [],

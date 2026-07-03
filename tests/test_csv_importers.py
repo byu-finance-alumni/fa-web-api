@@ -118,6 +118,17 @@ def test_events_evaluate_matches_attendees():
     assert report["attendees"][0]["alumni_id"] == 42
 
 
+def test_events_evaluate_warns_when_nothing_matched():
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "ghost,Nobody\n"))
+    meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
+    session = _EventEvalSession(matched_rows=[])  # no active match
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    # Importable stays true (policy) but the empty-roster footgun is warned.
+    assert report["importable"] is True
+    assert report["summary"]["attendees_matched"] == 0
+    assert any(w["code"] == "no_attendees_matched" for w in report["warnings"])
+
+
 def test_events_evaluate_rejects_bad_event_date():
     rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane Doe\n"))
     meta = import_events.normalize_event_meta("Banquet", "not-a-date")

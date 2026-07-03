@@ -33,6 +33,11 @@ _GENDER_MAX = 30
 _GRADUATE_DEGREE_MAX = 100
 _LINKEDIN_MAX = 500
 _NOTES_MAX = 10000
+# Secondary affiliation / education (#47). Short single-value fields mirror the
+# related-table varchar(255) convention; the narrative free-text fields share
+# the generous notes-style cap.
+_AFFILIATION_NAME_MAX = 255
+_AFFILIATION_TEXT_MAX = 10000
 
 # byu_id: no seed/mock data exists with a byu_id yet (checked database/ and
 # scripts/), so we enforce the canonical BYU NetID-card length of exactly 9
@@ -87,11 +92,23 @@ class AlumniBase(BaseModel):
     graduation_year: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    # Secondary affiliation / education (#47, PRD section 6). All optional.
+    mba_program: str | None = None
+    law_school: str | None = None
+    medical_school: str | None = None
+    graduate_school: str | None = None
+    startup_involvement: str | None = None
+    advisory_roles: str | None = None
+    secondary_employment: str | None = None
     spouse_first_name: str | None = None
     spouse_last_name: str | None = None
     spouse_birth_date: datetime.date | None = None
     spouse_alumni_id: int | None = None
     deceased: bool | None = None
+    # Friends of the finance program (#218). Omitted on existing alumni payloads
+    # -> stays None here and the DB ``server_default`` of true applies, so the
+    # record remains an alumnus. Send ``false`` to create/flag a "friend".
+    is_alumni: bool | None = None
     linkedin_url: str | None = None
     notes: str | None = None
 
@@ -242,6 +259,53 @@ class AlumniBase(BaseModel):
         if len(value) > _GRADUATE_DEGREE_MAX:
             raise ValueError(
                 f"Must be at most {_GRADUATE_DEGREE_MAX} characters."
+            )
+        return value
+
+    # --- Secondary affiliation / education (#47) -----------------------------
+
+    @field_validator(
+        "mba_program",
+        "law_school",
+        "medical_school",
+        "graduate_school",
+        mode="before",
+    )
+    @classmethod
+    def _validate_affiliation_name(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if _has_control_chars(value):
+            raise ValueError("Must not contain control characters.")
+        if len(value) > _AFFILIATION_NAME_MAX:
+            raise ValueError(
+                f"Must be at most {_AFFILIATION_NAME_MAX} characters."
+            )
+        return value
+
+    @field_validator(
+        "startup_involvement",
+        "advisory_roles",
+        "secondary_employment",
+        mode="before",
+    )
+    @classmethod
+    def _validate_affiliation_text(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if len(value) > _AFFILIATION_TEXT_MAX:
+            raise ValueError(
+                f"Must be at most {_AFFILIATION_TEXT_MAX} characters."
             )
         return value
 
@@ -452,11 +516,19 @@ class AlumniRead(BaseModel):
     graduation_year: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    mba_program: str | None = None
+    law_school: str | None = None
+    medical_school: str | None = None
+    graduate_school: str | None = None
+    startup_involvement: str | None = None
+    advisory_roles: str | None = None
+    secondary_employment: str | None = None
     spouse_first_name: str | None = None
     spouse_last_name: str | None = None
     spouse_birth_date: datetime.date | None = None
     spouse_alumni_id: int | None = None
     deceased: bool
+    is_alumni: bool = True
     linkedin_url: str | None = None
     notes: str | None = None
     archived: bool
@@ -468,11 +540,15 @@ class AlumniRead(BaseModel):
 
 class AlumniListItem(AlumniRead):
     """List-row variant: adds the alumnus's current employer + industry (joined
-    from ``current_employment``) for the alumni table. Single-record reads use
-    plain ``AlumniRead``, which omits these."""
+    from ``current_employment``) and current city + state (from
+    ``alumni_contact_info`` — the SAME source the geography map shades by, so the
+    list and the map agree on a record's location) for the alumni table.
+    Single-record reads use plain ``AlumniRead``, which omits these."""
 
     current_employer: str | None = None
     current_industry: str | None = None
+    current_city: str | None = None
+    current_state: str | None = None
 
 
 class AlumniPage(BaseModel):

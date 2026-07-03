@@ -10,7 +10,7 @@ deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
 """
 
 import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
@@ -23,6 +23,11 @@ from app.api.dependencies.auth import (
 )
 from app.core.database import get_session
 from app.core.errors import NotFoundError
+from app.core.rate_limit import (
+    EmploymentWriteRateLimit,
+    InteractionWriteRateLimit,
+    TaskWriteRateLimit,
+)
 from app.core.security import AuthorizationError
 from app.repositories.alumni import SURVEY_CADENCE
 from app.schemas.alumni import (
@@ -211,6 +216,17 @@ async def list_alumni(
         Query(description="Only alumni flagged as duplicate candidates."),
     ] = False,
     include_archived: bool = False,
+    kind: Annotated[
+        Literal["alumni", "friend", "all"],
+        Query(
+            description=(
+                "Which records to return (#218): 'alumni' (default) — only "
+                "graduates (is_alumni=true); 'friend' — only friends of the "
+                "program (is_alumni=false); 'all' — both. Defaults to 'alumni' so "
+                "the Alumni page is unchanged."
+            )
+        ),
+    ] = "alumni",
     sort: Annotated[
         str,
         Query(description="Sort order: name | grad_desc | grad_asc."),
@@ -233,6 +249,9 @@ async def list_alumni(
                 "The 'needs surveying' view is restricted to admin users."
             )
         survey_due_before = datetime.datetime.now(datetime.UTC) - SURVEY_CADENCE
+    # Map the friends/alumni split (#218) to the repository's tri-state filter:
+    # alumni-only (True), friends-only (False), or both (None).
+    is_alumni_filter = {"alumni": True, "friend": False, "all": None}[kind]
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -274,6 +293,7 @@ async def list_alumni(
         missing_email=missing_email,
         missing_employer=missing_employer,
         duplicate=duplicate,
+        is_alumni=is_alumni_filter,
         include_archived=effective_include_archived,
         sort=sort,
     )
@@ -311,6 +331,9 @@ async def list_alumni(
             "cpa": cpa or None,
             "spoke_after": spoke_after.isoformat() if spoke_after else None,
             "spoke_before": spoke_before.isoformat() if spoke_before else None,
+            # Only record the friends/alumni split when it deviates from the
+            # default alumni-only view (keeps the audit summary terse).
+            "kind": kind if kind != "alumni" else None,
             "limit": limit,
             "offset": offset,
             "sort": sort,
@@ -547,7 +570,7 @@ async def export_alumni_profile(
 async def add_interaction(
     alumni_id: int,
     payload: InteractionCreate,
-    user: RequireViewAccess,
+    user: InteractionWriteRateLimit,
     session: SessionDep,
 ) -> InteractionRead:
     """Log an interaction on an alumni's timeline.
@@ -569,7 +592,7 @@ async def update_interaction(
     alumni_id: int,
     interaction_id: int,
     payload: InteractionUpdate,
-    user: RequireViewAccess,
+    user: InteractionWriteRateLimit,
     session: SessionDep,
 ) -> InteractionRead:
     """Edit an interaction on an alumni's timeline. 404 if the row is missing or
@@ -595,7 +618,7 @@ async def update_interaction(
 async def delete_interaction(
     alumni_id: int,
     interaction_id: int,
-    user: RequireViewAccess,
+    user: InteractionWriteRateLimit,
     session: SessionDep,
 ) -> None:
     """Delete an interaction from an alumni's timeline. 404 if the row is missing
@@ -622,7 +645,7 @@ async def delete_interaction(
 async def add_task(
     alumni_id: int,
     payload: TaskCreate,
-    user: RequireAlumniEdit,
+    user: TaskWriteRateLimit,
     session: SessionDep,
 ) -> TaskRead:
     """Create a follow-up task for an alumni (full_access)."""
@@ -634,7 +657,7 @@ async def update_task_completion(
     alumni_id: int,
     task_id: int,
     payload: TaskCompleteUpdate,
-    user: RequireAlumniEdit,
+    user: TaskWriteRateLimit,
     session: SessionDep,
 ) -> TaskRead:
     """Toggle a follow-up task's completion state (full_access)."""
@@ -651,7 +674,7 @@ async def update_task_completion(
 async def add_employment(
     alumni_id: int,
     payload: EmploymentHistoryCreate,
-    user: RequireAlumniEdit,
+    user: EmploymentWriteRateLimit,
     session: SessionDep,
 ) -> EmploymentHistoryRead:
     """Add a prior role to an alumni's employment history (full_access)."""
@@ -668,7 +691,7 @@ async def update_employment(
     alumni_id: int,
     employment_history_id: int,
     payload: EmploymentHistoryUpdate,
-    user: RequireAlumniEdit,
+    user: EmploymentWriteRateLimit,
     session: SessionDep,
 ) -> EmploymentHistoryRead:
     """Edit a prior role on an alumni's employment history (full_access). 404 if
@@ -689,7 +712,7 @@ async def update_employment(
 async def delete_employment(
     alumni_id: int,
     employment_history_id: int,
-    user: RequireAlumniEdit,
+    user: EmploymentWriteRateLimit,
     session: SessionDep,
 ) -> None:
     """Delete a prior role from an alumni's employment history (full_access). 404

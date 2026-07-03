@@ -217,6 +217,7 @@ class _FakeSession:
         for attr, default in (
             ("alumni_id", 100),
             ("deceased", False),
+            ("is_alumni", True),
             ("archived", False),
             ("created_at", now),
             ("updated_at", now),
@@ -234,6 +235,7 @@ def _alum(**kw):
         byu_id=None,
         net_id=None,
         archived=False,
+        is_alumni=True,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -334,6 +336,43 @@ def test_fuzzy_duplicate_only_warns_create_succeeds():
     assert created.json()["first_name"] == "Jane"
 
 
+def test_create_persists_and_returns_secondary_affiliation():
+    # #47: POST /alumni with the new secondary-affiliation fields persists them
+    # and the AlumniRead response echoes them back. No exact-dup scalars needed
+    # (no byu_id / net_id provided).
+    session = _FakeSession(scalars=[])
+    with _full_access_client(session) as c:
+        resp = c.post(
+            "/alumni",
+            json={
+                "last_name": "Doe",
+                "mba_program": "BYU Marriott MBA",
+                "law_school": "Harvard Law",
+                "medical_school": "Johns Hopkins",
+                "graduate_school": "MIT",
+                "startup_involvement": "Co-founded Acme",
+                "advisory_roles": "Board advisor at Foo Inc.",
+                "secondary_employment": "Adjunct professor",
+            },
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 201
+    body = resp.json()
+    # The written ORM row carries the values...
+    written = session.added[0]
+    assert written.mba_program == "BYU Marriott MBA"
+    assert written.secondary_employment == "Adjunct professor"
+    # ...and the AlumniRead response surfaces every new field (same shape the
+    # GET /{id}/profile read returns, which serializes via AlumniRead too).
+    assert body["mba_program"] == "BYU Marriott MBA"
+    assert body["law_school"] == "Harvard Law"
+    assert body["medical_school"] == "Johns Hopkins"
+    assert body["graduate_school"] == "MIT"
+    assert body["startup_involvement"] == "Co-founded Acme"
+    assert body["advisory_roles"] == "Board advisor at Foo Inc."
+    assert body["secondary_employment"] == "Adjunct professor"
+
+
 def test_update_preview_excludes_self_from_dup_detection():
     # Updating alum 5's byu_id to a value: the only DB row with that id is alum
     # 5 itself, which the query excludes -> no blocker. get_alumni returns the
@@ -356,3 +395,41 @@ def test_update_preview_excludes_self_from_dup_detection():
     assert resp.status_code == 200
     assert resp.json()["blockers"] == []
     assert resp.json()["cleaned"]["byu_id"] == "123456789"
+
+
+# --- L3: boolean query params accept standard truthy values -------------------
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "True", "TRUE", "yes", "on"])
+def test_list_boolean_filter_accepts_truthy_values(monkeypatch, truthy):
+    """``?missing_email=true`` (and other truthy spellings) must filter exactly
+    like ``=1`` — the API coerces standard boolean strings, not just ``1``."""
+    captured: dict = {}
+
+    async def _fake_list(session, *, limit, offset, **filters):
+        captured.update(filters)
+        return [], 0
+
+    async def _fake_log(session, *, actor_user_id, filters):
+        return None
+
+    from app.api.routes import alumni as alumni_routes
+
+    monkeypatch.setattr(alumni_routes.service, "list_alumni", _fake_list)
+    monkeypatch.setattr(alumni_routes.service, "log_search", _fake_log)
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _no_db_session
+    try:
+        resp = client_get_list(truthy)
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    # Every truthy spelling resolves to the same True the repo would get from "1".
+    assert captured["missing_email"] is True
+    assert captured["cfa"] is True
+
+
+def client_get_list(value: str):
+    with TestClient(app) as c:
+        return c.get(f"/alumni?missing_email={value}&cfa={value}")

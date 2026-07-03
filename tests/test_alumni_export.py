@@ -124,6 +124,7 @@ def _alum(**kw):
         graduation_year=2018,
         linkedin_url=None,
         deceased=False,
+        is_alumni=True,
         notes=None,
         birth_date=None,
     )

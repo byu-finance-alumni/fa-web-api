@@ -235,6 +235,22 @@ def test_create_event_rejects_blank_name(client):
     assert response.status_code == 422
 
 
+def test_create_event_rejects_missing_date(client):
+    # M4: event_date is required — a dateless event is a 422, not a defaulted row.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post("/events", json={"event_name": "Mixer"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_update_event_rejects_clearing_date(client):
+    # M4: an explicit null must not wipe the (now required) event date.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.patch("/events/1", json={"event_date": None})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
 class _CreateSession:
     """Captures added rows and assigns a PK on flush, mirroring a real insert."""
 

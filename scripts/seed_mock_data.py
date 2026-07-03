@@ -27,6 +27,7 @@ from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Attachment, FollowUpTask, Interaction, Survey
 from app.models.data_source import DataSource
+from app.models.donation import Donation
 from app.models.employment import (
     CurrentEmployment,
     EducationHistory,
@@ -81,6 +82,14 @@ MOCK_ALUMNI: list[dict] = [
     {"byu_id": "001000014", "net_id": "iclark14", "first_name": "Isabella", "last_name": "Clark", "gender": "F", "birth_date": datetime.date(1992, 7, 3), "graduation_year": 2014, "finance_program_year": 2013, "archived": True, "notes": "[MOCK] Archived — for soft-delete testing."},
     {"byu_id": "001000015", "net_id": "alewis15", "first_name": "Andrew", "last_name": "Lewis", "gender": "M", "birth_date": datetime.date(1988, 1, 22), "graduation_year": 2011, "finance_program_year": 2010, "graduate_degree": "MAcc"},
     {"byu_id": "001000016", "net_id": "shall16", "first_name": "Sophia", "last_name": "Hall", "gender": "F", "birth_date": datetime.date(1998, 5, 16), "graduation_year": 2020, "finance_program_year": 2019, "notes": "[MOCK] Equity research."},
+    # International alumni (#238) — located OUTSIDE the US so the world-map view
+    # has content. No US state; country is a clean ISO English name so it joins
+    # the frontend's country -> centroid lookup.
+    {"byu_id": "001000017", "net_id": "obennett17", "first_name": "Oliver", "last_name": "Bennett", "gender": "M", "birth_date": datetime.date(1990, 6, 4), "graduation_year": 2012, "finance_program_year": 2011, "notes": "[MOCK] London — international."},
+    {"byu_id": "001000018", "net_id": "ytanaka18", "first_name": "Yuki", "last_name": "Tanaka", "gender": "F", "birth_date": datetime.date(1994, 2, 27), "graduation_year": 2016, "finance_program_year": 2015, "notes": "[MOCK] Tokyo — international."},
+    {"byu_id": "001000019", "net_id": "rsouza19", "first_name": "Rafael", "last_name": "Souza", "gender": "M", "birth_date": datetime.date(1992, 9, 18), "graduation_year": 2014, "finance_program_year": 2013, "notes": "[MOCK] Sao Paulo — international."},
+    {"byu_id": "001000020", "net_id": "asingh20", "first_name": "Aria", "last_name": "Singh", "gender": "F", "birth_date": datetime.date(1997, 12, 9), "graduation_year": 2019, "finance_program_year": 2018, "notes": "[MOCK] Toronto — international."},
+    {"byu_id": "001000021", "net_id": "wlim21", "first_name": "Wei", "last_name": "Lim", "gender": "M", "birth_date": datetime.date(1995, 4, 21), "graduation_year": 2017, "finance_program_year": 2016, "notes": "[MOCK] Singapore — international."},
 ]
 
 # Reciprocal spouse links between alumni records (net_id -> spouse net_id).
@@ -148,6 +157,11 @@ MOCK_DETAIL: dict[str, dict] = {
             "piff_donor": True,
             "engagement_notes": "Hosts NetTrek in NYC; active IB-track mentor.",
         },
+        "donations": [
+            {"amount": 1000, "donation_year": 2024, "donation_month": 12, "notes": "[MOCK] Year-end gift"},
+            {"amount": 500, "donation_year": 2023, "donation_month": 6, "notes": "[MOCK] Spring campaign"},
+            {"amount": 500, "donation_year": 2021, "donation_month": 11, "notes": "[MOCK] Pay It Forward"},
+        ],
         "engagement_notes": [
             {"engagement_interest_type": "Mentorship", "engagement_notes": "Willing to mentor students pursuing investment banking."},
         ],
@@ -179,6 +193,10 @@ MOCK_DETAIL: dict[str, dict] = {
         "contact": {"personal_email": "ava.lee@example.com", "phone": "+1 (415) 555-0199", "city": "San Francisco", "state": "CA", "country": "USA", "region": "West"},
         "career": {"current_employer": "Bain Capital", "current_title": "Associate", "current_industry": "Private Equity", "current_city": "San Francisco", "current_state": "CA", "seniority_level": "Associate"},
         "program": {"piff_donor": True, "mentor_willing": True},
+        "donations": [
+            {"amount": 250, "donation_year": 2025, "donation_month": 3, "notes": "[MOCK] Pay It Forward"},
+            {"amount": 250, "donation_year": 2022, "donation_month": 9, "notes": "[MOCK] Pay It Forward"},
+        ],
         "tags": ["Highly Engaged", "Donor"],
         "interactions": [
             {"interaction_type": "Event Follow-Up", "days_ago": 30, "interaction_notes": "Followed up after Women in Finance mixer."},
@@ -246,7 +264,312 @@ MOCK_DETAIL: dict[str, dict] = {
     },
     "nwright11": {"status_labels": ["Deceased"]},
     "iclark14": {"status_labels": ["Lost Contact"]},
+    # International alumni (#238): city + clean country name, no US state/region,
+    # so they surface on the world-map view but not the US state/county maps.
+    "obennett17": {
+        "contact": {"personal_email": "oliver.bennett@example.com", "city": "London", "country": "United Kingdom"},
+        "career": {"current_employer": "Barclays", "current_title": "Vice President", "current_industry": "Investment Banking", "current_city": "London", "current_country": "United Kingdom", "seniority_level": "Vice President"},
+    },
+    "ytanaka18": {
+        "contact": {"personal_email": "yuki.tanaka@example.com", "city": "Tokyo", "country": "Japan"},
+        "career": {"current_employer": "Nomura", "current_title": "Associate", "current_industry": "Asset Management", "current_city": "Tokyo", "current_country": "Japan", "seniority_level": "Associate"},
+    },
+    "rsouza19": {
+        "contact": {"personal_email": "rafael.souza@example.com", "city": "Sao Paulo", "country": "Brazil"},
+        "career": {"current_employer": "Itau BBA", "current_title": "Senior Analyst", "current_industry": "Investment Banking", "current_city": "Sao Paulo", "current_country": "Brazil", "seniority_level": "Senior Analyst"},
+    },
+    "asingh20": {
+        "contact": {"personal_email": "aria.singh@example.com", "city": "Toronto", "country": "Canada"},
+        "career": {"current_employer": "RBC Capital Markets", "current_title": "Analyst", "current_industry": "Investment Banking", "current_city": "Toronto", "current_country": "Canada", "seniority_level": "Analyst"},
+    },
+    "wlim21": {
+        "contact": {"personal_email": "wei.lim@example.com", "city": "Singapore", "country": "Singapore"},
+        "career": {"current_employer": "DBS Bank", "current_title": "Manager", "current_industry": "Wealth Management", "current_city": "Singapore", "current_country": "Singapore", "seniority_level": "Manager"},
+    },
 }
+
+
+# --- Bulk generation (#152) --------------------------------------------------
+#
+# The 16 hand-crafted records above mirror the Figma demo. To make the alumni
+# list, geography map shading, and profiles look truly populated, we ALSO
+# generate a large batch of unique, complete synthetic records. Generation is
+# deterministic (seeded RNG) so re-running produces the SAME 250 rows — combined
+# with seed_mock()'s remove-then-insert, the result is fully idempotent.
+#
+# Every generated row is COMPLETE: name + unique byu_id/net_id/mst_id, gender,
+# plausible birthday, grad year, a contact row (city/state/region for the map),
+# a current-employment row (employer/title/industry/city/state), one education
+# row, and most carry a tag or two. A realistic minority are deceased/archived
+# or marked as a "friend" (is_alumni=false) so the new friends split has data.
+# Everything is tagged via the same MOCK_DATA source, so --remove wipes it all.
+
+GENERATED_COUNT = 250
+
+_FIRST_NAMES_M = [
+    "Liam", "Noah", "Oliver", "Elijah", "William", "Henry", "Lucas", "Mason",
+    "Logan", "Jackson", "Aiden", "Carter", "Jack", "Owen", "Wyatt", "Caleb",
+    "Hunter", "Connor", "Spencer", "Tyler", "Bryson", "Porter", "Easton",
+    "Tanner", "Cole", "Brigham", "Parker", "Dallin", "Kyle", "Trevor",
+]
+_FIRST_NAMES_F = [
+    "Olivia", "Emma", "Charlotte", "Amelia", "Sophia", "Isabella", "Mia",
+    "Evelyn", "Harper", "Abigail", "Emily", "Ella", "Scarlett", "Grace",
+    "Chloe", "Lily", "Aria", "Brooke", "Hailey", "Paige", "Sydney", "McKenna",
+    "Brynn", "Whitney", "Kennedy", "Savannah", "Taylor", "Morgan", "Reagan",
+    "Eliza",
+]
+_LAST_NAMES = [
+    "Anderson", "Bennett", "Brooks", "Bryant", "Caldwell", "Carlson", "Coleman",
+    "Crawford", "Davies", "Erickson", "Fletcher", "Foster", "Gallagher",
+    "Hansen", "Hawkins", "Higgins", "Holloway", "Ingram", "Jennings", "Knight",
+    "Larsen", "Lawson", "Maxwell", "Mercer", "Nielsen", "Osborne", "Pearson",
+    "Quincy", "Ramsey", "Reeves", "Sanders", "Schwartz", "Sullivan", "Tucker",
+    "Underwood", "Vaughn", "Wallace", "Whitaker", "Young", "Zimmerman",
+    "Abbott", "Barrett", "Castillo", "Donovan", "Everett", "Franklin",
+    "Griffith", "Holt", "Jacobsen", "Kendrick",
+]
+_BIRTH_NAMES = [
+    "Stevenson", "Marsh", "Pope", "Wren", "Holland", "Frost", "Barker",
+    "Dalton", "Mead", "Crane",
+]
+
+# (city, state, region) tuples. Utah-heavy (BYU hub) plus the major financial
+# centers, so the geography map has a realistic, well-shaded distribution.
+_LOCATIONS = [
+    ("Provo", "UT", "Mountain West"),
+    ("Salt Lake City", "UT", "Mountain West"),
+    ("Lehi", "UT", "Mountain West"),
+    ("Orem", "UT", "Mountain West"),
+    ("Draper", "UT", "Mountain West"),
+    ("American Fork", "UT", "Mountain West"),
+    ("New York", "NY", "Northeast"),
+    ("Boston", "MA", "Northeast"),
+    ("Stamford", "CT", "Northeast"),
+    ("Chicago", "IL", "Midwest"),
+    ("Dallas", "TX", "South"),
+    ("Austin", "TX", "South"),
+    ("Houston", "TX", "South"),
+    ("Atlanta", "GA", "South"),
+    ("Charlotte", "NC", "South"),
+    ("San Francisco", "CA", "West"),
+    ("San Jose", "CA", "West"),
+    ("Los Angeles", "CA", "West"),
+    ("Seattle", "WA", "West"),
+    ("Denver", "CO", "Mountain West"),
+    ("Phoenix", "AZ", "West"),
+    ("Las Vegas", "NV", "West"),
+    ("Washington", "DC", "Northeast"),
+    ("Miami", "FL", "South"),
+]
+
+# (employer, industry-from-canonical-INDUSTRIES). Industries here are the
+# canonical vocabulary used by the filters so the advanced-search facets and the
+# real records line up.
+_EMPLOYERS = [
+    ("Goldman Sachs", "Investment Banking"),
+    ("J.P. Morgan", "Investment Banking"),
+    ("Morgan Stanley", "Investment Banking"),
+    ("Bank of America", "Commercial Banking"),
+    ("Wells Fargo", "Commercial Banking"),
+    ("Citi", "Commercial Banking"),
+    ("Bain Capital", "Private Equity"),
+    ("KKR", "Private Equity"),
+    ("Blackstone", "Private Equity"),
+    ("BlackRock", "Asset Management"),
+    ("Fidelity", "Asset Management"),
+    ("Vanguard", "Asset Management"),
+    ("Northern Trust", "Asset Management"),
+    ("PIMCO", "Asset Management"),
+    ("Charles Schwab", "Wealth Management"),
+    ("Edward Jones", "Wealth Management"),
+    ("UBS", "Wealth Management"),
+    ("McKinsey & Company", "Consulting"),
+    ("Bain & Company", "Consulting"),
+    ("Deloitte", "Consulting"),
+    ("KPMG", "Valuation & Advisory"),
+    ("EY", "Valuation & Advisory"),
+    ("Qualtrics", "Corporate Finance"),
+    ("Adobe", "Corporate Finance"),
+    ("Microsoft", "Corporate Finance"),
+    ("Sequoia Capital", "Venture Capital"),
+    ("Andreessen Horowitz", "Venture Capital"),
+    ("CBRE", "Real Estate"),
+    ("Jefferies", "Equity Research"),
+    ("Ares Management", "Private Credit"),
+]
+
+_TITLES_BY_SENIORITY = [
+    ("Analyst", "Analyst"),
+    ("Senior Analyst", "Senior Analyst"),
+    ("Associate", "Associate"),
+    ("Senior Associate", "Senior Associate"),
+    ("Manager", "Manager"),
+    ("Vice President", "Vice President"),
+    ("Director", "Director"),
+    ("Principal", "Principal"),
+    ("Partner", "Partner"),
+]
+
+_UNIVERSITIES = [
+    ("Brigham Young University", "Marriott School of Business", "Finance"),
+]
+_DEGREES = ["BS", "BA"]
+_MAJORS = ["Finance", "Accounting", "Economics", "Entrepreneurship"]
+_GRADUATE_DEGREES = [None, None, None, "MBA", "MAcc"]
+_GENDERS = ["M", "F"]
+
+
+def _generate_records(start_index: int) -> tuple[list[dict], dict[str, dict]]:
+    """Build GENERATED_COUNT unique alumni dicts + their MOCK_DETAIL entries.
+
+    ``start_index`` offsets the byu_id / net_id sequence so generated rows never
+    collide with the hand-crafted block. Deterministic: a fixed RNG seed makes
+    re-runs produce identical data (idempotent with seed_mock's wipe+insert).
+    """
+    import random
+
+    rng = random.Random(20260630)
+    rows: list[dict] = []
+    detail: dict[str, dict] = {}
+
+    for i in range(GENERATED_COUNT):
+        n = start_index + i  # global sequence number, unique across the batch
+        gender = _GENDERS[i % 2]
+        first = rng.choice(_FIRST_NAMES_M if gender == "M" else _FIRST_NAMES_F)
+        last = _LAST_NAMES[n % len(_LAST_NAMES)]
+        # net_id: lowercase letters + the sequence number -> globally unique and
+        # matches the ^[a-z0-9]{2,12}$ shape. byu_id: 9 digits, unique. mst_id:
+        # a distinct MST-prefixed token.
+        net_id = f"mk{n:05d}"
+        byu_id = f"{100000000 + n:09d}"
+        mst_id = f"MST-{n:06d}"
+
+        grad_year = 2005 + (n % 20)  # 2005..2024
+        finance_year = grad_year - 1
+        # Birthday ~22 years before graduation, jittered so dates vary.
+        birth_year = grad_year - 22 - (i % 3)
+        birth_month = (i % 12) + 1
+        birth_day = (i % 27) + 1
+        birth_date = datetime.date(birth_year, birth_month, birth_day)
+
+        city, state, region = rng.choice(_LOCATIONS)
+        employer, industry = rng.choice(_EMPLOYERS)
+        title, seniority = rng.choice(_TITLES_BY_SENIORITY)
+        degree = rng.choice(_DEGREES)
+        major = rng.choice(_MAJORS)
+        grad_degree = rng.choice(_GRADUATE_DEGREES)
+        university, college, department = _UNIVERSITIES[0]
+
+        # A small, realistic minority of special-case rows.
+        deceased = i % 50 == 7        # ~2% deceased
+        archived = i % 40 == 13       # ~2.5% archived (soft-deleted)
+        is_alumni = not (i % 12 == 5)  # ~8% are "friends" (non-alumni contacts)
+
+        row: dict = {
+            "byu_id": byu_id,
+            "mst_id": mst_id,
+            "net_id": net_id,
+            "first_name": first,
+            "last_name": last,
+            "gender": gender,
+            "birth_date": birth_date,
+            "graduation_year": grad_year,
+            "finance_program_year": finance_year,
+            "is_alumni": is_alumni,
+            "linkedin_url": f"https://www.linkedin.com/in/mock-{net_id}",
+            "notes": "[MOCK] Generated alumni record.",
+        }
+        if grad_degree:
+            row["graduate_degree"] = grad_degree
+        # Some women carry a maiden / birth name (exercises #216 search).
+        if gender == "F" and i % 5 == 0:
+            row["birth_name"] = rng.choice(_BIRTH_NAMES)
+        # ~30% preferred name.
+        if i % 10 < 3:
+            row["preferred_first_name"] = first
+        # A subset married to a free-text (non-alumni) spouse.
+        if i % 4 == 0:
+            sp_gender_pool = _FIRST_NAMES_F if gender == "M" else _FIRST_NAMES_M
+            row["spouse_first_name"] = rng.choice(sp_gender_pool)
+            row["spouse_last_name"] = last
+            row["spouse_birth_date"] = datetime.date(
+                birth_year + (i % 3) - 1, ((i + 4) % 12) + 1, ((i + 7) % 27) + 1
+            )
+        if deceased:
+            row["deceased"] = True
+        if archived:
+            row["archived"] = True
+
+        rows.append(row)
+
+        # Matching COMPLETE detail so the list/map/profile render populated.
+        d: dict = {
+            "contact": {
+                "personal_email": f"{net_id}@example.com",
+                "phone": f"+1 (801) 555-{(1000 + n) % 10000:04d}",
+                "city": city,
+                "state": state,
+                "country": "USA",
+                "region": region,
+            },
+            "career": {
+                "current_employer": employer,
+                "current_title": title,
+                "current_industry": industry,
+                "current_city": city,
+                "current_state": state,
+                "current_country": "USA",
+                "seniority_level": seniority,
+            },
+            "education": [
+                {
+                    "university": university,
+                    "college": college,
+                    "department": department,
+                    "degree": degree,
+                    "major": major,
+                    "degree_status": "Completed",
+                    "degree_year": grad_year,
+                }
+            ],
+        }
+        # Roughly half carry one or two engagement tags so the chips/filters have
+        # variety without every row looking identical.
+        tag_pool = MOCK_TAGS
+        picks = []
+        if i % 2 == 0:
+            picks.append(tag_pool[i % len(tag_pool)])
+        if i % 6 == 0:
+            picks.append(tag_pool[(i + 2) % len(tag_pool)])
+        if picks:
+            d["tags"] = list(dict.fromkeys(picks))  # de-dupe, keep order
+        # A donor/mentor engagement profile for a subset (drives those filters).
+        if i % 7 == 0:
+            d["program"] = {"piff_donor": True, "mentor_willing": True}
+            # Pay It Forward gifts so the ledger + per-year rollups have data.
+            # Whole-dollar amounts (> 0 per the check constraint); 1-4 gifts
+            # across 2018-2024. Cascades on alumni delete, so no separate tag.
+            n_gifts = 1 + (i % 4)
+            d["donations"] = [
+                {
+                    "amount": 50 + ((i * 37 + g * 113) % 80) * 25,
+                    "donation_year": 2018 + ((i + g * 2) % 7),
+                    "donation_month": 1 + ((i + g) % 12),
+                    "notes": "[MOCK] Pay It Forward gift",
+                }
+                for g in range(n_gifts)
+            ]
+        elif i % 7 == 3:
+            d["program"] = {"mentor_willing": True}
+        # Status labels for the deceased / archived special cases.
+        if deceased:
+            d["status_labels"] = ["Deceased"]
+        elif archived:
+            d["status_labels"] = ["Inactive"]
+        detail[net_id] = d
+
+    return rows, detail
 
 
 async def _get_source(session) -> DataSource | None:
@@ -271,15 +594,24 @@ async def _get_or_create_lookup(session, model, name_attr: str, names: list[str]
     return {name: getattr(row, name_attr.replace("_name", "_id")) for name, row in existing.items()}
 
 
-async def _seed_details(session, alumni_by_net_id: dict[str, int], actor_user_id: int | None) -> None:
-    """Insert the rich per-alumni related rows defined in MOCK_DETAIL."""
+async def _seed_details(
+    session,
+    alumni_by_net_id: dict[str, int],
+    actor_user_id: int | None,
+    detail_map: dict[str, dict] | None = None,
+) -> None:
+    """Insert the rich per-alumni related rows for ``detail_map`` (the
+    hand-crafted MOCK_DETAIL by default, or the combined hand-crafted + generated
+    map passed by seed_mock)."""
+    if detail_map is None:
+        detail_map = MOCK_DETAIL
     tag_ids = await _get_or_create_lookup(session, Tag, "tag_name", MOCK_TAGS)
     status_ids = await _get_or_create_lookup(
         session, StatusLabel, "status_label_name", MOCK_STATUS_LABELS
     )
     now = datetime.datetime.now(datetime.UTC)
 
-    for net_id, detail in MOCK_DETAIL.items():
+    for net_id, detail in detail_map.items():
         aid = alumni_by_net_id.get(net_id)
         if aid is None:
             continue
@@ -295,6 +627,10 @@ async def _seed_details(session, alumni_by_net_id: dict[str, int], actor_user_id
             session.add(FinanceSocietyLeadership(alumni_id=aid, **le))
         if program := detail.get("program"):
             session.add(AlumniProgramEngagement(alumni_id=aid, **program))
+        for dn in detail.get("donations", []):
+            session.add(
+                Donation(alumni_id=aid, logged_by_user_id=actor_user_id, **dn)
+            )
         for en in detail.get("engagement_notes", []):
             session.add(AlumniEngagement(alumni_id=aid, **en))
         for tag_name in detail.get("tags", []):
@@ -357,13 +693,22 @@ async def seed_mock(session) -> int:
     )
     session.add(source)
     await session.flush()  # assign source_id
-    alumni = [Alumni(source_id=source.source_id, **row) for row in MOCK_ALUMNI]
+
+    # Combine the 16 hand-crafted demo records with the 250 generated ones. The
+    # generated batch starts at sequence 1000 so its byu_id / net_id / mst_id can
+    # never collide with the hand-crafted block (001000001..001000016). Both
+    # share the MOCK_DATA source, so --remove wipes everything.
+    generated_rows, generated_detail = _generate_records(start_index=1000)
+    all_rows = MOCK_ALUMNI + generated_rows
+    combined_detail = {**MOCK_DETAIL, **generated_detail}
+
+    alumni = [Alumni(source_id=source.source_id, **row) for row in all_rows]
     session.add_all(alumni)
     await session.flush()  # assign alumni_ids
     alumni_ids = [a.alumni_id for a in alumni]
     alumni_by_net_id = {
         row["net_id"]: a.alumni_id
-        for row, a in zip(MOCK_ALUMNI, alumni, strict=True)
+        for row, a in zip(all_rows, alumni, strict=True)
         if row.get("net_id")
     }
 
@@ -371,10 +716,10 @@ async def seed_mock(session) -> int:
     # name + birthday from the partner's row so the linked records stay in sync.
     alumni_obj_by_net_id = {
         row["net_id"]: a
-        for row, a in zip(MOCK_ALUMNI, alumni, strict=True)
+        for row, a in zip(all_rows, alumni, strict=True)
         if row.get("net_id")
     }
-    row_by_net_id = {r["net_id"]: r for r in MOCK_ALUMNI if r.get("net_id")}
+    row_by_net_id = {r["net_id"]: r for r in all_rows if r.get("net_id")}
     for net_id, spouse_net_id in MOCK_SPOUSE_LINKS.items():
         a = alumni_obj_by_net_id.get(net_id)
         spouse_obj = alumni_obj_by_net_id.get(spouse_net_id)
@@ -393,11 +738,12 @@ async def seed_mock(session) -> int:
     actor_user_id = await session.scalar(
         select(User.user_id).order_by(User.user_id).limit(1)
     )
-    await _seed_details(session, alumni_by_net_id, actor_user_id)
+    await _seed_details(session, alumni_by_net_id, actor_user_id, combined_detail)
 
     # Guarantee every alumnus has a current employer + industry and a LinkedIn
     # so the alumni list never renders blank cells. Fallbacks are deterministic
-    # (indexed) and use the canonical industry vocabulary.
+    # (indexed) and use the canonical industry vocabulary. (Generated rows always
+    # carry a career section, so this only backfills the hand-crafted block.)
     fallback_careers = [
         ("Deloitte", "Consulting"),
         ("Wells Fargo", "Commercial Banking"),
@@ -405,9 +751,9 @@ async def seed_mock(session) -> int:
         ("KPMG", "Valuation & Advisory"),
         ("PIMCO", "Asset Management"),
     ]
-    for idx, (row, a) in enumerate(zip(MOCK_ALUMNI, alumni, strict=True)):
+    for idx, (row, a) in enumerate(zip(all_rows, alumni, strict=True)):
         nid = row.get("net_id")
-        if not MOCK_DETAIL.get(nid or "", {}).get("career"):
+        if not combined_detail.get(nid or "", {}).get("career"):
             employer, industry = fallback_careers[idx % len(fallback_careers)]
             session.add(
                 CurrentEmployment(
@@ -436,7 +782,9 @@ async def seed_mock(session) -> int:
     # explicit additions below can't violate the (event, alumni) unique key).
     attendance: set[tuple[int, int]] = set()
     for i, e in enumerate(events):
-        for aid in alumni_ids[i : i + 4]:
+        # Pull a spread of attendees from across the (now large) population so
+        # each event has a realistic, non-trivial guest list.
+        for aid in alumni_ids[i :: max(1, len(alumni_ids) // 25)][:25]:
             attendance.add((e.event_id, aid))
     # Ensure the demo-rich profile (James Doe) attends three recent events so the
     # profile's Recent events panel is well populated.
@@ -451,7 +799,7 @@ async def seed_mock(session) -> int:
             )
         )
     await session.commit()
-    return len(MOCK_ALUMNI)
+    return len(all_rows)
 
 
 async def main(remove: bool) -> None:

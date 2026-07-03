@@ -18,6 +18,8 @@ from app.schemas.auth import UserContext
 from app.schemas.geography import (
     Breakdown,
     CityDetail,
+    CountryCount,
+    CountryDetail,
     CountyCount,
     GeoAlumniPage,
     GeoSummary,
@@ -104,6 +106,49 @@ async def counties(
 
     Aggregate counts only (no PII), so view-accessible like ``/states``."""
     return await svc.get_counties(session, filters)
+
+
+@router.get("/countries", response_model=list[CountryCount])
+async def countries(
+    _: RequireViewAccess, session: SessionDep, filters: FiltersDep
+) -> list[CountryCount]:
+    """Per-country alumni counts (international) for the world-map view.
+
+    Aggregate counts only (no PII), so view-accessible like ``/states``."""
+    return await svc.get_countries(session, filters)
+
+
+@router.get("/countries/{country}", response_model=CountryDetail)
+async def country_detail(
+    country: str, _: RequireViewAccess, session: SessionDep, filters: FiltersDep
+) -> CountryDetail:
+    """Country drill-down: count + top employers / industries + grad-year
+    histogram (aggregate only, so view-accessible like ``/states/{state}``)."""
+    return await svc.get_country_detail(session, country, filters)
+
+
+@router.get("/countries/{country}/alumni", response_model=GeoAlumniPage)
+async def country_alumni(
+    country: str,
+    actor: RequireFullAccess,
+    session: SessionDep,
+    filters: FiltersDep,
+    sort: Annotated[str, Query(pattern="^(name|year|city)$")] = "name",
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> GeoAlumniPage:
+    """Paginated, sortable alumni list for one country (world-view drill-down).
+
+    FERPA: this lists the individual alumni behind a country count, so it is
+    gated to full_access (view_only gets 403) and the disclosure is audited; the
+    aggregate country count/detail stay view-accessible."""
+    result = await svc.get_country_alumni(
+        session, country, filters, limit=limit, offset=offset, sort=sort
+    )
+    await _audit_view(
+        session, actor, entity_type="geography:country_alumni", field_name=country
+    )
+    return result
 
 
 @router.get("/breakdown", response_model=Breakdown)

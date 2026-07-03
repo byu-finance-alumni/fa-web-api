@@ -26,7 +26,7 @@ from app.core.errors import NotFoundError
 from app.main import app
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
-from app.models.crm import Interaction
+from app.models.crm import Attachment, Interaction
 from app.models.user import User
 from app.schemas.alumni import (
     VIEW_ONLY_HIDDEN_FIELDS,
@@ -64,6 +64,7 @@ def _alumni_model(**kw) -> Alumni:
         spouse_last_name="Doe",
         spouse_birth_date=datetime.date(1989, 1, 1),
         deceased=False,
+        is_alumni=True,
         notes="private note",
         archived=False,
         manually_edited_at=now,
@@ -377,3 +378,112 @@ def test_export_forbidden_for_student(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
     resp = client.get("/alumni/1/export")
     assert resp.status_code == 403
+
+
+# --- #112b: AuditEntryRead / AttachmentRead hide internal user PKs ------------
+#
+# Both schemas now resolve the internal user PK to a display name and DROP the
+# raw integer PK from the response (matching InteractionRead/TaskRead).
+
+
+class _ProfileAuditAttachmentFakeSession(_ProfileFakeSession):
+    """Returns one audit row and one attachment for the aggregate, plus the
+    uploader user so ``uploaded_by`` name-building (a single batched lookup) is
+    covered."""
+
+    def __init__(self, alumnus, audit_row, attachment, uploader):
+        super().__init__(alumnus)
+        self._audit_row = audit_row
+        self._attachment = attachment
+        self._uploader = uploader
+
+    async def get(self, model, pk):
+        if model is User and pk == self._uploader.user_id:
+            return self._uploader
+        return await super().get(model, pk)
+
+    async def scalars(self, stmt):
+        entity = stmt.column_descriptions[0]["entity"]
+        if entity is Attachment:
+            return _Scalars([self._attachment])
+        if entity is AuditLog:
+            return _Scalars([self._audit_row])
+        if entity is User:
+            return _Scalars([self._uploader])
+        return _Scalars([])
+
+
+def _uploader_user():
+    return SimpleNamespace(
+        user_id=55, first_name="Dana", last_name="Lee", email="dana@byu.edu"
+    )
+
+
+def _attachment():
+    return SimpleNamespace(
+        attachment_id=3,
+        file_name="resume.pdf",
+        file_type="application/pdf",
+        attachment_notes=None,
+        uploaded_at=datetime.datetime(2026, 6, 2, tzinfo=datetime.UTC),
+        uploaded_by_user_id=55,
+    )
+
+
+def _audit_row_with_snapshot():
+    # actor_name/actor_email are snapshotted at insert by a DB trigger and
+    # survive the actor's deletion, so AuditEntryRead resolves performed_by from
+    # them without a join.
+    return SimpleNamespace(
+        audit_log_id=7,
+        action_type="update_interaction",
+        field_name="interaction_notes",
+        old_value="old",
+        new_value="new",
+        created_at=datetime.datetime(2026, 6, 3, tzinfo=datetime.UTC),
+        user_id=99,
+        actor_name="Sam Smith",
+        actor_email="sam@byu.edu",
+    )
+
+
+def _audit_attachment_profile():
+    session = _ProfileAuditAttachmentFakeSession(
+        _alumni_model(),
+        _audit_row_with_snapshot(),
+        _attachment(),
+        _uploader_user(),
+    )
+    return asyncio.run(
+        profile_service.get_profile(session, 1, can_edit=True, actor_user_id=7)
+    )
+
+
+def test_audit_entry_resolves_performed_by_from_snapshot():
+    profile = _audit_attachment_profile()
+    assert len(profile.audit) == 1
+    entry = profile.audit[0]
+    # Display name resolved from the actor_name snapshot.
+    assert entry.performed_by == "Sam Smith"
+    # The raw internal user PK is gone from the schema entirely.
+    assert not hasattr(entry, "user_id")
+    assert "user_id" not in entry.model_dump()
+
+
+def test_attachment_resolves_uploaded_by_name():
+    profile = _audit_attachment_profile()
+    assert len(profile.attachments) == 1
+    att = profile.attachments[0]
+    assert att.uploaded_by == "Dana Lee"
+    # The raw uploader PK is gone from the schema entirely.
+    assert not hasattr(att, "uploaded_by_user_id")
+    assert "uploaded_by_user_id" not in att.model_dump()
+
+
+def test_audit_attachment_pks_absent_from_serialized_profile():
+    profile = _audit_attachment_profile()
+    dumped = profile.model_dump(mode="json")
+    assert "user_id" not in dumped["audit"][0]
+    assert dumped["audit"][0]["performed_by"] == "Sam Smith"
+    assert "uploaded_by_user_id" not in dumped["attachments"][0]
+    assert dumped["attachments"][0]["uploaded_by"] == "Dana Lee"

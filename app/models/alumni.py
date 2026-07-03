@@ -56,6 +56,18 @@ class Alumni(TimestampMixin, Base):
     finance_program_year: Mapped[int | None] = mapped_column(Integer)
     graduate_degree: Mapped[str | None] = mapped_column(String(100))
 
+    # Secondary affiliation / education (#47, PRD section 6). All optional/
+    # nullable additive fields that extend the alumni record beyond the core
+    # program/employment fields. Short single-value fields are varchar; the
+    # narrative ones (free-text descriptions of involvement / roles) are text.
+    mba_program: Mapped[str | None] = mapped_column(String(255))
+    law_school: Mapped[str | None] = mapped_column(String(255))
+    medical_school: Mapped[str | None] = mapped_column(String(255))
+    graduate_school: Mapped[str | None] = mapped_column(String(255))
+    startup_involvement: Mapped[str | None] = mapped_column(Text)
+    advisory_roles: Mapped[str | None] = mapped_column(Text)
+    secondary_employment: Mapped[str | None] = mapped_column(Text)
+
     # Spouse. Free-text name + birthday; spouse_alumni_id links to another
     # alumni record when the spouse is also an alumnus (self-referential FK,
     # ON DELETE SET NULL so deleting the spouse just clears the pointer).
@@ -69,6 +81,15 @@ class Alumni(TimestampMixin, Base):
     deceased: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+
+    # Friends of the finance program (#218). ``is_alumni = false`` marks a
+    # non-alumnus contact ("friend") stored in this same table so they reuse all
+    # detail tables, search, and map shading. Defaults to true so every existing
+    # row and any payload that omits the flag stays an alumnus.
+    is_alumni: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+
     linkedin_url: Mapped[str | None] = mapped_column(String(500))
     notes: Mapped[str | None] = mapped_column(Text)
 

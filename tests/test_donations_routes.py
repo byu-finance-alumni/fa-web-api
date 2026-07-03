@@ -355,3 +355,93 @@ def test_alumni_donations_shows_amounts_for_full_access(client):
     assert body["lifetime_total"] == 250.0
     assert body["donations"][0]["amount"] == 250.0
     assert body["donations"][0]["notes"] == "memo"
+
+
+# --- H3: amount / year server-side validation ---------------------------------
+
+
+def test_add_donation_rejects_huge_amount(client):
+    # An absurd amount above the numeric(12,2) ceiling is a 422.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    response = client.post(
+        "/donations/alumni/42",
+        json={"amount": "99999999999999.99", "year": 2026},
+    )
+    assert response.status_code == 422
+
+
+def test_add_donation_rejects_year_9999(client):
+    # An out-of-range far-future year is a 422 (upper bound is current_year + 1).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "100", "year": 9999}
+    )
+    assert response.status_code == 422
+
+
+def test_add_donation_rejects_year_too_old(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "100", "year": 1800}
+    )
+    assert response.status_code == 422
+
+
+def test_update_donation_rejects_year_9999(client):
+    from types import SimpleNamespace
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
+    donation = SimpleNamespace(
+        donation_id=5, alumni_id=42, amount=100, donation_year=2026,
+        donation_month=4, notes=None,
+    )
+    app.dependency_overrides[get_session] = _with_session(
+        _SeqSession(get_obj=donation)
+    )
+    response = client.patch("/donations/5", json={"year": 9999})
+    assert response.status_code == 422
+
+
+# --- H4: donation delete (full_access and up, audited, 204) --------------------
+
+
+@pytest.mark.parametrize("role", ["view_only", "student"])
+def test_delete_donation_forbidden_below_full_access(client, role):
+    # DELETE is gated to the full_access admin tier — view_only / student are 403.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    response = client.delete("/donations/5")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_delete_donation_requires_auth(client):
+    assert client.delete("/donations/5").status_code == 401
+
+
+def test_delete_donation_missing_is_404(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _SeqSession(get_obj=None)
+    )
+    response = client.delete("/donations/999")
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("role", ["full_access", "super_admin"])
+def test_delete_donation_succeeds_and_audits(client, role):
+    # full_access (and up) may delete; the row is removed, an audit entry is
+    # written (FERPA trail), and the response is a bare 204.
+    donation = _donation(5, 2026, 4, 250, notes="memo")
+    session = _SeqSession(get_obj=donation)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.delete("/donations/5")
+    assert response.status_code == 204
+    assert response.content == b""
+    assert session.committed is True
+    assert session.deleted == [donation]
+    audits = [o for o in session.added if hasattr(o, "action_type")]
+    assert len(audits) == 1
+    assert audits[0].entity_type == "donation"
+    assert audits[0].action_type == "delete"
+    assert audits[0].user_id == 1

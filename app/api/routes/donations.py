@@ -7,7 +7,10 @@ before serialization for a caller without the ``alumni.full`` capability, so a
 non-privileged client never receives a value (not merely a hidden one). Donation
 notes are gated alongside amounts (free text may reference figures).
 
-Writes (add / edit / delete / bulk import) are ``super_admin``-only.
+Writes are admin-tier: add / edit / bulk import are ``super_admin``-only;
+DELETE is gated to ``full_access`` and up (the destructive-data-management tier,
+matching event delete / alumni archive — broadened from super_admin in QA
+hardening, H4).
 
 Responses are assembled as plain dicts (no ``response_model``) so the amount
 fields can be conditionally nulled per-caller — the same convention the events
@@ -24,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     PermissionConfig,
+    RequireFullAccess,
     RequireSuperAdmin,
     RequireViewAccess,
 )
@@ -332,14 +336,20 @@ async def update_donation(
     return _serialize_donation(donation)
 
 
-@router.delete("/{donation_id}")
+@router.delete("/{donation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_donation(
     donation_id: int,
-    user: RequireSuperAdmin,
+    user: RequireFullAccess,
     session: SessionDep,
-) -> dict:
-    """Delete a donation (super_admin). 404 if unknown. Audits the write
-    (entity_type "donation", action "delete")."""
+) -> Response:
+    """Delete a donation (full_access and up). 404 if unknown. Audits the write
+    (entity_type "donation", action "delete") with the actor's user id — the
+    DB trigger snapshots the actor email for the FERPA trail. Returns 204.
+
+    Gated to the ``alumni.full`` admin tier (full_access / super_admin /
+    engineer), matching the other destructive data-management writes (event
+    delete, alumni archive). Broadened from the original super_admin-only gate
+    during QA hardening (H4)."""
     donation = await session.get(Donation, donation_id)
     if donation is None:
         raise NotFoundError(f"Donation {donation_id} not found.")
@@ -355,7 +365,7 @@ async def delete_donation(
         )
     )
     await session.commit()
-    return {"donation_id": donation_id, "deleted": True}
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- Bulk CSV import (super_admin) -------------------------------------------

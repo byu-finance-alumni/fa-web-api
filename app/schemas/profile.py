@@ -202,13 +202,38 @@ class EventAttendanceCreate(BaseModel):
         return stripped or None
 
 
+def _reject_future_datetime(
+    value: datetime.datetime | None,
+) -> datetime.datetime | None:
+    """Reject an interaction timestamp later than 'now' (H2).
+
+    An interaction records something that has ALREADY happened, so a future
+    date/time is invalid. Comparison is timezone-aware: a naive input is treated
+    as UTC (matching how the service stamps timestamps) so a client in any zone
+    is compared consistently against the server clock. A small skew tolerance
+    absorbs client/server clock drift so a legitimately-"now" entry isn't
+    rejected over a few seconds.
+    """
+    if value is None:
+        return None
+    now = datetime.datetime.now(datetime.UTC)
+    compare = value if value.tzinfo is not None else value.replace(tzinfo=datetime.UTC)
+    if compare > now + datetime.timedelta(minutes=5):
+        raise ValueError("interaction_date_time cannot be in the future.")
+    return value
+
+
 class InteractionCreate(BaseModel):
-    """Log an interaction against an alumni (Interactions tab)."""
+    """Log an interaction against an alumni (Interactions tab).
+
+    ``interaction_type`` and ``interaction_date_time`` are both REQUIRED (H1) —
+    an empty payload is a 422, never a silently-defaulted record. The date/time
+    must not be in the future (H2)."""
 
     model_config = ConfigDict(extra="forbid")
 
     interaction_type: str = Field(min_length=1, max_length=100)
-    interaction_date_time: datetime.datetime | None = None
+    interaction_date_time: datetime.datetime
     interaction_notes: str | None = None
 
     @field_validator("interaction_type", mode="before")
@@ -221,6 +246,13 @@ class InteractionCreate(BaseModel):
                 raise ValueError("Interaction type cannot be blank.")
             return stripped
         return value
+
+    @field_validator("interaction_date_time")
+    @classmethod
+    def _not_future(
+        cls, value: datetime.datetime
+    ) -> datetime.datetime:
+        return _reject_future_datetime(value)
 
     @field_validator("interaction_notes", mode="before")
     @classmethod
@@ -249,6 +281,15 @@ class InteractionUpdate(BaseModel):
         if value is None or (isinstance(value, str) and not value.strip()):
             raise ValueError("Interaction type cannot be blank.")
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("interaction_date_time")
+    @classmethod
+    def _not_future(
+        cls, value: datetime.datetime | None
+    ) -> datetime.datetime | None:
+        # An explicit null is a legitimate "clear the date" request (FA-6); only
+        # a provided timestamp is checked, and it must not be in the future (H2).
+        return _reject_future_datetime(value)
 
     @field_validator("interaction_notes", mode="before")
     @classmethod
@@ -425,7 +466,10 @@ class AttachmentRead(_Orm):
     file_type: str | None = None
     attachment_notes: str | None = None
     uploaded_at: datetime.datetime
-    uploaded_by_user_id: int | None = None
+    # Internal uploader PK is never disclosed; only the resolved display name
+    # ``uploaded_by`` leaves the API (FERPA — minimize internal identifiers),
+    # matching how ``InteractionRead``/``TaskRead`` hide their user PKs.
+    uploaded_by: str | None = None
 
 
 class EventAttendedRead(_Orm):
@@ -444,7 +488,10 @@ class AuditEntryRead(_Orm):
     old_value: str | None = None
     new_value: str | None = None
     created_at: datetime.datetime
-    user_id: int | None = None
+    # Internal actor PK is never disclosed; only the resolved display name
+    # ``performed_by`` leaves the API (FERPA — minimize internal identifiers),
+    # matching how ``InteractionRead``/``TaskRead`` hide their user PKs.
+    performed_by: str | None = None
 
 
 class ProfileRead(BaseModel):

@@ -56,14 +56,32 @@ def normalize_state(value: str | None) -> str | None:
 _STATE = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
 _ALUMNI = func.count(func.distinct(Alumni.alumni_id))
 
+# Normalized country expression (upper-cased, trimmed) for the world map's
+# per-country grouping, plus the set of values that all mean "United States" —
+# the world view plots INTERNATIONAL alumni only, so the US is excluded (the US
+# view already covers domestic alumni by state/county).
+_COUNTRY = func.upper(func.trim(cast(AlumniContactInfo.country, String)))
+_USA_ALIASES = {
+    "USA", "US", "U.S.", "U.S.A.", "UNITED STATES",
+    "UNITED STATES OF AMERICA", "AMERICA",
+}
 
-def _filter_conditions(filters: dict) -> list:
-    """Shared WHERE conditions for every geography query."""
+
+def _filter_conditions(filters: dict, *, require_state: bool = True) -> list:
+    """Shared WHERE conditions for every geography query.
+
+    ``require_state`` gates to alumni with a non-empty US state — every
+    US-centric query (states/counties/radius/city) needs it. The world/country
+    aggregation (``get_countries``) opts out with ``require_state=False`` because
+    international alumni have no US state."""
     conds = [
         Alumni.archived.is_(False),
-        AlumniContactInfo.state.is_not(None),
-        func.trim(cast(AlumniContactInfo.state, String)) != "",
+        # Alumni-only map: exclude friends of the program (#218 follow-up).
+        Alumni.is_alumni.is_(True),
     ]
+    if require_state:
+        conds.append(AlumniContactInfo.state.is_not(None))
+        conds.append(func.trim(cast(AlumniContactInfo.state, String)) != "")
     if filters.get("employer"):
         conds.append(CurrentEmployment.current_employer == filters["employer"])
     if filters.get("industry"):
@@ -171,9 +189,108 @@ async def get_counties(session: AsyncSession, filters: dict) -> list[dict]:
     return [{"county_fips": fips, "count": int(c)} for fips, c in rows]
 
 
-async def _top(session, filters, column, label, *, extra=None, limit=10):
-    """Generic top-N GROUP BY over the filtered, located alumni set."""
-    conds = list(_filter_conditions(filters))
+async def get_countries(session: AsyncSession, filters: dict) -> list[dict]:
+    """Per-country alumni counts for the world map (INTERNATIONAL alumni only).
+
+    Groups by ``country`` with ``COUNT(DISTINCT alumni_id)`` and excludes the
+    United States (every alias) — the world view plots alumni located OUTSIDE
+    the US, while the US view already covers domestic alumni by state/county.
+    Unlike the US-centric queries this does NOT require a US state (international
+    alumni have none), so it opts out via ``require_state=False``. The same
+    employer/industry/year/region/tag filters apply uniformly."""
+    country = func.trim(cast(AlumniContactInfo.country, String))
+    rows = (
+        await session.execute(
+            _base()
+            .with_only_columns(country.label("country"), _ALUMNI.label("count"))
+            .where(
+                *_filter_conditions(filters, require_state=False),
+                AlumniContactInfo.country.is_not(None),
+                country != "",
+                _COUNTRY.notin_(_USA_ALIASES),
+            )
+            .group_by(country)
+            .order_by(desc("count"))
+        )
+    ).all()
+    # Fold any case/spacing variants of the same country together, keeping the
+    # first-seen (highest-count) display spelling.
+    out: dict[str, dict] = {}
+    for raw, count in rows:
+        display = (raw or "").strip()
+        if not display:
+            continue
+        key = display.upper()
+        if key in out:
+            out[key]["alumni_count"] += int(count)
+        else:
+            out[key] = {"country": display, "alumni_count": int(count)}
+    return sorted(
+        out.values(), key=lambda r: r["alumni_count"], reverse=True
+    )
+
+
+async def get_country_detail(session, country: str, filters: dict) -> dict:
+    """Aggregate drill-down for one country: count + top employers / industries +
+    grad-year histogram (mirrors ``get_state_detail`` minus cities, since
+    international city data isn't populated). Aggregate only (no PII), so
+    view-accessible like ``get_states``."""
+    key = (country or "").strip().upper()
+    empty = {
+        "country": (country or "").strip(),
+        "alumni_count": 0,
+        "employers": [],
+        "industries": [],
+        "by_graduation_year": [],
+    }
+    # The world view is international; never resolve the US through here.
+    if not key or key in _USA_ALIASES:
+        return empty
+    country_match = _COUNTRY == key
+    base_conds = _filter_conditions(filters, require_state=False)
+    total = await session.scalar(
+        _base().with_only_columns(_ALUMNI).where(*base_conds, country_match)
+    )
+    employers = await _top(
+        session, filters, CurrentEmployment.current_employer, "employer",
+        extra=country_match, require_state=False,
+    )
+    industries = await _top(
+        session, filters, CurrentEmployment.current_industry, "industry",
+        extra=country_match, require_state=False,
+    )
+    year_rows = (
+        await session.execute(
+            _base()
+            .with_only_columns(
+                Alumni.graduation_year.label("year"), _ALUMNI.label("count")
+            )
+            .where(
+                *base_conds, country_match, Alumni.graduation_year.is_not(None)
+            )
+            .group_by(Alumni.graduation_year)
+            .order_by(Alumni.graduation_year)
+        )
+    ).all()
+    return {
+        "country": (country or "").strip(),
+        "alumni_count": int(total or 0),
+        "employers": employers,
+        "industries": industries,
+        "by_graduation_year": [
+            {"year": y, "count": int(c)} for y, c in year_rows
+        ],
+    }
+
+
+async def _top(
+    session, filters, column, label, *, extra=None, limit=10, require_state=True
+):
+    """Generic top-N GROUP BY over the filtered, located alumni set.
+
+    ``require_state`` mirrors ``_filter_conditions`` — the country drill-down
+    passes ``False`` so international alumni (no US state) are counted."""
+    conds = list(_filter_conditions(filters, require_state=require_state))
     if extra is not None:
         conds.append(extra)
     rows = (
@@ -260,6 +377,65 @@ async def get_state_alumni(
     if code is None:
         return {"items": [], "total": 0, "limit": limit, "offset": offset}
     conds = [*_filter_conditions(filters), _STATE == code]
+    total = await session.scalar(
+        _base().with_only_columns(_ALUMNI).where(*conds)
+    )
+    order = _SORTS.get(sort, _SORTS["name"])
+    rows = (
+        await session.execute(
+            select(
+                Alumni,
+                AlumniContactInfo.city,
+                CurrentEmployment.current_employer,
+                CurrentEmployment.current_title,
+            )
+            .select_from(Alumni)
+            .join(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+            )
+            .outerjoin(
+                CurrentEmployment,
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+            )
+            .where(*conds)
+            .order_by(*order)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return {
+        "items": [
+            {
+                "alumni_id": a.alumni_id,
+                "name": _full_name(a),
+                "city": city,
+                "graduation_year": a.graduation_year,
+                "current_employer": employer,
+                "current_title": title,
+            }
+            for a, city, employer, title in rows
+        ],
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+async def get_country_alumni(
+    session, country: str, filters: dict, *, limit: int, offset: int, sort: str
+) -> dict:
+    """Paginated, sortable alumni list for one country (world-view drill-down).
+
+    Mirrors ``get_state_alumni`` but matches on country with
+    ``require_state=False`` (international alumni have no US state). The world
+    view is international, so a US alias yields an empty page. FERPA: lists the
+    individual alumni behind a country count, so the route gates this to
+    full_access and audits the disclosure."""
+    key = (country or "").strip().upper()
+    if not key or key in _USA_ALIASES:
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
+    conds = [*_filter_conditions(filters, require_state=False), _COUNTRY == key]
     total = await session.scalar(
         _base().with_only_columns(_ALUMNI).where(*conds)
     )
@@ -501,7 +677,11 @@ async def _distinct(session, column, *, limit: int = _OPTIONS_CAP) -> list:
                 CurrentEmployment,
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
             )
-            .where(Alumni.archived.is_(False), column.is_not(None))
+            .where(
+                Alumni.archived.is_(False),
+                Alumni.is_alumni.is_(True),
+                column.is_not(None),
+            )
             .distinct()
             .order_by(column)
             .limit(limit)

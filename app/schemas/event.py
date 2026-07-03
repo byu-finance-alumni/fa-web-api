@@ -45,14 +45,19 @@ class AttendeeCreate(BaseModel):
 class EventCreate(BaseModel):
     """Client-editable fields for creating an event. ``extra='forbid'`` rejects
     unknown keys; ``event_name`` is required, non-empty, and at most 255 chars.
-    ``event_type``/``event_location`` are capped at 255 chars and ``event_notes``
-    at 10000 chars."""
+    ``event_date`` is REQUIRED (M4) — a missing date is a 422, never a dateless
+    event. ``event_type``/``event_location`` are capped at 255 chars and
+    ``event_notes`` at 10000 chars.
+
+    Note: ``event_type`` stays OPTIONAL — it's free text with no enforced
+    controlled vocabulary at the schema layer, and bulk-imported events may
+    legitimately have no type; requiring it would reject valid data."""
 
     model_config = ConfigDict(extra="forbid")
 
     event_name: str
     event_type: str | None = None
-    event_date: datetime.date | None = None
+    event_date: datetime.date
     event_location: str | None = None
     event_notes: str | None = None
 
@@ -113,6 +118,16 @@ class EventUpdate(BaseModel):
         if value is None:
             return None
         return EventCreate._name_non_empty.__func__(cls, value)  # type: ignore[attr-defined]
+
+    @field_validator("event_date")
+    @classmethod
+    def _date_not_cleared(cls, value: datetime.date | None) -> datetime.date | None:
+        # event_date is required on create (M4). On a partial update, omitting it
+        # is fine, but an explicit ``null`` is a real attempt to clear a required
+        # field — reject it (422) rather than wiping the date.
+        if value is None:
+            raise ValueError("event_date cannot be cleared.")
+        return value
 
     # Reuse EventCreate's free-text validators so the rules stay in one place.
     _validate_type_location = field_validator("event_type", "event_location")(

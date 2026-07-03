@@ -242,7 +242,10 @@ def test_attendee_export_returns_csv_and_audits(client):
     assert audits[0].entity_type == "event"
     assert audits[0].entity_id == 7
     assert audits[0].user_id == 1
-    assert audits[0].new_value == "rows=3"
+    # Disclosure record is self-contained: row count + fixed column set + event.
+    assert audits[0].new_value == (
+        "rows=3; columns=name,email,net_id; event='Spring Networking Night'"
+    )
 
 
 # --- list filters (compiled SQL) ----------------------------------------------

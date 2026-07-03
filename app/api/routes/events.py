@@ -435,17 +435,28 @@ async def export_event_attendees(
             ]
         )
 
+    # Disclosure record: WHAT left the system (row count + the fixed column set)
+    # and WHICH event — never the data itself. Mirrors the alumni export's
+    # self-contained audit summary so the trail stays reconstructable if the
+    # column set ever changes.
     session.add(
         AuditLog(
             user_id=user.user_id,
             action_type="export_event_attendees",
             entity_type="event",
             entity_id=event_id,
-            new_value=f"rows={len(rows)}",
+            new_value=(
+                f"rows={len(rows)}; columns=name,email,net_id; "
+                f"event={event.event_name!r}"
+            ),
         )
     )
     await session.commit()
 
+    # event_id is a path int (FastAPI-validated), so this header value is always
+    # a safe decimal string. Do NOT extend this filename with free-text DB fields
+    # (e.g. event name) without RFC 5987 encoding — that would open header
+    # injection into Content-Disposition.
     filename = f"event_{event_id}_attendees.csv"
     return Response(
         content=buffer.getvalue(),

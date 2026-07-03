@@ -26,16 +26,18 @@ def _bytes(text: str) -> bytes:
 # --- events: parse_and_map ----------------------------------------------------
 
 
-_EV_HEADER = "Net ID,Name\n"
+_EV_HEADER = "Net ID,First name,Last name,Notes\n"
 
 
 def test_events_parse_attendee_rows():
-    csv_text = _EV_HEADER + "jdoe,Jane Doe\nmsmith,Mark Smith\n"
+    csv_text = _EV_HEADER + "jdoe,Jane,Doe,VIP\nmsmith,Mark,Smith,\n"
     rows, header_errors = import_events.parse_and_map(_bytes(csv_text))
     assert header_errors == []
     assert len(rows) == 2
     assert rows[0]["net_id"] == "jdoe"
     assert rows[0]["attendee_name"] == "Jane Doe"
+    assert rows[0]["notes"] == "VIP"
+    assert rows[1]["notes"] is None  # blank Notes -> None
     assert rows[0]["error"] is None
 
 
@@ -46,7 +48,7 @@ def test_events_parse_rejects_bad_headers():
 
 
 def test_events_parse_flags_missing_net_id():
-    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + ",Jane Doe\n"))
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + ",Jane,Doe\n"))
     assert rows[0]["error"] is not None
     assert "net id" in rows[0]["error"].lower()
 
@@ -96,7 +98,7 @@ class _EventEvalSession:
 
 def test_events_evaluate_reports_unmatched_without_blocking():
     rows, _ = import_events.parse_and_map(
-        _bytes(_EV_HEADER + "jdoe,Jane Doe\nghost,Nobody\n")
+        _bytes(_EV_HEADER + "jdoe,Jane,Doe\nghost,Nobody\n")
     )
     meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
     session = _EventEvalSession(matched_rows=[(42, "jdoe")])
@@ -110,7 +112,7 @@ def test_events_evaluate_reports_unmatched_without_blocking():
 
 
 def test_events_evaluate_matches_attendees():
-    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane Doe\n"))
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe\n"))
     meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
     session = _EventEvalSession(matched_rows=[(42, "jdoe")])
     report = asyncio.run(import_events.evaluate(session, rows, meta))
@@ -129,8 +131,18 @@ def test_events_evaluate_warns_when_nothing_matched():
     assert any(w["code"] == "no_attendees_matched" for w in report["warnings"])
 
 
+def test_events_evaluate_carries_attendee_notes():
+    # The Notes column flows parse -> evaluate -> attendee dict, and commit
+    # persists it as EventAttendance.attendance_notes (#252).
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe,VIP\n"))
+    meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
+    session = _EventEvalSession(matched_rows=[(42, "jdoe")])
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    assert report["attendees"][0]["notes"] == "VIP"
+
+
 def test_events_evaluate_rejects_bad_event_date():
-    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane Doe\n"))
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe\n"))
     meta = import_events.normalize_event_meta("Banquet", "not-a-date")
     session = _EventEvalSession(matched_rows=[(42, "jdoe")])
     report = asyncio.run(import_events.evaluate(session, rows, meta))
@@ -139,7 +151,7 @@ def test_events_evaluate_rejects_bad_event_date():
 
 
 def test_events_evaluate_rejects_duplicate_event():
-    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane Doe\n"))
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe\n"))
     meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
     # scalar returns an existing event id -> duplicate.
     session = _EventEvalSession(matched_rows=[(42, "jdoe")], existing=7)
@@ -321,7 +333,13 @@ def test_events_import_preview_forbidden_for_view_only(client):
     response = client.post(
         "/events/import/preview",
         data={"event_name": "Banquet"},
-        files={"file": ("a.csv", b"Net ID,Name\njdoe,Jane Doe\n", "text/csv")},
+        files={
+            "file": (
+                "a.csv",
+                b"Net ID,First name,Last name,Notes\njdoe,Jane,Doe\n",
+                "text/csv",
+            )
+        },
     )
     assert response.status_code == 403
 
@@ -330,7 +348,13 @@ def test_events_import_preview_requires_event_name(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     response = client.post(
         "/events/import/preview",
-        files={"file": ("a.csv", b"Net ID,Name\njdoe,Jane Doe\n", "text/csv")},
+        files={
+            "file": (
+                "a.csv",
+                b"Net ID,First name,Last name,Notes\njdoe,Jane,Doe\n",
+                "text/csv",
+            )
+        },
     )
     assert response.status_code == 422
 
@@ -345,7 +369,13 @@ def test_events_import_preview_happy_path(client):
     response = client.post(
         "/events/import/preview",
         data={"event_name": "Banquet", "event_date": "2026-04-15"},
-        files={"file": ("a.csv", b"Net ID,Name\njdoe,Jane Doe\n", "text/csv")},
+        files={
+            "file": (
+                "a.csv",
+                b"Net ID,First name,Last name,Notes\njdoe,Jane,Doe\n",
+                "text/csv",
+            )
+        },
     )
     assert response.status_code == 200
     body = response.json()

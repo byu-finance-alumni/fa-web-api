@@ -46,15 +46,18 @@ MAX_IMPORT_ROWS = 5000  # attendee rows for ONE event
 _TITLE_MAX = 255
 
 # One CSV = one event's attendee list. The event identity lives in the wizard,
-# NOT the CSV, so the only columns are the attendee's Net ID (the key) and Name
-# (confirmation only). A drift here surfaces as a header error.
+# NOT the CSV. Columns: the attendee's Net ID (the match key), First/Last name
+# (confirmation only), and a free-text Notes column that IS persisted onto the
+# attendance row. A drift here surfaces as a header error.
 COL_NET_ID = "Net ID"
-COL_NAME = "Name"
-EXPECTED_HEADERS: list[str] = [COL_NET_ID, COL_NAME]
+COL_FIRST = "First name"
+COL_LAST = "Last name"
+COL_NOTES = "Notes"
+EXPECTED_HEADERS: list[str] = [COL_NET_ID, COL_FIRST, COL_LAST, COL_NOTES]
 EXAMPLE_ROWS: list[list[str]] = [
-    ["jdoe", "Jane Doe"],
-    ["msmith", "Mark Smith"],
-    ["alee", "Amy Lee"],
+    ["jdoe", "Jane", "Doe", ""],
+    ["msmith", "Mark", "Smith", "Sponsor table"],
+    ["alee", "Amy", "Lee", ""],
 ]
 
 
@@ -131,12 +134,16 @@ def _cell(index: dict[str, int], raw_row: list[str], header: str) -> str:
 
 def _map_row(row_num: int, index: dict[str, int], raw_row: list[str]) -> dict:
     net_id = _cell(index, raw_row, COL_NET_ID)
-    name = _cell(index, raw_row, COL_NAME)
+    first = _cell(index, raw_row, COL_FIRST)
+    last = _cell(index, raw_row, COL_LAST)
+    notes = _cell(index, raw_row, COL_NOTES)
+    name = " ".join(p for p in (first, last) if p).strip()
     error = None if net_id else f"{COL_NET_ID}: required."
     return {
         "row": row_num,
         "net_id": net_id,
         "attendee_name": name,
+        "notes": notes or None,
         "error": error,
     }
 
@@ -269,6 +276,7 @@ async def evaluate(session: AsyncSession, rows: list[dict], meta: dict) -> dict:
                 "row": r["row"],
                 "net_id": net,
                 "name": r["attendee_name"],
+                "notes": r["notes"],
                 "matched": alumni_id is not None,
                 "alumni_id": alumni_id,
             }
@@ -379,6 +387,7 @@ async def commit_import(
                     EventAttendance(
                         event_id=event.event_id,
                         alumni_id=att["alumni_id"],
+                        attendance_notes=att["notes"],
                     )
                 )
                 session.add(

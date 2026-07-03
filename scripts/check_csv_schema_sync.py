@@ -125,15 +125,18 @@ def _check_alumni_export(errors: list[str]) -> None:
 
 
 def _check_events_import(errors: list[str]) -> None:
+    from app.models.event import EventAttendance
     from app.services import import_events as ie
 
     surface = "events import (import_events)"
     # One CSV = one event's roster (#149): the event identity is entered in the
-    # wizard, so the CSV columns are just the attendee's Net ID (the match key)
-    # and Name (confirmation only, never persisted).
+    # wizard. CSV columns are the attendee's Net ID (match key), First/Last name
+    # (confirmation only), and Notes (persisted onto the attendance row, #252).
     bindings: dict[str, tuple[object, str] | None] = {
         ie.COL_NET_ID: (Alumni, "net_id"),  # attendee match key
-        ie.COL_NAME: None,  # confirmation only
+        ie.COL_FIRST: None,  # confirmation only
+        ie.COL_LAST: None,  # confirmation only
+        ie.COL_NOTES: (EventAttendance, "attendance_notes"),
     }
     _check_header_sets(errors, surface, set(ie.EXPECTED_HEADERS), set(bindings))
     for header, target in bindings.items():

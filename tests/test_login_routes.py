@@ -178,6 +178,8 @@ def _fake_user(user_id=2, *, locked_at=None, roles=("full_access",)):
         auth_user_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
         locked_at=locked_at,
         locked_reason="too_many_failed_logins" if locked_at else None,
+        must_change_password=False,
+        active_session_id=None,
         roles=[SimpleNamespace(role_name=r) for r in roles],
     )
 
@@ -364,6 +366,7 @@ def test_authenticated_user_resolution_clears_login_attempts(monkeypatch):
         last_name="B",
         active=True,
         must_change_password=False,
+        active_session_id=None,
         roles=[SimpleNamespace(role_name="view_only")],
     )
 
@@ -375,7 +378,7 @@ def test_authenticated_user_resolution_clears_login_attempts(monkeypatch):
     )
 
     session = _AuthClearSession()
-    current = SimpleNamespace(auth_user_id=str(auth_uuid))
+    current = SimpleNamespace(auth_user_id=str(auth_uuid), session_id=None)
 
     ctx = asyncio.run(auth_deps.get_current_db_user(current, session))
 
@@ -406,6 +409,7 @@ def test_authenticated_clear_failure_never_breaks_request(monkeypatch):
         last_name="B",
         active=True,
         must_change_password=False,
+        active_session_id=None,
         roles=[SimpleNamespace(role_name="view_only")],
     )
 
@@ -430,7 +434,7 @@ def test_authenticated_clear_failure_never_breaks_request(monkeypatch):
             self.rollbacks += 1
 
     session = _BoomSession()
-    current = SimpleNamespace(auth_user_id=str(auth_uuid))
+    current = SimpleNamespace(auth_user_id=str(auth_uuid), session_id=None)
 
     # Must still resolve the user despite the clear blowing up.
     ctx = asyncio.run(auth_deps.get_current_db_user(current, session))

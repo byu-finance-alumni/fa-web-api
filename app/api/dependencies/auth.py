@@ -23,6 +23,7 @@ from app.core.security import (
     AuthorizationError,
     DeactivatedAccountError,
     MustChangePasswordError,
+    SessionSupersededError,
     verify_supabase_jwt,
 )
 from app.models.login_attempt import LoginAttempt
@@ -53,6 +54,7 @@ async def get_current_user(
         auth_user_id=subject,
         email=claims.get("email"),
         token_role=claims.get("role"),
+        session_id=claims.get("session_id"),
     )
 
 
@@ -94,7 +96,14 @@ async def get_current_db_user_allow_must_change(
 
     await _clear_login_attempts(session, user.email)
 
-    return UserContext.from_orm_user(user)
+    context = UserContext.from_orm_user(user)
+    # Carry THIS request's token session so downstream guards (single active
+    # session, #147) can compare it against the account's active session. This
+    # base resolver does NOT reject a superseded session — that is layered on in
+    # ``get_current_db_user`` so the claiming call (POST /auth/login) and the
+    # status probe can still run.
+    context.session_id = current.session_id
+    return context
 
 
 async def get_current_db_user(
@@ -115,9 +124,26 @@ async def get_current_db_user(
     depend on the exempt variant above so the user can read and clear the flag.
     """
     user = await get_current_db_user_allow_must_change(current, session)
+    _enforce_single_session(user)
     if user.must_change_password:
         raise MustChangePasswordError()
     return user
+
+
+def _enforce_single_session(user: UserContext) -> None:
+    """Reject a session the account has superseded by signing in elsewhere (#147).
+
+    Enforced here (the strict resolver used by every data route) and NOT in the
+    base resolver, so the sign-in that CLAIMS the new session (POST /auth/login)
+    and the status probe (GET /auth/session/active) still run. Fails open when
+    either id is absent: a token predating the ``session_id`` claim, or a user
+    who hasn't signed in since this shipped (``active_session_id`` still NULL),
+    is never locked out — enforcement begins once both exist and they differ.
+    """
+    active = user.active_session_id
+    current = user.session_id
+    if active and current and active != current:
+        raise SessionSupersededError()
 
 
 async def _clear_login_attempts(session: AsyncSession, email: str) -> None:

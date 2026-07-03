@@ -35,6 +35,12 @@ CREATE TABLE users (
     -- app/services/login_lockout.py). Cleared by a super_admin password reset.
     locked_at       timestamptz,
     locked_reason   text,
+    -- Single active session per account (#147): the Supabase session_id of the
+    -- MOST RECENT sign-in. A newer login overwrites it, so any earlier device's
+    -- session no longer matches and is rejected (forced logout) on the backend.
+    -- NULL until the user's first sign-in after this feature shipped.
+    active_session_id  text,
+    active_session_at  timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );

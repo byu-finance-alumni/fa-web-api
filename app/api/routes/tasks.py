@@ -8,11 +8,12 @@ view-only read).
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess
 from app.core.database import get_session
+from app.core.errors import InvalidRequestError
 from app.schemas.profile import AdminTaskPage
 from app.services import tasks as service
 
@@ -83,9 +84,8 @@ async def list_tasks(
         try:
             int(assignee)
         except ValueError:
-            raise HTTPException(
-                status_code=422,
-                detail="assignee must be a user id or 'unassigned'.",
+            raise InvalidRequestError(
+                "assignee must be a user id or 'unassigned'."
             ) from None
 
     return await service.list_all_tasks(

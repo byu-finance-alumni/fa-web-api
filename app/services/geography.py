@@ -699,8 +699,8 @@ _BREAKDOWN_TITLES = {
 
 
 async def get_breakdown(session, dimension: str, filters: dict) -> dict:
-    """Full ranked list for one dimension (no top-N cap) — backs the 'View all'
-    breakdown table. ``key`` is what a row links to on the map."""
+    """Full ranked list for one dimension (capped at the top 1000 rows) — backs
+    the 'View all' breakdown table. ``key`` is what a row links to on the map."""
     title = _BREAKDOWN_TITLES.get(dimension)
     if title is None:
         return {"dimension": dimension, "title": dimension, "items": []}
@@ -727,6 +727,7 @@ async def get_breakdown(session, dimension: str, filters: dict) -> dict:
                 .where(*_filter_conditions(filters), AlumniContactInfo.city.is_not(None))
                 .group_by(AlumniContactInfo.city, _STATE)
                 .order_by(desc("count"))
+                .limit(1000)
             )
         ).all()
         items = [

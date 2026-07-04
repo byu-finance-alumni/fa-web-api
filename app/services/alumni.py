@@ -332,7 +332,10 @@ async def update_alumni(
     payload: AlumniUpdateFull,
     actor_user_id: int | None = None,
 ) -> Alumni:
-    alumnus = await get_alumni(session, alumni_id, include_archived=True)
+    # Archived records 404 on edit, symmetric with GET /alumni/{id} — an archived
+    # record is "removed from the directory", so it must be restored (via
+    # POST /alumni/{id}/restore) before it can be edited, not silently mutated.
+    alumnus = await get_alumni(session, alumni_id, include_archived=False)
     # Data-hygiene pass: clean the provided fields (write the CLEANED values) and
     # block exact duplicates against everyone *except* this record. Fuzzy
     # warnings never block. jsonable=False keeps dates as date objects for the
@@ -383,6 +386,11 @@ async def update_alumni(
             order_by=CurrentEmployment.current_employment_id.desc(),
         )
     if education is not None and education.has_values():
+        # NOTE (#175): the full-edit-form education block edits the alumnus's
+        # MOST-RECENT degree in place (single-row upsert). Multi-degree records
+        # (e.g. BS + MBA) are managed via the dedicated per-row endpoints
+        # (POST/PATCH/DELETE /alumni/{id}/education); this path intentionally does
+        # NOT create a second row, so a form save can't silently fan out degrees.
         section_written |= await _upsert_section(
             session,
             EducationHistory,

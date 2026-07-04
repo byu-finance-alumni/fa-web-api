@@ -10,7 +10,17 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, String, Text, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -18,6 +28,16 @@ from app.core.database import Base
 
 class DuplicateCandidate(Base):
     __tablename__ = "duplicate_candidates"
+    __table_args__ = (
+        # Ordered + unique pair guard (#175): store a pair once, low id first, so
+        # (a,b) and (b,a) cannot both exist.
+        CheckConstraint(
+            "alumni_id_1 < alumni_id_2", name="ck_duplicate_candidates_ordered"
+        ),
+        UniqueConstraint(
+            "alumni_id_1", "alumni_id_2", name="uq_duplicate_candidates_pair"
+        ),
+    )
 
     duplicate_candidate_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     alumni_id_1: Mapped[int] = mapped_column(

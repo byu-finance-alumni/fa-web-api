@@ -40,6 +40,15 @@ class AlumniExportFilters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     q: str | None = None
+    # Name/identifier facets — kept in parity with GET /alumni so a future list-UI
+    # facet on these exports the same population (they flow straight into
+    # build_alumni_query via _filters_dict). The export route is full_access-only,
+    # so the email/net_id enumeration concern that gates these on GET doesn't apply.
+    net_id: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    preferred_name: str | None = None
+    email: str | None = None
     graduation_year: int | None = None
     grad_year_min: int | None = None
     grad_year_max: int | None = None

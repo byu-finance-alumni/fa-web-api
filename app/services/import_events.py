@@ -41,7 +41,9 @@ log = logging.getLogger(__name__)
 
 # Upload guards. Byte cap is enforced at the route; the row cap is enforced here
 # so /preview and /commit share it.
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB
+# 4 MiB, deliberately BELOW Vercel's ~4.5 MB serverless Function request-body
+# ceiling so the app's own friendly 413 fires instead of a raw platform error.
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 MiB
 MAX_IMPORT_ROWS = 5000  # attendee rows for ONE event
 _TITLE_MAX = 255
 

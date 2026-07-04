@@ -55,7 +55,10 @@ CREATE TABLE login_attempts (
     first_failed_at timestamptz,
     last_failed_at  timestamptz,
     cooldown_until  timestamptz,
-    updated_at      timestamptz NOT NULL DEFAULT now()
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    -- email_lc must already be lowercased by the writer (#176). See
+    -- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+    CONSTRAINT ck_login_attempts_email_lc_lower CHECK (email_lc = lower(email_lc))
 );
 
 -- Login history (security log). One row per successful sign-in, written by
@@ -200,11 +203,13 @@ CREATE INDEX IF NOT EXISTS idx_alumni_spouse_alumni_id ON alumni (spouse_alumni_
 -- be unique. These are the authoritative guard behind the application-layer
 -- duplicate detection (closes a TOCTOU race between concurrent writes). NULL ids
 -- and archived rows are excluded. byu_id is stored digits-only by the cleaner.
--- See migrations/2026-06-12_alumni_unique_byu_net.sql.
+-- net_id is matched case-insensitively (lower(trim(...))) per #175.
+-- See migrations/2026-06-12_alumni_unique_byu_net.sql and
+-- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_byu_id_active
     ON alumni (byu_id) WHERE archived = false AND byu_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_net_id_active
-    ON alumni (net_id) WHERE archived = false AND net_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_net_id_lower_active
+    ON alumni (lower(trim(net_id))) WHERE archived = false AND net_id IS NOT NULL;
 
 CREATE TABLE alumni_contact_info (
     contact_info_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -226,6 +231,11 @@ CREATE TABLE alumni_contact_info (
     CONSTRAINT fk_alumni_contact_info_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL
 );
 
+-- One contact-info row per alum (#171). See
+-- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_contact_info_alumni_id
+    ON alumni_contact_info (alumni_id);
+
 CREATE TABLE current_employment (
     current_employment_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id                 bigint NOT NULL,
@@ -245,6 +255,11 @@ CREATE TABLE current_employment (
     CONSTRAINT fk_current_employment_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_current_employment_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL
 );
+
+-- One current-employment row per alum (#171). See
+-- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_current_employment_alumni_id
+    ON current_employment (alumni_id);
 
 CREATE TABLE education_history (
     education_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -582,7 +597,12 @@ CREATE TABLE duplicate_candidates (
     CONSTRAINT fk_duplicate_candidates_alumni_id_1 FOREIGN KEY (alumni_id_1) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_duplicate_candidates_alumni_id_2 FOREIGN KEY (alumni_id_2) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_duplicate_candidates_user_id FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
-    CONSTRAINT chk_duplicate_candidates_distinct CHECK (alumni_id_1 <> alumni_id_2)
+    CONSTRAINT chk_duplicate_candidates_distinct CHECK (alumni_id_1 <> alumni_id_2),
+    -- Ordered + unique pair guard (#175): a pair is stored once, low id first, so
+    -- (a,b) and (b,a) cannot both exist. See
+    -- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+    CONSTRAINT ck_duplicate_candidates_ordered CHECK (alumni_id_1 < alumni_id_2),
+    CONSTRAINT uq_duplicate_candidates_pair UNIQUE (alumni_id_1, alumni_id_2)
 );
 
 -- -----------------------------------------------------------------------------
@@ -680,12 +700,20 @@ CREATE INDEX idx_alumni_source_id                ON alumni (source_id);
 CREATE INDEX idx_alumni_last_name                ON alumni (last_name);
 CREATE INDEX idx_alumni_byu_id                   ON alumni (byu_id);
 CREATE INDEX idx_alumni_net_id                   ON alumni (net_id);
+-- Case-insensitive mst_id lookup (#172).
+CREATE INDEX IF NOT EXISTS idx_alumni_mst_id_lower
+    ON alumni (lower(trim(mst_id))) WHERE mst_id IS NOT NULL;
+-- Graduation-year filter + (archived,is_alumni) hot-path predicate (#175).
+CREATE INDEX IF NOT EXISTS idx_alumni_graduation_year   ON alumni (graduation_year);
+CREATE INDEX IF NOT EXISTS idx_alumni_archived_is_alumni ON alumni (archived, is_alumni);
 CREATE INDEX idx_alumni_contact_info_alumni_id   ON alumni_contact_info (alumni_id);
 CREATE INDEX idx_alumni_contact_info_state        ON alumni_contact_info (state);
 CREATE INDEX idx_alumni_contact_info_city_state   ON alumni_contact_info (city, state);
+CREATE INDEX IF NOT EXISTS idx_alumni_contact_info_country ON alumni_contact_info (country);
 CREATE INDEX idx_current_employment_alumni_id    ON current_employment (alumni_id);
 CREATE INDEX idx_current_employment_employer      ON current_employment (current_employer);
 CREATE INDEX idx_current_employment_industry      ON current_employment (current_industry);
+CREATE INDEX IF NOT EXISTS idx_current_employment_state ON current_employment (current_state);
 CREATE INDEX idx_education_history_alumni_id     ON education_history (alumni_id);
 CREATE INDEX idx_employment_history_alumni_id    ON employment_history (alumni_id);
 CREATE INDEX idx_verification_log_alumni_id      ON verification_log (alumni_id);

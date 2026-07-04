@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, ForeignKey, String
+from sqlalchemy import BigInteger, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -11,6 +11,10 @@ from app.models.mixins import TimestampMixin
 
 class AlumniContactInfo(TimestampMixin, Base):
     __tablename__ = "alumni_contact_info"
+    __table_args__ = (
+        # One contact-info row per alum (#171).
+        UniqueConstraint("alumni_id", name="uq_alumni_contact_info_alumni_id"),
+    )
 
     contact_info_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     alumni_id: Mapped[int] = mapped_column(

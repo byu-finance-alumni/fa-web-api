@@ -19,6 +19,11 @@ from app.models.contact import AlumniContactInfo
 from app.models.event import Event, EventAttendance
 from app.schemas.event import AttendeeCreate, EventCreate, EventUpdate
 from app.services import import_events
+
+# Reuse the alumni export's formula-injection neutralizer (canonical source:
+# alumni_export._FORMULA_LEAD) so attendee cells starting with = + - @ \t \r are
+# tab-prefixed to plain text instead of executing as spreadsheet formulas (#169).
+from app.services.alumni_export import _fmt
 from app.utils.sql import escape_like
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -465,11 +470,13 @@ async def export_event_attendees(
     writer = csv.writer(buffer)
     writer.writerow(["Name", "Email", "Net ID"])
     for alumni, personal_email, work_email in rows:
+        # Neutralize every free-text cell (#169) — a name/email/net_id starting
+        # with a formula lead char would otherwise export as an executable cell.
         writer.writerow(
             [
-                _attendee_name(alumni),
-                personal_email or work_email or "",
-                alumni.net_id or "",
+                _fmt(_attendee_name(alumni), "str"),
+                _fmt(personal_email or work_email or "", "str"),
+                _fmt(alumni.net_id or "", "str"),
             ]
         )
 

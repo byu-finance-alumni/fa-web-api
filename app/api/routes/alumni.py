@@ -228,7 +228,7 @@ async def list_alumni(
         ),
     ] = "alumni",
     sort: Annotated[
-        str,
+        Literal["name", "grad_desc", "grad_asc"],
         Query(description="Sort order: name | grad_desc | grad_asc."),
     ] = "name",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -238,6 +238,12 @@ async def list_alumni(
     # passing ``include_archived=true`` must NOT receive soft-deleted records.
     has_full_access = user.is_full_access or user.is_super_admin or user.is_engineer
     effective_include_archived = include_archived and has_full_access
+    # The exact-email filter is a contact-PII enumeration oracle: a low-privilege
+    # (view_only / student) caller could confirm an email belongs to a specific
+    # alumnus even though no response body exposes that email to them. Gate it to
+    # full_access-and-up; below that it's silently ignored (AND'd away like
+    # include_archived) rather than 422'd, so a stray param can't leak.
+    email = email if has_full_access else None
     # "Needs surveying" is an admin-tier view (engineer / super_admin /
     # full_access = "admin"). student and view_only ("professor") are denied
     # server-side — a 403, not a silent ignore, so the access decision is

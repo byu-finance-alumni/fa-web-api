@@ -612,6 +612,46 @@ def recommended_warnings(effective: dict) -> list[dict]:
                 "message": "No graduation year on file.",
             }
         )
+    # Address placeholder / malformed-ZIP nudges (non-blocking): departments often
+    # type "N/A"/"unknown" instead of leaving a cell blank, which then looks like
+    # real data to any downstream mailing export.
+    _placeholders = {"n/a", "n.a.", "na", "none", "null", "unknown", "tbd"}
+    flagged = [
+        f
+        for f in ("address_line_1", "address_line_2", "city", "state", "zip", "country")
+        if isinstance(contact.get(f), str)
+        and contact[f].strip()
+        and (
+            contact[f].strip().lower() in _placeholders
+            or set(contact[f].strip().lower()) == {"x"}
+        )
+    ]
+    if flagged:
+        warnings.append(
+            {
+                "code": "address_placeholder",
+                "message": (
+                    "Address field(s) look like a placeholder rather than real "
+                    "data: " + ", ".join(flagged) + ". Leave blank if unknown."
+                ),
+            }
+        )
+    zip_val = contact.get("zip")
+    if isinstance(zip_val, str) and zip_val.strip():
+        z = zip_val.strip()
+        # Warn (never block) on non-US-ZIP shape — international postal codes vary.
+        if z.lower() not in _placeholders and not re.fullmatch(
+            r"\d{5}(-\d{4})?", z
+        ):
+            warnings.append(
+                {
+                    "code": "zip_format",
+                    "message": (
+                        f"ZIP '{z}' isn't a US 5-digit or ZIP+4 format — double-check "
+                        "it (non-US postal codes are fine to ignore)."
+                    ),
+                }
+            )
     return warnings
 
 

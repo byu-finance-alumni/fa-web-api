@@ -531,11 +531,11 @@ def test_interaction_write_rate_limited_returns_429(client):
     ]
     assert seen[:_MUTATION_LIMIT] == [422] * _MUTATION_LIMIT
     assert seen[-1] == 429
-    # The 429 body carries the rate_limited error code (FastAPI nests a raw
-    # HTTPException detail under "detail").
+    # The 429 body carries the rate_limited error code in the standard
+    # {"error": {...}} envelope (normalized by the StarletteHTTPException handler).
     blocked = client.post("/alumni/1/interactions", json={"interaction_type": ""})
     assert blocked.status_code == 429
-    assert blocked.json()["detail"]["error"]["code"] == "rate_limited"
+    assert blocked.json()["error"]["code"] == "rate_limited"
     assert blocked.headers.get("Retry-After") == "60"
 
 

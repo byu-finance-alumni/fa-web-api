@@ -20,9 +20,9 @@ routes use.
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
@@ -74,44 +74,70 @@ async def list_donors(
     user: RequireViewAccess,
     config: PermissionConfig,
     session: SessionDep,
-) -> list[dict]:
-    """List donors with per-year and lifetime roll-ups (view access).
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    """List donors with per-year and lifetime roll-ups (view access, paginated).
 
     Everyone sees who gave and in which years; ``lifetime_total`` and each
-    ``per_year.total`` are non-null only for amount-viewers (full_access+)."""
+    ``per_year.total`` are non-null only for amount-viewers (full_access+).
+
+    Returns a ``{items, total, limit, offset}`` envelope. The ranking, LIMIT, and
+    OFFSET are pushed into PostgreSQL; only the page's per-year breakdown is then
+    aggregated (``WHERE alumni_id IN (<page ids>)``), so the endpoint is bounded
+    regardless of donor count. Amount-viewers see the biggest givers first;
+    others get a stable name sort (the lifetime ranking is amount-gated too)."""
     show = _can_view_amounts(user, config)
 
-    base = (
-        await session.execute(
-            select(
-                Alumni.alumni_id,
-                Alumni.first_name,
-                Alumni.preferred_first_name,
-                Alumni.last_name,
-                Alumni.graduation_year,
-                func.count(Donation.donation_id),
-                func.coalesce(func.sum(Donation.amount), 0),
-            )
-            .join(Donation, Donation.alumni_id == Alumni.alumni_id)
-            .group_by(Alumni.alumni_id)
+    total = await session.scalar(
+        select(func.count(func.distinct(Donation.alumni_id)))
+    )
+
+    lifetime_total = func.coalesce(func.sum(Donation.amount), 0).label("lifetime_total")
+    page_stmt = (
+        select(
+            Alumni.alumni_id,
+            Alumni.first_name,
+            Alumni.preferred_first_name,
+            Alumni.last_name,
+            Alumni.graduation_year,
+            func.count(Donation.donation_id),
+            lifetime_total,
         )
+        .join(Donation, Donation.alumni_id == Alumni.alumni_id)
+        .group_by(Alumni.alumni_id)
+    )
+    # Push the sort into SQL. Amount-viewers rank by lifetime giving (tie-broken by
+    # name); non-viewers get a name-only sort so the giving ranking isn't leaked.
+    if show:
+        page_stmt = page_stmt.order_by(
+            desc("lifetime_total"), Alumni.last_name, Alumni.first_name
+        )
+    else:
+        page_stmt = page_stmt.order_by(Alumni.last_name, Alumni.first_name)
+    base = (
+        await session.execute(page_stmt.limit(limit).offset(offset))
     ).all()
 
-    # Per-(alumnus, year) roll-up for the breakdown + the "years gave" list.
-    year_rows = (
-        await session.execute(
-            select(
-                Donation.alumni_id,
-                Donation.donation_year,
-                func.coalesce(func.sum(Donation.amount), 0),
-            )
-            .group_by(Donation.alumni_id, Donation.donation_year)
-            .order_by(Donation.alumni_id, Donation.donation_year.desc())
-        )
-    ).all()
+    # Per-(alumnus, year) roll-up for the breakdown + the "years gave" list —
+    # only for the page's donors so we never aggregate the whole donation table.
+    page_ids = [row[0] for row in base]
     per_year_map: dict[int, list[tuple[int, Decimal]]] = {}
-    for alumni_id, year, total in year_rows:
-        per_year_map.setdefault(alumni_id, []).append((year, total))
+    if page_ids:
+        year_rows = (
+            await session.execute(
+                select(
+                    Donation.alumni_id,
+                    Donation.donation_year,
+                    func.coalesce(func.sum(Donation.amount), 0),
+                )
+                .where(Donation.alumni_id.in_(page_ids))
+                .group_by(Donation.alumni_id, Donation.donation_year)
+                .order_by(Donation.alumni_id, Donation.donation_year.desc())
+            )
+        ).all()
+        for alumni_id, year, year_total in year_rows:
+            per_year_map.setdefault(alumni_id, []).append((year, year_total))
 
     donors: list[dict] = []
     for alumni_id, first, preferred, last, grad, count, lifetime in base:
@@ -125,17 +151,18 @@ async def list_donors(
                 "years": [y for y, _ in years],
                 "lifetime_total": _money(lifetime, show),
                 "per_year": [
-                    {"year": y, "total": _money(total, show)} for y, total in years
+                    {"year": y, "total": _money(year_total, show)}
+                    for y, year_total in years
                 ],
             }
         )
 
-    # Amount-viewers see the biggest givers first; others get a stable name sort.
-    if show:
-        donors.sort(key=lambda d: (-(d["lifetime_total"] or 0), d["name"].lower()))
-    else:
-        donors.sort(key=lambda d: d["name"].lower())
-    return donors
+    return {
+        "items": donors,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/summary")

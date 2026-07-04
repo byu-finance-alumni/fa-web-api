@@ -14,7 +14,7 @@ import re
 import unicodedata
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.dropdowns import validate_industry
 
@@ -137,6 +137,12 @@ class AlumniBase(BaseModel):
             raise ValueError(f"Must be at most {_NAME_MAX} characters.")
         if _has_control_chars(value):
             raise ValueError("Must not contain control characters.")
+        # A leading =, +, -, or @ turns the cell into a live formula when the
+        # value is later exported to CSV/Excel (formula injection). '=' is already
+        # blocked below; block a LEADING +/-/@ here (they're legitimate mid-name,
+        # e.g. hyphenated surnames, so only the first char is rejected).
+        if value[0] in "+-@":
+            raise ValueError("Must not start with '+', '-', or '@'.")
         bad = sorted(_NAME_DISALLOWED & set(value))
         if bad:
             raise ValueError(
@@ -159,8 +165,12 @@ class AlumniBase(BaseModel):
         value = _empty_to_none(value)
         if value is None:
             return None
+        # Strip formatting (dashes/spaces) before validating, matching the spouse
+        # BYU-ID resolver and hygiene._clean_byu_id — a dashed "900-11-2233" is an
+        # ordinary way to paste a 9-digit id and shouldn't hard-reject the row.
+        value = re.sub(r"\D", "", value)
         if not _BYU_ID_RE.match(value):
-            raise ValueError("Must be exactly 9 digits.")
+            raise ValueError("Must be exactly 9 digits (remove any dashes or spaces).")
         return value
 
     @field_validator("net_id", mode="before")
@@ -377,7 +387,17 @@ class _Section(BaseModel):
     @classmethod
     def _trim_strings(cls, value: object) -> object:
         if isinstance(value, str):
-            return _empty_to_none(value)
+            cleaned = _empty_to_none(value)
+            # Reject NUL/other C0 control bytes here, at preview time — Postgres
+            # rejects a literal NUL in a text column, which otherwise slips past
+            # /preview and fails opaquely at commit (import #176). Tab/newline/CR
+            # are allowed so multi-line free-text (e.g. engagement notes) is fine.
+            if cleaned is not None and any(
+                unicodedata.category(ch) == "Cc" and ch not in "\t\n\r"
+                for ch in cleaned
+            ):
+                raise ValueError("Must not contain control characters.")
+            return cleaned
         return value
 
     def has_values(self) -> bool:
@@ -395,28 +415,31 @@ class _Section(BaseModel):
 
 
 class ContactCreate(_Section):
-    personal_email: str | None = None
-    work_email: str | None = None
-    phone: str | None = None
-    address_line_1: str | None = None
-    address_line_2: str | None = None
-    city: str | None = None
-    state: str | None = None
-    zip: str | None = None
-    country: str | None = None
-    region: str | None = None
+    # max_length mirrors database/schema.sql column widths so an over-long value
+    # is caught at /preview with a clear message instead of a DBAPIError at commit.
+    personal_email: str | None = Field(default=None, max_length=255)
+    work_email: str | None = Field(default=None, max_length=255)
+    phone: str | None = Field(default=None, max_length=50)
+    address_line_1: str | None = Field(default=None, max_length=255)
+    address_line_2: str | None = Field(default=None, max_length=255)
+    city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    zip: str | None = Field(default=None, max_length=20)
+    country: str | None = Field(default=None, max_length=100)
+    region: str | None = Field(default=None, max_length=100)
 
 
 class CareerCreate(_Section):
-    current_employer: str | None = None
-    current_title: str | None = None
-    current_industry: str | None = None
-    current_industry_secondary: str | None = None
-    current_city: str | None = None
-    current_state: str | None = None
-    current_country: str | None = None
-    current_zip: str | None = None
-    seniority_level: str | None = None
+    # max_length mirrors database/schema.sql column widths (see ContactCreate).
+    current_employer: str | None = Field(default=None, max_length=255)
+    current_title: str | None = Field(default=None, max_length=255)
+    current_industry: str | None = Field(default=None, max_length=255)
+    current_industry_secondary: str | None = Field(default=None, max_length=255)
+    current_city: str | None = Field(default=None, max_length=100)
+    current_state: str | None = Field(default=None, max_length=100)
+    current_country: str | None = Field(default=None, max_length=100)
+    current_zip: str | None = Field(default=None, max_length=20)
+    seniority_level: str | None = Field(default=None, max_length=100)
 
     @field_validator(
         "current_industry", "current_industry_secondary", mode="before"
@@ -431,12 +454,13 @@ class CareerCreate(_Section):
 
 
 class EducationCreate(_Section):
-    university: str | None = None
-    college: str | None = None
-    department: str | None = None
-    degree: str | None = None
-    major: str | None = None
-    degree_status: str | None = None
+    # max_length mirrors database/schema.sql column widths (see ContactCreate).
+    university: str | None = Field(default=None, max_length=255)
+    college: str | None = Field(default=None, max_length=255)
+    department: str | None = Field(default=None, max_length=255)
+    degree: str | None = Field(default=None, max_length=255)
+    major: str | None = Field(default=None, max_length=255)
+    degree_status: str | None = Field(default=None, max_length=100)
     degree_year: int | None = None
 
     @field_validator("degree_year")

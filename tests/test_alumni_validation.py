@@ -84,6 +84,24 @@ def test_control_char_name_rejected():
         AlumniCreate(first_name="Bad\x00Name")
 
 
+@pytest.mark.parametrize("name", ["+1+1", "-2", "@SUM(1)", "=cmd|'/c calc'!A1"])
+def test_name_leading_formula_char_rejected(name):
+    # CSV/formula-injection defense at the source (#169): a name that would
+    # become a live spreadsheet formula on export is rejected up front.
+    with pytest.raises(ValidationError):
+        AlumniCreate(first_name=name)
+
+
+def test_name_hyphen_midword_still_accepted():
+    # Only a LEADING +/-/@ is blocked; hyphenated names remain valid.
+    assert AlumniCreate(last_name="Smith-Jones").last_name == "Smith-Jones"
+
+
+def test_byu_id_with_dashes_is_cleaned():
+    # A formatted BYU id is digit-stripped rather than hard-rejected (#176).
+    assert AlumniCreate(byu_id="900-11-2233").byu_id == "900112233"
+
+
 @pytest.mark.parametrize(
     "byu_id", ["12345678", "1234567890", "12345678a", "abcdefghi"]
 )

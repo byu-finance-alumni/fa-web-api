@@ -42,7 +42,9 @@ from app.repositories.donor_match import (
 
 log = logging.getLogger(__name__)
 
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB
+# 4 MiB, deliberately BELOW Vercel's ~4.5 MB serverless Function request-body
+# ceiling so the app's own friendly 413 fires instead of a raw platform error.
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 MiB
 MAX_IMPORT_ROWS = 5000
 _AMOUNT_MAX = Decimal("9999999999.99")  # numeric(12,2) ceiling
 

@@ -9,7 +9,7 @@ cannot be used to enumerate which emails are registered.
 
 import datetime
 
-from sqlalchemy import DateTime, Integer, Text, func
+from sqlalchemy import CheckConstraint, DateTime, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -17,6 +17,12 @@ from app.core.database import Base
 
 class LoginAttempt(Base):
     __tablename__ = "login_attempts"
+    __table_args__ = (
+        # email_lc must already be lowercased by the writer (#176).
+        CheckConstraint(
+            "email_lc = lower(email_lc)", name="ck_login_attempts_email_lc_lower"
+        ),
+    )
 
     email_lc: Mapped[str] = mapped_column(Text, primary_key=True)
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

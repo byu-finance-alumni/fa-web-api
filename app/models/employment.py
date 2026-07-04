@@ -10,7 +10,16 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -19,6 +28,10 @@ from app.models.mixins import TimestampMixin
 
 class CurrentEmployment(TimestampMixin, Base):
     __tablename__ = "current_employment"
+    __table_args__ = (
+        # One current-employment row per alum (#171).
+        UniqueConstraint("alumni_id", name="uq_current_employment_alumni_id"),
+    )
 
     current_employment_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     alumni_id: Mapped[int] = mapped_column(

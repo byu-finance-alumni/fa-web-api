@@ -442,7 +442,9 @@ async def export_profile(
 def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     """Strip the FERPA-sensitive parts of a profile for a ``view_only`` caller.
 
-    Nulls the sensitive core PII (via ``minimize_alumni_read``), strips all
+    Nulls the sensitive core PII (via ``minimize_alumni_read``), redacts the
+    non-directory CONTACT fields (personal/work email, phone, street address,
+    ZIP — city/state/region/country stay, as directory-style location), strips all
     free-text notes (interaction / survey / engagement / program-engagement
     notes), and omits the embedded audit trail entirely. Returns a new
     ``ProfileRead``; the input is left untouched.
@@ -451,6 +453,22 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     ``get_profile`` (full name only for editors), so it is intentionally left
     untouched here — a view_only caller sees who made contact by first name.
     """
+    # Redact non-directory contact PII (email/phone/street/ZIP) for view_only;
+    # keep city/state/region/country (directory-style). Matches the frontend gate.
+    contact = (
+        profile.contact.model_copy(
+            update={
+                "personal_email": None,
+                "work_email": None,
+                "phone": None,
+                "address_line_1": None,
+                "address_line_2": None,
+                "zip": None,
+            }
+        )
+        if profile.contact is not None
+        else None
+    )
     # Drop interaction notes only; logged_by is already first-name for view_only.
     interactions = [
         i.model_copy(update={"interaction_notes": None})
@@ -469,6 +487,7 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     return profile.model_copy(
         update={
             "alumni": minimize_alumni_read(profile.alumni, can_edit=False),
+            "contact": contact,
             "interactions": interactions,
             "surveys": surveys,
             "engagement_notes": engagement_notes,

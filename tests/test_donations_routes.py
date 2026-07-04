@@ -122,8 +122,9 @@ def test_donors_hides_amounts_for_view_only(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     app.dependency_overrides[get_session] = _with_session(_donor_session())
     body = client.get("/donations/donors").json()
-    assert len(body) == 1
-    donor = body[0]
+    assert body["total"] == 0  # no scalars queued in the mock -> count falls back to 0
+    assert len(body["items"]) == 1
+    donor = body["items"][0]
     # Identity + which years they gave are visible...
     assert donor["name"] == "Jane Doe"
     assert donor["donation_count"] == 3
@@ -136,14 +137,14 @@ def test_donors_hides_amounts_for_view_only(client):
 def test_donors_hides_amounts_for_student(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
     app.dependency_overrides[get_session] = _with_session(_donor_session())
-    donor = client.get("/donations/donors").json()[0]
+    donor = client.get("/donations/donors").json()["items"][0]
     assert donor["lifetime_total"] is None
 
 
 def test_donors_shows_amounts_for_full_access(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(_donor_session())
-    donor = client.get("/donations/donors").json()[0]
+    donor = client.get("/donations/donors").json()["items"][0]
     assert donor["lifetime_total"] == 1500.0
     assert {py["year"]: py["total"] for py in donor["per_year"]} == {
         2026: 1000.0,

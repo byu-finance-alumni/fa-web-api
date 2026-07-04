@@ -12,7 +12,7 @@ import logging
 import re
 import secrets
 import unicodedata
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -108,14 +108,25 @@ class CreateUserRequest(BaseModel):
     email: str = Field(min_length=3, max_length=255)
     first_name: str | None = None
     last_name: str | None = None
-    # The top roles (engineer, super_admin) must NOT be bootstrappable via
-    # account creation — they can only be granted to an EXISTING user through
-    # the assign-role endpoint. Restrict the create payload to the non-privileged
-    # roles (full_access / student / view_only); anything else (incl. engineer
-    # and super_admin) is a clean 422.
-    role_name: Literal[
-        RoleName.FULL_ACCESS, RoleName.STUDENT, RoleName.VIEW_ONLY
-    ] = RoleName.VIEW_ONLY
+    # Typed as the plain ``RoleName`` enum (mirrors ``RoleAssign.role_name``) so
+    # an unknown role produces a clean Pydantic error listing the string values
+    # ('engineer', 'super_admin', ...) rather than the enum-member repr
+    # (``<RoleName.FULL_ACCESS: 'full_access'>``). The top roles (engineer,
+    # super_admin) must NOT be bootstrappable via account creation — they can
+    # only be granted to an EXISTING user through the assign-role endpoint — so
+    # the validator below restricts the create payload to the non-privileged
+    # roles (full_access / student / view_only); anything else is a clean 422.
+    role_name: RoleName = RoleName.VIEW_ONLY
+
+    @field_validator("role_name")
+    @classmethod
+    def _restrict_role(cls, value: RoleName) -> RoleName:
+        allowed = {RoleName.FULL_ACCESS, RoleName.STUDENT, RoleName.VIEW_ONLY}
+        if value not in allowed:
+            raise ValueError(
+                "Must be one of: full_access, student, view_only."
+            )
+        return value
 
     @field_validator("email", mode="before")
     @classmethod
@@ -247,10 +258,19 @@ def _serialize(u: User) -> dict:
     }
 
 
-async def _load_user(session: AsyncSession, user_id: int) -> User:
-    user = await session.scalar(
+async def _load_user(
+    session: AsyncSession, user_id: int, *, populate_existing: bool = False
+) -> User:
+    stmt = (
         select(User).options(selectinload(User.roles)).where(User.user_id == user_id)
     )
+    if populate_existing:
+        # Overwrite an already-identity-mapped instance's attributes (incl. the
+        # viewonly ``roles`` collection) from the DB. Needed after a commit that
+        # inserted a UserRole directly: expire_on_commit=False otherwise keeps the
+        # cached, pre-insert collection so the response omits the new role (#175).
+        stmt = stmt.execution_options(populate_existing=True)
+    user = await session.scalar(stmt)
     if user is None:
         raise NotFoundError(f"User {user_id} not found.")
     return user
@@ -539,7 +559,12 @@ async def assign_role(
             )
         )
         await session.commit()
-    return _serialize(await _load_user(session, user_id))
+        # ``User.roles`` is a viewonly relationship and the session keeps objects
+        # alive across commit (expire_on_commit=False), so a plain reload returns
+        # the cached instance WITHOUT the just-added role. Reload with
+        # populate_existing to overwrite the cached collection (#175).
+        user = await _load_user(session, user_id, populate_existing=True)
+    return _serialize(user)
 
 
 @router.delete("/users/{user_id}/roles/{role_name}")

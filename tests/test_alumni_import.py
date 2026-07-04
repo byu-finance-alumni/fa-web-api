@@ -11,7 +11,6 @@ served from queued results.
 
 import asyncio
 import uuid
-from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -192,6 +191,16 @@ def test_header_validation_passes_for_template():
     assert rows == []  # no data rows
 
 
+def test_duplicate_header_rejected():
+    # A repeated column would silently last-wins-overwrite data (#168).
+    headers = import_csv.EXPECTED_HEADERS + ["First name"]
+    rows, errors = import_csv.parse_and_map(
+        _csv_bytes(["x"] * len(headers), headers=headers)
+    )
+    assert rows == []
+    assert any("Duplicate column" in e for e in errors)
+
+
 # --- Row-cap + decoding guards -----------------------------------------------
 
 
@@ -208,7 +217,8 @@ def test_too_many_rows_rejected():
 
 def test_row_cap_default_constant():
     assert import_csv.MAX_IMPORT_ROWS == 2000
-    assert import_csv.MAX_UPLOAD_BYTES == 5 * 1024 * 1024
+    # 4 MiB, kept under Vercel's ~4.5 MB Function body ceiling (#170).
+    assert import_csv.MAX_UPLOAD_BYTES == 4 * 1024 * 1024
 
 
 def test_non_utf8_file_reports_friendly_error():
@@ -222,9 +232,10 @@ def test_non_utf8_file_reports_friendly_error():
 
 def test_existing_index_normalizes_formatted_byu_id():
     # A stored formatted id "123-456-789" must collide with incoming "123456789".
-    index = [(7, "123-456-789", None, "Jane", "Doe", 2018)]
+    # Rows are (id, byu_id, net_id, first, last, grad_year, archived).
+    index = [(7, "123-456-789", None, "Jane", "Doe", 2018, False)]
     idx = _run(import_csv._load_existing_index(FakeSession(index_rows=index)))
-    assert idx["byu_ids"] == {"123456789": 7}
+    assert idx["active_byu"] == {"123456789": (7, "Jane", "Doe")}
 
 
 # --- Clean row imports -------------------------------------------------------
@@ -321,13 +332,12 @@ def test_bad_int_rejected():
 
 
 def test_exact_duplicate_vs_db_rejected():
-    # Existing index has byu 123456789 -> alumni_id 7. The hygiene byu scalar
-    # lookup also returns that alum, producing the blocker.
-    existing = SimpleNamespace(
-        alumni_id=7, first_name="Jane", last_name="Doe", byu_id="123456789"
-    )
-    index = [(7, "123456789", None, "Jane", "Doe", 2018)]
-    session = FakeSession(index_rows=index, scalars=[existing])
+    # Existing index has byu 123456789 -> alumni_id 7. Duplicate detection now
+    # runs in-memory off the preloaded index (no per-row scalar), so the index
+    # row alone produces the blocker. Rows are
+    # (id, byu_id, net_id, first, last, grad_year, archived).
+    index = [(7, "123456789", None, "Jane", "Doe", 2018, False)]
+    session = FakeSession(index_rows=index)
     csv = _csv_bytes(
         _row_values(byu_id="123456789", first_name="Jane", last_name="Doe")
     )

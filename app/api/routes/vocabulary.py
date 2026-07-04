@@ -13,7 +13,7 @@ it just disappears from new-entry dropdowns.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireViewAccess, RequireVocabAdmin
@@ -61,12 +61,18 @@ async def create_vocabulary_term(
     payload: VocabularyTermCreate,
     actor: RequireVocabAdmin,
     session: SessionDep,
+    response: Response,
 ) -> VocabularyTermRead:
     """Add a term (or reactivate a previously-deactivated identical one).
-    409 if an active term with the same value already exists in the category."""
+    409 if an active term with the same value already exists in the category.
+
+    Returns 201 Created for a genuinely new term, 200 OK when an existing
+    soft-deleted term was reactivated (nothing new was created) (#176)."""
     term, reactivated = await service.create_term(
         session, payload.category, payload.value, payload.sort_order
     )
+    if reactivated:
+        response.status_code = status.HTTP_200_OK
     session.add(
         AuditLog(
             user_id=actor.user_id,

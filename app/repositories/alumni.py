@@ -71,10 +71,14 @@ def alumni_order_by(sort: str | None) -> tuple:
         "grad_desc": (
             Alumni.graduation_year.desc().nulls_last(),
             Alumni.last_name.asc(),
+            # Final tiebreak on the unique PK so tied rows have a total order and
+            # OFFSET paging can't duplicate/skip across a page boundary (#183).
+            Alumni.alumni_id.asc(),
         ),
         "grad_asc": (
             Alumni.graduation_year.asc().nulls_last(),
             Alumni.last_name.asc(),
+            Alumni.alumni_id.asc(),
         ),
     }.get(sort or "name", (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
 

@@ -13,7 +13,7 @@ from typing import Annotated
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import delete, func, update
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.capabilities import Capability, effective_capabilities
@@ -27,7 +27,6 @@ from app.core.security import (
     verify_supabase_jwt,
 )
 from app.models.login_attempt import LoginAttempt
-from app.models.user import User
 from app.repositories.permissions import load_grants
 from app.repositories.user import get_user_with_roles_by_auth_id
 from app.schemas.auth import AuthenticatedUser, UserContext
@@ -56,7 +55,6 @@ async def get_current_user(
         email=claims.get("email"),
         token_role=claims.get("role"),
         session_id=claims.get("session_id"),
-        session_issued_at=claims.get("iat"),
     )
 
 
@@ -111,7 +109,6 @@ async def get_current_db_user_allow_must_change(
     # ``get_current_db_user`` so the claiming call (POST /auth/login) and the
     # status probe can still run.
     context.session_id = current.session_id
-    context.session_issued_at = current.session_issued_at
     return context
 
 
@@ -133,73 +130,37 @@ async def get_current_db_user(
     depend on the exempt variant above so the user can read and clear the flag.
     """
     user = await get_current_db_user_allow_must_change(current, session)
-    await _enforce_single_session(user, session)
+    _enforce_single_session(user)
     if user.must_change_password:
         raise MustChangePasswordError()
     return user
 
 
-async def _enforce_single_session(user: UserContext, session: AsyncSession) -> None:
-    """Reject a session the account has superseded by signing in elsewhere (#147),
-    resolving ties by which login is genuinely NEWER (#188).
+def _enforce_single_session(user: UserContext) -> None:
+    """Reject a session the account has superseded by signing in elsewhere (#147).
 
     Enforced here (the strict resolver used by every data route) and NOT in the
     base resolver, so the sign-in that CLAIMS the new session (POST /auth/login)
-    and the status probe (GET /auth/session/active) still run.
+    and the status probe (GET /auth/session/active) still run. Fails open when
+    either id is absent: a token predating the ``session_id`` claim, or a user
+    who hasn't signed in since this shipped (``active_session_id`` still NULL),
+    is never locked out — enforcement begins once both exist and they differ.
 
-    Behaviour:
-
-    * No token ``session_id`` (predates the claim) -> allow (can't compare).
-    * ``active_session_id`` still NULL -> allow WITHOUT claiming. Deliberate: an
-      account that hasn't signed in since #147 shipped keeps its existing
-      device(s) working (grace), and claiming here would collapse them on the
-      first request. The claim happens on a real sign-in (POST /auth/login).
-    * Session matches the active one -> allow.
-    * Session DIFFERS from the active one -> decide by recency (#188). The token
-      ``iat`` (issued-at) tells us whether THIS session is newer than the one
-      that currently holds the account. If it is, adopt it server-side (a
-      conditional, race-safe UPDATE) so a genuine newer login wins EVEN IF its
-      best-effort ``POST /auth/login`` claim never landed — previously a dropped
-      claim left the OLD session active and kicked the NEW device (inverting
-      "new login wins"). If this session is the same-age-or-older one, it has
-      been superseded -> reject.
-
-    This preserves the core guarantee: a genuinely newer login always supersedes
-    an older session. The only writes are on the (rare) mismatch path — the
-    common steady state (one active session, ids equal) never writes, so this
-    does not reintroduce the per-request write removed in #182.
+    KNOWN LOW-RISK EDGE CASE (#188, deliberately NOT solved here): the claim on
+    ``active_session_id`` is written only by the best-effort ``POST /auth/login``
+    the frontend fires after sign-in. If that call is dropped, a NEW device can
+    momentarily be the one kicked (the OLD session still holds ``active``) rather
+    than superseding it. A recency-based server-side reclaim was rejected because
+    it lets a superseded device steal the session back on token refresh (refresh
+    keeps ``session_id`` but bumps ``iat``) and it reintroduces per-request
+    writes (#182). The correct fix is a reliable login-time claim (e.g. a
+    server-driven sign-in hook), left for future work; strict enforcement here
+    keeps the single-session security guarantee intact in the meantime.
     """
     active = user.active_session_id
     current = user.session_id
-    if not current or not active or active == current:
-        return
-
-    issued_at = user.session_issued_at
-    if issued_at is None:
-        # Can't prove this session is the newer one; stay strict and reject the
-        # mismatched session rather than silently allowing two live sessions.
+    if active and current and active != current:
         raise SessionSupersededError()
-
-    # Race-safe claim: only adopt when THIS token was issued strictly later than
-    # the session currently on file. If a concurrent, even-newer login already
-    # advanced ``active_session_at`` past our ``iat``, the WHERE clause fails,
-    # we claim nothing, and we fall through to reject (that newer login wins).
-    result = await session.execute(
-        update(User)
-        .where(
-            User.user_id == user.user_id,
-            User.active_session_at < func.to_timestamp(issued_at),
-        )
-        .values(
-            active_session_id=current,
-            active_session_at=func.to_timestamp(issued_at),
-        )
-    )
-    await session.commit()
-    if result.rowcount and result.rowcount > 0:
-        user.active_session_id = current
-        return
-    raise SessionSupersededError()
 
 
 async def _clear_login_attempts(session: AsyncSession, email: str) -> None:

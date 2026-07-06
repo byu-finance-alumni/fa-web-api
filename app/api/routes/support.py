@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireEngineer, RequireViewAccess
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.models.audit import AuditLog
@@ -107,7 +108,7 @@ async def create_support_contact(
 
 @admin_router.patch("/{contact_id}", response_model=SupportContactRead)
 async def update_support_contact(
-    contact_id: int,
+    contact_id: IdPath,
     payload: SupportContactUpdate,
     actor: RequireEngineer,
     session: SessionDep,
@@ -137,7 +138,7 @@ async def update_support_contact(
 
 @admin_router.delete("/{contact_id}", response_model=SupportContactRead)
 async def delete_support_contact(
-    contact_id: int, actor: RequireEngineer, session: SessionDep
+    contact_id: IdPath, actor: RequireEngineer, session: SessionDep
 ) -> SupportContactRead:
     """Remove a support contact (engineer only). 404 if missing."""
     contact = await _load(session, contact_id)

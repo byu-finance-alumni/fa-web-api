@@ -11,6 +11,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
@@ -18,6 +19,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.event import Event, EventAttendance
 from app.schemas.event import AttendeeCreate, AttendeeRead, EventCreate, EventUpdate
+from app.schemas.imports import EventImportPreview, EventImportResult
 from app.services import import_events
 
 # Reuse the alumni export's formula-injection neutralizer (canonical source:
@@ -211,7 +213,7 @@ def _headers_bad_preview(header_errors: list[str], meta: dict) -> dict:
     }
 
 
-@router.post("/import/preview", response_model=None)
+@router.post("/import/preview", response_model=EventImportPreview)
 async def preview_import_events(
     _: RequireFullAccess,
     session: SessionDep,
@@ -240,7 +242,7 @@ async def preview_import_events(
     return await import_events.evaluate(session, rows, meta)
 
 
-@router.post("/import", response_model=None)
+@router.post("/import", response_model=EventImportResult)
 async def import_events_commit(
     user: RequireFullAccess,
     session: SessionDep,
@@ -307,7 +309,7 @@ async def create_event(
 
 @router.get("/{event_id}")
 async def get_event(
-    event_id: int, _: RequireViewAccess, session: SessionDep
+    event_id: IdPath, _: RequireViewAccess, session: SessionDep
 ) -> dict:
     event = await session.get(Event, event_id)
     if event is None:
@@ -331,7 +333,7 @@ def _audit_value(value) -> str | None:
 
 @router.patch("/{event_id}")
 async def update_event(
-    event_id: int,
+    event_id: IdPath,
     payload: EventUpdate,
     user: RequireFullAccess,
     session: SessionDep,
@@ -377,7 +379,7 @@ async def update_event(
 
 @router.delete("/{event_id}")
 async def delete_event(
-    event_id: int, user: RequireFullAccess, session: SessionDep
+    event_id: IdPath, user: RequireFullAccess, session: SessionDep
 ) -> dict:
     """Delete an event (full_access). Cascades to its attendance rows (and any
     attached notes) via the FK ``ON DELETE CASCADE``. 404 if the event is
@@ -409,7 +411,7 @@ def _attendee_name(a: Alumni) -> str:
 
 @router.get("/{event_id}/attendees", response_model=list[AttendeeRead])
 async def list_event_attendees(
-    event_id: int, _: RequireViewAccess, session: SessionDep
+    event_id: IdPath, _: RequireViewAccess, session: SessionDep
 ) -> list[AttendeeRead]:
     """Alumni who attended an event (view-access read). 404 if the event is
     unknown so callers can distinguish "no attendees" from "no such event".
@@ -445,7 +447,7 @@ async def list_event_attendees(
 
 @router.get("/{event_id}/attendees/export")
 async def export_event_attendees(
-    event_id: int, user: RequireFullAccess, session: SessionDep
+    event_id: IdPath, user: RequireFullAccess, session: SessionDep
 ) -> Response:
     """Download an event's attendee list as CSV — columns **Name, Email, Net ID**
     (#219). Gated at ``full_access`` (a rung above the view-only attendee list)
@@ -520,7 +522,7 @@ async def export_event_attendees(
 
 @router.post("/{event_id}/attendees", status_code=status.HTTP_201_CREATED)
 async def add_event_attendee(
-    event_id: int,
+    event_id: IdPath,
     payload: AttendeeCreate,
     user: RequireFullAccess,
     session: SessionDep,
@@ -586,8 +588,8 @@ async def add_event_attendee(
 
 @router.delete("/{event_id}/attendees/{alumni_id}")
 async def remove_event_attendee(
-    event_id: int,
-    alumni_id: int,
+    event_id: IdPath,
+    alumni_id: IdPath,
     user: RequireFullAccess,
     session: SessionDep,
 ) -> dict:

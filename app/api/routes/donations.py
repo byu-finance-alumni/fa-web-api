@@ -33,6 +33,7 @@ from app.api.dependencies.auth import (
     RequireFullAccess,
     RequireViewAccess,
 )
+from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
@@ -41,6 +42,7 @@ from app.models.audit import AuditLog
 from app.models.donation import Donation
 from app.schemas.auth import UserContext
 from app.schemas.donation import DonationCreate, DonationUpdate
+from app.schemas.imports import DonationImportPreview, DonationImportResult
 from app.services import import_donations
 
 router = APIRouter(prefix="/donations", tags=["donations"])
@@ -217,7 +219,7 @@ async def donations_summary(
 
 @router.get("/alumni/{alumni_id}")
 async def list_alumni_donations(
-    alumni_id: int,
+    alumni_id: IdPath,
     user: RequireViewAccess,
     config: PermissionConfig,
     session: SessionDep,
@@ -277,7 +279,7 @@ def _serialize_donation(d: Donation) -> dict:
 
 @router.post("/alumni/{alumni_id}", status_code=status.HTTP_201_CREATED)
 async def add_donation(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: DonationCreate,
     user: RequireDonationsManage,
     session: SessionDep,
@@ -323,7 +325,7 @@ _FIELD_MAP = {
 
 @router.patch("/{donation_id}")
 async def update_donation(
-    donation_id: int,
+    donation_id: IdPath,
     payload: DonationUpdate,
     user: RequireDonationsManage,
     session: SessionDep,
@@ -368,7 +370,7 @@ async def update_donation(
 
 @router.delete("/{donation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_donation(
-    donation_id: int,
+    donation_id: IdPath,
     user: RequireFullAccess,
     session: SessionDep,
 ) -> Response:
@@ -437,7 +439,7 @@ async def donations_import_template(_: RequireDonationsManage) -> Response:
     )
 
 
-@router.post("/import/preview", response_model=None)
+@router.post("/import/preview", response_model=DonationImportPreview)
 async def preview_import_donations(
     _: RequireDonationsManage,
     session: SessionDep,
@@ -460,7 +462,7 @@ async def preview_import_donations(
     return await import_donations.evaluate(session, rows)
 
 
-@router.post("/import", response_model=None)
+@router.post("/import", response_model=DonationImportResult)
 async def import_donations_commit(
     user: RequireDonationsManage,
     session: SessionDep,

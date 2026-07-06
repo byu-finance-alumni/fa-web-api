@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.dependencies.auth import RequireEngineer, RequireSuperAdmin
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.rate_limit import (
@@ -423,7 +424,7 @@ async def list_logins(
 # a non-numeric segment can't match an int path param.
 @router.patch("/users/{user_id}")
 async def set_user_active(
-    user_id: int,
+    user_id: IdPath,
     payload: UserActiveUpdate,
     actor: RequireSuperAdmin,
     session: SessionDep,
@@ -463,7 +464,7 @@ async def set_user_active(
 
 @router.delete("/users/{user_id}", response_model=DeleteUserResponse)
 async def delete_user(
-    user_id: int,
+    user_id: IdPath,
     actor: DeleteUserRateLimit,
     session: SessionDep,
 ) -> DeleteUserResponse:
@@ -570,7 +571,7 @@ async def delete_user(
 
 @router.post("/users/{user_id}/roles")
 async def assign_role(
-    user_id: int,
+    user_id: IdPath,
     payload: RoleAssign,
     actor: AssignRoleRateLimit,
     session: SessionDep,
@@ -619,7 +620,7 @@ async def assign_role(
 
 @router.delete("/users/{user_id}/roles/{role_name}")
 async def remove_role(
-    user_id: int,
+    user_id: IdPath,
     role_name: RoleName,
     actor: RequireSuperAdmin,
     session: SessionDep,
@@ -692,7 +693,7 @@ async def remove_role(
 
 @router.post("/users/{user_id}/reset-password", response_model=ResetPasswordResponse)
 async def reset_password(
-    user_id: int,
+    user_id: IdPath,
     actor: ResetPasswordRateLimit,
     session: SessionDep,
 ) -> ResetPasswordResponse:
@@ -862,7 +863,7 @@ async def create_user(
 
 @router.patch("/users/{user_id}/name")
 async def update_user_name(
-    user_id: int,
+    user_id: IdPath,
     payload: UpdateUserNameRequest,
     actor: RequireSuperAdmin,
     session: SessionDep,

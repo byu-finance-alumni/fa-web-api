@@ -433,3 +433,25 @@ def test_list_boolean_filter_accepts_truthy_values(monkeypatch, truthy):
 def client_get_list(value: str):
     with TestClient(app) as c:
         return c.get(f"/alumni?missing_email={value}&cfa={value}")
+
+
+# --- #185: numeric path ids are bounded (out-of-range -> 422, never 500) ------
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "99999999999999999999",  # beyond int64: would 500 at the asyncpg bind
+        "0",  # below the 1-based identity floor (ge=1)
+    ],
+)
+def test_out_of_range_alumni_id_returns_422(client, bad_id):
+    # #185: a numeric path id outside the bigint range must be rejected as a 422
+    # validation error BEFORE the query runs — it must never reach asyncpg and
+    # surface as a 500.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.get(f"/alumni/{bad_id}")
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert any(f["field"] == "alumni_id" for f in body["error"]["fields"])

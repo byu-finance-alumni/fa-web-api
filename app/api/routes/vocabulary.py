@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireViewAccess, RequireVocabAdmin
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.vocabularies import VocabularyCategory
 from app.models.audit import AuditLog
@@ -90,7 +91,7 @@ async def create_vocabulary_term(
 
 @admin_router.patch("/{term_id}", response_model=VocabularyTermRead)
 async def update_vocabulary_term(
-    term_id: int,
+    term_id: IdPath,
     payload: VocabularyTermUpdate,
     actor: RequireVocabAdmin,
     session: SessionDep,
@@ -124,7 +125,7 @@ async def update_vocabulary_term(
 
 @admin_router.delete("/{term_id}", response_model=VocabularyTermRead)
 async def deactivate_vocabulary_term(
-    term_id: int, actor: RequireVocabAdmin, session: SessionDep
+    term_id: IdPath, actor: RequireVocabAdmin, session: SessionDep
 ) -> VocabularyTermRead:
     """Soft-delete a term (active=false): hidden from new-entry dropdowns, but
     still valid on existing records. Idempotent."""

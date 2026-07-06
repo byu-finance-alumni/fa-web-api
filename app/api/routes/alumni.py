@@ -21,6 +21,7 @@ from app.api.dependencies.auth import (
     RequireFullAccess,
     RequireViewAccess,
 )
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.core.rate_limit import (
@@ -40,6 +41,11 @@ from app.schemas.alumni import (
 )
 from app.schemas.alumni_export import AlumniExportRequest, ExportColumnCatalog
 from app.schemas.filters import FilterOptions
+from app.schemas.imports import (
+    AlumniHygienePreview,
+    AlumniImportPreview,
+    AlumniImportResult,
+)
 from app.schemas.profile import (
     EducationCreate,
     EducationRead,
@@ -406,7 +412,7 @@ async def alumni_import_template(_: RequireFullAccess) -> Response:
     )
 
 
-@router.post("/import/preview", response_model=None)
+@router.post("/import/preview", response_model=AlumniImportPreview)
 async def preview_import_alumni(
     _: RequireFullAccess,
     session: SessionDep,
@@ -438,7 +444,7 @@ async def preview_import_alumni(
     return await import_csv.evaluate(session, rows)
 
 
-@router.post("/import", response_model=None)
+@router.post("/import", response_model=AlumniImportResult)
 async def import_alumni(
     user: RequireFullAccess,
     session: SessionDep,
@@ -520,7 +526,7 @@ async def export_alumni(
 
 
 @router.get("/{alumni_id}", response_model=AlumniRead)
-async def get_alumni(alumni_id: int, user: RequireViewAccess, session: SessionDep) -> AlumniRead:
+async def get_alumni(alumni_id: IdPath, user: RequireViewAccess, session: SessionDep) -> AlumniRead:
     """Single lightweight alumni core record.
 
     Archived records 404 (they were removed from the directory). view_only
@@ -533,7 +539,7 @@ async def get_alumni(alumni_id: int, user: RequireViewAccess, session: SessionDe
 
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
 async def get_alumni_profile(
-    alumni_id: int, user: RequireViewAccess, session: SessionDep
+    alumni_id: IdPath, user: RequireViewAccess, session: SessionDep
 ) -> ProfileRead:
     """Full profile aggregate (core + contact, career, employment, leadership,
     engagement, surveys, interactions, tasks, attachments, audit) for the tabs.
@@ -554,9 +560,16 @@ async def get_alumni_profile(
     )
 
 
-@router.get("/{alumni_id}/export")
+@router.get(
+    "/{alumni_id}/export",
+    response_model=ProfileRead,
+    # The exported body is the full profile aggregate MINUS the embedded audit
+    # trail (the service drops it). Exclude it here too so the declared model
+    # matches the actual output exactly and the ``audit`` key is never re-added.
+    response_model_exclude={"audit"},
+)
 async def export_alumni_profile(
-    alumni_id: int, user: RequireFullAccess, session: SessionDep
+    alumni_id: IdPath, user: RequireFullAccess, session: SessionDep
 ) -> dict:
     """Server-side, audited profile export (full_access).
 
@@ -574,7 +587,7 @@ async def export_alumni_profile(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_interaction(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: InteractionCreate,
     user: InteractionWriteRateLimit,
     session: SessionDep,
@@ -595,8 +608,8 @@ async def add_interaction(
     response_model=InteractionRead,
 )
 async def update_interaction(
-    alumni_id: int,
-    interaction_id: int,
+    alumni_id: IdPath,
+    interaction_id: IdPath,
     payload: InteractionUpdate,
     user: InteractionWriteRateLimit,
     session: SessionDep,
@@ -622,8 +635,8 @@ async def update_interaction(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def delete_interaction(
-    alumni_id: int,
-    interaction_id: int,
+    alumni_id: IdPath,
+    interaction_id: IdPath,
     user: InteractionWriteRateLimit,
     session: SessionDep,
 ) -> None:
@@ -649,7 +662,7 @@ async def delete_interaction(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_task(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: TaskCreate,
     user: TaskWriteRateLimit,
     session: SessionDep,
@@ -660,8 +673,8 @@ async def add_task(
 
 @router.patch("/{alumni_id}/tasks/{task_id}", response_model=TaskRead)
 async def update_task_completion(
-    alumni_id: int,
-    task_id: int,
+    alumni_id: IdPath,
+    task_id: IdPath,
     payload: TaskCompleteUpdate,
     user: TaskWriteRateLimit,
     session: SessionDep,
@@ -678,7 +691,7 @@ async def update_task_completion(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_employment(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: EmploymentHistoryCreate,
     user: EmploymentWriteRateLimit,
     session: SessionDep,
@@ -694,8 +707,8 @@ async def add_employment(
     response_model=EmploymentHistoryRead,
 )
 async def update_employment(
-    alumni_id: int,
-    employment_history_id: int,
+    alumni_id: IdPath,
+    employment_history_id: IdPath,
     payload: EmploymentHistoryUpdate,
     user: EmploymentWriteRateLimit,
     session: SessionDep,
@@ -716,8 +729,8 @@ async def update_employment(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def delete_employment(
-    alumni_id: int,
-    employment_history_id: int,
+    alumni_id: IdPath,
+    employment_history_id: IdPath,
     user: EmploymentWriteRateLimit,
     session: SessionDep,
 ) -> None:
@@ -734,7 +747,7 @@ async def delete_employment(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_education(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: EducationCreate,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -750,8 +763,8 @@ async def add_education(
     response_model=EducationRead,
 )
 async def update_education(
-    alumni_id: int,
-    education_id: int,
+    alumni_id: IdPath,
+    education_id: IdPath,
     payload: EducationUpdate,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -768,8 +781,8 @@ async def update_education(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def delete_education(
-    alumni_id: int,
-    education_id: int,
+    alumni_id: IdPath,
+    education_id: IdPath,
     user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
@@ -786,7 +799,7 @@ async def delete_education(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_leadership(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: LeadershipCreate,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -802,8 +815,8 @@ async def add_leadership(
     response_model=LeadershipRead,
 )
 async def update_leadership(
-    alumni_id: int,
-    finance_society_leadership_id: int,
+    alumni_id: IdPath,
+    finance_society_leadership_id: IdPath,
     payload: LeadershipUpdate,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -824,8 +837,8 @@ async def update_leadership(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def delete_leadership(
-    alumni_id: int,
-    finance_society_leadership_id: int,
+    alumni_id: IdPath,
+    finance_society_leadership_id: IdPath,
     user: RequireAlumniEdit,
     session: SessionDep,
 ) -> None:
@@ -845,7 +858,7 @@ async def delete_leadership(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_tag(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: TagCreate,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -857,7 +870,7 @@ async def add_tag(
 
 @router.delete("/{alumni_id}/tags/{tag:path}", response_model=list[str])
 async def remove_tag(
-    alumni_id: int,
+    alumni_id: IdPath,
     tag: str,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -873,7 +886,7 @@ async def remove_tag(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_status_label(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: StatusLabelCreate,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -887,7 +900,7 @@ async def add_status_label(
 
 @router.delete("/{alumni_id}/status-labels/{label:path}", response_model=list[str])
 async def remove_status_label(
-    alumni_id: int,
+    alumni_id: IdPath,
     label: str,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -905,7 +918,7 @@ async def remove_status_label(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_event_attendance(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: EventAttendanceCreate,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -917,7 +930,7 @@ async def add_event_attendance(
     )
 
 
-@router.post("/preview")
+@router.post("/preview", response_model=AlumniHygienePreview)
 async def preview_create_alumni(
     payload: AlumniCreateFull, user: RequireFullAccess, session: SessionDep
 ) -> dict:
@@ -933,9 +946,9 @@ async def preview_create_alumni(
     return result
 
 
-@router.post("/{alumni_id}/preview")
+@router.post("/{alumni_id}/preview", response_model=AlumniHygienePreview)
 async def preview_update_alumni(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: AlumniUpdateFull,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -965,7 +978,7 @@ async def create_alumni(
 
 @router.patch("/{alumni_id}", response_model=AlumniRead)
 async def update_alumni(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: AlumniUpdateFull,
     user: RequireAlumniEdit,
     session: SessionDep,
@@ -975,7 +988,7 @@ async def update_alumni(
 
 @router.delete("/{alumni_id}", response_model=AlumniRead)
 async def archive_alumni(
-    alumni_id: int, user: RequireFullAccess, session: SessionDep
+    alumni_id: IdPath, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
     """Soft-delete (archive) an alumni record."""
     return await service.archive_alumni(session, alumni_id, actor_user_id=user.user_id)
@@ -983,7 +996,7 @@ async def archive_alumni(
 
 @router.post("/{alumni_id}/restore", response_model=AlumniRead)
 async def restore_alumni(
-    alumni_id: int, user: RequireFullAccess, session: SessionDep
+    alumni_id: IdPath, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
     """Restore (unarchive) a previously archived alumni record."""
     return await service.restore_alumni(session, alumni_id, actor_user_id=user.user_id)

@@ -25,6 +25,15 @@ from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
 from app.schemas.auth import UserContext
+from app.schemas.dashboard import (
+    ActivityFeed,
+    BirthdayRow,
+    DashboardSummary,
+    DataQuality,
+    EventParticipationRow,
+    FollowUpRow,
+    InteractionActivity,
+)
 from app.utils.sql import escape_like
 
 logger = logging.getLogger(__name__)
@@ -144,7 +153,7 @@ def _serialize_interaction(i, a, u) -> dict:
     }
 
 
-@router.get("/summary")
+@router.get("/summary", response_model=DashboardSummary)
 async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     """KPIs, distributions (cohort / top employers / by state), and recent
     activity for the dashboard.
@@ -353,7 +362,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     }
 
 
-@router.get("/birthdays")
+@router.get("/birthdays", response_model=list[BirthdayRow])
 async def birthdays(
     actor: RequireViewAccess, session: SessionDep
 ) -> list[dict]:
@@ -421,7 +430,7 @@ async def birthdays(
     ]
 
 
-@router.get("/event-participation")
+@router.get("/event-participation", response_model=list[EventParticipationRow])
 async def event_participation(
     _: RequireViewAccess, session: SessionDep
 ) -> list[dict]:
@@ -487,7 +496,7 @@ async def event_participation(
     ]
 
 
-@router.get("/activity")
+@router.get("/activity", response_model=ActivityFeed)
 async def activity_feed(
     actor: RequireFullAccess,
     session: SessionDep,
@@ -627,7 +636,7 @@ async def activity_feed(
     }
 
 
-@router.get("/data-quality")
+@router.get("/data-quality", response_model=DataQuality)
 async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
     """The data-quality alert counts (same predicates as the summary KPIs),
     for the dedicated data-quality page.
@@ -661,7 +670,7 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
     }
 
 
-@router.get("/contacted-this-month")
+@router.get("/contacted-this-month", response_model=list[InteractionActivity])
 async def contacted_this_month_list(
     actor: RequireFullAccess, session: SessionDep
 ) -> list[dict]:
@@ -712,7 +721,7 @@ async def contacted_this_month_list(
     return [_serialize_interaction(i, a, u) for i, a, u in rows]
 
 
-@router.get("/follow-ups")
+@router.get("/follow-ups", response_model=list[FollowUpRow])
 async def upcoming_follow_ups_list(
     actor: RequireFullAccess, session: SessionDep
 ) -> list[dict]:

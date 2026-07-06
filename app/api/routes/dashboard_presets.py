@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireSuperAdmin, RequireViewAccess
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.models.audit import AuditLog
@@ -106,7 +107,7 @@ async def create_dashboard_preset(
 
 @admin_router.patch("/{preset_id}", response_model=DashboardPresetRead)
 async def update_dashboard_preset(
-    preset_id: int,
+    preset_id: IdPath,
     payload: DashboardPresetUpdate,
     actor: RequireSuperAdmin,
     session: SessionDep,
@@ -136,7 +137,7 @@ async def update_dashboard_preset(
 
 @admin_router.delete("/{preset_id}", response_model=DashboardPresetRead)
 async def delete_dashboard_preset(
-    preset_id: int, actor: RequireSuperAdmin, session: SessionDep
+    preset_id: IdPath, actor: RequireSuperAdmin, session: SessionDep
 ) -> DashboardPresetRead:
     """Remove a quick-filter preset (engineer / super_admin). 404 if missing."""
     preset = await _load(session, preset_id)

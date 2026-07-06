@@ -14,7 +14,7 @@ from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.event import Event, EventAttendance
-from app.schemas.event import AttendeeCreate, EventCreate, EventUpdate
+from app.schemas.event import AttendeeCreate, AttendeeRead, EventCreate, EventUpdate
 from app.services import import_events
 from app.utils.sql import escape_like
 
@@ -361,18 +361,23 @@ def _attendee_name(a: Alumni) -> str:
     return name or f"Alumni #{a.alumni_id}"
 
 
-@router.get("/{event_id}/attendees")
+@router.get("/{event_id}/attendees", response_model=list[AttendeeRead])
 async def list_event_attendees(
     event_id: int, _: RequireViewAccess, session: SessionDep
 ) -> list[dict]:
     """Alumni who attended an event (view-access read). 404 if the event is
-    unknown so callers can distinguish "no attendees" from "no such event"."""
+    unknown so callers can distinguish "no attendees" from "no such event".
+    ``notes`` exposes the per-attendee ``attendance_notes`` column (#181)."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
     rows = (
         await session.execute(
-            select(Alumni, EventAttendance.attendance_status)
+            select(
+                Alumni,
+                EventAttendance.attendance_status,
+                EventAttendance.attendance_notes,
+            )
             .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
             .where(EventAttendance.event_id == event_id)
             .order_by(Alumni.last_name, Alumni.first_name)
@@ -384,12 +389,17 @@ async def list_event_attendees(
             "name": _attendee_name(a),
             "graduation_year": a.graduation_year,
             "attendance_status": status,
+            "notes": notes,
         }
-        for a, status in rows
+        for a, status, notes in rows
     ]
 
 
-@router.post("/{event_id}/attendees", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{event_id}/attendees",
+    response_model=AttendeeRead,
+    status_code=status.HTTP_201_CREATED,
+)
 async def add_event_attendee(
     event_id: int,
     payload: AttendeeCreate,
@@ -397,9 +407,12 @@ async def add_event_attendee(
     session: SessionDep,
 ) -> dict:
     """Add an alumni to an event's attendance (full_access). 404 if the event or
-    alumni is unknown; 409 if the (event, alumni) pair already exists. Audits the
-    write (entity_type "event", action "add_attendee", entity_id event_id,
-    new_value the alumni id/name).
+    alumni is unknown; 404 too if the alumni is archived — archived alumni are
+    not valid attendees, mirroring the active-only matching the bulk importer
+    uses (``repositories/net_id.match_net_ids``). 409 if the (event, alumni) pair
+    already exists. An optional ``notes`` in the body is persisted to
+    ``attendance_notes`` (#181). Audits the write (entity_type "event", action
+    "add_attendee", entity_id event_id, new_value the alumni id/name).
 
     Note: this is the event-roster management surface and stays ``full_access``
     on purpose. Recording attendance from an alumnus's PROFILE
@@ -410,7 +423,9 @@ async def add_event_attendee(
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
     alumni = await session.get(Alumni, payload.alumni_id)
-    if alumni is None:
+    if alumni is None or alumni.archived:
+        # Archived alumni are treated as non-attendees (same policy as the bulk
+        # importer's active-only match), so a manual add of one is a 404.
         raise NotFoundError(f"Alumni {payload.alumni_id} not found.")
 
     existing = await session.scalar(
@@ -428,6 +443,7 @@ async def add_event_attendee(
         event_id=event_id,
         alumni_id=payload.alumni_id,
         attendance_status=payload.attendance_status,
+        attendance_notes=payload.notes,
     )
     session.add(attendance)
     name = _attendee_name(alumni)
@@ -446,6 +462,7 @@ async def add_event_attendee(
         "name": name,
         "graduation_year": alumni.graduation_year,
         "attendance_status": payload.attendance_status,
+        "notes": payload.notes,
     }
 
 

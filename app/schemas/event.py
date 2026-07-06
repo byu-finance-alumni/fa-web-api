@@ -22,12 +22,15 @@ _STATUS_MAX = 100
 class AttendeeCreate(BaseModel):
     """Body for adding an attendee to an event (full_access). ``extra='forbid'``
     rejects unknown keys; ``alumni_id`` is required; ``attendance_status`` is an
-    optional free-text label capped at 100 chars (blank collapses to None)."""
+    optional free-text label capped at 100 chars (blank collapses to None).
+    ``notes`` is optional per-attendee free text (blank collapses to None,
+    capped at 10000 chars) so the roster note isn't import-only (#181)."""
 
     model_config = ConfigDict(extra="forbid")
 
     alumni_id: int
     attendance_status: str | None = None
+    notes: str | None = None
 
     @field_validator("attendance_status")
     @classmethod
@@ -40,6 +43,31 @@ class AttendeeCreate(BaseModel):
         if len(stripped) > _STATUS_MAX:
             raise ValueError(f"must be at most {_STATUS_MAX} characters.")
         return stripped
+
+    @field_validator("notes")
+    @classmethod
+    def _notes_blank_to_none_capped(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if len(stripped) > _NOTES_MAX:
+            raise ValueError(f"must be at most {_NOTES_MAX} characters.")
+        return stripped
+
+
+class AttendeeRead(BaseModel):
+    """A single roster row on ``GET /events/{id}/attendees`` (view read) and the
+    echo returned when an attendee is added manually. ``notes`` surfaces the
+    ``event_attendance.attendance_notes`` column (#181) — previously write-only
+    "dark data" set by the CSV importer with no read path."""
+
+    alumni_id: int
+    name: str
+    graduation_year: int | None = None
+    attendance_status: str | None = None
+    notes: str | None = None
 
 
 class EventCreate(BaseModel):

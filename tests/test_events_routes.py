@@ -88,13 +88,14 @@ def _event():
     )
 
 
-def _attendee():
+def _attendee(archived=False):
     return SimpleNamespace(
         alumni_id=42,
         first_name="Jane",
         preferred_first_name=None,
         last_name="Doe",
         graduation_year=2018,
+        archived=archived,
     )
 
 
@@ -108,7 +109,10 @@ def _with_session(session):
 def test_event_attendees_returns_alumni(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     app.dependency_overrides[get_session] = _with_session(
-        _FakeSession(event=_event(), attendee_rows=[(_attendee(), "attended")])
+        _FakeSession(
+            event=_event(),
+            attendee_rows=[(_attendee(), "attended", "VIP guest")],
+        )
     )
     response = client.get("/events/7/attendees")
     assert response.status_code == 200
@@ -119,6 +123,7 @@ def test_event_attendees_returns_alumni(client):
             "name": "Jane Doe",
             "graduation_year": 2018,
             "attendance_status": "attended",
+            "notes": "VIP guest",
         }
     ]
 
@@ -499,6 +504,7 @@ def test_add_attendee_happy_path_creates_and_audits(client):
         "name": "Jane Doe",
         "graduation_year": 2018,
         "attendance_status": "attended",
+        "notes": None,
     }
     assert session.committed is True
     attendance = [o for o in session.added if hasattr(o, "alumni_id")]
@@ -507,6 +513,7 @@ def test_add_attendee_happy_path_creates_and_audits(client):
     assert attendance[0].event_id == 7
     assert attendance[0].alumni_id == 42
     assert attendance[0].attendance_status == "attended"
+    assert attendance[0].attendance_notes is None
     assert len(audits) == 1
     assert audits[0].action_type == "add_attendee"
     assert audits[0].entity_type == "event"
@@ -514,6 +521,34 @@ def test_add_attendee_happy_path_creates_and_audits(client):
     assert audits[0].user_id == 1
     assert "42" in audits[0].new_value
     assert "Jane Doe" in audits[0].new_value
+
+
+def test_add_attendee_persists_notes(client):
+    # #181: an optional ``notes`` in the body is persisted to attendance_notes
+    # and echoed back, so the note is no longer import-only "dark data".
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _AddAttendeeSession(event=_event(), alumni=_attendee())
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.post(
+        "/events/7/attendees",
+        json={"alumni_id": 42, "attendance_status": "attended", "notes": "  VIP  "},
+    )
+    assert response.status_code == 201
+    assert response.json()["notes"] == "VIP"
+    attendance = [o for o in session.added if hasattr(o, "alumni_id")]
+    assert attendance[0].attendance_notes == "VIP"
+
+
+def test_add_attendee_rejects_archived_alumni(client):
+    # #181: archived alumni are not valid attendees (mirrors the importer's
+    # active-only matching), so a manual add of one is a 404.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _AddAttendeeSession(event=_event(), alumni=_attendee(archived=True))
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.post("/events/7/attendees", json={"alumni_id": 42})
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+    assert session.committed is False
 
 
 # --- remove attendee (DELETE /events/{id}/attendees/{alumni_id}) --------------

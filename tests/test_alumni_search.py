@@ -473,6 +473,24 @@ def test_grad_sorts_are_not_swapped():
     assert "graduation_year DESC" not in asc_order
 
 
+def test_grad_desc_final_tiebreak_is_unique_alumni_id():
+    # #183: grad_desc tiebreaks on the non-unique last_name, then the UNIQUE PK.
+    # Ending on alumni_id gives tied rows a total order so OFFSET paging can't
+    # duplicate/skip a row across a page boundary.
+    order_by = _order_sql("grad_desc").split("ORDER BY", 1)[1]
+    assert "graduation_year DESC NULLS LAST" in order_by
+    assert "last_name ASC" in order_by
+    assert order_by.rstrip().endswith("alumni.alumni_id ASC")
+
+
+def test_grad_asc_final_tiebreak_is_unique_alumni_id():
+    # #183: same total-order guarantee for the ascending direction.
+    order_by = _order_sql("grad_asc").split("ORDER BY", 1)[1]
+    assert "graduation_year ASC NULLS LAST" in order_by
+    assert "last_name ASC" in order_by
+    assert order_by.rstrip().endswith("alumni.alumni_id ASC")
+
+
 def test_default_and_name_sort_by_last_name():
     for token in (None, "name", "bogus", "grad_desc_typo"):
         sql = _order_sql(token)

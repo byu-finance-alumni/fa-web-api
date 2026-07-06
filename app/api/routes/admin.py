@@ -29,12 +29,13 @@ from app.core.rate_limit import (
     DeleteUserRateLimit,
     ResetPasswordRateLimit,
 )
-from app.core.roles import RoleName
+from app.core.roles import ROLE_LABELS, ROLE_ORDER, RoleName
 from app.core.security import AuthorizationError
 from app.models.audit import AuditLog
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
 from app.models.user import Role, User, UserRole
+from app.schemas.auth import UserContext
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -56,6 +57,43 @@ _TEMP_PW_LENGTH = 20
 def _generate_temp_password() -> str:
     """Return a strong, single-use temporary password from the CSPRNG."""
     return "".join(secrets.choice(_TEMP_PW_ALPHABET) for _ in range(_TEMP_PW_LENGTH))
+
+
+# --- Privilege ceiling for role mutation (#178) ------------------------------
+#
+# Role-mutation endpoints must never let an actor grant, remove, or delete a
+# role that outranks their own highest tier. The old guards only special-cased
+# the ``engineer`` role, so a lower role that an engineer had delegated the
+# ``USER_ADMIN`` capability to (supported by the permission editor) could pass
+# the route guard and then assign itself ``super_admin`` — a self-escalation.
+# Ranking via the canonical ROLE_ORDER closes that path for every top tier while
+# leaving the default config (super_admin / engineer holding USER_ADMIN)
+# unchanged: a super_admin can still manage super_admin and below, and only an
+# engineer can touch the engineer tier.
+
+
+def _role_rank(role_name: str) -> int:
+    """Privilege rank of a role: lower index = more privileged (see ROLE_ORDER).
+
+    An unrecognized role ranks below every known role (least privileged).
+    """
+    for index, role in enumerate(ROLE_ORDER):
+        if role.value == role_name:
+            return index
+    return len(ROLE_ORDER)
+
+
+def _actor_ceiling_rank(actor: UserContext) -> int:
+    """The actor's highest tier as a rank (lower = more privileged).
+
+    An actor with no recognized role sits below the entire ladder.
+    """
+    return min((_role_rank(r) for r in actor.roles), default=len(ROLE_ORDER))
+
+
+def _outranks_actor(actor: UserContext, role_name: str) -> bool:
+    """True if ``role_name`` is above the actor's own highest tier."""
+    return _role_rank(role_name) < _actor_ceiling_rank(actor)
 
 
 # --- Name validation ---------------------------------------------------------
@@ -425,8 +463,10 @@ async def delete_user(
 
     Guards (mirroring remove_role):
       * You cannot delete your own account.
-      * Privilege ceiling: only an engineer may delete a user who holds the
-        engineer role.
+      * Privilege ceiling (#178): an actor may only delete a user whose highest
+        role is at or below the actor's own highest tier (ranked via
+        ROLE_ORDER) — so only an engineer may delete an engineer, and only
+        super_admin/engineer may delete a super_admin.
       * Last-holder guard: you cannot delete the final holder of a top role
         (super_admin / engineer), which would lock administration out for
         everyone.
@@ -444,9 +484,17 @@ async def delete_user(
     user = await _load_user(session, user_id)
     target_roles = {r.role_name for r in user.roles}
 
-    # Privilege ceiling: the engineer tier is managed exclusively by engineers.
-    if RoleName.ENGINEER.value in target_roles and not actor.is_engineer:
-        raise AuthorizationError("Only an engineer can delete an engineer.")
+    # Privilege ceiling (#178): never delete a user who holds a role above the
+    # actor's own highest tier. Ranking every role via ROLE_ORDER (not just
+    # special-casing engineer) blocks a lower role that was delegated the
+    # USER_ADMIN capability from deleting a super_admin/engineer.
+    highest_target = min(target_roles, key=_role_rank, default=None)
+    if highest_target is not None and _outranks_actor(actor, highest_target):
+        label = ROLE_LABELS.get(highest_target, highest_target)
+        raise AuthorizationError(
+            f"You cannot delete a user who holds the {label} role; "
+            "it is above your privilege tier."
+        )
 
     # System-wide last-holder guard: never delete the final holder of a top role,
     # which would lock user (or engineer-only vocab/database) administration out
@@ -510,14 +558,16 @@ async def assign_role(
     """Grant a role to an existing user (idempotent). super_admin and up.
 
     Rate-limited per actor (best-effort, in-process) to brake bulk privilege
-    changes. Privilege ceiling: only an ``engineer`` may grant the ``engineer``
-    role. A
-    ``super_admin`` (who is below engineer) cannot mint an account that outranks
-    them — that would be a privilege escalation above the actor's own ceiling.
+    changes. Privilege ceiling (#178): an actor may only grant a role at or
+    below their own highest tier (ranked via ROLE_ORDER). So only an
+    ``engineer`` may grant ``engineer``, and only ``super_admin``/``engineer``
+    may grant ``super_admin`` — a lower role that was delegated ``USER_ADMIN``
+    still cannot mint an account that outranks it.
     """
-    if payload.role_name == RoleName.ENGINEER and not actor.is_engineer:
+    if _outranks_actor(actor, payload.role_name.value):
+        label = ROLE_LABELS.get(payload.role_name.value, payload.role_name.value)
         raise AuthorizationError(
-            "Only an engineer can grant the engineer role."
+            f"You cannot grant the {label} role; it is above your privilege tier."
         )
     user = await _load_user(session, user_id)
     role = await session.scalar(
@@ -551,17 +601,20 @@ async def remove_role(
 ) -> dict:
     """Revoke a role from an existing user (idempotent). super_admin and up.
 
-    Privilege ceiling (symmetric with assign_role): only an ``engineer`` may
-    remove the ``engineer`` role. A ``super_admin`` cannot demote an engineer —
-    the engineer tier is managed exclusively by engineers.
+    Privilege ceiling (symmetric with assign_role, #178): an actor may only
+    remove a role at or below their own highest tier (ranked via ROLE_ORDER).
+    So only an ``engineer`` may remove ``engineer``, and only
+    ``super_admin``/``engineer`` may remove ``super_admin`` — a lower role that
+    was delegated ``USER_ADMIN`` cannot strip a role that outranks it.
 
     Guards against an admin removing their OWN top role (super_admin or
     engineer), which would lock user administration (or, for engineer, vocab /
     database administration) out of the system if they were the last holder.
     """
-    if role_name == RoleName.ENGINEER and not actor.is_engineer:
+    if _outranks_actor(actor, role_name.value):
+        label = ROLE_LABELS.get(role_name.value, role_name.value)
         raise AuthorizationError(
-            "Only an engineer can remove the engineer role."
+            f"You cannot remove the {label} role; it is above your privilege tier."
         )
     await _load_user(session, user_id)  # 404 if the user doesn't exist
     role = await session.scalar(

@@ -54,6 +54,7 @@ class Capability:
     ALUMNI_EDIT = "alumni.edit"
     ALUMNI_FULL = "alumni.full"
     USER_ADMIN = "user_admin"
+    DONATIONS_MANAGE = "donations.manage"
     VOCAB_ADMIN = "vocab_admin"
     PROFILE_COMPLETENESS = "profile.completeness"
     ENGINEER = "engineer"
@@ -94,6 +95,15 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         ),
     ),
     CapabilitySpec(
+        code=Capability.DONATIONS_MANAGE,
+        label="Manage donations",
+        description=(
+            "Add, edit, and bulk-import Pay It Forward Fund donation-ledger "
+            "records. Distinct from user administration so donation-ledger "
+            "writes aren't silently granted when user-admin is delegated (#189)."
+        ),
+    ),
+    CapabilitySpec(
         code=Capability.VOCAB_ADMIN,
         label="Vocabulary & dropdowns",
         description=(
@@ -101,6 +111,13 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "dropdowns."
         ),
     ),
+    # NOTE (#189): profile.completeness is enforced CLIENT-SIDE ONLY — it toggles
+    # the visibility of the completeness tab/score in the UI. There is no backend
+    # guard (no ``require_capability(PROFILE_COMPLETENESS)`` on any route), so it is
+    # NOT an access-control boundary and must not be mistaken for one: the
+    # underlying alumni fields it summarizes are already returned by the normal
+    # view-access routes. Add a server-side guard here (and gate the relevant
+    # route) if it ever needs to actually restrict data.
     CapabilitySpec(
         code=Capability.PROFILE_COMPLETENESS,
         label="Profile completeness",
@@ -146,6 +163,10 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             Capability.ALUMNI_EDIT,
             Capability.ALUMNI_FULL,
             Capability.USER_ADMIN,
+            # donations.manage defaults to EXACTLY the roles that held user_admin
+            # before it was split out (super_admin + engineer), so gating the
+            # donation writes on it is behaviour-preserving on day one (#189).
+            Capability.DONATIONS_MANAGE,
             Capability.PROFILE_COMPLETENESS,
         }
     ),

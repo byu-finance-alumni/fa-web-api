@@ -27,6 +27,10 @@ class AuthenticatedUser(BaseModel):
     # sign-in/device, so the single-active-session guard (#147) can tell one of
     # the account's sessions from another. None if the token predates the claim.
     session_id: str | None = None
+    # Token issued-at (``iat`` claim, epoch seconds). Used by the single-session
+    # guard to decide which of two sessions is genuinely NEWER (#188), so a newer
+    # login supersedes an older one even if its best-effort claim call was lost.
+    session_issued_at: int | None = None
 
 
 class UserContext(BaseModel):
@@ -56,7 +60,10 @@ class UserContext(BaseModel):
     # session (from the JWT); ``active_session_id`` is the account's current
     # active session from the DB. When both are set and differ, this session has
     # been superseded by a newer login. Populated by the auth resolver.
+    # ``session_issued_at`` is the token ``iat`` used to break ties by recency
+    # (#188). Populated by the auth resolver.
     session_id: str | None = None
+    session_issued_at: int | None = None
     active_session_id: str | None = None
 
     @classmethod

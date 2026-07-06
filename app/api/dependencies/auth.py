@@ -13,7 +13,7 @@ from typing import Annotated
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import delete
+from sqlalchemy import delete, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.capabilities import Capability, effective_capabilities
@@ -27,6 +27,7 @@ from app.core.security import (
     verify_supabase_jwt,
 )
 from app.models.login_attempt import LoginAttempt
+from app.models.user import User
 from app.repositories.permissions import load_grants
 from app.repositories.user import get_user_with_roles_by_auth_id
 from app.schemas.auth import AuthenticatedUser, UserContext
@@ -55,6 +56,7 @@ async def get_current_user(
         email=claims.get("email"),
         token_role=claims.get("role"),
         session_id=claims.get("session_id"),
+        session_issued_at=claims.get("iat"),
     )
 
 
@@ -94,7 +96,13 @@ async def get_current_db_user_allow_must_change(
     if not user.active:
         raise DeactivatedAccountError()
 
-    await _clear_login_attempts(session, user.email)
+    # NOTE (#182): the rolling failed-login counter is NO LONGER cleared here.
+    # This resolver runs on EVERY authenticated request (data routes, the
+    # /auth/session/active poll, …); clearing login_attempts here issued a
+    # DELETE + its own commit on every single one, even with zero matching rows.
+    # The counter is now cleared once, on the login-success path
+    # (POST /auth/login -> ``_clear_login_attempts``), which is the only
+    # trustworthy, un-abusable place a real sign-in reaches.
 
     context = UserContext.from_orm_user(user)
     # Carry THIS request's token session so downstream guards (single active
@@ -103,6 +111,7 @@ async def get_current_db_user_allow_must_change(
     # ``get_current_db_user`` so the claiming call (POST /auth/login) and the
     # status probe can still run.
     context.session_id = current.session_id
+    context.session_issued_at = current.session_issued_at
     return context
 
 
@@ -124,52 +133,92 @@ async def get_current_db_user(
     depend on the exempt variant above so the user can read and clear the flag.
     """
     user = await get_current_db_user_allow_must_change(current, session)
-    _enforce_single_session(user)
+    await _enforce_single_session(user, session)
     if user.must_change_password:
         raise MustChangePasswordError()
     return user
 
 
-def _enforce_single_session(user: UserContext) -> None:
-    """Reject a session the account has superseded by signing in elsewhere (#147).
+async def _enforce_single_session(user: UserContext, session: AsyncSession) -> None:
+    """Reject a session the account has superseded by signing in elsewhere (#147),
+    resolving ties by which login is genuinely NEWER (#188).
 
     Enforced here (the strict resolver used by every data route) and NOT in the
     base resolver, so the sign-in that CLAIMS the new session (POST /auth/login)
-    and the status probe (GET /auth/session/active) still run. Fails open when
-    either id is absent: a token predating the ``session_id`` claim, or a user
-    who hasn't signed in since this shipped (``active_session_id`` still NULL),
-    is never locked out — enforcement begins once both exist and they differ.
+    and the status probe (GET /auth/session/active) still run.
+
+    Behaviour:
+
+    * No token ``session_id`` (predates the claim) -> allow (can't compare).
+    * ``active_session_id`` still NULL -> allow WITHOUT claiming. Deliberate: an
+      account that hasn't signed in since #147 shipped keeps its existing
+      device(s) working (grace), and claiming here would collapse them on the
+      first request. The claim happens on a real sign-in (POST /auth/login).
+    * Session matches the active one -> allow.
+    * Session DIFFERS from the active one -> decide by recency (#188). The token
+      ``iat`` (issued-at) tells us whether THIS session is newer than the one
+      that currently holds the account. If it is, adopt it server-side (a
+      conditional, race-safe UPDATE) so a genuine newer login wins EVEN IF its
+      best-effort ``POST /auth/login`` claim never landed — previously a dropped
+      claim left the OLD session active and kicked the NEW device (inverting
+      "new login wins"). If this session is the same-age-or-older one, it has
+      been superseded -> reject.
+
+    This preserves the core guarantee: a genuinely newer login always supersedes
+    an older session. The only writes are on the (rare) mismatch path — the
+    common steady state (one active session, ids equal) never writes, so this
+    does not reintroduce the per-request write removed in #182.
     """
     active = user.active_session_id
     current = user.session_id
-    if active and current and active != current:
+    if not current or not active or active == current:
+        return
+
+    issued_at = user.session_issued_at
+    if issued_at is None:
+        # Can't prove this session is the newer one; stay strict and reject the
+        # mismatched session rather than silently allowing two live sessions.
         raise SessionSupersededError()
+
+    # Race-safe claim: only adopt when THIS token was issued strictly later than
+    # the session currently on file. If a concurrent, even-newer login already
+    # advanced ``active_session_at`` past our ``iat``, the WHERE clause fails,
+    # we claim nothing, and we fall through to reject (that newer login wins).
+    result = await session.execute(
+        update(User)
+        .where(
+            User.user_id == user.user_id,
+            User.active_session_at < func.to_timestamp(issued_at),
+        )
+        .values(
+            active_session_id=current,
+            active_session_at=func.to_timestamp(issued_at),
+        )
+    )
+    await session.commit()
+    if result.rowcount and result.rowcount > 0:
+        user.active_session_id = current
+        return
+    raise SessionSupersededError()
 
 
 async def _clear_login_attempts(session: AsyncSession, email: str) -> None:
-    """Best-effort clear of the rolling failed-login counter for ``email``.
+    """Clear the rolling failed-login counter for ``email`` (login-success path).
 
-    A genuinely successful login is the only way to reach an authenticated
-    route, so resolving the DB user here is the trustworthy signal to drop the
-    rolling ``login_attempts`` row — this replaces the old (abusable)
-    unauthenticated ``/auth/login/record {success:true}`` clear. Keyed on the
-    lowercased email to match the throttle's case-insensitive keying.
+    Called from ``POST /auth/login`` (the authenticated sign-in the frontend
+    fires right after a successful password auth) — the only trustworthy,
+    un-abusable place to drop the rolling ``login_attempts`` row, replacing both
+    the old unauthenticated ``/auth/login/record {success:true}`` clear AND the
+    per-request resolver clear removed in #182. Keyed on the lowercased email to
+    match the throttle's case-insensitive keying.
 
-    Deliberately defensive: a failure here must never break the authenticated
-    request, so any error is swallowed (the counter just isn't cleared this
-    time; it self-expires via the rolling window anyway).
+    Does NOT manage the transaction — the caller owns the commit, so the clear
+    lands atomically with the rest of the sign-in bookkeeping (last_login_at,
+    login_events, the single-session claim).
     """
-    try:
-        await session.execute(
-            delete(LoginAttempt).where(LoginAttempt.email_lc == email.lower())
-        )
-        await session.commit()
-    except Exception:  # noqa: BLE001 - best-effort; never fail the request
-        logger.warning("Failed to clear login_attempts on auth", exc_info=True)
-        try:
-            await session.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+    await session.execute(
+        delete(LoginAttempt).where(LoginAttempt.email_lc == email.lower())
+    )
 
 
 CurrentDBUser = Annotated[UserContext, Depends(get_current_db_user)]
@@ -231,6 +280,10 @@ def require_capability(
 # engineer holds every capability unconditionally; the other roles hold whatever
 # the config grants them.
 require_super_admin = require_capability(Capability.USER_ADMIN)
+# Donation-ledger writes / imports (#189). Split out from USER_ADMIN so that
+# delegating user administration does NOT silently grant donation-ledger writes;
+# defaults to the same roles (super_admin + engineer), so behaviour is unchanged.
+require_donations_manage = require_capability(Capability.DONATIONS_MANAGE)
 require_full_access = require_capability(Capability.ALUMNI_FULL)
 # Edit an EXISTING alumnus / their nested records — not create/archive/import.
 require_alumni_edit = require_capability(Capability.ALUMNI_EDIT)
@@ -243,6 +296,7 @@ require_vocab_admin = require_capability(Capability.VOCAB_ADMIN)
 require_engineer = require_capability(Capability.ENGINEER)
 
 RequireSuperAdmin = Annotated[UserContext, Depends(require_super_admin)]
+RequireDonationsManage = Annotated[UserContext, Depends(require_donations_manage)]
 RequireFullAccess = Annotated[UserContext, Depends(require_full_access)]
 RequireAlumniEdit = Annotated[UserContext, Depends(require_alumni_edit)]
 RequireViewAccess = Annotated[UserContext, Depends(require_view_only)]

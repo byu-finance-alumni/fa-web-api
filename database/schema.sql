@@ -710,6 +710,9 @@ CREATE INDEX idx_alumni_contact_info_alumni_id   ON alumni_contact_info (alumni_
 CREATE INDEX idx_alumni_contact_info_state        ON alumni_contact_info (state);
 CREATE INDEX idx_alumni_contact_info_city_state   ON alumni_contact_info (city, state);
 CREATE INDEX IF NOT EXISTS idx_alumni_contact_info_country ON alumni_contact_info (country);
+-- Expression indexes matching the normalized geography GROUP BYs (#186).
+CREATE INDEX IF NOT EXISTS idx_alumni_contact_info_state_norm      ON alumni_contact_info (upper(trim(state)));
+CREATE INDEX IF NOT EXISTS idx_alumni_contact_info_city_state_norm ON alumni_contact_info (lower(trim(city)), upper(trim(state)));
 CREATE INDEX idx_current_employment_alumni_id    ON current_employment (alumni_id);
 CREATE INDEX idx_current_employment_employer      ON current_employment (current_employer);
 CREATE INDEX idx_current_employment_industry      ON current_employment (current_industry);
@@ -723,6 +726,8 @@ CREATE INDEX idx_alumni_tags_alumni_id           ON alumni_tags (alumni_id);
 CREATE INDEX idx_alumni_tags_tag_id              ON alumni_tags (tag_id);
 CREATE INDEX idx_alumni_status_labels_alumni_id  ON alumni_status_labels (alumni_id);
 CREATE INDEX idx_interactions_alumni_id          ON interactions (alumni_id);
+-- Dashboard last-contacted anti-joins filter on alumni_id + date (#186).
+CREATE INDEX idx_interactions_alumni_id_date     ON interactions (alumni_id, interaction_date_time);
 CREATE INDEX idx_follow_up_tasks_alumni_id       ON follow_up_tasks (alumni_id);
 CREATE INDEX idx_event_attendance_event_id       ON event_attendance (event_id);
 CREATE INDEX idx_event_attendance_alumni_id      ON event_attendance (alumni_id);

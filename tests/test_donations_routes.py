@@ -193,6 +193,40 @@ def test_add_donation_forbidden_below_super_admin(client, role):
     assert response.json()["error"]["code"] == "forbidden"
 
 
+def test_add_donation_forbidden_for_user_admin_only_role(client):
+    # #189: donation writes are gated on the dedicated ``donations.manage``
+    # capability, NOT ``user_admin``. A role holding ONLY user_admin (i.e. if
+    # user administration were delegated) must NOT gain donation-ledger writes.
+    from app.api.dependencies.auth import get_permission_config
+    from app.core.capabilities import Capability
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("delegated_admin")
+    app.dependency_overrides[get_permission_config] = lambda: {
+        "delegated_admin": frozenset({Capability.USER_ADMIN})
+    }
+    response = client.post(
+        "/donations/alumni/42", json={"amount": "100.00", "year": 2026}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_import_forbidden_for_user_admin_only_role(client):
+    # Same guarantee on the bulk-import path (#189).
+    from app.api.dependencies.auth import get_permission_config
+    from app.core.capabilities import Capability
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("delegated_admin")
+    app.dependency_overrides[get_permission_config] = lambda: {
+        "delegated_admin": frozenset({Capability.USER_ADMIN})
+    }
+    response = client.post(
+        "/donations/import/preview",
+        files={"file": ("d.csv", b"Net ID,Name,Month,Year,Amount\n", "text/csv")},
+    )
+    assert response.status_code == 403
+
+
 def test_add_donation_requires_auth(client):
     response = client.post(
         "/donations/alumni/42", json={"amount": "100.00", "year": 2026}

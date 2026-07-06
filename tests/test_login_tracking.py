@@ -35,15 +35,21 @@ def _ctx(*roles: str, user_id: int = 1) -> UserContext:
 
 class _RecordSession:
     """Fake session: ``scalar`` returns the loaded user; ``add``/``commit`` are
-    recorded so we can assert the LoginEvent was written."""
+    recorded so we can assert the LoginEvent was written. ``execute`` captures the
+    in-transaction login_attempts clear (#182)."""
 
     def __init__(self, user):
         self.user = user
         self.added: list = []
         self.commits = 0
+        self.executed: list = []
 
     async def scalar(self, _stmt):
         return self.user
+
+    async def execute(self, stmt):
+        self.executed.append(stmt)
+        return None
 
     def add(self, obj):
         self.added.append(obj)
@@ -92,6 +98,10 @@ def test_record_login_stamps_last_login_and_writes_event():
     assert event.user_id == 7
     assert event.email == "boss@byu.edu"
     assert event.occurred_at == user.last_login_at
+    # ...and the rolling failed-login counter was cleared in the SAME transaction
+    # (#182): the login-success path is where the clear now lives (it used to run
+    # on every authenticated request in the resolver). One statement, one commit.
+    assert len(session.executed) == 1
     assert session.commits == 1
 
 

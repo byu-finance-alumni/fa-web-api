@@ -7,10 +7,12 @@ before serialization for a caller without the ``alumni.full`` capability, so a
 non-privileged client never receives a value (not merely a hidden one). Donation
 notes are gated alongside amounts (free text may reference figures).
 
-Writes are admin-tier: add / edit / bulk import are ``super_admin``-only;
-DELETE is gated to ``full_access`` and up (the destructive-data-management tier,
-matching event delete / alumni archive — broadened from super_admin in QA
-hardening, H4).
+Writes are admin-tier: add / edit / bulk import require the dedicated
+``donations.manage`` capability (super_admin + engineer by default, #189) — split
+out from ``user_admin`` so delegating user administration does not silently grant
+donation-ledger writes. DELETE is gated to ``full_access`` and up (the
+destructive-data-management tier, matching event delete / alumni archive —
+broadened from super_admin in QA hardening, H4).
 
 Responses are assembled as plain dicts (no ``response_model``) so the amount
 fields can be conditionally nulled per-caller — the same convention the events
@@ -27,8 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     PermissionConfig,
+    RequireDonationsManage,
     RequireFullAccess,
-    RequireSuperAdmin,
     RequireViewAccess,
 )
 from app.core.capabilities import Capability, effective_capabilities
@@ -277,11 +279,12 @@ def _serialize_donation(d: Donation) -> dict:
 async def add_donation(
     alumni_id: int,
     payload: DonationCreate,
-    user: RequireSuperAdmin,
+    user: RequireDonationsManage,
     session: SessionDep,
 ) -> dict:
-    """Add a donation to an alumnus (super_admin). 404 if the alumnus is unknown
-    or archived. Audits the write (entity_type "donation", action "create")."""
+    """Add a donation to an alumnus (donations.manage). 404 if the alumnus is
+    unknown or archived. Audits the write (entity_type "donation", action
+    "create")."""
     alumni = await session.get(Alumni, alumni_id)
     if alumni is None or alumni.archived:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
@@ -322,11 +325,11 @@ _FIELD_MAP = {
 async def update_donation(
     donation_id: int,
     payload: DonationUpdate,
-    user: RequireSuperAdmin,
+    user: RequireDonationsManage,
     session: SessionDep,
 ) -> dict:
-    """Partially update a donation (super_admin). Only fields present in the body
-    are applied; each change is audited. 404 if the donation is unknown."""
+    """Partially update a donation (donations.manage). Only fields present in the
+    body are applied; each change is audited. 404 if the donation is unknown."""
     donation = await session.get(Donation, donation_id)
     if donation is None:
         raise NotFoundError(f"Donation {donation_id} not found.")
@@ -422,8 +425,8 @@ def _too_large_response() -> JSONResponse:
 
 
 @router.get("/import/template")
-async def donations_import_template(_: RequireSuperAdmin) -> Response:
-    """Download the donations bulk-import CSV template (super_admin): columns
+async def donations_import_template(_: RequireDonationsManage) -> Response:
+    """Download the donations bulk-import CSV template (donations.manage): columns
     Net ID, Name, Month, Year, Amount plus a couple of example rows."""
     return Response(
         content=import_donations.build_template_csv(),
@@ -436,11 +439,11 @@ async def donations_import_template(_: RequireSuperAdmin) -> Response:
 
 @router.post("/import/preview", response_model=None)
 async def preview_import_donations(
-    _: RequireSuperAdmin,
+    _: RequireDonationsManage,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
-    """Dry-run a donations bulk CSV import (super_admin, NO writes). Matches
+    """Dry-run a donations bulk CSV import (donations.manage, NO writes). Matches
     donors by Net ID and flags unmatched Net IDs, bad month/year, and non-numeric
     amounts. A bad header set surfaces as ``columns_ok: false``."""
     file_bytes = await _read_capped(file)
@@ -459,11 +462,11 @@ async def preview_import_donations(
 
 @router.post("/import", response_model=None)
 async def import_donations_commit(
-    user: RequireSuperAdmin,
+    user: RequireDonationsManage,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
-    """Commit a donations bulk CSV import (super_admin). Re-evaluates and inserts
+    """Commit a donations bulk CSV import (donations.manage). Re-evaluates and inserts
     every importable donation in one transaction (audited per row); rejected rows
     are skipped and reported. A bad header set imports nothing."""
     file_bytes = await _read_capped(file)

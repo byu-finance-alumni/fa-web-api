@@ -12,6 +12,7 @@ from app.api.dependencies.auth import (
     CurrentDBUserAllowMustChange,
     CurrentUser,
     PermissionConfig,
+    _clear_login_attempts,
 )
 from app.core.capabilities import effective_capabilities
 from app.core.database import get_session
@@ -71,6 +72,14 @@ async def me(current_user: CurrentUser) -> AuthenticatedUser:
 
     Requires a valid Supabase access token in the `Authorization: Bearer`
     header.
+
+    NOTE (#189): this deliberately uses the token-only resolver, so it does NOT
+    reflect single-session validity — a superseded token still gets 200 here. It
+    is a pure token-identity echo, and session validity has its own purpose-built
+    endpoint (``GET /auth/session/active``) that the frontend polls. If /me is
+    ever meant to gate on session validity too, switch it to the session-aware
+    resolver (``get_current_db_user``) — a scoped change left out here on purpose,
+    since it would also change the response to a DB ``UserContext``.
     """
     return current_user
 
@@ -145,6 +154,10 @@ async def record_login(
       2. Inserts a ``login_events`` row (the security log backing the engineer
          "Logins" tab; email is snapshotted so the history survives the user's
          later deletion).
+      3. Clears the rolling failed-login counter for this email (#182) — a real
+         sign-in is the correct, un-abusable place to reset it, so it no longer
+         runs on every authenticated request.
+      4. Claims this sign-in as the account's single active session (#147).
 
     Uses the force-password-change-EXEMPT resolver: a user on an admin-issued
     temp password has still genuinely signed in, so their login must be recorded
@@ -179,6 +192,10 @@ async def record_login(
                 country=_clean(context.country) if context else None,
             )
         )
+        # Login SUCCESS clears the rolling failed-login counter (#182). Runs in
+        # this same transaction (the helper does not commit) so it lands
+        # atomically with the sign-in bookkeeping in the single commit below.
+        await _clear_login_attempts(session, db_user.email)
         await session.commit()
     return LoginRecordedResponse(last_login_at=now)
 
@@ -293,7 +310,8 @@ async def login_record(
     rolling counter, because an attacker could otherwise POST ``{email,
     success:true}`` to wipe a legitimately-set cooldown and brute-force
     unbounded. The genuine success-clear happens on the AUTHENTICATED path
-    (``get_current_db_user``), which only a real, signed-in user can reach.
+    (``POST /auth/login`` -> ``_clear_login_attempts``), which only a real,
+    signed-in user can reach.
 
     The ``locked`` flag the service returns is intentionally NOT echoed to the
     client (anti-enumeration); only the coarse ``reason`` is.

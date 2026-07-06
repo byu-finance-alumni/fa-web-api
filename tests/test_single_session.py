@@ -64,14 +64,19 @@ def test_enforce_fails_open_when_token_has_no_session_id():
 # --- full resolver: get_current_db_user raises on a superseded session --------
 
 
-class _ClearSession:
-    """Minimal session for the resolver's login-attempt clear (execute+commit)."""
+class _NoWriteSession:
+    """Session for the read-path resolver: records any statement/commit so tests
+    can assert the read path issues NONE (#182 — no per-request write)."""
 
-    async def execute(self, _stmt):
-        return None
+    def __init__(self):
+        self.executed: list = []
+        self.commits = 0
+
+    async def execute(self, stmt):
+        self.executed.append(stmt)
 
     async def commit(self):
-        return None
+        self.commits += 1
 
 
 def _db_user(active_session_id):
@@ -95,7 +100,7 @@ def test_get_current_db_user_rejects_superseded(monkeypatch):
     monkeypatch.setattr(auth_deps, "get_user_with_roles_by_auth_id", _lookup)
     current = SimpleNamespace(auth_user_id=_AUTH_UUID, session_id="sessB")
     with pytest.raises(SessionSupersededError):
-        asyncio.run(auth_deps.get_current_db_user(current, _ClearSession()))
+        asyncio.run(auth_deps.get_current_db_user(current, _NoWriteSession()))
 
 
 def test_get_current_db_user_allows_active_session(monkeypatch):
@@ -103,9 +108,13 @@ def test_get_current_db_user_allows_active_session(monkeypatch):
         return _db_user(active_session_id="sessA")
 
     monkeypatch.setattr(auth_deps, "get_user_with_roles_by_auth_id", _lookup)
+    session = _NoWriteSession()
     current = SimpleNamespace(auth_user_id=_AUTH_UUID, session_id="sessA")
-    ctx = asyncio.run(auth_deps.get_current_db_user(current, _ClearSession()))
+    ctx = asyncio.run(auth_deps.get_current_db_user(current, session))
     assert ctx.user_id == 1
+    # #182: the matching-session read path issues no DELETE/commit.
+    assert session.executed == []
+    assert session.commits == 0
 
 
 # --- POST /auth/login claims the newest session ------------------------------
@@ -116,9 +125,15 @@ class _RecordSession:
         self.user = user
         self.added: list = []
         self.commits = 0
+        self.executed: list = []
 
     async def scalar(self, _stmt):
         return self.user
+
+    async def execute(self, stmt):
+        # record_login clears login_attempts in-transaction (#182).
+        self.executed.append(stmt)
+        return None
 
     def add(self, obj):
         self.added.append(obj)

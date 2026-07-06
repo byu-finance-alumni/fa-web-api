@@ -17,7 +17,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.event import Event, EventAttendance
-from app.schemas.event import AttendeeCreate, EventCreate, EventUpdate
+from app.schemas.event import AttendeeCreate, AttendeeRead, EventCreate, EventUpdate
 from app.services import import_events
 
 # Reuse the alumni export's formula-injection neutralizer (canonical source:
@@ -407,31 +407,39 @@ def _attendee_name(a: Alumni) -> str:
     return name or f"Alumni #{a.alumni_id}"
 
 
-@router.get("/{event_id}/attendees")
+@router.get("/{event_id}/attendees", response_model=list[AttendeeRead])
 async def list_event_attendees(
     event_id: int, _: RequireViewAccess, session: SessionDep
-) -> list[dict]:
+) -> list[AttendeeRead]:
     """Alumni who attended an event (view-access read). 404 if the event is
-    unknown so callers can distinguish "no attendees" from "no such event"."""
+    unknown so callers can distinguish "no attendees" from "no such event".
+
+    ``notes`` echoes the per-attendance ``attendance_notes`` (#181) so the notes
+    the bulk importer writes are actually readable on the roster."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
     rows = (
         await session.execute(
-            select(Alumni, EventAttendance.attendance_status)
+            select(
+                Alumni,
+                EventAttendance.attendance_status,
+                EventAttendance.attendance_notes,
+            )
             .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
             .where(EventAttendance.event_id == event_id)
             .order_by(Alumni.last_name, Alumni.first_name)
         )
     ).all()
     return [
-        {
-            "alumni_id": a.alumni_id,
-            "name": _attendee_name(a),
-            "graduation_year": a.graduation_year,
-            "attendance_status": status,
-        }
-        for a, status in rows
+        AttendeeRead(
+            alumni_id=a.alumni_id,
+            name=_attendee_name(a),
+            graduation_year=a.graduation_year,
+            attendance_status=status,
+            notes=notes,
+        )
+        for a, status, notes in rows
     ]
 
 
@@ -531,7 +539,11 @@ async def add_event_attendee(
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
     alumni = await session.get(Alumni, payload.alumni_id)
-    if alumni is None:
+    # Archived alumni are not valid attendees. The bulk importer already matches
+    # active-only (repositories/net_id.match_net_ids), so reject them here too and
+    # surface it as a 404 — an archived record is "not found" for this purpose,
+    # keeping manual add and import consistent (#181).
+    if alumni is None or alumni.archived:
         raise NotFoundError(f"Alumni {payload.alumni_id} not found.")
 
     existing = await session.scalar(
@@ -549,6 +561,7 @@ async def add_event_attendee(
         event_id=event_id,
         alumni_id=payload.alumni_id,
         attendance_status=payload.attendance_status,
+        attendance_notes=payload.notes,
     )
     session.add(attendance)
     name = _attendee_name(alumni)
@@ -567,6 +580,7 @@ async def add_event_attendee(
         "name": name,
         "graduation_year": alumni.graduation_year,
         "attendance_status": payload.attendance_status,
+        "notes": payload.notes,
     }
 
 

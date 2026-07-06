@@ -12,21 +12,21 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 
-class GradYearCount(BaseModel):
+class DashboardGradYearCount(BaseModel):
     """One graduation-year bucket in the cohort distribution."""
 
     year: int
     count: int
 
 
-class EmployerCount(BaseModel):
+class DashboardEmployerCount(BaseModel):
     """One employer bucket in the top-employers distribution."""
 
     employer: str
     count: int
 
 
-class StateCount(BaseModel):
+class DashboardStateCount(BaseModel):
     """One state bucket in the by-state distribution."""
 
     state: str
@@ -54,9 +54,9 @@ class DashboardSummary(BaseModel):
     guest_speakers_this_month: int
     piff_donors: int
     willing_mentors: int
-    by_graduation_year: list[GradYearCount]
-    top_employers: list[EmployerCount]
-    by_state: list[StateCount]
+    by_graduation_year: list[DashboardGradYearCount]
+    top_employers: list[DashboardEmployerCount]
+    by_state: list[DashboardStateCount]
 
 
 class BirthdayRow(BaseModel):

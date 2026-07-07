@@ -2,9 +2,10 @@
 
 import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, event, func
+from sqlalchemy.orm import Mapped, Session, mapped_column
 
+from app.core.audit_context import audit_suppressed
 from app.core.database import Base
 
 
@@ -29,3 +30,25 @@ class AuditLog(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+@event.listens_for(Session, "before_flush")
+def _drop_engineer_audit_rows(session, flush_context, instances):
+    """Suppress ``audit_logs`` writes performed by an engineer actor (#199).
+
+    The engineer is a maintenance / super-user role whose actions must not
+    clutter the FERPA audit trail. When the current request's actor is an
+    engineer -- recorded in a request-scoped contextvar by the auth layer (see
+    ``app/core/audit_context``) -- every pending AuditLog INSERT is expunged from
+    the flush, so no row is written. Non-engineer actors are unaffected.
+
+    Registering on the base ``Session`` (which the AsyncSession drives) makes the
+    guard central: it covers every callsite that adds an AuditLog, present and
+    future, without any per-callsite change. The default (not suppressed) means
+    the trail is preserved for everyone else.
+    """
+    if not audit_suppressed():
+        return
+    for obj in list(session.new):
+        if isinstance(obj, AuditLog):
+            session.expunge(obj)

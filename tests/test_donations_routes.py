@@ -1,11 +1,11 @@
-"""Tests for the Pay It Forward Fund donation routes (#161).
+"""Tests for the Pay It Forward Fund donation routes (#161, #278).
 
-The CRITICAL property here is FIELD-LEVEL amount gating: donor identity is
-view-access, but dollar amounts must be nulled server-side for any caller
-without the ``alumni.full`` capability (full_access+). These tests assert that
-``/donors`` and ``/summary`` return ``None`` for every amount field to a
-view-only / student caller and real numbers to a full_access caller — proving
-the gate lives in the response, not just the UI. Writes are super_admin-only.
+Read access (#278): the ledger reads (``/donors``, ``/summary``,
+``/alumni/{id}``) require the ``alumni.full`` capability — students and
+view_only are DENIED (403) outright. FIELD-LEVEL amount gating still nulls
+dollar amounts server-side for any authorized reader lacking ``alumni.full``
+(belt-and-suspenders that holds if an engineer later widens who may read);
+authorized readers (full_access+) see real numbers. Writes are super_admin-only.
 
 No real DATABASE_URL is required (CI has none); sessions are stubbed.
 """
@@ -118,27 +118,18 @@ def _donor_session():
     )
 
 
-def test_donors_hides_amounts_for_view_only(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    app.dependency_overrides[get_session] = _with_session(_donor_session())
-    body = client.get("/donations/donors").json()
-    assert body["total"] == 0  # no scalars queued in the mock -> count falls back to 0
-    assert len(body["items"]) == 1
-    donor = body["items"][0]
-    # Identity + which years they gave are visible...
-    assert donor["name"] == "Jane Doe"
-    assert donor["donation_count"] == 3
-    assert donor["years"] == [2026, 2025]
-    # ...but every dollar figure is withheld.
-    assert donor["lifetime_total"] is None
-    assert all(py["total"] is None for py in donor["per_year"])
-
-
-def test_donors_hides_amounts_for_student(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
-    app.dependency_overrides[get_session] = _with_session(_donor_session())
-    donor = client.get("/donations/donors").json()["items"][0]
-    assert donor["lifetime_total"] is None
+@pytest.mark.parametrize("role", ["view_only", "student"])
+@pytest.mark.parametrize(
+    "path", ["/donations/donors", "/donations/summary", "/donations/alumni/42"]
+)
+def test_ledger_reads_forbidden_for_students_and_view_only(client, role, path):
+    # #278: Pay It Forward is a data-management surface, not part of the
+    # read-only directory. Students and view_only are DENIED the ledger reads
+    # outright (403) — not merely amount-gated.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    response = client.get(path)
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
 
 
 def test_donors_shows_amounts_for_full_access(client):
@@ -152,20 +143,19 @@ def test_donors_shows_amounts_for_full_access(client):
     }
 
 
-def test_summary_hides_amounts_for_view_only_but_shows_counts(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+def test_summary_shows_amounts_for_full_access(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     session = _SeqSession(
         scalars=[5, 12, 9999],  # donor_count, donation_count, total_raised
         results=[[(2026, 4, 9999)]],  # per-year (year, donor_count, total)
     )
     app.dependency_overrides[get_session] = _with_session(session)
     body = client.get("/donations/summary").json()
-    # Counts are public; dollars are withheld.
     assert body["donor_count"] == 5
     assert body["donation_count"] == 12
-    assert body["total_raised"] is None
+    assert body["total_raised"] == 9999.0
     assert body["per_year"][0]["donor_count"] == 4
-    assert body["per_year"][0]["total"] is None
+    assert body["per_year"][0]["total"] == 9999.0
 
 
 def test_summary_shows_amounts_for_super_admin(client):
@@ -356,28 +346,6 @@ def _donation(donation_id, year, month, amount, notes=None):
         amount=amount,
         notes=notes,
     )
-
-
-def test_alumni_donations_hides_amounts_for_view_only(client):
-    from types import SimpleNamespace
-
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    alumni = SimpleNamespace(
-        alumni_id=42, first_name="Jane", preferred_first_name=None, last_name="Doe"
-    )
-    session = _SeqSession(
-        get_obj=alumni,
-        results=[[_donation(1, 2026, 4, 250, notes="secret")]],
-    )
-    app.dependency_overrides[get_session] = _with_session(session)
-    body = client.get("/donations/alumni/42").json()
-    assert body["name"] == "Jane Doe"
-    assert body["lifetime_total"] is None
-    assert body["donations"][0]["amount"] is None
-    # Notes are gated alongside amounts (may contain figures).
-    assert body["donations"][0]["notes"] is None
-    # Period is still visible.
-    assert body["donations"][0]["year"] == 2026
 
 
 def test_alumni_donations_shows_amounts_for_full_access(client):

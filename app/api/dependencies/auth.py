@@ -16,6 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_context import set_audit_actor
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.security import (
@@ -103,6 +104,11 @@ async def get_current_db_user_allow_must_change(
     # trustworthy, un-abusable place a real sign-in reaches.
 
     context = UserContext.from_orm_user(user)
+    # Record whether this request's actor is an engineer so the audit layer
+    # can drop their audit_logs writes (#199). Set on the base resolver, which
+    # runs on EVERY authenticated request, so the guard is central and the
+    # value is freshly re-set per request (no cross-request leakage).
+    set_audit_actor(context.roles)
     # Carry THIS request's token session so downstream guards (single active
     # session, #147) can compare it against the account's active session. This
     # base resolver does NOT reject a superseded session — that is layered on in

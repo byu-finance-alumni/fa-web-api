@@ -255,6 +255,12 @@ class LoginEventPage(BaseModel):
     offset: int
 
 
+class LoginPurgeResult(BaseModel):
+    """Count of login-history rows removed by the engineer purge (#200)."""
+
+    deleted: int
+
+
 class RoleAssign(BaseModel):
     """Assign a canonical role to a user. ``role_name`` is validated against the
     RoleName enum, so an unknown role is a 422 before any query runs."""
@@ -417,6 +423,25 @@ async def list_logins(
     return LoginEventPage(
         items=items, total=int(total or 0), limit=limit, offset=offset
     )
+
+
+@router.delete("/logins", response_model=LoginPurgeResult)
+async def purge_logins(
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> LoginPurgeResult:
+    """Delete ALL recorded sign-ins (the entire ``login_events`` history).
+    Engineer only.
+
+    The irreversible counterpart to GET /admin/logins: it wipes the whole
+    login-history table in one shot (e.g. to clear accumulated dev/test noise
+    from the Admin -> Logins tab). Engineer-gated (RequireEngineer) like the
+    listing. Since #199 stops auditing engineer actions, this purge is
+    intentionally NOT written to the audit trail. Returns the row count removed.
+    """
+    result = await session.execute(delete(LoginEvent))
+    await session.commit()
+    return LoginPurgeResult(deleted=result.rowcount or 0)
 
 
 # ``{user_id}`` is declared ``int`` (below), so string sub-paths like

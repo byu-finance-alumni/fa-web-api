@@ -96,6 +96,18 @@ def _has_email_exists():
     )
 
 
+def _has_phone_exists():
+    """Correlated EXISTS: the alumnus has a phone number on file."""
+    return (
+        select(AlumniContactInfo.contact_info_id)
+        .where(
+            AlumniContactInfo.alumni_id == Alumni.alumni_id,
+            AlumniContactInfo.phone.is_not(None),
+        )
+        .exists()
+    )
+
+
 def _has_employer_exists():
     """Correlated EXISTS: the alumnus has a current employer on file."""
     return (
@@ -659,6 +671,11 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
         .select_from(Alumni)
         .where(active, ~_has_employer_exists())
     )
+    missing_phone = await session.scalar(
+        select(func.count())
+        .select_from(Alumni)
+        .where(active, ~_has_phone_exists())
+    )
     duplicate_count = await session.scalar(
         text("SELECT count(*) FROM duplicate_candidates")
     )
@@ -666,6 +683,7 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
         "total_alumni": int(total or 0),
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
+        "missing_phone": int(missing_phone or 0),
         "duplicate_count": int(duplicate_count or 0),
     }
 

@@ -114,6 +114,7 @@ class DataQuality(BaseModel):
     """Data-quality alert counts for ``GET /dashboard/data-quality``."""
 
     total_alumni: int
+    complete_alumni: int
     missing_email: int
     missing_employer: int
     missing_phone: int

@@ -79,6 +79,15 @@ def test_delete_vocab_forbidden_below_engineer(client, role):
     assert client.delete("/admin/vocabulary/5").status_code == 403
 
 
+@pytest.mark.parametrize(
+    "role", ["view_only", "student", "full_access", "super_admin"]
+)
+def test_permanent_delete_vocab_forbidden_below_engineer(client, role):
+    # The hard-delete route is engineer-only too (same guard as the soft delete).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    assert client.delete("/admin/vocabulary/5/permanent").status_code == 403
+
+
 def test_engineer_may_list_vocab_admin(client, monkeypatch):
     # The engineer (controlled-vocabulary admin) passes the guard: the request
     # reaches the handler (200), proving the route is engineer-allowed and not
@@ -125,6 +134,7 @@ class _Sess:
         self._get = get
         self._scalars = scalars or []
         self.added: list = []
+        self.deleted: list = []
         self.flushed = 0
 
     async def scalar(self, _stmt):
@@ -138,6 +148,9 @@ class _Sess:
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def delete(self, obj):
+        self.deleted.append(obj)
 
     async def flush(self):
         self.flushed += 1
@@ -226,3 +239,19 @@ def test_deactivate_term_soft_deletes():
     session = _Sess(get=target)
     term = asyncio.run(svc.deactivate_term(session, 4))
     assert term.active is False
+
+
+def test_delete_term_hard_deletes():
+    # Hard delete removes the row from the session entirely (not a soft
+    # active=false), and returns it so the route can audit it before commit.
+    target = _term("Gala", active=True, term_id=4)
+    session = _Sess(get=target)
+    term = asyncio.run(svc.delete_term(session, 4))
+    assert term is target
+    assert target in session.deleted
+
+
+def test_delete_term_missing_is_404():
+    session = _Sess(get=None)
+    with pytest.raises(NotFoundError):
+        asyncio.run(svc.delete_term(session, 999))

@@ -676,11 +676,24 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
         .select_from(Alumni)
         .where(active, ~_has_phone_exists())
     )
+    # "Complete" = an active alumnus with all three tracked contact/career fields
+    # on file (email AND phone AND current employer).
+    complete_alumni = await session.scalar(
+        select(func.count())
+        .select_from(Alumni)
+        .where(
+            active,
+            _has_email_exists(),
+            _has_phone_exists(),
+            _has_employer_exists(),
+        )
+    )
     duplicate_count = await session.scalar(
         text("SELECT count(*) FROM duplicate_candidates")
     )
     return {
         "total_alumni": int(total or 0),
+        "complete_alumni": int(complete_alumni or 0),
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
         "missing_phone": int(missing_phone or 0),

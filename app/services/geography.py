@@ -56,6 +56,19 @@ def normalize_state(value: str | None) -> str | None:
 _STATE = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
 _ALUMNI = func.count(func.distinct(Alumni.alumni_id))
 
+# Normalized city expression (lower-cased, trimmed) for GROUP BY, so "Provo",
+# "provo", and "Provo " collapse into one hub instead of fragmenting the count.
+# Paired with _STATE it keeps same-named cities in different states apart
+# (Springfield IL vs MO). ``_CITY_DISPLAY`` picks a representative human
+# spelling for each normalized group (min of the trimmed values).
+_CITY = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
+_CITY_DISPLAY = func.min(func.trim(cast(AlumniContactInfo.city, String)))
+# Reusable "city present" guard (non-null and not blank after trimming).
+_CITY_PRESENT = (
+    AlumniContactInfo.city.is_not(None),
+    func.trim(cast(AlumniContactInfo.city, String)) != "",
+)
+
 # Normalized country expression (upper-cased, trimmed) for the world map's
 # per-country grouping, plus the set of values that all mean "United States" —
 # the world view plots INTERNATIONAL alumni only, so the US is excluded (the US
@@ -699,8 +712,8 @@ _BREAKDOWN_TITLES = {
 
 
 async def get_breakdown(session, dimension: str, filters: dict) -> dict:
-    """Full ranked list for one dimension (no top-N cap) — backs the 'View all'
-    breakdown table. ``key`` is what a row links to on the map."""
+    """Full ranked list for one dimension (capped at the top 1000 rows) — backs
+    the 'View all' breakdown table. ``key`` is what a row links to on the map."""
     title = _BREAKDOWN_TITLES.get(dimension)
     if title is None:
         return {"dimension": dimension, "title": dimension, "items": []}
@@ -720,13 +733,14 @@ async def get_breakdown(session, dimension: str, filters: dict) -> dict:
             await session.execute(
                 _base()
                 .with_only_columns(
-                    AlumniContactInfo.city.label("city"),
+                    _CITY_DISPLAY.label("city"),
                     _STATE.label("state"),
                     _ALUMNI.label("count"),
                 )
-                .where(*_filter_conditions(filters), AlumniContactInfo.city.is_not(None))
-                .group_by(AlumniContactInfo.city, _STATE)
+                .where(*_filter_conditions(filters), *_CITY_PRESENT)
+                .group_by(_CITY, _STATE)
                 .order_by(desc("count"))
+                .limit(1000)
             )
         ).all()
         items = [
@@ -756,23 +770,22 @@ async def get_breakdown(session, dimension: str, filters: dict) -> dict:
 async def get_summary(session, filters: dict) -> dict:
     conds = _filter_conditions(filters)
     total = await session.scalar(_base().with_only_columns(_ALUMNI).where(*conds))
-    states_count = await session.scalar(
-        select(func.count(func.distinct(_STATE)))
-        .select_from(Alumni)
-        .join(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
-        .outerjoin(
-            CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
-        )
-        .where(*conds)
+    # Count states the same way the map does: fold full names into 2-letter
+    # codes and drop non-US values by reusing get_states, so "UT" and "Utah"
+    # count as one state (not two) and the summary matches the map (#180).
+    states_count = len(await get_states(session, filters))
+    # Count distinct (normalized city, normalized state) pairs so case/spacing
+    # variants collapse ("Provo"/"provo"/"Provo ") while same-named cities in
+    # different states stay distinct (Springfield IL vs MO) (#180).
+    city_pairs = (
+        _base()
+        .with_only_columns(_CITY.label("city"), _STATE.label("state"))
+        .where(*conds, *_CITY_PRESENT)
+        .group_by(_CITY, _STATE)
+        .subquery()
     )
     cities_count = await session.scalar(
-        select(func.count(func.distinct(AlumniContactInfo.city)))
-        .select_from(Alumni)
-        .join(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
-        .outerjoin(
-            CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
-        )
-        .where(*conds, AlumniContactInfo.city.is_not(None))
+        select(func.count()).select_from(city_pairs)
     )
     top_employers = await _top(
         session, filters, CurrentEmployment.current_employer, "employer", limit=8
@@ -784,12 +797,12 @@ async def get_summary(session, filters: dict) -> dict:
         await session.execute(
             _base()
             .with_only_columns(
-                AlumniContactInfo.city.label("city"),
+                _CITY_DISPLAY.label("city"),
                 _STATE.label("state"),
                 _ALUMNI.label("count"),
             )
-            .where(*conds, AlumniContactInfo.city.is_not(None))
-            .group_by(AlumniContactInfo.city, _STATE)
+            .where(*conds, *_CITY_PRESENT)
+            .group_by(_CITY, _STATE)
             .order_by(desc("count"))
             .limit(8)
         )

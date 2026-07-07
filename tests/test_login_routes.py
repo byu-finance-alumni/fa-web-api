@@ -178,6 +178,8 @@ def _fake_user(user_id=2, *, locked_at=None, roles=("full_access",)):
         auth_user_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
         locked_at=locked_at,
         locked_reason="too_many_failed_logins" if locked_at else None,
+        must_change_password=False,
+        active_session_id=None,
         roles=[SimpleNamespace(role_name=r) for r in roles],
     )
 
@@ -344,26 +346,28 @@ class _AuthClearSession:
         self.rollbacks += 1
 
 
-def test_authenticated_user_resolution_clears_login_attempts(monkeypatch):
-    """Resolving an authenticated DB user clears that email's login_attempts row.
+def test_authenticated_read_path_does_not_clear_login_attempts(monkeypatch):
+    """#182: resolving a DB user on the READ path must NOT touch login_attempts.
 
-    This is the trustworthy success-clear that replaced the abusable
-    unauthenticated `/auth/login/record {success:true}` path.
+    The per-request DELETE + commit was removed from the resolver (it ran on
+    EVERY authenticated request, incl. the /auth/session/active poll and all data
+    routes). The success-clear now lives on the login-success path only
+    (POST /auth/login) — see ``test_login_success_clears_login_attempts_lowercased``.
     """
     import asyncio
 
     from app.api.dependencies import auth as auth_deps
-    from app.models.login_attempt import LoginAttempt
 
     auth_uuid = uuid.UUID("33333333-3333-3333-3333-333333333333")
     user = SimpleNamespace(
         user_id=7,
         auth_user_id=auth_uuid,
-        email="Alum@BYU.edu",  # mixed case; clear must lowercase
+        email="Alum@BYU.edu",
         first_name="A",
         last_name="B",
         active=True,
         must_change_password=False,
+        active_session_id=None,
         roles=[SimpleNamespace(role_name="view_only")],
     )
 
@@ -375,64 +379,71 @@ def test_authenticated_user_resolution_clears_login_attempts(monkeypatch):
     )
 
     session = _AuthClearSession()
-    current = SimpleNamespace(auth_user_id=str(auth_uuid))
+    # session_id None -> single-session enforcement fails open, so the resolver
+    # does no DB work at all beyond the (mocked) user lookup.
+    current = SimpleNamespace(
+        auth_user_id=str(auth_uuid), session_id=None, session_issued_at=None
+    )
 
     ctx = asyncio.run(auth_deps.get_current_db_user(current, session))
 
     assert ctx.user_id == 7
-    # Exactly one DELETE against login_attempts was issued and committed.
+    # NO statement executed and NO commit on the read path.
+    assert session.executed == []
+    assert session.commits == 0
+
+
+def test_login_success_clears_login_attempts_lowercased(monkeypatch):
+    """#182: POST /auth/login clears the caller's login_attempts row (lowercased
+    email), in the same transaction as the rest of the sign-in bookkeeping."""
+    from app.api.dependencies.auth import get_current_db_user_allow_must_change
+    from app.models.login_attempt import LoginAttempt
+
+    db_user = SimpleNamespace(
+        user_id=7,
+        email="Alum@BYU.edu",  # mixed case; the clear must lowercase it
+        last_login_at=None,
+        active_session_id=None,
+        active_session_at=None,
+    )
+
+    class _LoginSession:
+        def __init__(self):
+            self.executed: list = []
+            self.commits = 0
+
+        async def scalar(self, _stmt):
+            return db_user
+
+        async def execute(self, stmt):
+            self.executed.append(stmt)
+
+        def add(self, _obj):
+            pass
+
+        async def commit(self):
+            self.commits += 1
+
+    session = _LoginSession()
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user_allow_must_change] = (
+        lambda: _ctx("view_only", user_id=7)
+    )
+    with TestClient(app) as client:
+        resp = client.post("/auth/login")
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    # Exactly one DELETE against login_attempts, keyed on the lowercased email.
     assert len(session.executed) == 1
     stmt = session.executed[0]
     assert stmt.is_delete
     assert stmt.table.name == LoginAttempt.__tablename__
-    # Lowercased-email keying in the WHERE clause.
-    assert "alum@byu.edu" in str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "alum@byu.edu" in str(
+        stmt.compile(compile_kwargs={"literal_binds": True})
+    )
     assert session.commits == 1
-    assert session.rollbacks == 0
-
-
-def test_authenticated_clear_failure_never_breaks_request(monkeypatch):
-    """A failure clearing login_attempts must not break the authenticated request."""
-    import asyncio
-
-    from app.api.dependencies import auth as auth_deps
-
-    auth_uuid = uuid.UUID("44444444-4444-4444-4444-444444444444")
-    user = SimpleNamespace(
-        user_id=8,
-        auth_user_id=auth_uuid,
-        email="x@byu.edu",
-        first_name="A",
-        last_name="B",
-        active=True,
-        must_change_password=False,
-        roles=[SimpleNamespace(role_name="view_only")],
-    )
-
-    async def _fake_lookup(session, _auth_id):
-        return user
-
-    monkeypatch.setattr(
-        auth_deps, "get_user_with_roles_by_auth_id", _fake_lookup
-    )
-
-    class _BoomSession:
-        def __init__(self):
-            self.rollbacks = 0
-
-        async def execute(self, stmt):
-            raise RuntimeError("db down")
-
-        async def commit(self):
-            raise RuntimeError("db down")
-
-        async def rollback(self):
-            self.rollbacks += 1
-
-    session = _BoomSession()
-    current = SimpleNamespace(auth_user_id=str(auth_uuid))
-
-    # Must still resolve the user despite the clear blowing up.
-    ctx = asyncio.run(auth_deps.get_current_db_user(current, session))
-    assert ctx.user_id == 8
-    assert session.rollbacks == 1

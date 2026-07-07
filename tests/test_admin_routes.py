@@ -305,3 +305,108 @@ def test_deactivate_already_inactive_is_idempotent():
     assert response.json()["active"] is False
     assert session.commits == 0  # no change -> no commit, no audit
     assert not any(type(a).__name__ == "AuditLog" for a in session.added)
+
+
+# --- engineer-action oversight log (GET /admin/engineer-actions, #199/#200) ---
+#
+# The tamper-resistant engineer-action log is oversight *of* the engineer, so its
+# read gate is ROLE-based super_admin and explicitly DENIES engineer -- unlike the
+# capability-based RequireSuperAdmin, which an engineer also satisfies. There is no
+# delete/purge route for the table.
+
+
+class _EngineerActionsSession:
+    """Session stand-in for GET /admin/engineer-actions: ``scalar`` returns the
+    total count, ``scalars`` returns a page of rows, and add/commit are recorded."""
+
+    def __init__(self, total, rows):
+        self._total = total
+        self._rows = rows
+        self.added: list = []
+        self.commits = 0
+
+    async def scalar(self, _stmt):
+        return self._total
+
+    async def scalars(self, _stmt):
+        return SimpleNamespace(all=lambda: self._rows)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.commits += 1
+
+
+def test_engineer_actions_requires_auth(client):
+    assert client.get("/admin/engineer-actions").status_code == 401
+
+
+@pytest.mark.parametrize("role", ["view_only", "full_access", "student", "engineer"])
+def test_engineer_actions_forbidden_for_non_super_admin(client, role):
+    # The strict role gate rejects every role that is not super_admin -- crucially
+    # including engineer (the audited party), even though it holds every capability.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    response = client.get("/admin/engineer-actions")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+
+
+def test_engineer_actions_forbidden_when_engineer_and_super_admin():
+    # Holding super_admin does NOT rescue an engineer: any actor with the engineer
+    # role is denied so the audited party can never read its own oversight log.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", "engineer", user_id=1
+    )
+    with TestClient(app) as test_client:
+        response = test_client.get("/admin/engineer-actions")
+    app.dependency_overrides.clear()
+    assert response.status_code == 403
+
+
+def test_engineer_actions_super_admin_reads_and_audits():
+    row = SimpleNamespace(
+        engineer_action_log_id=5,
+        actor_user_id=9,
+        actor_email="eng@byu.edu",
+        action_type="delete_user",
+        entity_type="user",
+        entity_id=3,
+        field_name="email",
+        old_value="victim@byu.edu",
+        new_value=None,
+        occurred_at=__import__("datetime").datetime(2026, 7, 6, 12, 0, 0),
+    )
+    session = _EngineerActionsSession(total=1, rows=[row])
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as test_client:
+        response = test_client.get("/admin/engineer-actions")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["items"][0]["engineer_action_log_id"] == 5
+    assert body["items"][0]["actor_email"] == "eng@byu.edu"
+    assert body["items"][0]["action_type"] == "delete_user"
+    # The read itself is audited (actor + page window); rows are not logged.
+    audit = next(a for a in session.added if type(a).__name__ == "AuditLog")
+    assert audit.action_type == "read_engineer_action_log"
+    assert audit.user_id == 1
+
+
+def test_engineer_actions_has_no_delete_route(client):
+    # The table is append-only by design: there must be NO delete/purge route.
+    # A DELETE to the collection path is not registered -> 405 Method Not Allowed.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    response = client.delete("/admin/engineer-actions")
+    assert response.status_code == 405

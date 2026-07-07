@@ -13,10 +13,11 @@ it just disappears from new-entry dropdowns.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireViewAccess, RequireVocabAdmin
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.vocabularies import VocabularyCategory
 from app.models.audit import AuditLog
@@ -61,12 +62,18 @@ async def create_vocabulary_term(
     payload: VocabularyTermCreate,
     actor: RequireVocabAdmin,
     session: SessionDep,
+    response: Response,
 ) -> VocabularyTermRead:
     """Add a term (or reactivate a previously-deactivated identical one).
-    409 if an active term with the same value already exists in the category."""
+    409 if an active term with the same value already exists in the category.
+
+    Returns 201 Created for a genuinely new term, 200 OK when an existing
+    soft-deleted term was reactivated (nothing new was created) (#176)."""
     term, reactivated = await service.create_term(
         session, payload.category, payload.value, payload.sort_order
     )
+    if reactivated:
+        response.status_code = status.HTTP_200_OK
     session.add(
         AuditLog(
             user_id=actor.user_id,
@@ -84,7 +91,7 @@ async def create_vocabulary_term(
 
 @admin_router.patch("/{term_id}", response_model=VocabularyTermRead)
 async def update_vocabulary_term(
-    term_id: int,
+    term_id: IdPath,
     payload: VocabularyTermUpdate,
     actor: RequireVocabAdmin,
     session: SessionDep,
@@ -118,7 +125,7 @@ async def update_vocabulary_term(
 
 @admin_router.delete("/{term_id}", response_model=VocabularyTermRead)
 async def deactivate_vocabulary_term(
-    term_id: int, actor: RequireVocabAdmin, session: SessionDep
+    term_id: IdPath, actor: RequireVocabAdmin, session: SessionDep
 ) -> VocabularyTermRead:
     """Soft-delete a term (active=false): hidden from new-entry dropdowns, but
     still valid on existing records. Idempotent."""

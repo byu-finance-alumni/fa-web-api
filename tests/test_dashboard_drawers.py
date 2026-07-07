@@ -150,6 +150,40 @@ def test_contacted_this_month_serializes_rows(client):
     ]
 
 
+def test_contacted_this_month_list_excludes_archived_and_friends(client):
+    # The drill-down list must apply the same active-alumni predicate as the
+    # KPI count (archived=false AND is_alumni=true) so archived / friend-of-
+    # program records never leak into the list and the row count reconciles
+    # with the tile (#179). We assert on the compiled page-rows statement.
+    session = _FakeSession([])
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/contacted-this-month")
+    assert response.status_code == 200
+    sql = _compiled(session.execute_args[0])
+    assert "archived" in sql
+    assert "is_alumni" in sql
+
+
+def test_summary_event_kpis_filter_active_alumni(client):
+    # The attended-event (#12, index 11) and guest-speaker (#15, index 14) KPIs
+    # must join Alumni and filter archived / is_alumni like every other alumni
+    # KPI, so friends-of-program and archived records don't inflate them (#179).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 17)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    attended_sql = _compiled(session.scalar_args[11])
+    assert "archived" in attended_sql
+    assert "is_alumni" in attended_sql
+    speaker_sql = _compiled(session.scalar_args[14])
+    assert "archived" in speaker_sql
+    assert "is_alumni" in speaker_sql
+
+
 def test_activity_feed_paginates_and_serializes(client):
     when = datetime.datetime(2026, 5, 20, 9, 30, tzinfo=datetime.UTC)
     interaction = SimpleNamespace(
@@ -194,17 +228,19 @@ def test_data_quality_returns_counts(client, role):
     # Data-quality is full-access only (matches the sidebar gate), like /tasks.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     # Scalars consumed in handler order: total, missing_email,
-    # missing_employer, duplicate_count.
+    # missing_employer, missing_phone, complete_alumni, duplicate_count.
     app.dependency_overrides[get_session] = _with_session(
-        _FakeSession([], scalars=[100, 12, 9, 3])
+        _FakeSession([], scalars=[100, 12, 9, 7, 80, 3])
     )
 
     response = client.get("/dashboard/data-quality")
     assert response.status_code == 200
     assert response.json() == {
         "total_alumni": 100,
+        "complete_alumni": 80,
         "missing_email": 12,
         "missing_employer": 9,
+        "missing_phone": 7,
         "duplicate_count": 3,
     }
 
@@ -522,3 +558,45 @@ def test_summary_contacted_this_month_excludes_archived(client):
     assert response.status_code == 200
     sql = _compiled(session.scalar_args[5])
     assert "archived" in sql
+
+
+# --- #187: responses validate against their declared response_model ----------
+
+
+def test_data_quality_response_validates_against_model(client):
+    # #187: /dashboard/data-quality now declares a concrete response_model
+    # (DataQuality). The served body must validate cleanly against it AND
+    # round-trip unchanged, proving the schema matches the real shape.
+    from app.schemas.dashboard import DataQuality
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    # Six scalars: total, missing_email, missing_employer, missing_phone,
+    # complete_alumni, duplicate_count.
+    session = _FakeSession([], scalars=[10, 3, 2, 5, 6, 1])
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/data-quality")
+    assert response.status_code == 200
+    body = response.json()
+    model = DataQuality.model_validate(body)
+    assert model.total_alumni == 10
+    assert model.duplicate_count == 1
+    # No fields dropped or added by the response_model.
+    assert model.model_dump() == body
+
+
+def test_summary_response_validates_against_model(client):
+    # #187: /dashboard/summary declares DashboardSummary; the served body must
+    # validate against it with no missing/extra keys.
+    from app.schemas.dashboard import DashboardSummary
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # 17 scalar KPIs; the three distribution queries fall back to empty rows.
+    session = _FakeSession([], scalars=[0] * 17)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    body = response.json()
+    model = DashboardSummary.model_validate(body)
+    assert model.model_dump() == body

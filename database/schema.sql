@@ -35,6 +35,12 @@ CREATE TABLE users (
     -- app/services/login_lockout.py). Cleared by a super_admin password reset.
     locked_at       timestamptz,
     locked_reason   text,
+    -- Single active session per account (#147): the Supabase session_id of the
+    -- MOST RECENT sign-in. A newer login overwrites it, so any earlier device's
+    -- session no longer matches and is rejected (forced logout) on the backend.
+    -- NULL until the user's first sign-in after this feature shipped.
+    active_session_id  text,
+    active_session_at  timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
@@ -49,7 +55,10 @@ CREATE TABLE login_attempts (
     first_failed_at timestamptz,
     last_failed_at  timestamptz,
     cooldown_until  timestamptz,
-    updated_at      timestamptz NOT NULL DEFAULT now()
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    -- email_lc must already be lowercased by the writer (#176). See
+    -- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+    CONSTRAINT ck_login_attempts_email_lc_lower CHECK (email_lc = lower(email_lc))
 );
 
 -- Login history (security log). One row per successful sign-in, written by
@@ -194,11 +203,13 @@ CREATE INDEX IF NOT EXISTS idx_alumni_spouse_alumni_id ON alumni (spouse_alumni_
 -- be unique. These are the authoritative guard behind the application-layer
 -- duplicate detection (closes a TOCTOU race between concurrent writes). NULL ids
 -- and archived rows are excluded. byu_id is stored digits-only by the cleaner.
--- See migrations/2026-06-12_alumni_unique_byu_net.sql.
+-- net_id is matched case-insensitively (lower(trim(...))) per #175.
+-- See migrations/2026-06-12_alumni_unique_byu_net.sql and
+-- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_byu_id_active
     ON alumni (byu_id) WHERE archived = false AND byu_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_net_id_active
-    ON alumni (net_id) WHERE archived = false AND net_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_net_id_lower_active
+    ON alumni (lower(trim(net_id))) WHERE archived = false AND net_id IS NOT NULL;
 
 CREATE TABLE alumni_contact_info (
     contact_info_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -220,6 +231,11 @@ CREATE TABLE alumni_contact_info (
     CONSTRAINT fk_alumni_contact_info_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL
 );
 
+-- One contact-info row per alum (#171). See
+-- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_alumni_contact_info_alumni_id
+    ON alumni_contact_info (alumni_id);
+
 CREATE TABLE current_employment (
     current_employment_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id                 bigint NOT NULL,
@@ -239,6 +255,11 @@ CREATE TABLE current_employment (
     CONSTRAINT fk_current_employment_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_current_employment_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL
 );
+
+-- One current-employment row per alum (#171). See
+-- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_current_employment_alumni_id
+    ON current_employment (alumni_id);
 
 CREATE TABLE education_history (
     education_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -562,6 +583,53 @@ CREATE TRIGGER trg_audit_logs_snapshot_actor
     FOR EACH ROW
     EXECUTE FUNCTION audit_logs_snapshot_actor();
 
+-- engineer_action_log: append-only, tamper-resistant record of engineer-actor
+-- actions (#199 / #200 forensic blind spot). Engineer audit_logs writes are
+-- suppressed so they don't clutter the record-change trail; the before_flush guard
+-- reroutes each into a row here instead of dropping it (see app/models/audit.py).
+-- No delete/purge route exists and only super_admin can read it (GET
+-- /admin/engineer-actions) -- the engineer cannot read, delete, or disable it.
+-- actor_email is snapshotted at INSERT (trigger below) so a row survives the
+-- actor's later deletion (actor_user_id -> NULL). See migration
+-- 2026-07-07_engineer_action_log.sql.
+CREATE TABLE engineer_action_log (
+    engineer_action_log_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    actor_user_id bigint,
+    actor_email   varchar(255),
+    action_type   varchar(100) NOT NULL,
+    entity_type   varchar(100) NOT NULL,
+    entity_id     bigint,
+    field_name    varchar(255),
+    old_value     text,
+    new_value     text,
+    occurred_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_engineer_action_log_actor_user_id FOREIGN KEY (actor_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+CREATE INDEX idx_engineer_action_log_occurred_at ON engineer_action_log (occurred_at DESC);
+CREATE INDEX idx_engineer_action_log_actor_user_id ON engineer_action_log (actor_user_id);
+
+-- Snapshot the acting user's email onto each engineer_action_log row at write
+-- time (mirrors audit_logs_snapshot_actor), so a later user deletion
+-- (actor_user_id -> NULL) never erases who performed the action.
+CREATE OR REPLACE FUNCTION engineer_action_log_snapshot_actor()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.actor_email IS NULL AND NEW.actor_user_id IS NOT NULL THEN
+        SELECT u.email
+          INTO NEW.actor_email
+          FROM users u
+         WHERE u.user_id = NEW.actor_user_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_engineer_action_log_snapshot_actor ON engineer_action_log;
+CREATE TRIGGER trg_engineer_action_log_snapshot_actor
+    BEFORE INSERT ON engineer_action_log
+    FOR EACH ROW
+    EXECUTE FUNCTION engineer_action_log_snapshot_actor();
+
 CREATE TABLE duplicate_candidates (
     duplicate_candidate_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id_1            bigint NOT NULL,
@@ -576,7 +644,12 @@ CREATE TABLE duplicate_candidates (
     CONSTRAINT fk_duplicate_candidates_alumni_id_1 FOREIGN KEY (alumni_id_1) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_duplicate_candidates_alumni_id_2 FOREIGN KEY (alumni_id_2) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_duplicate_candidates_user_id FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
-    CONSTRAINT chk_duplicate_candidates_distinct CHECK (alumni_id_1 <> alumni_id_2)
+    CONSTRAINT chk_duplicate_candidates_distinct CHECK (alumni_id_1 <> alumni_id_2),
+    -- Ordered + unique pair guard (#175): a pair is stored once, low id first, so
+    -- (a,b) and (b,a) cannot both exist. See
+    -- migrations/2026-07-03_fleet_audit_constraints_indexes.sql.
+    CONSTRAINT ck_duplicate_candidates_ordered CHECK (alumni_id_1 < alumni_id_2),
+    CONSTRAINT uq_duplicate_candidates_pair UNIQUE (alumni_id_1, alumni_id_2)
 );
 
 -- -----------------------------------------------------------------------------
@@ -674,12 +747,23 @@ CREATE INDEX idx_alumni_source_id                ON alumni (source_id);
 CREATE INDEX idx_alumni_last_name                ON alumni (last_name);
 CREATE INDEX idx_alumni_byu_id                   ON alumni (byu_id);
 CREATE INDEX idx_alumni_net_id                   ON alumni (net_id);
+-- Case-insensitive mst_id lookup (#172).
+CREATE INDEX IF NOT EXISTS idx_alumni_mst_id_lower
+    ON alumni (lower(trim(mst_id))) WHERE mst_id IS NOT NULL;
+-- Graduation-year filter + (archived,is_alumni) hot-path predicate (#175).
+CREATE INDEX IF NOT EXISTS idx_alumni_graduation_year   ON alumni (graduation_year);
+CREATE INDEX IF NOT EXISTS idx_alumni_archived_is_alumni ON alumni (archived, is_alumni);
 CREATE INDEX idx_alumni_contact_info_alumni_id   ON alumni_contact_info (alumni_id);
 CREATE INDEX idx_alumni_contact_info_state        ON alumni_contact_info (state);
 CREATE INDEX idx_alumni_contact_info_city_state   ON alumni_contact_info (city, state);
+CREATE INDEX IF NOT EXISTS idx_alumni_contact_info_country ON alumni_contact_info (country);
+-- Expression indexes matching the normalized geography GROUP BYs (#186).
+CREATE INDEX IF NOT EXISTS idx_alumni_contact_info_state_norm      ON alumni_contact_info (upper(trim(state)));
+CREATE INDEX IF NOT EXISTS idx_alumni_contact_info_city_state_norm ON alumni_contact_info (lower(trim(city)), upper(trim(state)));
 CREATE INDEX idx_current_employment_alumni_id    ON current_employment (alumni_id);
 CREATE INDEX idx_current_employment_employer      ON current_employment (current_employer);
 CREATE INDEX idx_current_employment_industry      ON current_employment (current_industry);
+CREATE INDEX IF NOT EXISTS idx_current_employment_state ON current_employment (current_state);
 CREATE INDEX idx_education_history_alumni_id     ON education_history (alumni_id);
 CREATE INDEX idx_employment_history_alumni_id    ON employment_history (alumni_id);
 CREATE INDEX idx_verification_log_alumni_id      ON verification_log (alumni_id);
@@ -689,6 +773,8 @@ CREATE INDEX idx_alumni_tags_alumni_id           ON alumni_tags (alumni_id);
 CREATE INDEX idx_alumni_tags_tag_id              ON alumni_tags (tag_id);
 CREATE INDEX idx_alumni_status_labels_alumni_id  ON alumni_status_labels (alumni_id);
 CREATE INDEX idx_interactions_alumni_id          ON interactions (alumni_id);
+-- Dashboard last-contacted anti-joins filter on alumni_id + date (#186).
+CREATE INDEX idx_interactions_alumni_id_date     ON interactions (alumni_id, interaction_date_time);
 CREATE INDEX idx_follow_up_tasks_alumni_id       ON follow_up_tasks (alumni_id);
 CREATE INDEX idx_event_attendance_event_id       ON event_attendance (event_id);
 CREATE INDEX idx_event_attendance_alumni_id      ON event_attendance (alumni_id);

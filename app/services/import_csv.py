@@ -50,7 +50,9 @@ log = logging.getLogger(__name__)
 
 # Upload guards (also enforced at the route layer for the byte cap). The row cap
 # is enforced here in parse_and_map so both /preview and /import share it.
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB
+# 4 MiB, deliberately BELOW Vercel's ~4.5 MB serverless Function request-body
+# ceiling so the app's own friendly 413 fires instead of a raw platform error.
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 MiB
 MAX_IMPORT_ROWS = 2000
 
 # --- Column mapping ----------------------------------------------------------
@@ -323,12 +325,25 @@ def _validate_headers(headers: list[str]) -> list[str]:
     errors: list[str] = []
     seen = set(headers)
     expected = set(EXPECTED_HEADERS)
+    # Reject duplicated column names (last-wins would otherwise silently drop
+    # the earlier column's data). Mirrors import_events / import_donations.
+    for dup in sorted({h for h in headers if h and headers.count(h) > 1}):
+        errors.append(f"Duplicate column: {dup!r}.")
     for missing in EXPECTED_HEADERS:
         if missing not in seen:
             errors.append(f"Missing required column: {missing!r}.")
     for extra in headers:
         if extra and extra not in expected:
             errors.append(f"Unexpected column: {extra!r}.")
+    # Wrong-delimiter hint: a single "column" carrying several ';'/tab separators
+    # is almost always a semicolon/tab-delimited file fed to a comma parser.
+    if len(headers) == 1 and (
+        headers[0].count(";") >= 2 or headers[0].count("\t") >= 2
+    ):
+        errors.append(
+            "This looks like a semicolon- or tab-delimited file. Re-save it as "
+            "a comma-delimited CSV and try again."
+        )
     return errors
 
 
@@ -395,19 +410,27 @@ def _coerce(kind: str, header: str, raw: str):
 # --- Stage 2: evaluate (dry-run report) --------------------------------------
 
 
+_IndexRec = tuple[int, "str | None", "str | None"]
+
+
 async def _load_existing_index(session: AsyncSession) -> dict:
-    """Batch-load existing non-archived identity keys ONCE.
+    """Batch-load existing identity keys ONCE for in-memory duplicate detection.
 
-    Returns sets used for O(1) duplicate checks in the per-row loop:
-      * ``byu_ids``  — DIGIT-STRIPPED existing byu_id -> alumni_id (normalized
-        the SAME way the cleaner / detect_duplicates normalize incoming ids, so
-        a stored "123-456-789" matches an incoming "123456789")
-      * ``net_ids``  — lowercased existing net_id -> alumni_id
-      * ``names``    — (lower first, lower last, grad_year) -> alumni_id
+    Loads BOTH active and archived rows in a SINGLE query so the per-row loop can
+    reproduce :func:`hygiene.detect_duplicates` (exact byu_id/net_id blockers,
+    archived "ghost" warnings, fuzzy name warnings) and the spouse-link lookup with
+    ZERO further DB round trips — the whole ``evaluate`` pass costs one query, not
+    ~6 per row. The authoritative duplicate check still fires at write time in
+    ``create_alumni`` (DB partial-unique index), so this stays a fast pre-filter.
 
-    Mapping to alumni_id (not just membership) lets the in-DB duplicate
-    messages point at the conflicting record. Only the first match per key is
-    kept (any collision blocks anyway).
+    Each value is ``(alumni_id, first, last)`` so duplicate messages can name the
+    conflicting record:
+      * ``active_byu`` / ``archived_byu``  — DIGIT-STRIPPED byu_id -> record
+      * ``active_net`` / ``archived_net``  — lowercased net_id -> record
+      * ``active_names`` — (lower first, lower last, grad_year) -> LIST of records
+        (a fuzzy key can match several; each becomes its own warning)
+    ``active_byu`` also backs the spouse-link lookup (active only), matching the
+    old per-row ``_resolve_spouse`` query.
     """
     stmt = select(
         Alumni.alumni_id,
@@ -416,33 +439,165 @@ async def _load_existing_index(session: AsyncSession) -> dict:
         Alumni.first_name,
         Alumni.last_name,
         Alumni.graduation_year,
-    ).where(Alumni.archived.is_(False))
+        Alumni.archived,
+    )
     result = await session.execute(stmt)
 
-    byu_ids: dict[str, int] = {}
-    net_ids: dict[str, int] = {}
-    names: dict[tuple[str, str, int], int] = {}
-    for alumni_id, byu_id, net_id, first, last, grad_year in result.all():
-        if byu_id:
-            # Digit-strip to match the cleaner (which stores byu_id digits-only)
-            # so a stored formatted id still collides with an incoming one.
-            byu_key = re.sub(r"\D", "", byu_id.strip())
+    active_byu: dict[str, _IndexRec] = {}
+    active_net: dict[str, _IndexRec] = {}
+    archived_byu: dict[str, _IndexRec] = {}
+    archived_net: dict[str, _IndexRec] = {}
+    active_names: dict[tuple[str, str, int], list[_IndexRec]] = {}
+    for alumni_id, byu_id, net_id, first, last, grad_year, archived in result.all():
+        rec: _IndexRec = (alumni_id, first, last)
+        # Digit-strip byu_id to match the cleaner (stores digits-only) so a stored
+        # formatted id still collides with an incoming one.
+        byu_key = re.sub(r"\D", "", byu_id.strip()) if byu_id else ""
+        net_key = net_id.strip().lower() if net_id else ""
+        if archived:
             if byu_key:
-                byu_ids.setdefault(byu_key, alumni_id)
-        if net_id:
-            net_ids.setdefault(net_id.strip().lower(), alumni_id)
+                archived_byu.setdefault(byu_key, rec)
+            if net_key:
+                archived_net.setdefault(net_key, rec)
+            continue
+        if byu_key:
+            active_byu.setdefault(byu_key, rec)
+        if net_key:
+            active_net.setdefault(net_key, rec)
         if first and last and grad_year is not None:
-            names.setdefault(
-                (first.strip().lower(), last.strip().lower(), grad_year),
-                alumni_id,
+            active_names.setdefault(
+                (first.strip().lower(), last.strip().lower(), grad_year), []
+            ).append(rec)
+    return {
+        "active_byu": active_byu,
+        "active_net": active_net,
+        "archived_byu": archived_byu,
+        "archived_net": archived_net,
+        "active_names": active_names,
+    }
+
+
+def _detect_duplicates_indexed(
+    cleaned: dict, existing: dict
+) -> tuple[list[dict], list[dict]]:
+    """In-memory twin of :func:`hygiene.detect_duplicates` for bulk import.
+
+    Reproduces the exact blocker/warning codes and messages using the once-loaded
+    ``existing`` index (no per-row DB queries). Kept byte-for-byte aligned with the
+    live query version so preview and single-record create report identically.
+    """
+    blockers: list[dict] = []
+    blocker_ids: set[int] = set()
+    warnings: list[dict] = []
+
+    byu_id = cleaned.get("byu_id")
+    if byu_id:
+        key = re.sub(r"\D", "", str(byu_id).strip())
+        match = existing["active_byu"].get(key) if key else None
+        if match is not None:
+            aid, first, last = match
+            blockers.append(
+                {
+                    "code": "duplicate_byu_id",
+                    "field": "byu_id",
+                    "message": (
+                        f"BYU ID {byu_id} already belongs to "
+                        f"{hygiene._display_name(first, last)}."
+                    ),
+                    "alumni_id": aid,
+                }
             )
-    return {"byu_ids": byu_ids, "net_ids": net_ids, "names": names}
+            blocker_ids.add(aid)
+        else:
+            ghost = existing["archived_byu"].get(key) if key else None
+            if ghost is not None:
+                aid, first, last = ghost
+                warnings.append(
+                    {
+                        "code": "duplicate_archived",
+                        "message": (
+                            f"BYU ID {byu_id} matches an archived record for "
+                            f"{hygiene._display_name(first, last)}"
+                            " — restoring it would create a duplicate."
+                        ),
+                        "alumni_id": aid,
+                    }
+                )
+
+    net_id = cleaned.get("net_id")
+    if net_id:
+        key = str(net_id).strip().lower()
+        match = existing["active_net"].get(key) if key else None
+        if match is not None:
+            aid, first, last = match
+            blockers.append(
+                {
+                    "code": "duplicate_net_id",
+                    "field": "net_id",
+                    "message": (
+                        f"Net ID {net_id} already belongs to "
+                        f"{hygiene._display_name(first, last)}."
+                    ),
+                    "alumni_id": aid,
+                }
+            )
+            blocker_ids.add(aid)
+        else:
+            ghost = existing["archived_net"].get(key) if key else None
+            if ghost is not None:
+                aid, first, last = ghost
+                warnings.append(
+                    {
+                        "code": "duplicate_archived",
+                        "message": (
+                            f"Net ID {net_id} matches an archived record for "
+                            f"{hygiene._display_name(first, last)}"
+                            " — restoring it would create a duplicate."
+                        ),
+                        "alumni_id": aid,
+                    }
+                )
+
+    first = cleaned.get("first_name")
+    last = cleaned.get("last_name")
+    grad_year = cleaned.get("graduation_year")
+    if first and last and grad_year is not None:
+        key = (first.lower(), last.lower(), grad_year)
+        for aid, mfirst, mlast in existing["active_names"].get(key, []):
+            if aid in blocker_ids:
+                continue  # already a hard blocker; don't double-report
+            warnings.append(
+                {
+                    "code": "possible_duplicate",
+                    "message": (
+                        "Possible duplicate of "
+                        f"{hygiene._display_name(mfirst, mlast)} "
+                        f"(Class of {grad_year})."
+                    ),
+                    "alumni_id": aid,
+                }
+            )
+    return blockers, warnings
+
+
+def _spouse_from_index(spouse_byu_id: str, existing: dict) -> int | None:
+    """Resolve a raw spouse BYU ID to an ACTIVE alumni_id via the preloaded index."""
+    key = "".join(ch for ch in spouse_byu_id if ch.isdigit())
+    if not key:
+        return None
+    match = existing["active_byu"].get(key)
+    return match[0] if match else None
 
 
 async def _resolve_spouse(
     session: AsyncSession, spouse_byu_id: str
 ) -> int | None:
-    """Resolve a raw spouse BYU ID to an existing non-archived alumni_id."""
+    """Resolve a raw spouse BYU ID to an existing non-archived alumni_id.
+
+    Still used by ``commit_import`` (per importable row, at write time). The
+    ``evaluate`` preview path uses :func:`_spouse_from_index` instead to stay
+    query-free.
+    """
     cleaned = "".join(ch for ch in spouse_byu_id if ch.isdigit())
     if not cleaned:
         return None
@@ -484,8 +639,8 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
     importable = rejected = with_warnings = cleaned_count = 0
 
     for row in rows:
-        report = await _evaluate_row(
-            session, row, existing, seen_byu, seen_net, seen_names
+        report = _evaluate_row(
+            row, existing, seen_byu, seen_net, seen_names
         )
         out_rows.append(report)
         if report["status"] == "importable":
@@ -511,15 +666,17 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
     }
 
 
-async def _evaluate_row(
-    session: AsyncSession,
+def _evaluate_row(
     row: dict,
     existing: dict,
     seen_byu: dict[str, int],
     seen_net: dict[str, int],
     seen_names: dict[tuple[str, str, int], int],
 ) -> dict:
-    """Evaluate a single mapped row into a report entry."""
+    """Evaluate a single mapped row into a report entry.
+
+    Pure/query-free: all duplicate and spouse-link resolution runs against the
+    once-loaded ``existing`` index (see :func:`_load_existing_index`)."""
     base = {
         "row": row["row"],
         "name": row["name"],
@@ -558,7 +715,7 @@ async def _evaluate_row(
 
     # Spouse link resolution (warn-only; never blocks the row).
     if row["spouse_byu_id"]:
-        spouse_id = await _resolve_spouse(session, row["spouse_byu_id"])
+        spouse_id = _spouse_from_index(row["spouse_byu_id"], existing)
         if spouse_id is not None:
             cleaned["spouse_alumni_id"] = spouse_id
         else:
@@ -573,8 +730,9 @@ async def _evaluate_row(
                 }
             )
 
-    # Duplicate detection against the DB (reuses the hygiene query logic).
-    db_blockers, db_warnings = await hygiene.detect_duplicates(session, cleaned)
+    # Duplicate detection against the DB, done in-memory via the preloaded index
+    # (byte-identical to hygiene.detect_duplicates, but zero per-row queries).
+    db_blockers, db_warnings = _detect_duplicates_indexed(cleaned, existing)
     blockers.extend(db_blockers)
     warnings.extend(db_warnings)
 

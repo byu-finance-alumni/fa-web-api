@@ -16,8 +16,9 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.dependencies.auth import get_current_db_user
+from app.api.dependencies.auth import get_current_db_user, get_permission_config
 from app.api.routes import admin as admin_routes
+from app.core.capabilities import Capability
 from app.core.database import get_session
 from app.core.errors import ServiceError
 from app.main import app
@@ -670,6 +671,81 @@ def test_delete_user_404_when_missing():
         resp = client.delete("/admin/users/5")
     app.dependency_overrides.clear()
     assert resp.status_code == 404
+
+
+# --- delegated USER_ADMIN cannot self-escalate (#178) ------------------------
+#
+# The role-mutation route guard is the USER_ADMIN capability, which an engineer
+# can delegate to a lower role in the permission editor. The tier ceiling in the
+# route body must still stop that role from granting/removing a role above its
+# own tier. We model the delegation by overriding the live permission config so
+# ``full_access`` holds USER_ADMIN, then assert the escalation is refused.
+
+_DELEGATED_USER_ADMIN = {
+    "full_access": frozenset(
+        {
+            Capability.VIEW,
+            Capability.ALUMNI_EDIT,
+            Capability.ALUMNI_FULL,
+            Capability.USER_ADMIN,
+        }
+    ),
+}
+
+
+def test_delegated_user_admin_cannot_assign_super_admin():
+    """A full_access actor granted USER_ADMIN passes the route guard but is
+    blocked by the tier ceiling from minting a super_admin -> 403 (before any
+    DB access)."""
+    app.dependency_overrides[get_session] = _no_db_session
+    app.dependency_overrides[get_permission_config] = lambda: _DELEGATED_USER_ADMIN
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/admin/users/2/roles", json={"role_name": "super_admin"}
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+
+
+def test_delegated_user_admin_cannot_remove_super_admin():
+    """Symmetric with assign: the delegated actor cannot strip a super_admin
+    role either -> 403 before any DB access."""
+    app.dependency_overrides[get_session] = _no_db_session
+    app.dependency_overrides[get_permission_config] = lambda: _DELEGATED_USER_ADMIN
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/2/roles/super_admin")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+
+
+def test_delegated_user_admin_cannot_delete_super_admin():
+    """The delegated actor cannot permanently delete a user who holds a role
+    above its tier (super_admin) -> 403."""
+    user = _del_user(5, roles=("super_admin",))
+    session = _DeleteSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_permission_config] = lambda: _DELEGATED_USER_ADMIN
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "full_access", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/users/5")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+    assert session.deleted == []
 
 
 def test_delete_user_auth_failure_still_succeeds(monkeypatch):

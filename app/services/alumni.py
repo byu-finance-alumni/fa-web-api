@@ -23,7 +23,7 @@ from app.models.employment import (
     EmploymentHistory,
 )
 from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
-from app.models.tags import StatusLabel, Tag
+from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.repositories import alumni as repo
 from app.schemas.alumni import AlumniCreateFull, AlumniUpdateFull
 from app.services import hygiene
@@ -33,17 +33,47 @@ from app.services import hygiene
 _OPTIONS_CAP = 200
 
 
-async def _distinct_values(session: AsyncSession, column, *, desc: bool = False) -> list:
-    """Distinct, non-null, sorted values for one column (capped)."""
-    order = column.desc() if desc else column
-    rows = (
-        await session.execute(
-            select(column)
-            .where(column.is_not(None))
-            .distinct()
-            .order_by(order)
-            .limit(_OPTIONS_CAP)
+def _visible_alumni_exists(alumni_id_col):
+    """Correlated EXISTS restricting an option row to the VISIBLE population.
+
+    The list endpoint defaults to ``kind="alumni"`` with archived excluded, so a
+    filter option must only surface values held by a non-archived graduate —
+    otherwise the panel offers a value that returns zero rows (#184). Archived
+    and friend-only (``is_alumni=false``) records are excluded here to match.
+    ``alumni_id_col`` is the linking column on the option's own (or association)
+    table.
+    """
+    return (
+        select(Alumni.alumni_id)
+        .where(
+            Alumni.alumni_id == alumni_id_col,
+            Alumni.archived.is_(False),
+            Alumni.is_alumni.is_(True),
         )
+        .exists()
+    )
+
+
+def _distinct_query(column, *, desc: bool = False, scope=None):
+    """Pure ``SELECT DISTINCT column`` (non-null, sorted, capped).
+
+    ``scope`` is an optional iterable of extra WHERE predicates restricting the
+    rows to the visible population. Split out (no IO) so the scoping can be
+    unit-tested by compiling the statement.
+    """
+    order = column.desc() if desc else column
+    stmt = select(column).where(column.is_not(None))
+    if scope is not None:
+        stmt = stmt.where(*scope)
+    return stmt.distinct().order_by(order).limit(_OPTIONS_CAP)
+
+
+async def _distinct_values(
+    session: AsyncSession, column, *, desc: bool = False, scope=None
+) -> list:
+    """Distinct, non-null, sorted values for one column (capped, population-scoped)."""
+    rows = (
+        await session.execute(_distinct_query(column, desc=desc, scope=scope))
     ).all()
     return [r[0] for r in rows]
 
@@ -52,29 +82,85 @@ async def filter_options(session: AsyncSession) -> dict:
     """Distinct option lists for the advanced-filter panel's multi-selects.
 
     Pulled live from the data so new employers / titles / etc. appear without a
-    code change. Each list is capped."""
+    code change. Each list is capped and scoped to the VISIBLE population (the
+    list endpoint's default: non-archived graduates), so an option never returns
+    zero rows (#184).
+    """
+    # Per-table links into the visible-population guard. Every option table (or
+    # its association table) references the alumni row via ``alumni_id``.
+    employment_scope = [_visible_alumni_exists(CurrentEmployment.alumni_id)]
+    history_scope = [_visible_alumni_exists(EmploymentHistory.alumni_id)]
+    contact_scope = [_visible_alumni_exists(AlumniContactInfo.alumni_id)]
+    leadership_scope = [_visible_alumni_exists(FinanceSocietyLeadership.alumni_id)]
+    survey_scope = [_visible_alumni_exists(Survey.alumni_id)]
+    # graduation_year lives on the alumni row itself, so the guard is a plain
+    # predicate rather than a correlated EXISTS.
+    alumni_scope = [Alumni.archived.is_(False), Alumni.is_alumni.is_(True)]
+    # Tag / status-label labels live in lookup tables; scope through their
+    # association row to the visible population.
+    tag_scope = [
+        select(AlumniTag.alumni_tag_id)
+        .where(
+            AlumniTag.tag_id == Tag.tag_id,
+            _visible_alumni_exists(AlumniTag.alumni_id),
+        )
+        .exists()
+    ]
+    status_scope = [
+        select(AlumniStatusLabel.alumni_status_label_id)
+        .where(
+            AlumniStatusLabel.status_label_id == StatusLabel.status_label_id,
+            _visible_alumni_exists(AlumniStatusLabel.alumni_id),
+        )
+        .exists()
+    ]
+
+    # Industries span the PRIMARY and SECONDARY columns because the list filter
+    # matches either (repositories.alumni.build_alumni_query), so the option list
+    # must offer both. Union the two distinct sets, dedupe + sort, then re-cap so
+    # options and results agree (#184).
+    primary_industries = await _distinct_values(
+        session, CurrentEmployment.current_industry, scope=employment_scope
+    )
+    secondary_industries = await _distinct_values(
+        session, CurrentEmployment.current_industry_secondary, scope=employment_scope
+    )
+    industries = sorted(set(primary_industries) | set(secondary_industries))[
+        :_OPTIONS_CAP
+    ]
+
     return {
-        "employers": await _distinct_values(session, CurrentEmployment.current_employer),
+        "employers": await _distinct_values(
+            session, CurrentEmployment.current_employer, scope=employment_scope
+        ),
         "past_employers": await _distinct_values(
-            session, EmploymentHistory.employer_name
+            session, EmploymentHistory.employer_name, scope=history_scope
         ),
-        "titles": await _distinct_values(session, CurrentEmployment.current_title),
+        "titles": await _distinct_values(
+            session, CurrentEmployment.current_title, scope=employment_scope
+        ),
         "seniority_levels": await _distinct_values(
-            session, CurrentEmployment.seniority_level
+            session, CurrentEmployment.seniority_level, scope=employment_scope
         ),
-        "industries": await _distinct_values(
-            session, CurrentEmployment.current_industry
+        "industries": industries,
+        "cities": await _distinct_values(
+            session, AlumniContactInfo.city, scope=contact_scope
         ),
-        "cities": await _distinct_values(session, AlumniContactInfo.city),
-        "states": await _distinct_values(session, AlumniContactInfo.state),
-        "tags": await _distinct_values(session, Tag.tag_name),
-        "status_labels": await _distinct_values(session, StatusLabel.status_label_name),
+        "states": await _distinct_values(
+            session, AlumniContactInfo.state, scope=contact_scope
+        ),
+        "tags": await _distinct_values(session, Tag.tag_name, scope=tag_scope),
+        "status_labels": await _distinct_values(
+            session, StatusLabel.status_label_name, scope=status_scope
+        ),
         "leadership_roles": await _distinct_values(
-            session, FinanceSocietyLeadership.leadership_role
+            session, FinanceSocietyLeadership.leadership_role, scope=leadership_scope
         ),
-        "survey_statuses": await _distinct_values(session, Survey.survey_status),
+        "survey_statuses": await _distinct_values(
+            session, Survey.survey_status, scope=survey_scope
+        ),
         "graduation_years": await _distinct_values(
-            session, Alumni.graduation_year, desc=True
+            session, Alumni.graduation_year, desc=True, scope=alumni_scope
         ),
     }
 
@@ -332,7 +418,10 @@ async def update_alumni(
     payload: AlumniUpdateFull,
     actor_user_id: int | None = None,
 ) -> Alumni:
-    alumnus = await get_alumni(session, alumni_id, include_archived=True)
+    # Archived records 404 on edit, symmetric with GET /alumni/{id} — an archived
+    # record is "removed from the directory", so it must be restored (via
+    # POST /alumni/{id}/restore) before it can be edited, not silently mutated.
+    alumnus = await get_alumni(session, alumni_id, include_archived=False)
     # Data-hygiene pass: clean the provided fields (write the CLEANED values) and
     # block exact duplicates against everyone *except* this record. Fuzzy
     # warnings never block. jsonable=False keeps dates as date objects for the
@@ -383,6 +472,11 @@ async def update_alumni(
             order_by=CurrentEmployment.current_employment_id.desc(),
         )
     if education is not None and education.has_values():
+        # NOTE (#175): the full-edit-form education block edits the alumnus's
+        # MOST-RECENT degree in place (single-row upsert). Multi-degree records
+        # (e.g. BS + MBA) are managed via the dedicated per-row endpoints
+        # (POST/PATCH/DELETE /alumni/{id}/education); this path intentionally does
+        # NOT create a second row, so a form save can't silently fan out degrees.
         section_written |= await _upsert_section(
             session,
             EducationHistory,

@@ -8,6 +8,7 @@ without touching Postgres.
 import asyncio
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from app.core.errors import NotFoundError
 from app.models.alumni import Alumni
@@ -163,3 +164,74 @@ def test_restore_alumni(monkeypatch):
     obj = asyncio.run(service.restore_alumni(session, 1))
     assert obj.archived is False
     assert session.committed == 1
+
+
+# --- filter_options: population-scoped + secondary industry (#184) -----------
+#
+# No live DB in CI (see tests/conftest.py), so a fake session returns canned,
+# per-column rows and captures the compiled SQL of every distinct query. That
+# lets these assert (a) each option query is scoped to the visible population
+# and (b) the industries list unions primary + secondary values, all offline.
+
+
+class _RowsResult:
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    def all(self) -> list:
+        return self._rows
+
+
+class _FilterOptionsSession:
+    """Fake async session for ``filter_options``.
+
+    ``by_fragment`` is an ordered list of ``(sql_fragment, values)``; the FIRST
+    fragment found in a query's compiled SQL supplies its rows. Order matters —
+    put the more specific fragment first (e.g. ``current_industry_secondary``
+    before ``current_industry``).
+    """
+
+    def __init__(self, by_fragment: list[tuple[str, list]] | None = None) -> None:
+        self.by_fragment = by_fragment or []
+        self.seen: list[str] = []
+
+    async def execute(self, stmt: object) -> _RowsResult:
+        sql = str(stmt.compile(dialect=postgresql.dialect()))
+        self.seen.append(sql)
+        for fragment, values in self.by_fragment:
+            if fragment in sql:
+                return _RowsResult([(v,) for v in values])
+        return _RowsResult([])
+
+
+def test_filter_options_scopes_every_query_to_visible_population():
+    # #184: options must not offer archived / friend-only values, so every
+    # distinct query is gated to non-archived graduates (archived=false AND
+    # is_alumni=true) — directly on the alumni row or via a correlated EXISTS.
+    session = _FilterOptionsSession()
+    asyncio.run(service.filter_options(session))
+    assert session.seen  # sanity: queries actually ran
+    for sql in session.seen:
+        assert "archived IS false" in sql
+        assert "is_alumni IS true" in sql
+
+
+def test_filter_options_industries_union_primary_and_secondary():
+    # #184: the list filter matches primary OR secondary industry, so the option
+    # list unions both columns, deduped + sorted.
+    session = _FilterOptionsSession(
+        [
+            ("current_industry_secondary", ["Private Equity", "Investment Banking"]),
+            ("current_industry", ["Investment Banking", "Asset Management"]),
+        ]
+    )
+    opts = asyncio.run(service.filter_options(session))
+    # Deduped across the two columns and sorted; the secondary-only value is
+    # present even though it never appears in current_industry.
+    assert opts["industries"] == [
+        "Asset Management",
+        "Investment Banking",
+        "Private Equity",
+    ]
+    # Both the primary and the secondary industry column are actually queried.
+    assert any("current_industry_secondary" in sql for sql in session.seen)

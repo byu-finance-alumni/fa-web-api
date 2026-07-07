@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import __version__
 from app.api.routes import (
@@ -45,6 +46,7 @@ from app.core.security import (
     AuthorizationError,
     DeactivatedAccountError,
     MustChangePasswordError,
+    SessionSupersededError,
 )
 from app.core.security_log import log_security_event
 
@@ -141,6 +143,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Set baseline security response headers on every response (#176).
+
+    - ``X-Content-Type-Options: nosniff`` — stop MIME sniffing.
+    - ``X-Frame-Options: DENY`` — the API is never meant to be framed
+      (clickjacking defense on the JSON/docs surfaces).
+    - ``Referrer-Policy: no-referrer`` — never leak the request URL (which may
+      carry ids/tokens) in an outbound Referer header.
+
+    Runs outside the CORS middleware so it does not interfere with CORS
+    negotiation; ``setdefault`` avoids clobbering any header a specific route
+    already set.
+    """
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
+
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(alumni.router)
@@ -160,6 +184,26 @@ app.include_router(vocabulary.router)
 app.include_router(vocabulary.admin_router)
 app.include_router(support.router)
 app.include_router(support.admin_router)
+
+
+@app.exception_handler(SessionSupersededError)
+async def session_superseded_handler(
+    request: Request, exc: SessionSupersededError
+) -> JSONResponse:
+    """Return 401 / ``session_superseded`` for a session the account has replaced
+    by signing in on another device (#147).
+
+    Registered ahead of the generic AuthError handler so the subclass dispatches
+    here with its own machine code — the frontend detects it, signs the device
+    out, and tells the user why. Recorded as its own security event."""
+    log_security_event(
+        request, "session_superseded", status_code=401, detail=exc.message
+    )
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"error": {"code": "session_superseded", "message": exc.message}},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @app.exception_handler(AuthError)
@@ -323,6 +367,54 @@ async def validation_error_handler(
                 "fields": fields,
             }
         },
+    )
+
+
+# Maps a raw HTTP status to the project's stable ``error.code`` so a stray
+# ``HTTPException`` (framework 404s, or a route that raises one directly)
+# serializes as the SAME envelope the domain handlers use.
+_HTTP_STATUS_ERROR_CODES: dict[int, str] = {
+    status.HTTP_400_BAD_REQUEST: "bad_request",
+    status.HTTP_401_UNAUTHORIZED: "unauthorized",
+    status.HTTP_403_FORBIDDEN: "forbidden",
+    status.HTTP_404_NOT_FOUND: "not_found",
+    status.HTTP_405_METHOD_NOT_ALLOWED: "method_not_allowed",
+    status.HTTP_409_CONFLICT: "conflict",
+    status.HTTP_422_UNPROCESSABLE_ENTITY: "validation_error",
+    status.HTTP_429_TOO_MANY_REQUESTS: "rate_limited",
+    status.HTTP_502_BAD_GATEWAY: "service_unavailable",
+    status.HTTP_503_SERVICE_UNAVAILABLE: "service_unavailable",
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    """Normalize ANY raw ``HTTPException`` into the project error envelope.
+
+    Belt-and-suspenders (#175): the domain-specific exceptions above are the
+    intended path, but framework-raised 404/405s and any bare
+    ``HTTPException`` a route or dependency raises would otherwise leak
+    FastAPI's default ``{"detail": ...}`` shape — or, if ``detail`` is already
+    an envelope dict, double-nest it as ``{"detail": {"error": {...}}}``. This
+    handler emits ``{"error": {"code": ..., "message": ...}}`` at the top level
+    while preserving the status code and any headers (e.g. ``Retry-After`` on a
+    429, ``WWW-Authenticate`` on a 401).
+    """
+    detail = exc.detail
+    if isinstance(detail, dict) and "error" in detail:
+        # A caller already provided the envelope as ``detail`` — pass it through
+        # unwrapped rather than nesting it under ``detail``.
+        content = detail
+    else:
+        code = _HTTP_STATUS_ERROR_CODES.get(exc.status_code, "http_error")
+        message = detail if isinstance(detail, str) else "Request failed."
+        content = {"error": {"code": code, "message": message}}
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=getattr(exc, "headers", None),
     )
 
 

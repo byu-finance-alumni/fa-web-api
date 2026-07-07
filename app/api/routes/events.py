@@ -1,21 +1,31 @@
 """Event listing routes."""
 
+import csv
 import datetime
+import io
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
+from app.models.contact import AlumniContactInfo
 from app.models.event import Event, EventAttendance
-from app.schemas.event import AttendeeCreate, EventCreate, EventUpdate
+from app.schemas.event import AttendeeCreate, AttendeeRead, EventCreate, EventUpdate
+from app.schemas.imports import EventImportPreview, EventImportResult
 from app.services import import_events
+
+# Reuse the alumni export's formula-injection neutralizer (canonical source:
+# alumni_export._FORMULA_LEAD) so attendee cells starting with = + - @ \t \r are
+# tab-prefixed to plain text instead of executing as spreadsheet formulas (#169).
+from app.services.alumni_export import _fmt
 from app.utils.sql import escape_like
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -171,63 +181,101 @@ async def events_import_template(_: RequireFullAccess) -> Response:
     )
 
 
-@router.post("/import/preview", response_model=None)
+# The event's identity is entered in the wizard and posted alongside the file as
+# multipart form fields (the CSV is only the attendee roster — #149).
+EventNameForm = Annotated[str, Form()]
+EventDateForm = Annotated[str | None, Form()]
+EventTypeForm = Annotated[str | None, Form()]
+EventLocationForm = Annotated[str | None, Form()]
+EventNotesForm = Annotated[str | None, Form()]
+
+
+def _headers_bad_preview(header_errors: list[str], meta: dict) -> dict:
+    return {
+        "columns_ok": False,
+        "header_errors": header_errors,
+        "event": {
+            "event_name": meta["event_name"],
+            "event_date": meta["event_date"],
+            "event_type": meta["event_type"],
+            "event_location": meta["event_location"],
+            "event_notes": meta["event_notes"],
+        },
+        "importable": False,
+        "event_errors": [],
+        "summary": {
+            "total_rows": 0,
+            "attendees_matched": 0,
+            "attendees_unmatched": 0,
+        },
+        "attendees": [],
+        "warnings": [],
+    }
+
+
+@router.post("/import/preview", response_model=EventImportPreview)
 async def preview_import_events(
     _: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
+    event_name: EventNameForm,
+    event_date: EventDateForm = None,
+    event_type: EventTypeForm = None,
+    event_location: EventLocationForm = None,
+    event_notes: EventNotesForm = None,
 ) -> dict | JSONResponse:
-    """Dry-run an events bulk CSV import (full_access, NO writes).
+    """Dry-run a single-event attendee CSV import (full_access, NO writes).
 
-    Groups attendee rows into events, resolves attendees by Net ID, and flags
-    unmatched Net IDs, bad dates, and duplicate events. A bad header set surfaces
-    as ``columns_ok: false`` with ``header_errors``."""
+    The event's identity (title/date/type/…) comes from the wizard as form
+    fields; the CSV is the attendee roster. Resolves attendees by Net ID and
+    flags unmatched/duplicate attendees, a bad date, and a pre-existing event. A
+    bad header set surfaces as ``columns_ok: false`` with ``header_errors``."""
+    meta = import_events.normalize_event_meta(
+        event_name, event_date, event_type, event_location, event_notes
+    )
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
     rows, header_errors = import_events.parse_and_map(file_bytes)
     if header_errors:
-        return {
-            "columns_ok": False,
-            "header_errors": header_errors,
-            "summary": {
-                "total_rows": 0,
-                "events": 0,
-                "importable_events": 0,
-                "rejected_events": 0,
-                "attendees_matched": 0,
-                "attendees_unmatched": 0,
-            },
-            "events": [],
-        }
-    return await import_events.evaluate(session, rows)
+        return _headers_bad_preview(header_errors, meta)
+    return await import_events.evaluate(session, rows, meta)
 
 
-@router.post("/import", response_model=None)
+@router.post("/import", response_model=EventImportResult)
 async def import_events_commit(
     user: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
+    event_name: EventNameForm,
+    event_date: EventDateForm = None,
+    event_type: EventTypeForm = None,
+    event_location: EventLocationForm = None,
+    event_notes: EventNotesForm = None,
 ) -> dict | JSONResponse:
-    """Commit an events bulk CSV import (full_access). Re-evaluates and inserts
-    every importable event + its matched attendees in one transaction (audit
-    logging fires per event and attendee); rejected events are skipped and
-    reported. A bad header set imports nothing."""
+    """Commit a single-event attendee CSV import (full_access). Re-evaluates and,
+    if the event identity is valid and new, inserts the event + its matched
+    attendees in one transaction (audit logging fires for the event and each
+    attendee); unmatched attendees are skipped and reported. A bad header set
+    imports nothing."""
+    meta = import_events.normalize_event_meta(
+        event_name, event_date, event_type, event_location, event_notes
+    )
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
     rows, header_errors = import_events.parse_and_map(file_bytes)
     if header_errors:
         return {
-            "imported_events": 0,
+            "imported": False,
+            "event_id": None,
             "imported_attendees": 0,
-            "skipped_events": 0,
-            "rejects": [
-                {"event": "(header)", "date": None, "reason": msg}
-                for msg in header_errors
-            ],
+            "unmatched": [],
+            "event_error": header_errors[0],
         }
-    return await import_events.commit_import(session, rows, actor_user_id=user.user_id)
+    return await import_events.commit_import(
+        session, rows, meta, actor_user_id=user.user_id
+    )
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -261,7 +309,7 @@ async def create_event(
 
 @router.get("/{event_id}")
 async def get_event(
-    event_id: int, _: RequireViewAccess, session: SessionDep
+    event_id: IdPath, _: RequireViewAccess, session: SessionDep
 ) -> dict:
     event = await session.get(Event, event_id)
     if event is None:
@@ -285,7 +333,7 @@ def _audit_value(value) -> str | None:
 
 @router.patch("/{event_id}")
 async def update_event(
-    event_id: int,
+    event_id: IdPath,
     payload: EventUpdate,
     user: RequireFullAccess,
     session: SessionDep,
@@ -331,7 +379,7 @@ async def update_event(
 
 @router.delete("/{event_id}")
 async def delete_event(
-    event_id: int, user: RequireFullAccess, session: SessionDep
+    event_id: IdPath, user: RequireFullAccess, session: SessionDep
 ) -> dict:
     """Delete an event (full_access). Cascades to its attendance rows (and any
     attached notes) via the FK ``ON DELETE CASCADE``. 404 if the event is
@@ -361,37 +409,120 @@ def _attendee_name(a: Alumni) -> str:
     return name or f"Alumni #{a.alumni_id}"
 
 
-@router.get("/{event_id}/attendees")
+@router.get("/{event_id}/attendees", response_model=list[AttendeeRead])
 async def list_event_attendees(
-    event_id: int, _: RequireViewAccess, session: SessionDep
-) -> list[dict]:
+    event_id: IdPath, _: RequireViewAccess, session: SessionDep
+) -> list[AttendeeRead]:
     """Alumni who attended an event (view-access read). 404 if the event is
-    unknown so callers can distinguish "no attendees" from "no such event"."""
+    unknown so callers can distinguish "no attendees" from "no such event".
+
+    ``notes`` echoes the per-attendance ``attendance_notes`` (#181) so the notes
+    the bulk importer writes are actually readable on the roster."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
     rows = (
         await session.execute(
-            select(Alumni, EventAttendance.attendance_status)
+            select(
+                Alumni,
+                EventAttendance.attendance_status,
+                EventAttendance.attendance_notes,
+            )
             .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
             .where(EventAttendance.event_id == event_id)
             .order_by(Alumni.last_name, Alumni.first_name)
         )
     ).all()
     return [
-        {
-            "alumni_id": a.alumni_id,
-            "name": _attendee_name(a),
-            "graduation_year": a.graduation_year,
-            "attendance_status": status,
-        }
-        for a, status in rows
+        AttendeeRead(
+            alumni_id=a.alumni_id,
+            name=_attendee_name(a),
+            graduation_year=a.graduation_year,
+            attendance_status=status,
+            notes=notes,
+        )
+        for a, status, notes in rows
     ]
+
+
+@router.get("/{event_id}/attendees/export")
+async def export_event_attendees(
+    event_id: IdPath, user: RequireFullAccess, session: SessionDep
+) -> Response:
+    """Download an event's attendee list as CSV — columns **Name, Email, Net ID**
+    (#219). Gated at ``full_access`` (a rung above the view-only attendee list)
+    because bulk contact details — alumni PII — leave the system here, and audited
+    as a disclosure (action ``export_event_attendees``, row count only, never the
+    data itself). 404 if the event is unknown.
+
+    Email is the alumnus's personal email, falling back to the work email. Rows
+    are ordered by name, matching the on-screen roster."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    rows = (
+        await session.execute(
+            select(
+                Alumni,
+                AlumniContactInfo.personal_email,
+                AlumniContactInfo.work_email,
+            )
+            .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
+            .outerjoin(
+                AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id
+            )
+            .where(EventAttendance.event_id == event_id)
+            .order_by(Alumni.last_name, Alumni.first_name)
+        )
+    ).all()
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["Name", "Email", "Net ID"])
+    for alumni, personal_email, work_email in rows:
+        # Neutralize every free-text cell (#169) — a name/email/net_id starting
+        # with a formula lead char would otherwise export as an executable cell.
+        writer.writerow(
+            [
+                _fmt(_attendee_name(alumni), "str"),
+                _fmt(personal_email or work_email or "", "str"),
+                _fmt(alumni.net_id or "", "str"),
+            ]
+        )
+
+    # Disclosure record: WHAT left the system (row count + the fixed column set)
+    # and WHICH event — never the data itself. Mirrors the alumni export's
+    # self-contained audit summary so the trail stays reconstructable if the
+    # column set ever changes.
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="export_event_attendees",
+            entity_type="event",
+            entity_id=event_id,
+            new_value=(
+                f"rows={len(rows)}; columns=name,email,net_id; "
+                f"event={event.event_name!r}"
+            ),
+        )
+    )
+    await session.commit()
+
+    # event_id is a path int (FastAPI-validated), so this header value is always
+    # a safe decimal string. Do NOT extend this filename with free-text DB fields
+    # (e.g. event name) without RFC 5987 encoding — that would open header
+    # injection into Content-Disposition.
+    filename = f"event_{event_id}_attendees.csv"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/{event_id}/attendees", status_code=status.HTTP_201_CREATED)
 async def add_event_attendee(
-    event_id: int,
+    event_id: IdPath,
     payload: AttendeeCreate,
     user: RequireFullAccess,
     session: SessionDep,
@@ -410,7 +541,11 @@ async def add_event_attendee(
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
     alumni = await session.get(Alumni, payload.alumni_id)
-    if alumni is None:
+    # Archived alumni are not valid attendees. The bulk importer already matches
+    # active-only (repositories/net_id.match_net_ids), so reject them here too and
+    # surface it as a 404 — an archived record is "not found" for this purpose,
+    # keeping manual add and import consistent (#181).
+    if alumni is None or alumni.archived:
         raise NotFoundError(f"Alumni {payload.alumni_id} not found.")
 
     existing = await session.scalar(
@@ -428,6 +563,7 @@ async def add_event_attendee(
         event_id=event_id,
         alumni_id=payload.alumni_id,
         attendance_status=payload.attendance_status,
+        attendance_notes=payload.notes,
     )
     session.add(attendance)
     name = _attendee_name(alumni)
@@ -446,13 +582,14 @@ async def add_event_attendee(
         "name": name,
         "graduation_year": alumni.graduation_year,
         "attendance_status": payload.attendance_status,
+        "notes": payload.notes,
     }
 
 
 @router.delete("/{event_id}/attendees/{alumni_id}")
 async def remove_event_attendee(
-    event_id: int,
-    alumni_id: int,
+    event_id: IdPath,
+    alumni_id: IdPath,
     user: RequireFullAccess,
     session: SessionDep,
 ) -> dict:

@@ -1,9 +1,9 @@
 """Tests for the events (#156) and donations (#161) bulk CSV importers.
 
-The ``parse_and_map`` stage is pure (no DB), so header validation, grouping, and
-per-cell coercion are tested directly. The ``evaluate`` stage (Net-ID matching,
-unmatched-row rejection) is exercised with a sequenced fake session. Route-level
-auth gating for the new endpoints is covered too.
+The ``parse_and_map`` stage is pure (no DB), so header validation and per-cell
+coercion are tested directly. The ``evaluate`` stage (donor / Net-ID matching,
+ambiguity, unmatched reporting) is exercised with fake sessions. Route-level auth
+gating for the new endpoints is covered too.
 """
 
 import asyncio
@@ -26,23 +26,19 @@ def _bytes(text: str) -> bytes:
 # --- events: parse_and_map ----------------------------------------------------
 
 
-def test_events_parse_groups_and_validates():
-    csv_text = (
-        "Event title,Event date (YYYY-MM-DD),Attendee Net ID,Attendee name\n"
-        "Banquet,2026-04-15,jdoe,Jane Doe\n"
-        "Banquet,2026-04-15,msmith,Mark Smith\n"
-        "Trek,not-a-date,alee,Amy Lee\n"
-    )
+_EV_HEADER = "Net ID,First name,Last name,Notes\n"
+
+
+def test_events_parse_attendee_rows():
+    csv_text = _EV_HEADER + "jdoe,Jane,Doe,VIP\nmsmith,Mark,Smith,\n"
     rows, header_errors = import_events.parse_and_map(_bytes(csv_text))
     assert header_errors == []
-    assert len(rows) == 3
-    # First two rows share an event group identity.
-    assert rows[0]["event_title"] == "Banquet"
-    assert rows[0]["event_date"] == "2026-04-15"
+    assert len(rows) == 2
+    assert rows[0]["net_id"] == "jdoe"
+    assert rows[0]["attendee_name"] == "Jane Doe"
+    assert rows[0]["notes"] == "VIP"
+    assert rows[1]["notes"] is None  # blank Notes -> None
     assert rows[0]["error"] is None
-    # Bad date is flagged on the row.
-    assert rows[2]["error"] is not None
-    assert "date" in rows[2]["error"].lower()
 
 
 def test_events_parse_rejects_bad_headers():
@@ -51,22 +47,16 @@ def test_events_parse_rejects_bad_headers():
     assert any("Missing required column" in e for e in header_errors)
 
 
-def test_events_parse_flags_missing_title():
-    csv_text = (
-        "Event title,Event date (YYYY-MM-DD),Attendee Net ID,Attendee name\n"
-        ",2026-04-15,jdoe,Jane Doe\n"
-    )
-    rows, _ = import_events.parse_and_map(_bytes(csv_text))
+def test_events_parse_flags_missing_net_id():
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + ",Jane,Doe\n"))
     assert rows[0]["error"] is not None
-    assert "title" in rows[0]["error"].lower()
+    assert "net id" in rows[0]["error"].lower()
 
 
 def test_events_template_has_headers_and_examples():
     csv_text = import_events.build_template_csv()
-    assert "Event title" in csv_text
-    assert "Attendee Net ID" in csv_text
-    # Two example rows share an event to demonstrate grouping.
-    assert csv_text.count("Spring Finance Banquet") == 2
+    assert "Net ID" in csv_text
+    assert "jdoe" in csv_text
 
 
 # --- events: evaluate (Net-ID matching, group rejection) ----------------------
@@ -90,56 +80,111 @@ class _SeqSession:
         return _Result(self._results.pop(0) if self._results else [])
 
 
-def test_events_evaluate_rejects_group_with_unmatched_net_id():
-    rows, _ = import_events.parse_and_map(
-        _bytes(
-            "Event title,Event date (YYYY-MM-DD),Attendee Net ID,Attendee name\n"
-            "Banquet,2026-04-15,jdoe,Jane Doe\n"
-            "Banquet,2026-04-15,ghost,Nobody\n"
-        )
-    )
-    # match_net_ids -> only jdoe is active; _load_existing_events -> none.
-    session = _SeqSession(results=[[(42, "jdoe")], []])
-    report = asyncio.run(import_events.evaluate(session, rows))
-    assert report["summary"]["events"] == 1
-    assert report["summary"]["importable_events"] == 0
-    event = report["events"][0]
-    assert event["status"] == "rejected"
-    assert any(b["code"] == "unmatched_net_id" for b in event["blockers"])
+class _EventEvalSession:
+    """Fake session for the one-event evaluate: ``scalar`` answers the
+    "does this event already exist?" probe; ``execute`` returns the Net-ID match
+    rows for ``match_net_ids``."""
+
+    def __init__(self, matched_rows, existing=None):
+        self._matched = matched_rows
+        self._existing = existing
+
+    async def scalar(self, _stmt):
+        return self._existing
+
+    async def execute(self, _stmt):
+        return _Result(self._matched)
 
 
-def test_events_evaluate_accepts_fully_matched_group():
+def test_events_evaluate_reports_unmatched_without_blocking():
     rows, _ = import_events.parse_and_map(
-        _bytes(
-            "Event title,Event date (YYYY-MM-DD),Attendee Net ID,Attendee name\n"
-            "Banquet,2026-04-15,jdoe,Jane Doe\n"
-        )
+        _bytes(_EV_HEADER + "jdoe,Jane,Doe\nghost,Nobody\n")
     )
-    session = _SeqSession(results=[[(42, "jdoe")], []])
-    report = asyncio.run(import_events.evaluate(session, rows))
-    assert report["summary"]["importable_events"] == 1
-    assert report["events"][0]["attendees"][0]["alumni_id"] == 42
+    meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
+    session = _EventEvalSession(matched_rows=[(42, "jdoe")])
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    # Event is importable; the unmatched attendee is reported, not blocking.
+    assert report["importable"] is True
+    assert report["summary"]["attendees_matched"] == 1
+    assert report["summary"]["attendees_unmatched"] == 1
+    ghost = next(a for a in report["attendees"] if a["net_id"] == "ghost")
+    assert ghost["matched"] is False
+
+
+def test_events_evaluate_matches_attendees():
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe\n"))
+    meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
+    session = _EventEvalSession(matched_rows=[(42, "jdoe")])
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    assert report["importable"] is True
+    assert report["attendees"][0]["alumni_id"] == 42
+
+
+def test_events_evaluate_warns_when_nothing_matched():
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "ghost,Nobody\n"))
+    meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
+    session = _EventEvalSession(matched_rows=[])  # no active match
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    # Importable stays true (policy) but the empty-roster footgun is warned.
+    assert report["importable"] is True
+    assert report["summary"]["attendees_matched"] == 0
+    assert any(w["code"] == "no_attendees_matched" for w in report["warnings"])
+
+
+def test_events_evaluate_carries_attendee_notes():
+    # The Notes column flows parse -> evaluate -> attendee dict, and commit
+    # persists it as EventAttendance.attendance_notes (#252).
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe,VIP\n"))
+    meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
+    session = _EventEvalSession(matched_rows=[(42, "jdoe")])
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    assert report["attendees"][0]["notes"] == "VIP"
+
+
+def test_events_evaluate_rejects_bad_event_date():
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe\n"))
+    meta = import_events.normalize_event_meta("Banquet", "not-a-date")
+    session = _EventEvalSession(matched_rows=[(42, "jdoe")])
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    assert report["importable"] is False
+    assert any(e["code"] == "invalid_event" for e in report["event_errors"])
+
+
+def test_events_evaluate_rejects_duplicate_event():
+    rows, _ = import_events.parse_and_map(_bytes(_EV_HEADER + "jdoe,Jane,Doe\n"))
+    meta = import_events.normalize_event_meta("Banquet", "2026-04-15")
+    # scalar returns an existing event id -> duplicate.
+    session = _EventEvalSession(matched_rows=[(42, "jdoe")], existing=7)
+    report = asyncio.run(import_events.evaluate(session, rows, meta))
+    assert report["importable"] is False
+    assert any(e["code"] == "duplicate_event" for e in report["event_errors"])
 
 
 # --- donations: parse_and_map -------------------------------------------------
 
 
+_DON_HEADER = "MSTID,First name,Last name,Month,Year,Amount\n"
+
+
 def test_donations_parse_valid_and_invalid_rows():
     csv_text = (
-        "Net ID,Name,Month,Year,Amount\n"
-        'jdoe,Jane Doe,4,2026,"$1,250.00"\n'  # money with $ and comma (Excel quotes it)
-        "msmith,Mark Smith,13,2025,100\n"      # bad month
-        "alee,Amy Lee,,2024,abc\n"             # bad amount
-        "bro,Bo Roe,5,,50\n"                   # missing year
+        _DON_HEADER
+        + '100200300,Jane,Doe,4,2026,"$1,250.00"\n'  # money with $ + comma (quoted)
+        + "100200301,Mark,Smith,13,2025,100\n"        # bad month
+        + "100200302,Amy,Lee,,2024,abc\n"             # bad amount
+        + "100200303,Bo,Roe,5,,50\n"                  # missing year
+        + ",,,,2024,50\n"                             # nothing to match on
     )
     rows, header_errors = import_donations.parse_and_map(_bytes(csv_text))
     assert header_errors == []
     assert rows[0]["error"] is None
     assert str(rows[0]["amount"]) == "1250.00"
     assert rows[0]["month"] == 4
+    assert rows[0]["mstid"] == "100200300"
     assert "Month" in rows[1]["error"]
     assert "Amount" in rows[2]["error"]
     assert "Year" in rows[3]["error"]
+    assert "MSTID" in rows[4]["error"]  # no MSTID and no name -> nothing to match
 
 
 def test_donations_parse_rejects_bad_headers():
@@ -150,30 +195,78 @@ def test_donations_parse_rejects_bad_headers():
 
 def test_donations_parse_rejects_zero_amount():
     rows, _ = import_donations.parse_and_map(
-        _bytes("Net ID,Name,Month,Year,Amount\njdoe,Jane,4,2026,0\n")
+        _bytes(_DON_HEADER + "100200300,Jane,Doe,4,2026,0\n")
     )
     assert rows[0]["error"] is not None
     assert "Amount" in rows[0]["error"]
 
 
+def test_donations_parse_allows_name_only_row():
+    # No MSTID is fine as long as both names are present (name-fallback match).
+    rows, _ = import_donations.parse_and_map(
+        _bytes(_DON_HEADER + ",Jane,Doe,4,2026,100\n")
+    )
+    assert rows[0]["error"] is None
+    assert rows[0]["mstid"] == ""
+    assert (rows[0]["first_name"], rows[0]["last_name"]) == ("Jane", "Doe")
+
+
 def test_donations_parse_flags_duplicate_header():
-    # Two "Net ID" columns map ambiguously — reject rather than last-wins.
+    # Two "MSTID" columns map ambiguously — reject rather than last-wins.
     rows, header_errors = import_donations.parse_and_map(
-        _bytes("Net ID,Net ID,Name,Month,Year,Amount\njdoe,x,Jane,4,2026,50\n")
+        _bytes("MSTID,MSTID,First name,Last name,Month,Year,Amount\n1,2,J,D,4,2026,50\n")
     )
     assert rows == []
     assert any("Duplicate column" in e for e in header_errors)
 
 
+def test_donations_evaluate_matches_by_mstid():
+    rows, _ = import_donations.parse_and_map(
+        _bytes(_DON_HEADER + "100200300,Jane,Doe,4,2026,100\n")
+    )
+    # match_mstids -> alumnus 42; match_names result is irrelevant (MSTID wins).
+    session = _SeqSession(results=[[(42, "100200300")]])
+    report = asyncio.run(import_donations.evaluate(session, rows))
+    assert report["summary"]["importable"] == 1
+    assert report["rows"][0]["alumni_id"] == 42
+    assert report["rows"][0]["match_method"] == "mstid"
+
+
+def test_donations_evaluate_falls_back_to_name():
+    rows, _ = import_donations.parse_and_map(
+        _bytes(_DON_HEADER + ",Jane,Doe,4,2026,100\n")
+    )
+    # No MSTID -> match_mstids doesn't query; match_names -> alumnus 42.
+    session = _SeqSession(results=[[(42, "Doe", "Jane")]])
+    report = asyncio.run(import_donations.evaluate(session, rows))
+    assert report["summary"]["importable"] == 1
+    assert report["rows"][0]["alumni_id"] == 42
+    assert report["rows"][0]["match_method"] == "name"
+
+
+def test_donations_evaluate_rejects_ambiguous_name():
+    rows, _ = import_donations.parse_and_map(
+        _bytes(_DON_HEADER + ",Jane,Doe,4,2026,100\n")
+    )
+    # Two active alumni named Jane Doe -> ambiguous, never auto-attributed.
+    session = _SeqSession(results=[[(42, "Doe", "Jane"), (43, "Doe", "Jane")]])
+    report = asyncio.run(import_donations.evaluate(session, rows))
+    assert report["summary"]["importable"] == 0
+    assert report["rows"][0]["status"] == "rejected"
+    assert any(
+        b["code"] == "ambiguous_name" for b in report["rows"][0]["blockers"]
+    )
+
+
 def test_donations_evaluate_warns_duplicate_in_file():
     rows, _ = import_donations.parse_and_map(
         _bytes(
-            "Net ID,Name,Month,Year,Amount\n"
-            "jdoe,Jane,4,2026,100\n"
-            "jdoe,Jane,4,2026,100\n"
+            _DON_HEADER
+            + "100200300,Jane,Doe,4,2026,100\n"
+            + "100200300,Jane,Doe,4,2026,100\n"
         )
     )
-    session = _SeqSession(results=[[(42, "jdoe")]])
+    session = _SeqSession(results=[[(42, "100200300")]])
     report = asyncio.run(import_donations.evaluate(session, rows))
     # Both rows are importable; the second carries a duplicate warning.
     assert report["summary"]["importable"] == 2
@@ -185,15 +278,18 @@ def test_donations_evaluate_warns_duplicate_in_file():
     assert report["rows"][0]["alumni_id"] == 42
 
 
-def test_donations_evaluate_rejects_unmatched_net_id():
+def test_donations_evaluate_rejects_unmatched_donor():
     rows, _ = import_donations.parse_and_map(
-        _bytes("Net ID,Name,Month,Year,Amount\nghost,Nobody,4,2026,100\n")
+        _bytes(_DON_HEADER + "999999999,Ghost,Nobody,4,2026,100\n")
     )
-    session = _SeqSession(results=[[]])  # no active match for "ghost"
+    # No MSTID match and no name match.
+    session = _SeqSession(results=[[], []])
     report = asyncio.run(import_donations.evaluate(session, rows))
     assert report["summary"]["importable"] == 0
     assert report["rows"][0]["status"] == "rejected"
-    assert any(b["code"] == "unmatched_net_id" for b in report["rows"][0]["blockers"])
+    assert any(
+        b["code"] == "unmatched_donor" for b in report["rows"][0]["blockers"]
+    )
     # Amount is echoed in the preview (super_admin-only endpoint).
     assert report["rows"][0]["amount"] == 100.0
 
@@ -229,7 +325,63 @@ def test_events_import_template_ok_for_full_access(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     response = client.get("/events/import/template")
     assert response.status_code == 200
-    assert "Event title" in response.text
+    assert "Net ID" in response.text
+
+
+def test_events_import_preview_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    response = client.post(
+        "/events/import/preview",
+        data={"event_name": "Banquet"},
+        files={
+            "file": (
+                "a.csv",
+                b"Net ID,First name,Last name,Notes\njdoe,Jane,Doe\n",
+                "text/csv",
+            )
+        },
+    )
+    assert response.status_code == 403
+
+
+def test_events_import_preview_requires_event_name(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post(
+        "/events/import/preview",
+        files={
+            "file": (
+                "a.csv",
+                b"Net ID,First name,Last name,Notes\njdoe,Jane,Doe\n",
+                "text/csv",
+            )
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_events_import_preview_happy_path(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+
+    async def _override():
+        yield _EventEvalSession(matched_rows=[(42, "jdoe")])
+
+    app.dependency_overrides[get_session] = _override
+    response = client.post(
+        "/events/import/preview",
+        data={"event_name": "Banquet", "event_date": "2026-04-15"},
+        files={
+            "file": (
+                "a.csv",
+                b"Net ID,First name,Last name,Notes\njdoe,Jane,Doe\n",
+                "text/csv",
+            )
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["importable"] is True
+    assert body["event"]["event_name"] == "Banquet"
+    assert body["summary"]["attendees_matched"] == 1
 
 
 def test_delete_event_requires_auth(client):

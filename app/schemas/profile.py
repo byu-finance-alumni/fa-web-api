@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.dropdowns import (
     validate_industry,
@@ -38,6 +38,16 @@ class EmploymentHistoryCreate(BaseModel):
     start_year: int | None = Field(default=None, ge=1900, le=2100)
     end_year: int | None = Field(default=None, ge=1900, le=2100)
     is_current: bool = False
+
+    @model_validator(mode="after")
+    def _check_year_order(self) -> EmploymentHistoryCreate:
+        if (
+            self.start_year is not None
+            and self.end_year is not None
+            and self.end_year < self.start_year
+        ):
+            raise ValueError("end_year must be greater than or equal to start_year.")
+        return self
 
     @field_validator("employment_industry", mode="before")
     @classmethod
@@ -71,6 +81,19 @@ class EmploymentHistoryUpdate(BaseModel):
     start_year: int | None = Field(default=None, ge=1900, le=2100)
     end_year: int | None = Field(default=None, ge=1900, le=2100)
     is_current: bool | None = None
+
+    @model_validator(mode="after")
+    def _check_year_order(self) -> EmploymentHistoryUpdate:
+        # Only cross-validates when BOTH years are present in this PATCH payload;
+        # a partial update touching one year can't be checked against the stored
+        # counterpart at the schema layer.
+        if (
+            self.start_year is not None
+            and self.end_year is not None
+            and self.end_year < self.start_year
+        ):
+            raise ValueError("end_year must be greater than or equal to start_year.")
+        return self
 
     @field_validator("employment_industry", mode="before")
     @classmethod

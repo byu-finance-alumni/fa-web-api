@@ -25,6 +25,15 @@ from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
 from app.schemas.auth import UserContext
+from app.schemas.dashboard import (
+    ActivityFeed,
+    BirthdayRow,
+    DashboardSummary,
+    DataQuality,
+    EventParticipationRow,
+    FollowUpRow,
+    InteractionActivity,
+)
 from app.utils.sql import escape_like
 
 logger = logging.getLogger(__name__)
@@ -87,6 +96,18 @@ def _has_email_exists():
     )
 
 
+def _has_phone_exists():
+    """Correlated EXISTS: the alumnus has a phone number on file."""
+    return (
+        select(AlumniContactInfo.contact_info_id)
+        .where(
+            AlumniContactInfo.alumni_id == Alumni.alumni_id,
+            AlumniContactInfo.phone.is_not(None),
+        )
+        .exists()
+    )
+
+
 def _has_employer_exists():
     """Correlated EXISTS: the alumnus has a current employer on file."""
     return (
@@ -144,7 +165,7 @@ def _serialize_interaction(i, a, u) -> dict:
     }
 
 
-@router.get("/summary")
+@router.get("/summary", response_model=DashboardSummary)
 async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     """KPIs, distributions (cohort / top employers / by state), and recent
     activity for the dashboard.
@@ -230,11 +251,18 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     )
 
     # Distinct alumni who attended an event held in the last 30 days (past
-    # events only — a future event hasn't been "attended" yet).
+    # events only — a future event hasn't been "attended" yet). Joins Alumni and
+    # applies the same active filter as every other alumni KPI so archived /
+    # friend-of-program records never inflate the count (#179).
     attended_event_this_month = await session.scalar(
         select(func.count(func.distinct(EventAttendance.alumni_id)))
         .join(Event, Event.event_id == EventAttendance.event_id)
-        .where(Event.event_date >= month_ago.date(), Event.event_date <= today)
+        .join(Alumni, Alumni.alumni_id == EventAttendance.alumni_id)
+        .where(
+            Event.event_date >= month_ago.date(),
+            Event.event_date <= today,
+            active,
+        )
     )
     # Events scheduled today or later.
     upcoming_events = await session.scalar(
@@ -266,10 +294,12 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     guest_speakers_this_month = await session.scalar(
         select(func.count(func.distinct(EventAttendance.alumni_id)))
         .join(Event, Event.event_id == EventAttendance.event_id)
+        .join(Alumni, Alumni.alumni_id == EventAttendance.alumni_id)
         .where(
             Event.event_date >= month_start,
             Event.event_date <= month_end,
             EventAttendance.attendance_status.ilike("%speaker%"),
+            active,
         )
     )
     # Active alumni flagged as PIFF donors.
@@ -344,7 +374,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     }
 
 
-@router.get("/birthdays")
+@router.get("/birthdays", response_model=list[BirthdayRow])
 async def birthdays(
     actor: RequireViewAccess, session: SessionDep
 ) -> list[dict]:
@@ -412,7 +442,7 @@ async def birthdays(
     ]
 
 
-@router.get("/event-participation")
+@router.get("/event-participation", response_model=list[EventParticipationRow])
 async def event_participation(
     _: RequireViewAccess, session: SessionDep
 ) -> list[dict]:
@@ -478,7 +508,7 @@ async def event_participation(
     ]
 
 
-@router.get("/activity")
+@router.get("/activity", response_model=ActivityFeed)
 async def activity_feed(
     actor: RequireFullAccess,
     session: SessionDep,
@@ -618,7 +648,7 @@ async def activity_feed(
     }
 
 
-@router.get("/data-quality")
+@router.get("/data-quality", response_model=DataQuality)
 async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
     """The data-quality alert counts (same predicates as the summary KPIs),
     for the dedicated data-quality page.
@@ -641,28 +671,54 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
         .select_from(Alumni)
         .where(active, ~_has_employer_exists())
     )
+    missing_phone = await session.scalar(
+        select(func.count())
+        .select_from(Alumni)
+        .where(active, ~_has_phone_exists())
+    )
+    # "Complete" = an active alumnus with all three tracked contact/career fields
+    # on file (email AND phone AND current employer).
+    complete_alumni = await session.scalar(
+        select(func.count())
+        .select_from(Alumni)
+        .where(
+            active,
+            _has_email_exists(),
+            _has_phone_exists(),
+            _has_employer_exists(),
+        )
+    )
     duplicate_count = await session.scalar(
         text("SELECT count(*) FROM duplicate_candidates")
     )
     return {
         "total_alumni": int(total or 0),
+        "complete_alumni": int(complete_alumni or 0),
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
+        "missing_phone": int(missing_phone or 0),
         "duplicate_count": int(duplicate_count or 0),
     }
 
 
-@router.get("/contacted-this-month")
+@router.get("/contacted-this-month", response_model=list[InteractionActivity])
 async def contacted_this_month_list(
     actor: RequireFullAccess, session: SessionDep
 ) -> list[dict]:
     """The alumni behind the "Contacted this month" KPI — one row per distinct
     alumnus contacted in the last 30 days, carrying their most recent
-    interaction in the window (DISTINCT ON matches the KPI's distinct count).
+    interaction in the window.
+
+    Applies the same active-alumni filter as the KPI count
+    (archived=false AND is_alumni=true) so archived / friend-of-program records
+    never leak into the list and the row count reconciles with the tile (#179).
 
     FERPA: exposes individual alumni + CRM interaction data, so it is gated to
     full_access (view_only gets 403) and the disclosure is audited; only the
     aggregate count KPI on /summary stays view-accessible."""
+    # Alumni-only: mirror the /summary KPI's predicate so the drill-down list
+    # reconciles with the "Contacted this month" tile count (#179).
+    active = and_(Alumni.archived.is_(False), Alumni.is_alumni.is_(True))
     now = datetime.datetime.now(datetime.UTC)
     month_ago = now - datetime.timedelta(days=30)
     latest = (
@@ -680,6 +736,7 @@ async def contacted_this_month_list(
             select(li, Alumni, User)
             .join(Alumni, Alumni.alumni_id == li.alumni_id)
             .outerjoin(User, User.user_id == li.user_id)
+            .where(active)
             .order_by(li.interaction_date_time.desc())
             .limit(200)
         )
@@ -695,7 +752,7 @@ async def contacted_this_month_list(
     return [_serialize_interaction(i, a, u) for i, a, u in rows]
 
 
-@router.get("/follow-ups")
+@router.get("/follow-ups", response_model=list[FollowUpRow])
 async def upcoming_follow_ups_list(
     actor: RequireFullAccess, session: SessionDep
 ) -> list[dict]:

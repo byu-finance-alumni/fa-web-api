@@ -75,16 +75,61 @@ class _FakeSession:
 def test_summary_options_includes_cities_alongside_employers():
     # The City dropdown sources its options from summary().options.cities, which
     # must be produced exactly like employers (distinct, non-null, sorted).
-    # execute() order in get_summary: _top employers, _top industries, city_rows,
-    # then the options _distinct queries (employers, CITIES, industries,
-    # graduation_years, regions) and finally the tags query. The 5th execute is
-    # the cities _distinct — feed it two city rows, everything else empty.
-    executes = [[], [], [], [], [("Provo",), ("Salt Lake City",)]]
+    # execute() order in get_summary: get_states (for states_represented), _top
+    # employers, _top industries, city_rows, then the options _distinct queries
+    # (employers, CITIES, industries, graduation_years, regions) and finally the
+    # tags query. The 6th execute is the cities _distinct — feed it two city
+    # rows, everything else empty.
+    executes = [[], [], [], [], [], [("Provo",), ("Salt Lake City",)]]
     summary = asyncio.run(svc.get_summary(_FakeSession(executes), {}))
     options = summary["options"]
     assert "cities" in options
     assert "employers" in options
     assert options["cities"] == ["Provo", "Salt Lake City"]
+
+
+def test_get_states_folds_full_names_into_codes():
+    # get_states normalizes raw state values: full names fold into their 2-letter
+    # code ("Utah" -> "UT") and non-US values drop, so the map shows one bubble
+    # per state regardless of how the value was entered.
+    executes = [[("UT", 5), ("Utah", 3), ("CA", 2), ("Narnia", 9)]]
+    result = asyncio.run(svc.get_states(_FakeSession(executes), {}))
+    assert result == [
+        {"state": "UT", "state_name": "Utah", "alumni_count": 8},
+        {"state": "CA", "state_name": "California", "alumni_count": 2},
+    ]
+
+
+def test_summary_counts_match_normalized_map(monkeypatch):
+    # #180: /geography/summary must count states/cities the SAME way the map does.
+    # states_represented is derived from get_states, so a mix of "UT" and "Utah"
+    # collapses to ONE state (raw COUNT DISTINCT would have said two). city rows
+    # fold their state display through normalize_state ("UTAH" -> "UT").
+    # execute() order: get_states rows, _top employers, _top industries,
+    # city_rows, then options queries (all empty here).
+    executes = [
+        [("UT", 5), ("Utah", 3), ("CA", 2)],  # get_states -> folds to UT, CA
+        [],                                     # top_employers
+        [],                                     # top_industries
+        [("Provo", "UTAH", 10)],                # city_rows (raw state name)
+    ]
+    summary = asyncio.run(svc.get_summary(_FakeSession(executes), {}))
+    # UT + Utah collapse -> 2 states, not 3.
+    assert summary["states_represented"] == 2
+    # City-row state display is normalized to the 2-letter code.
+    assert summary["top_cities"] == [{"city": "Provo", "state": "UT", "count": 10}]
+    assert summary["largest_hub"] == {"city": "Provo", "state": "UT", "count": 10}
+
+
+def test_city_group_by_normalizes_case_and_whitespace():
+    # #180: cities are grouped on lower(trim(city)) so "Provo", "provo", and
+    # "Provo " collapse into one hub instead of fragmenting the count. Assert the
+    # shared grouping expression folds case (lower) and whitespace (trim).
+    from sqlalchemy.dialects import postgresql
+
+    sql = str(svc._CITY.compile(dialect=postgresql.dialect())).lower()
+    assert "lower" in sql
+    assert "trim" in sql
 
 
 def test_get_counties_maps_fips_to_counts():

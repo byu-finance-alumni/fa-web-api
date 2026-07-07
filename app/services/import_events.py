@@ -1,27 +1,26 @@
-"""Bulk CSV event importer (#156).
+"""Bulk CSV event importer (#149, #156).
 
-Turns a department-filled CSV into validated event groups and attaches their
-attendees — matched to existing alumni **by Net ID** — committing the importable
-events in one transaction through the same models the single-event API uses (so
-the audit logging fires identically).
-
-CSV shape: ONE ROW PER ATTENDEE. Rows that share the same (``Event title``,
-``Event date``) form a single event group; the ``Attendee name`` column is for
-human confirmation only — the Net ID is the key. An event with no attendee rows
-is still creatable (leave the attendee columns blank on a single row).
+**One CSV = one event's attendee list.** The event's identity (title, date,
+type, location, notes) is captured in the import wizard, NOT the CSV — the CSV is
+purely the roster, one row per attendee, keyed on **Net ID** (the ``Name`` column
+is for human confirmation only). Attendees are matched to existing alumni by Net
+ID and committed with the new event in one transaction, through the same models
+the single-event API uses (so the audit logging fires identically).
 
 Three stages, mirroring ``import_csv``:
 
   1. :func:`parse_and_map` — pure parse + header validation + per-row coercion
-     (bad date, blank title). No DB.
-  2. :func:`evaluate` — dry-run report grouped by event: resolve every Net ID in
-     ONE batch query, flag unmatched / duplicate-in-DB, NO writes.
-  3. :func:`commit_import` — re-evaluate, then insert each importable event + its
-     matched attendees, each event under its own SAVEPOINT.
+     (blank Net ID). No DB.
+  2. :func:`evaluate` — dry-run report for ONE event: validate the event
+     identity, resolve every Net ID in ONE batch query, flag unmatched /
+     duplicate attendees and a pre-existing event. NO writes.
+  3. :func:`commit_import` — re-evaluate, then insert the event + its matched
+     attendees under a SAVEPOINT.
 
-Policy (confirmed): **any unmatched Net ID, a bad/missing date, a missing title,
-or an event that already exists (same title + date) rejects that whole event
-group.** Strict integrity — no placeholder alumni are ever created.
+Policy (confirmed): the event identity must be valid and not already exist (same
+title + date). **Unmatched Net IDs never block the import** — the event is
+created with its matched attendees and the unmatched rows are reported clearly
+(strict integrity: no placeholder alumni are ever created).
 """
 
 from __future__ import annotations
@@ -42,20 +41,25 @@ log = logging.getLogger(__name__)
 
 # Upload guards. Byte cap is enforced at the route; the row cap is enforced here
 # so /preview and /commit share it.
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB
-MAX_IMPORT_ROWS = 5000  # attendee rows (many per event), so a touch higher
+# 4 MiB, deliberately BELOW Vercel's ~4.5 MB serverless Function request-body
+# ceiling so the app's own friendly 413 fires instead of a raw platform error.
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 MiB
+MAX_IMPORT_ROWS = 5000  # attendee rows for ONE event
 _TITLE_MAX = 255
 
-# Exact, ordered template headers. A drift here surfaces as a header error.
-COL_TITLE = "Event title"
-COL_DATE = "Event date (YYYY-MM-DD)"
-COL_NET_ID = "Attendee Net ID"
-COL_NAME = "Attendee name"
-EXPECTED_HEADERS: list[str] = [COL_TITLE, COL_DATE, COL_NET_ID, COL_NAME]
+# One CSV = one event's attendee list. The event identity lives in the wizard,
+# NOT the CSV. Columns: the attendee's Net ID (the match key), First/Last name
+# (confirmation only), and a free-text Notes column that IS persisted onto the
+# attendance row. A drift here surfaces as a header error.
+COL_NET_ID = "Net ID"
+COL_FIRST = "First name"
+COL_LAST = "Last name"
+COL_NOTES = "Notes"
+EXPECTED_HEADERS: list[str] = [COL_NET_ID, COL_FIRST, COL_LAST, COL_NOTES]
 EXAMPLE_ROWS: list[list[str]] = [
-    ["Spring Finance Banquet", "2026-04-15", "jdoe", "Jane Doe"],
-    ["Spring Finance Banquet", "2026-04-15", "msmith", "Mark Smith"],
-    ["Wall Street Trek", "2026-03-02", "alee", "Amy Lee"],
+    ["jdoe", "Jane", "Doe", ""],
+    ["msmith", "Mark", "Smith", "Sponsor table"],
+    ["alee", "Amy", "Lee", ""],
 ]
 
 
@@ -67,10 +71,9 @@ def parse_and_map(
 ) -> tuple[list[dict], list[str]]:
     """Parse the CSV into per-attendee row dicts + header errors.
 
-    Each row dict: ``{"row": int, "event_title": str, "event_date": str|None,
-    "net_id": str, "attendee_name": str, "error": str|None}``. ``row`` is the
-    1-based spreadsheet row (header = row 1). ``error`` is set for a bad date or
-    a blank title, which rejects the row's whole event group downstream.
+    Each row dict: ``{"row": int, "net_id": str, "attendee_name": str,
+    "error": str|None}``. ``row`` is the 1-based spreadsheet row (header = row 1).
+    ``error`` is set for a blank Net ID, which drops that attendee row.
 
     Decoded as ``utf-8-sig`` so an Excel BOM is stripped. Over ``max_rows`` (or a
     non-decodable / empty file / bad header set) returns ``([], [errors])``.
@@ -132,177 +135,190 @@ def _cell(index: dict[str, int], raw_row: list[str], header: str) -> str:
 
 
 def _map_row(row_num: int, index: dict[str, int], raw_row: list[str]) -> dict:
-    title = _cell(index, raw_row, COL_TITLE)
-    raw_date = _cell(index, raw_row, COL_DATE)
     net_id = _cell(index, raw_row, COL_NET_ID)
-    name = _cell(index, raw_row, COL_NAME)
-
-    error: str | None = None
-    event_date: str | None = None
-    if not title:
-        error = f"{COL_TITLE}: required."
-    elif len(title) > _TITLE_MAX:
-        error = f"{COL_TITLE}: must be at most {_TITLE_MAX} characters."
-    if error is None and raw_date:
-        try:
-            datetime.date.fromisoformat(raw_date)
-            event_date = raw_date
-        except ValueError:
-            error = f"{COL_DATE}: expected a date as YYYY-MM-DD, got {raw_date!r}."
-
+    first = _cell(index, raw_row, COL_FIRST)
+    last = _cell(index, raw_row, COL_LAST)
+    notes = _cell(index, raw_row, COL_NOTES)
+    name = " ".join(p for p in (first, last) if p).strip()
+    error = None if net_id else f"{COL_NET_ID}: required."
     return {
         "row": row_num,
-        "event_title": title,
-        "event_date": event_date,
         "net_id": net_id,
         "attendee_name": name,
+        "notes": notes or None,
         "error": error,
     }
 
 
-# --- Stage 2: evaluate (dry-run, grouped by event) ---------------------------
+# --- Event identity (from the wizard, not the CSV) ---------------------------
 
 
-def _group_key(row: dict) -> tuple[str, str | None]:
-    """Group identity: case-insensitive title + date (None date is its own bucket)."""
-    return (row["event_title"].strip().lower(), row["event_date"])
+def normalize_event_meta(
+    event_name: str,
+    event_date: str | None = None,
+    event_type: str | None = None,
+    event_location: str | None = None,
+    event_notes: str | None = None,
+) -> dict:
+    """Trim the wizard-supplied event fields into a normalized meta dict. Empty
+    optional fields become ``None`` (so they don't write blank strings)."""
+
+    def _clean(v: str | None) -> str | None:
+        v = (v or "").strip()
+        return v or None
+
+    return {
+        "event_name": (event_name or "").strip(),
+        "event_date": _clean(event_date),
+        "event_type": _clean(event_type),
+        "event_location": _clean(event_location),
+        "event_notes": _clean(event_notes),
+    }
 
 
-async def _load_existing_events(
-    session: AsyncSession,
-) -> set[tuple[str, str | None]]:
-    """Existing (lower(title), date-iso) pairs, to flag duplicate events in DB."""
-    rows = (
-        await session.execute(
-            select(func.lower(Event.event_name), Event.event_date)
+def _validate_event(meta: dict) -> list[dict]:
+    """Blocker-level problems with the event identity itself (bad title/date)."""
+    errors: list[dict] = []
+    title = meta["event_name"]
+    if not title:
+        errors.append({"code": "invalid_event", "message": "Event title is required."})
+    elif len(title) > _TITLE_MAX:
+        errors.append(
+            {
+                "code": "invalid_event",
+                "message": f"Event title must be at most {_TITLE_MAX} characters.",
+            }
         )
-    ).all()
-    out: set[tuple[str, str | None]] = set()
-    for name, date in rows:
-        out.add((name, date.isoformat() if date else None))
-    return out
-
-
-async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
-    """Build the grouped dry-run report. NO writes.
-
-    Groups attendee rows by (title, date); resolves every Net ID in one batch
-    query; rejects a group if it has a coercion error, an unmatched Net ID, or
-    already exists in the DB. Duplicate Net IDs within a group are de-duplicated
-    with a warning (not a blocker)."""
-    all_net_ids = [r["net_id"] for r in rows if r["net_id"]]
-    matched = await match_net_ids(session, all_net_ids)
-    existing = await _load_existing_events(session)
-
-    # Preserve first-seen order of event groups.
-    order: list[tuple[str, str | None]] = []
-    grouped: dict[tuple[str, str | None], list[dict]] = {}
-    for row in rows:
-        key = _group_key(row)
-        if key not in grouped:
-            grouped[key] = []
-            order.append(key)
-        grouped[key].append(row)
-
-    events_out: list[dict] = []
-    importable = rejected = matched_count = unmatched_count = 0
-
-    for key in order:
-        group = grouped[key]
-        first = group[0]
-        blockers: list[dict] = []
-        warnings: list[dict] = []
-
-        # Coercion errors anywhere in the group reject it.
-        row_errors = [r["error"] for r in group if r["error"]]
-        for msg in row_errors:
-            blockers.append({"code": "invalid_row", "message": msg})
-
-        # Already in the DB (same title + date).
-        if (key[0], key[1]) in existing:
-            blockers.append(
+    if meta["event_date"]:
+        try:
+            datetime.date.fromisoformat(meta["event_date"])
+        except ValueError:
+            errors.append(
                 {
-                    "code": "duplicate_event",
+                    "code": "invalid_event",
                     "message": (
-                        f"An event titled {first['event_title']!r} on "
-                        f"{first['event_date'] or '(no date)'} already exists."
+                        f"Event date must be YYYY-MM-DD, got "
+                        f"{meta['event_date']!r}."
                     ),
                 }
             )
+    return errors
 
-        # Resolve + dedupe attendees.
-        attendees: list[dict] = []
-        seen_net: set[str] = set()
-        for r in group:
-            net = r["net_id"]
-            if not net:
-                continue  # an event with no attendees is allowed
-            norm = normalize_net_id(net)
-            if norm in seen_net:
-                warnings.append(
-                    {
-                        "code": "duplicate_attendee",
-                        "message": (
-                            f"Net ID {net!r} is listed more than once for this "
-                            "event; counted once."
-                        ),
-                    }
-                )
-                continue
-            seen_net.add(norm)
-            alumni_id = matched.get(norm)
-            if alumni_id is None:
-                unmatched_count += 1
-                blockers.append(
-                    {
-                        "code": "unmatched_net_id",
-                        "message": (
-                            f"Net ID {net!r} did not match an active alumnus."
-                        ),
-                    }
-                )
-            else:
-                matched_count += 1
-            attendees.append(
+
+async def _event_exists(session: AsyncSession, meta: dict) -> bool:
+    """True if an event with the same (case-insensitive title, date) exists."""
+    date = (
+        datetime.date.fromisoformat(meta["event_date"])
+        if meta["event_date"]
+        else None
+    )
+    stmt = select(Event.event_id).where(
+        func.lower(func.trim(Event.event_name)) == meta["event_name"].strip().lower()
+    )
+    stmt = stmt.where(
+        Event.event_date == date if date is not None else Event.event_date.is_(None)
+    )
+    return (await session.scalar(stmt.limit(1))) is not None
+
+
+# --- Stage 2: evaluate (dry-run, ONE event) ----------------------------------
+
+
+async def evaluate(session: AsyncSession, rows: list[dict], meta: dict) -> dict:
+    """Build the dry-run report for ONE event + its attendee list. NO writes.
+
+    Validates the event identity, resolves every Net ID in one batch query, and
+    reports each attendee as matched or unmatched (unmatched are skipped, not
+    blocking). The event is ``importable`` when its identity is valid and it
+    doesn't already exist — unmatched attendees never block it."""
+    event_errors = _validate_event(meta)
+    if not event_errors and await _event_exists(session, meta):
+        event_errors.append(
+            {
+                "code": "duplicate_event",
+                "message": (
+                    f"An event titled {meta['event_name']!r} on "
+                    f"{meta['event_date'] or '(no date)'} already exists."
+                ),
+            }
+        )
+
+    matched = await match_net_ids(session, [r["net_id"] for r in rows if r["net_id"]])
+
+    attendees: list[dict] = []
+    warnings: list[dict] = []
+    seen_net: set[str] = set()
+    matched_count = unmatched_count = 0
+
+    for r in rows:
+        if r["error"]:
+            # A blank Net ID row — surface as a skipped/invalid attendee.
+            warnings.append({"code": "invalid_row", "message": r["error"]})
+            continue
+        net = r["net_id"]
+        norm = normalize_net_id(net)
+        if norm in seen_net:
+            warnings.append(
                 {
-                    "row": r["row"],
-                    "net_id": net,
-                    "name": r["attendee_name"],
-                    "matched": alumni_id is not None,
-                    "alumni_id": alumni_id,
+                    "code": "duplicate_attendee",
+                    "message": (
+                        f"Net ID {net!r} is listed more than once; counted once."
+                    ),
                 }
             )
-
-        status = "rejected" if blockers else "importable"
-        if status == "importable":
-            importable += 1
+            continue
+        seen_net.add(norm)
+        alumni_id = matched.get(norm)
+        if alumni_id is None:
+            unmatched_count += 1
         else:
-            rejected += 1
-
-        events_out.append(
+            matched_count += 1
+        attendees.append(
             {
-                "event_title": first["event_title"],
-                "event_date": first["event_date"],
-                "status": status,
-                "attendee_count": len(attendees),
-                "attendees": attendees,
-                "blockers": blockers,
-                "warnings": warnings,
+                "row": r["row"],
+                "net_id": net,
+                "name": r["attendee_name"],
+                "notes": r["notes"],
+                "matched": alumni_id is not None,
+                "alumni_id": alumni_id,
+            }
+        )
+
+    # A non-empty roster where NOTHING matched almost always means the wrong CSV
+    # was uploaded for this event — warn before it silently creates an empty
+    # event. Importable stays true (per policy) so the operator can proceed if
+    # it's genuinely intended.
+    if attendees and matched_count == 0:
+        warnings.append(
+            {
+                "code": "no_attendees_matched",
+                "message": (
+                    "None of the attendee Net IDs matched an active alumnus — "
+                    "the event would be created with no attendees. Check you "
+                    "uploaded the right CSV."
+                ),
             }
         )
 
     return {
         "columns_ok": True,
         "header_errors": [],
+        "event": {
+            "event_name": meta["event_name"],
+            "event_date": meta["event_date"],
+            "event_type": meta["event_type"],
+            "event_location": meta["event_location"],
+            "event_notes": meta["event_notes"],
+        },
+        "importable": not event_errors,
+        "event_errors": event_errors,
         "summary": {
             "total_rows": len(rows),
-            "events": len(order),
-            "importable_events": importable,
-            "rejected_events": rejected,
             "attendees_matched": matched_count,
             "attendees_unmatched": unmatched_count,
         },
-        "events": events_out,
+        "attendees": attendees,
+        "warnings": warnings,
     }
 
 
@@ -312,102 +328,105 @@ async def evaluate(session: AsyncSession, rows: list[dict]) -> dict:
 async def commit_import(
     session: AsyncSession,
     rows: list[dict],
+    meta: dict,
     actor_user_id: int | None = None,
 ) -> dict:
-    """Re-evaluate and insert every importable event + attendees in ONE txn.
-
-    Each event is created under its own SAVEPOINT (``begin_nested``) so a failure
-    on one event rolls back only that event, leaving earlier ones intact. Each
-    created event is audited (``event``/``create``) and each attendee
+    """Re-evaluate and, if importable, insert the event + its MATCHED attendees in
+    ONE transaction under a SAVEPOINT. Unmatched attendees are skipped and
+    reported. Audits the event (``event``/``create``) and each attendee
     (``event``/``add_attendee``), mirroring the manual API. Returns:
-        ``{"imported_events": int, "imported_attendees": int, "skipped_events":
-           int, "rejects": [{"event": str, "date": str|None, "reason": str}]}``
+        ``{"imported": bool, "event_id": int|None, "imported_attendees": int,
+           "unmatched": [{"row", "net_id", "name"}], "event_error": str|None}``
     """
-    report = await evaluate(session, rows)
+    report = await evaluate(session, rows, meta)
+    unmatched = [
+        {"row": a["row"], "net_id": a["net_id"], "name": a["name"]}
+        for a in report["attendees"]
+        if not a["matched"]
+    ]
 
-    imported_events = imported_attendees = skipped = 0
-    rejects: list[dict] = []
+    if not report["importable"]:
+        return {
+            "imported": False,
+            "event_id": None,
+            "imported_attendees": 0,
+            "unmatched": unmatched,
+            "event_error": _reject_reason(report),
+        }
 
-    for ev in report["events"]:
-        if ev["status"] != "importable":
-            skipped += 1
-            rejects.append(
-                {
-                    "event": ev["event_title"],
-                    "date": ev["event_date"],
-                    "reason": _reject_reason(ev),
-                }
+    ev = report["event"]
+    imported_attendees = 0
+    async with session.begin_nested() as savepoint:
+        try:
+            event_date = (
+                datetime.date.fromisoformat(ev["event_date"])
+                if ev["event_date"]
+                else None
             )
-            continue
-
-        async with session.begin_nested() as savepoint:
-            try:
-                event_date = (
-                    datetime.date.fromisoformat(ev["event_date"])
-                    if ev["event_date"]
-                    else None
+            event = Event(
+                event_name=ev["event_name"],
+                event_date=event_date,
+                event_type=ev["event_type"],
+                event_location=ev["event_location"],
+                event_notes=ev["event_notes"],
+                logged_by_user_id=actor_user_id,
+            )
+            session.add(event)
+            await session.flush()
+            session.add(
+                AuditLog(
+                    user_id=actor_user_id,
+                    action_type="create",
+                    entity_type="event",
+                    entity_id=event.event_id,
+                    new_value="bulk_import",
                 )
-                event = Event(
-                    event_name=ev["event_title"].strip(),
-                    event_date=event_date,
-                    logged_by_user_id=actor_user_id,
+            )
+            for att in report["attendees"]:
+                if not att["matched"]:
+                    continue
+                session.add(
+                    EventAttendance(
+                        event_id=event.event_id,
+                        alumni_id=att["alumni_id"],
+                        attendance_notes=att["notes"],
+                    )
                 )
-                session.add(event)
-                await session.flush()
                 session.add(
                     AuditLog(
                         user_id=actor_user_id,
-                        action_type="create",
+                        action_type="add_attendee",
                         entity_type="event",
                         entity_id=event.event_id,
-                        new_value="bulk_import",
+                        new_value=f"{att['alumni_id']}: {att['name']}",
                     )
                 )
-                for att in ev["attendees"]:
-                    session.add(
-                        EventAttendance(
-                            event_id=event.event_id,
-                            alumni_id=att["alumni_id"],
-                        )
-                    )
-                    session.add(
-                        AuditLog(
-                            user_id=actor_user_id,
-                            action_type="add_attendee",
-                            entity_type="event",
-                            entity_id=event.event_id,
-                            new_value=f"{att['alumni_id']}: {att['name']}",
-                        )
-                    )
-                    imported_attendees += 1
-                imported_events += 1
-            except Exception as exc:  # noqa: BLE001 - record + continue per event
-                await savepoint.rollback()
-                skipped += 1
-                rejects.append(
-                    {
-                        "event": ev["event_title"],
-                        "date": ev["event_date"],
-                        "reason": f"Unexpected error ({exc.__class__.__name__})",
-                    }
-                )
-                log.exception("Unexpected error importing event %r", ev["event_title"])
+                imported_attendees += 1
+        except Exception as exc:  # noqa: BLE001 - record + report
+            await savepoint.rollback()
+            log.exception("Unexpected error importing event %r", ev["event_name"])
+            return {
+                "imported": False,
+                "event_id": None,
+                "imported_attendees": 0,
+                "unmatched": unmatched,
+                "event_error": f"Unexpected error ({exc.__class__.__name__}).",
+            }
 
-    if imported_events:
-        await session.commit()
-
+    await session.commit()
     return {
-        "imported_events": imported_events,
+        "imported": True,
+        "event_id": event.event_id,
         "imported_attendees": imported_attendees,
-        "skipped_events": skipped,
-        "rejects": rejects,
+        "unmatched": unmatched,
+        "event_error": None,
     }
 
 
-def _reject_reason(ev: dict) -> str:
-    blockers = ev.get("blockers") or []
-    if blockers:
-        return blockers[0]["message"]
+def _reject_reason(report: dict) -> str:
+    errors = report.get("event_errors") or []
+    if errors:
+        return errors[0]["message"]
     return "Rejected."
 
 
@@ -415,8 +434,8 @@ def _reject_reason(ev: dict) -> str:
 
 
 def build_template_csv() -> str:
-    """Return the events import template as CSV text: the exact headers plus a
-    few example rows (two attendees share one event to show grouping)."""
+    """Return the attendee-list CSV template as text: the exact headers plus a
+    few example attendee rows (Net ID is the key; Name is confirmation only)."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(EXPECTED_HEADERS)

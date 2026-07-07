@@ -35,15 +35,21 @@ def _ctx(*roles: str, user_id: int = 1) -> UserContext:
 
 class _RecordSession:
     """Fake session: ``scalar`` returns the loaded user; ``add``/``commit`` are
-    recorded so we can assert the LoginEvent was written."""
+    recorded so we can assert the LoginEvent was written. ``execute`` captures the
+    in-transaction login_attempts clear (#182)."""
 
     def __init__(self, user):
         self.user = user
         self.added: list = []
         self.commits = 0
+        self.executed: list = []
 
     async def scalar(self, _stmt):
         return self.user
+
+    async def execute(self, stmt):
+        self.executed.append(stmt)
+        return None
 
     def add(self, obj):
         self.added.append(obj)
@@ -92,6 +98,10 @@ def test_record_login_stamps_last_login_and_writes_event():
     assert event.user_id == 7
     assert event.email == "boss@byu.edu"
     assert event.occurred_at == user.last_login_at
+    # ...and the rolling failed-login counter was cleared in the SAME transaction
+    # (#182): the login-success path is where the clear now lives (it used to run
+    # on every authenticated request in the resolver). One statement, one commit.
+    assert len(session.executed) == 1
     assert session.commits == 1
 
 
@@ -295,3 +305,68 @@ def test_list_logins_returns_page_and_audits_read():
     assert audit.entity_type == "login_event"
     assert audit.user_id == 1
     assert session.commits == 1
+
+
+# --- DELETE /admin/logins (purge all) ----------------------------------------
+
+
+class _PurgeSession:
+    """Fake session for purge_logins: ``execute`` reports the delete rowcount and
+    ``commit`` is recorded so we can assert the wipe was committed."""
+
+    def __init__(self, rowcount):
+        self.rowcount = rowcount
+        self.commits = 0
+        self.executed: list = []
+
+    async def execute(self, stmt):
+        self.executed.append(stmt)
+        return SimpleNamespace(rowcount=self.rowcount)
+
+    async def commit(self):
+        self.commits += 1
+
+
+def test_purge_logins_engineer_deletes_all_and_returns_count():
+    session = _PurgeSession(rowcount=7)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "engineer", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.delete("/admin/logins")
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": 7}
+    assert len(session.executed) == 1  # a single bulk DELETE
+    assert session.commits == 1
+
+
+def test_purge_logins_forbidden_below_engineer():
+    async def _no_db():
+        yield None
+
+    app.dependency_overrides[get_session] = _no_db
+    for role in ("super_admin", "full_access", "student", "view_only"):
+        app.dependency_overrides[get_current_db_user] = lambda r=role: _ctx(r)
+        with TestClient(app) as client:
+            resp = client.delete("/admin/logins")
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "forbidden"
+    app.dependency_overrides.clear()
+
+
+def test_purge_logins_requires_auth():
+    async def _no_db():
+        yield None
+
+    app.dependency_overrides[get_session] = _no_db
+    with TestClient(app) as client:
+        resp = client.delete("/admin/logins")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 401

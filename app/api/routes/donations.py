@@ -1,16 +1,26 @@
 """Pay It Forward Fund donation routes (#161).
 
-Field-level access (CRITICAL): donor IDENTITY (who gave, and in which years) is
-readable by any view-access role, but dollar AMOUNTS are gated to ``full_access``
-and up. The gate is enforced HERE, server-side — every amount field is nulled
-before serialization for a caller without the ``alumni.full`` capability, so a
-non-privileged client never receives a value (not merely a hidden one). Donation
-notes are gated alongside amounts (free text may reference figures).
+Read access (#278): the donation ledger (donor list / fund summary / a donor's
+history) requires the ``alumni.full`` capability — full_access and up. Students
+and view_only ("Professor") are DENIED (403) outright: Pay It Forward is a
+data-management surface, not part of the read-only directory. The frontend also
+hides the nav, but the boundary is enforced HERE, server-side.
 
-Writes are admin-tier: add / edit / bulk import are ``super_admin``-only;
-DELETE is gated to ``full_access`` and up (the destructive-data-management tier,
-matching event delete / alumni archive — broadened from super_admin in QA
-hardening, H4).
+Field-level access (CRITICAL): dollar AMOUNTS are additionally gated to
+``full_access`` and up. The gate is enforced HERE, server-side — every amount
+field is nulled before serialization for a caller without the ``alumni.full``
+capability, so a non-privileged client never receives a value (not merely a
+hidden one). Donation notes are gated alongside amounts (free text may reference
+figures). With the read gate above now also requiring ``alumni.full``, this
+field gate is belt-and-suspenders that still holds if an engineer later widens
+who may read the ledger.
+
+Writes are admin-tier: add / edit / bulk import require the dedicated
+``donations.manage`` capability (super_admin + engineer by default, #189) — split
+out from ``user_admin`` so delegating user administration does not silently grant
+donation-ledger writes. DELETE is gated to ``full_access`` and up (the
+destructive-data-management tier, matching event delete / alumni archive —
+broadened from super_admin in QA hardening, H4).
 
 Responses are assembled as plain dicts (no ``response_model``) so the amount
 fields can be conditionally nulled per-caller — the same convention the events
@@ -20,17 +30,17 @@ routes use.
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     PermissionConfig,
+    RequireDonationsManage,
     RequireFullAccess,
-    RequireSuperAdmin,
-    RequireViewAccess,
 )
+from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
@@ -39,6 +49,7 @@ from app.models.audit import AuditLog
 from app.models.donation import Donation
 from app.schemas.auth import UserContext
 from app.schemas.donation import DonationCreate, DonationUpdate
+from app.schemas.imports import DonationImportPreview, DonationImportResult
 from app.services import import_donations
 
 router = APIRouter(prefix="/donations", tags=["donations"])
@@ -71,47 +82,73 @@ def _money(value, show: bool) -> float | None:
 
 @router.get("/donors")
 async def list_donors(
-    user: RequireViewAccess,
+    user: RequireFullAccess,
     config: PermissionConfig,
     session: SessionDep,
-) -> list[dict]:
-    """List donors with per-year and lifetime roll-ups (view access).
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    """List donors with per-year and lifetime roll-ups (full_access+, paginated).
 
     Everyone sees who gave and in which years; ``lifetime_total`` and each
-    ``per_year.total`` are non-null only for amount-viewers (full_access+)."""
+    ``per_year.total`` are non-null only for amount-viewers (full_access+).
+
+    Returns a ``{items, total, limit, offset}`` envelope. The ranking, LIMIT, and
+    OFFSET are pushed into PostgreSQL; only the page's per-year breakdown is then
+    aggregated (``WHERE alumni_id IN (<page ids>)``), so the endpoint is bounded
+    regardless of donor count. Amount-viewers see the biggest givers first;
+    others get a stable name sort (the lifetime ranking is amount-gated too)."""
     show = _can_view_amounts(user, config)
 
-    base = (
-        await session.execute(
-            select(
-                Alumni.alumni_id,
-                Alumni.first_name,
-                Alumni.preferred_first_name,
-                Alumni.last_name,
-                Alumni.graduation_year,
-                func.count(Donation.donation_id),
-                func.coalesce(func.sum(Donation.amount), 0),
-            )
-            .join(Donation, Donation.alumni_id == Alumni.alumni_id)
-            .group_by(Alumni.alumni_id)
+    total = await session.scalar(
+        select(func.count(func.distinct(Donation.alumni_id)))
+    )
+
+    lifetime_total = func.coalesce(func.sum(Donation.amount), 0).label("lifetime_total")
+    page_stmt = (
+        select(
+            Alumni.alumni_id,
+            Alumni.first_name,
+            Alumni.preferred_first_name,
+            Alumni.last_name,
+            Alumni.graduation_year,
+            func.count(Donation.donation_id),
+            lifetime_total,
         )
+        .join(Donation, Donation.alumni_id == Alumni.alumni_id)
+        .group_by(Alumni.alumni_id)
+    )
+    # Push the sort into SQL. Amount-viewers rank by lifetime giving (tie-broken by
+    # name); non-viewers get a name-only sort so the giving ranking isn't leaked.
+    if show:
+        page_stmt = page_stmt.order_by(
+            desc("lifetime_total"), Alumni.last_name, Alumni.first_name
+        )
+    else:
+        page_stmt = page_stmt.order_by(Alumni.last_name, Alumni.first_name)
+    base = (
+        await session.execute(page_stmt.limit(limit).offset(offset))
     ).all()
 
-    # Per-(alumnus, year) roll-up for the breakdown + the "years gave" list.
-    year_rows = (
-        await session.execute(
-            select(
-                Donation.alumni_id,
-                Donation.donation_year,
-                func.coalesce(func.sum(Donation.amount), 0),
-            )
-            .group_by(Donation.alumni_id, Donation.donation_year)
-            .order_by(Donation.alumni_id, Donation.donation_year.desc())
-        )
-    ).all()
+    # Per-(alumnus, year) roll-up for the breakdown + the "years gave" list —
+    # only for the page's donors so we never aggregate the whole donation table.
+    page_ids = [row[0] for row in base]
     per_year_map: dict[int, list[tuple[int, Decimal]]] = {}
-    for alumni_id, year, total in year_rows:
-        per_year_map.setdefault(alumni_id, []).append((year, total))
+    if page_ids:
+        year_rows = (
+            await session.execute(
+                select(
+                    Donation.alumni_id,
+                    Donation.donation_year,
+                    func.coalesce(func.sum(Donation.amount), 0),
+                )
+                .where(Donation.alumni_id.in_(page_ids))
+                .group_by(Donation.alumni_id, Donation.donation_year)
+                .order_by(Donation.alumni_id, Donation.donation_year.desc())
+            )
+        ).all()
+        for alumni_id, year, year_total in year_rows:
+            per_year_map.setdefault(alumni_id, []).append((year, year_total))
 
     donors: list[dict] = []
     for alumni_id, first, preferred, last, grad, count, lifetime in base:
@@ -125,26 +162,27 @@ async def list_donors(
                 "years": [y for y, _ in years],
                 "lifetime_total": _money(lifetime, show),
                 "per_year": [
-                    {"year": y, "total": _money(total, show)} for y, total in years
+                    {"year": y, "total": _money(year_total, show)}
+                    for y, year_total in years
                 ],
             }
         )
 
-    # Amount-viewers see the biggest givers first; others get a stable name sort.
-    if show:
-        donors.sort(key=lambda d: (-(d["lifetime_total"] or 0), d["name"].lower()))
-    else:
-        donors.sort(key=lambda d: d["name"].lower())
-    return donors
+    return {
+        "items": donors,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/summary")
 async def donations_summary(
-    user: RequireViewAccess,
+    user: RequireFullAccess,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:
-    """Fund totals (view access). Donor / donation COUNTS are public; the dollar
+    """Fund totals (full_access+). Donor / donation COUNTS are public; the dollar
     ``total_raised`` and each ``per_year.total`` are gated to amount-viewers."""
     show = _can_view_amounts(user, config)
 
@@ -188,12 +226,12 @@ async def donations_summary(
 
 @router.get("/alumni/{alumni_id}")
 async def list_alumni_donations(
-    alumni_id: int,
-    user: RequireViewAccess,
+    alumni_id: IdPath,
+    user: RequireFullAccess,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:
-    """A single donor's donation history (view access). 404 if the alumnus is
+    """A single donor's donation history (full_access+). 404 if the alumnus is
     unknown. Each entry's ``amount`` and ``notes`` are gated to amount-viewers."""
     show = _can_view_amounts(user, config)
     alumni = await session.get(Alumni, alumni_id)
@@ -248,13 +286,14 @@ def _serialize_donation(d: Donation) -> dict:
 
 @router.post("/alumni/{alumni_id}", status_code=status.HTTP_201_CREATED)
 async def add_donation(
-    alumni_id: int,
+    alumni_id: IdPath,
     payload: DonationCreate,
-    user: RequireSuperAdmin,
+    user: RequireDonationsManage,
     session: SessionDep,
 ) -> dict:
-    """Add a donation to an alumnus (super_admin). 404 if the alumnus is unknown
-    or archived. Audits the write (entity_type "donation", action "create")."""
+    """Add a donation to an alumnus (donations.manage). 404 if the alumnus is
+    unknown or archived. Audits the write (entity_type "donation", action
+    "create")."""
     alumni = await session.get(Alumni, alumni_id)
     if alumni is None or alumni.archived:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
@@ -293,13 +332,13 @@ _FIELD_MAP = {
 
 @router.patch("/{donation_id}")
 async def update_donation(
-    donation_id: int,
+    donation_id: IdPath,
     payload: DonationUpdate,
-    user: RequireSuperAdmin,
+    user: RequireDonationsManage,
     session: SessionDep,
 ) -> dict:
-    """Partially update a donation (super_admin). Only fields present in the body
-    are applied; each change is audited. 404 if the donation is unknown."""
+    """Partially update a donation (donations.manage). Only fields present in the
+    body are applied; each change is audited. 404 if the donation is unknown."""
     donation = await session.get(Donation, donation_id)
     if donation is None:
         raise NotFoundError(f"Donation {donation_id} not found.")
@@ -338,7 +377,7 @@ async def update_donation(
 
 @router.delete("/{donation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_donation(
-    donation_id: int,
+    donation_id: IdPath,
     user: RequireFullAccess,
     session: SessionDep,
 ) -> Response:
@@ -395,8 +434,8 @@ def _too_large_response() -> JSONResponse:
 
 
 @router.get("/import/template")
-async def donations_import_template(_: RequireSuperAdmin) -> Response:
-    """Download the donations bulk-import CSV template (super_admin): columns
+async def donations_import_template(_: RequireDonationsManage) -> Response:
+    """Download the donations bulk-import CSV template (donations.manage): columns
     Net ID, Name, Month, Year, Amount plus a couple of example rows."""
     return Response(
         content=import_donations.build_template_csv(),
@@ -407,13 +446,13 @@ async def donations_import_template(_: RequireSuperAdmin) -> Response:
     )
 
 
-@router.post("/import/preview", response_model=None)
+@router.post("/import/preview", response_model=DonationImportPreview)
 async def preview_import_donations(
-    _: RequireSuperAdmin,
+    _: RequireDonationsManage,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
-    """Dry-run a donations bulk CSV import (super_admin, NO writes). Matches
+    """Dry-run a donations bulk CSV import (donations.manage, NO writes). Matches
     donors by Net ID and flags unmatched Net IDs, bad month/year, and non-numeric
     amounts. A bad header set surfaces as ``columns_ok: false``."""
     file_bytes = await _read_capped(file)
@@ -430,13 +469,13 @@ async def preview_import_donations(
     return await import_donations.evaluate(session, rows)
 
 
-@router.post("/import", response_model=None)
+@router.post("/import", response_model=DonationImportResult)
 async def import_donations_commit(
-    user: RequireSuperAdmin,
+    user: RequireDonationsManage,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
-    """Commit a donations bulk CSV import (super_admin). Re-evaluates and inserts
+    """Commit a donations bulk CSV import (donations.manage). Re-evaluates and inserts
     every importable donation in one transaction (audited per row); rejected rows
     are skipped and reported. A bad header set imports nothing."""
     file_bytes = await _read_capped(file)

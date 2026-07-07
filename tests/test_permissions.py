@@ -64,8 +64,11 @@ def test_default_grants_reproduce_historical_guards():
         Capability.ALUMNI_EDIT,
         Capability.ALUMNI_FULL,
         Capability.USER_ADMIN,
-        # profile.completeness is a newer capability (not one of the original
-        # hardcoded guards) whose default grant includes super_admin.
+        # donations.manage and profile.completeness are newer capabilities (not
+        # among the original hardcoded guards) whose default grant includes
+        # super_admin. donations.manage defaults to exactly the old user_admin
+        # holders (super_admin + engineer), so donation writes are unchanged (#189).
+        Capability.DONATIONS_MANAGE,
         Capability.PROFILE_COMPLETENESS,
     }
 

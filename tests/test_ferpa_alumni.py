@@ -136,6 +136,52 @@ def test_minimize_strips_interaction_notes_but_preserves_logged_by():
     assert scoped.interactions[0].interaction_date_time is not None
 
 
+def test_minimize_exposes_email_phone_hides_home_address_for_view_only():
+    # #166 (INTENTIONAL product decision): view_only SHOULD see email + phone so
+    # a "Professor" can reach out to alumni, but the home mailing address
+    # (street + ZIP) stays hidden. City/state/region/country are directory-style
+    # and remain visible.
+    from app.schemas.profile import ContactRead, ProfileRead
+    from app.services.profile import _minimize_profile_for_view_only
+
+    contact = ContactRead(
+        contact_info_id=1,
+        personal_email="jane@example.com",
+        work_email="jane@work.com",
+        phone="555-1234",
+        address_line_1="123 Main St",
+        address_line_2="Apt 4",
+        city="Provo",
+        state="Utah",
+        zip="84604",
+        country="USA",
+        region="West",
+    )
+    profile = ProfileRead.model_construct(
+        alumni=AlumniRead.model_validate(_alumni_model()),
+        contact=contact,
+        interactions=[],
+        surveys=[],
+        engagement_notes=[],
+        program_engagement=None,
+        audit=[],
+    )
+    scoped = _minimize_profile_for_view_only(profile)
+    # Reachability fields are deliberately EXPOSED for outreach.
+    assert scoped.contact.personal_email == "jane@example.com"
+    assert scoped.contact.work_email == "jane@work.com"
+    assert scoped.contact.phone == "555-1234"
+    # Home mailing address stays protected.
+    assert scoped.contact.address_line_1 is None
+    assert scoped.contact.address_line_2 is None
+    assert scoped.contact.zip is None
+    # Directory-style location survives.
+    assert scoped.contact.city == "Provo"
+    assert scoped.contact.state == "Utah"
+    assert scoped.contact.region == "West"
+    assert scoped.contact.country == "USA"
+
+
 # --- Fake session for service-level profile/export tests ---------------------
 
 

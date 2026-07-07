@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.schemas.note import NoteCreate, NoteEntityType, NoteRead, NoteUpdate
 from app.services import notes as service
@@ -58,7 +59,7 @@ async def create_note(
 
 @router.patch("/{note_id}", response_model=NoteRead)
 async def update_note(
-    note_id: int,
+    note_id: IdPath,
     payload: NoteUpdate,
     user: RequireFullAccess,
     session: SessionDep,
@@ -69,7 +70,7 @@ async def update_note(
 
 @router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(
-    note_id: int,
+    note_id: IdPath,
     user: RequireFullAccess,
     session: SessionDep,
 ) -> None:

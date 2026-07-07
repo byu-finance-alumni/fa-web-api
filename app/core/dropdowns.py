@@ -38,24 +38,30 @@ INDUSTRIES: tuple[str, ...] = (
 MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
 
 _INDUSTRIES_SET = frozenset(INDUSTRIES)
+# Case-insensitive lookup -> canonical casing, so a CSV/HR export that varies
+# case ("investment banking") resolves to the stored value ("Investment Banking")
+# instead of hard-rejecting the row.
+_INDUSTRIES_BY_LOWER = {v.lower(): v for v in INDUSTRIES}
 
 
 def validate_industry(value: str | None) -> str | None:
-    """Return *value* unchanged if it's a valid industry (or ``None``/empty).
+    """Return the canonical industry casing if *value* matches (or ``None``/empty).
 
-    Trims whitespace and normalizes empty strings to ``None``. Raises
-    ``ValueError`` — which Pydantic surfaces as a 422 field error — when a
-    non-empty value isn't one of :data:`INDUSTRIES`. Use as a ``mode="before"``
-    field validator on industry-writing schemas.
+    Trims whitespace and normalizes empty strings to ``None``. Matching is
+    CASE-INSENSITIVE and returns the canonical-cased value. Raises ``ValueError``
+    — which Pydantic surfaces as a 422 field error — when a non-empty value isn't
+    one of :data:`INDUSTRIES`. Use as a ``mode="before"`` field validator on
+    industry-writing schemas.
     """
     if value is None:
         return None
     value = value.strip()
     if not value:
         return None
-    if value not in _INDUSTRIES_SET:
+    canonical = _INDUSTRIES_BY_LOWER.get(value.lower())
+    if canonical is None:
         raise ValueError("Must be one of: " + ", ".join(INDUSTRIES))
-    return value
+    return canonical
 
 
 # Tags — the fixed, canonical engagement tags an alumnus can be labelled with

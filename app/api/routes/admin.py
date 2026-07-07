@@ -12,7 +12,7 @@ import logging
 import re
 import secrets
 import unicodedata
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -20,7 +20,12 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.dependencies.auth import RequireEngineer, RequireSuperAdmin
+from app.api.dependencies.auth import (
+    CurrentDBUser,
+    RequireEngineer,
+    RequireSuperAdmin,
+)
+from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.rate_limit import (
@@ -29,12 +34,14 @@ from app.core.rate_limit import (
     DeleteUserRateLimit,
     ResetPasswordRateLimit,
 )
-from app.core.roles import RoleName
+from app.core.roles import ROLE_LABELS, ROLE_ORDER, RoleName
 from app.core.security import AuthorizationError
 from app.models.audit import AuditLog
+from app.models.engineer_action import EngineerActionLog
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
 from app.models.user import Role, User, UserRole
+from app.schemas.auth import UserContext
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -56,6 +63,43 @@ _TEMP_PW_LENGTH = 20
 def _generate_temp_password() -> str:
     """Return a strong, single-use temporary password from the CSPRNG."""
     return "".join(secrets.choice(_TEMP_PW_ALPHABET) for _ in range(_TEMP_PW_LENGTH))
+
+
+# --- Privilege ceiling for role mutation (#178) ------------------------------
+#
+# Role-mutation endpoints must never let an actor grant, remove, or delete a
+# role that outranks their own highest tier. The old guards only special-cased
+# the ``engineer`` role, so a lower role that an engineer had delegated the
+# ``USER_ADMIN`` capability to (supported by the permission editor) could pass
+# the route guard and then assign itself ``super_admin`` — a self-escalation.
+# Ranking via the canonical ROLE_ORDER closes that path for every top tier while
+# leaving the default config (super_admin / engineer holding USER_ADMIN)
+# unchanged: a super_admin can still manage super_admin and below, and only an
+# engineer can touch the engineer tier.
+
+
+def _role_rank(role_name: str) -> int:
+    """Privilege rank of a role: lower index = more privileged (see ROLE_ORDER).
+
+    An unrecognized role ranks below every known role (least privileged).
+    """
+    for index, role in enumerate(ROLE_ORDER):
+        if role.value == role_name:
+            return index
+    return len(ROLE_ORDER)
+
+
+def _actor_ceiling_rank(actor: UserContext) -> int:
+    """The actor's highest tier as a rank (lower = more privileged).
+
+    An actor with no recognized role sits below the entire ladder.
+    """
+    return min((_role_rank(r) for r in actor.roles), default=len(ROLE_ORDER))
+
+
+def _outranks_actor(actor: UserContext, role_name: str) -> bool:
+    """True if ``role_name`` is above the actor's own highest tier."""
+    return _role_rank(role_name) < _actor_ceiling_rank(actor)
 
 
 # --- Name validation ---------------------------------------------------------
@@ -108,14 +152,25 @@ class CreateUserRequest(BaseModel):
     email: str = Field(min_length=3, max_length=255)
     first_name: str | None = None
     last_name: str | None = None
-    # The top roles (engineer, super_admin) must NOT be bootstrappable via
-    # account creation — they can only be granted to an EXISTING user through
-    # the assign-role endpoint. Restrict the create payload to the non-privileged
-    # roles (full_access / student / view_only); anything else (incl. engineer
-    # and super_admin) is a clean 422.
-    role_name: Literal[
-        RoleName.FULL_ACCESS, RoleName.STUDENT, RoleName.VIEW_ONLY
-    ] = RoleName.VIEW_ONLY
+    # Typed as the plain ``RoleName`` enum (mirrors ``RoleAssign.role_name``) so
+    # an unknown role produces a clean Pydantic error listing the string values
+    # ('engineer', 'super_admin', ...) rather than the enum-member repr
+    # (``<RoleName.FULL_ACCESS: 'full_access'>``). The top roles (engineer,
+    # super_admin) must NOT be bootstrappable via account creation — they can
+    # only be granted to an EXISTING user through the assign-role endpoint — so
+    # the validator below restricts the create payload to the non-privileged
+    # roles (full_access / student / view_only); anything else is a clean 422.
+    role_name: RoleName = RoleName.VIEW_ONLY
+
+    @field_validator("role_name")
+    @classmethod
+    def _restrict_role(cls, value: RoleName) -> RoleName:
+        allowed = {RoleName.FULL_ACCESS, RoleName.STUDENT, RoleName.VIEW_ONLY}
+        if value not in allowed:
+            raise ValueError(
+                "Must be one of: full_access, student, view_only."
+            )
+        return value
 
     @field_validator("email", mode="before")
     @classmethod
@@ -205,6 +260,12 @@ class LoginEventPage(BaseModel):
     offset: int
 
 
+class LoginPurgeResult(BaseModel):
+    """Count of login-history rows removed by the engineer purge (#200)."""
+
+    deleted: int
+
+
 class RoleAssign(BaseModel):
     """Assign a canonical role to a user. ``role_name`` is validated against the
     RoleName enum, so an unknown role is a 422 before any query runs."""
@@ -247,10 +308,19 @@ def _serialize(u: User) -> dict:
     }
 
 
-async def _load_user(session: AsyncSession, user_id: int) -> User:
-    user = await session.scalar(
+async def _load_user(
+    session: AsyncSession, user_id: int, *, populate_existing: bool = False
+) -> User:
+    stmt = (
         select(User).options(selectinload(User.roles)).where(User.user_id == user_id)
     )
+    if populate_existing:
+        # Overwrite an already-identity-mapped instance's attributes (incl. the
+        # viewonly ``roles`` collection) from the DB. Needed after a commit that
+        # inserted a UserRole directly: expire_on_commit=False otherwise keeps the
+        # cached, pre-insert collection so the response omits the new role (#175).
+        stmt = stmt.execution_options(populate_existing=True)
+    user = await session.scalar(stmt)
     if user is None:
         raise NotFoundError(f"User {user_id} not found.")
     return user
@@ -360,12 +430,159 @@ async def list_logins(
     )
 
 
+@router.delete("/logins", response_model=LoginPurgeResult)
+async def purge_logins(
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> LoginPurgeResult:
+    """Delete ALL recorded sign-ins (the entire ``login_events`` history).
+    Engineer only.
+
+    The irreversible counterpart to GET /admin/logins: it wipes the whole
+    login-history table in one shot (e.g. to clear accumulated dev/test noise
+    from the Admin -> Logins tab). Engineer-gated (RequireEngineer) like the
+    listing. Since #199 stops auditing engineer actions, this purge is
+    intentionally NOT written to the audit trail. Returns the row count removed.
+
+    SCOPE (security review, #199/#200): this deletes ONLY ``login_events``. It
+    deliberately does NOT touch ``engineer_action_log`` -- that append-only table
+    is the tamper-resistant record of engineer actions and has no purge path, so
+    an engineer cannot use this endpoint (or any other) to erase their own trail.
+    """
+    result = await session.execute(delete(LoginEvent))
+    await session.commit()
+    return LoginPurgeResult(deleted=result.rowcount or 0)
+
+
+# --- Engineer-action oversight log (#199 / #200 forensic blind spot) ----------
+#
+# ``engineer_action_log`` is the append-only, tamper-resistant record of actions
+# taken by an engineer actor (rerouted there from ``audit_logs`` by the
+# before_flush guard in app/models/audit.py). It is oversight *of* the engineer,
+# so the READ gate below is ROLE-based (super_admin) and explicitly EXCLUDES the
+# engineer -- unlike RequireSuperAdmin, which is capability-based (USER_ADMIN) and
+# which an engineer also satisfies (the engineer holds every capability via a hard
+# override in effective_capabilities). Gating on the capability would let the
+# audited party read their own oversight log; the strict role gate keeps the log
+# beyond engineer control (they cannot read, view-gate, delete, or disable it).
+
+
+async def require_super_admin_role_strict(actor: CurrentDBUser) -> UserContext:
+    """Require the ``super_admin`` role, explicitly denying ``engineer`` (403).
+
+    Used only for the engineer-action oversight log: the engineer is the audited
+    party and must not be able to read or otherwise control it, so the plain
+    capability-based RequireSuperAdmin (which the engineer satisfies) is too broad
+    here. Any actor holding ``engineer`` is rejected even if they also hold
+    ``super_admin``.
+    """
+    if (
+        RoleName.ENGINEER.value in actor.roles
+        or RoleName.SUPER_ADMIN.value not in actor.roles
+    ):
+        raise AuthorizationError()
+    return actor
+
+
+RequireSuperAdminStrict = Annotated[
+    UserContext, Depends(require_super_admin_role_strict)
+]
+
+
+class EngineerActionRow(BaseModel):
+    """One recorded engineer action for the super_admin oversight view.
+    ``actor_user_id`` is null once the engineer has been deleted; ``actor_email``
+    is the snapshot taken at write time, so the row still shows who acted."""
+
+    engineer_action_log_id: int
+    actor_user_id: int | None = None
+    actor_email: str | None = None
+    action_type: str
+    entity_type: str
+    entity_id: int | None = None
+    field_name: str | None = None
+    old_value: str | None = None
+    new_value: str | None = None
+    occurred_at: datetime.datetime
+
+
+class EngineerActionPage(BaseModel):
+    """A page of engineer actions, newest first, with the total for pagination."""
+
+    items: list[EngineerActionRow]
+    total: int
+    limit: int
+    offset: int
+
+
+@router.get("/engineer-actions", response_model=EngineerActionPage)
+async def list_engineer_actions(
+    actor: RequireSuperAdminStrict,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> EngineerActionPage:
+    """List recorded engineer actions, newest first (paginated). super_admin only.
+
+    Reads the append-only ``engineer_action_log`` -- the tamper-resistant oversight
+    trail of engineer actions (#199/#200). ROLE-gated to ``super_admin`` and
+    explicitly denied to the ``engineer`` (see require_super_admin_role_strict), so
+    the audited party can neither read nor disable it; there is no delete/purge
+    route for this table at all. Paginated (default 50, hard cap 200 -- mirrors the
+    users/logins/audit endpoints) so one request can't enumerate the whole log.
+
+    Reading the log is itself audited (``read_engineer_action_log``; actor +
+    applied limit/offset) -- the returned rows are not logged.
+    """
+    total = await session.scalar(
+        select(func.count()).select_from(EngineerActionLog)
+    )
+    rows = await session.scalars(
+        select(EngineerActionLog)
+        .order_by(
+            EngineerActionLog.occurred_at.desc(),
+            EngineerActionLog.engineer_action_log_id.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+    items = [
+        EngineerActionRow(
+            engineer_action_log_id=e.engineer_action_log_id,
+            actor_user_id=e.actor_user_id,
+            actor_email=e.actor_email,
+            action_type=e.action_type,
+            entity_type=e.entity_type,
+            entity_id=e.entity_id,
+            field_name=e.field_name,
+            old_value=e.old_value,
+            new_value=e.new_value,
+            occurred_at=e.occurred_at,
+        )
+        for e in rows.all()
+    ]
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_engineer_action_log",
+            entity_type="engineer_action_log",
+            field_name=f"limit={limit};offset={offset}",
+        )
+    )
+    await session.commit()
+
+    return EngineerActionPage(
+        items=items, total=int(total or 0), limit=limit, offset=offset
+    )
+
+
 # ``{user_id}`` is declared ``int`` (below), so string sub-paths like
 # ``/users/{user_id}/name`` are unambiguous and never shadowed by this route —
 # a non-numeric segment can't match an int path param.
 @router.patch("/users/{user_id}")
 async def set_user_active(
-    user_id: int,
+    user_id: IdPath,
     payload: UserActiveUpdate,
     actor: RequireSuperAdmin,
     session: SessionDep,
@@ -405,7 +622,7 @@ async def set_user_active(
 
 @router.delete("/users/{user_id}", response_model=DeleteUserResponse)
 async def delete_user(
-    user_id: int,
+    user_id: IdPath,
     actor: DeleteUserRateLimit,
     session: SessionDep,
 ) -> DeleteUserResponse:
@@ -425,8 +642,10 @@ async def delete_user(
 
     Guards (mirroring remove_role):
       * You cannot delete your own account.
-      * Privilege ceiling: only an engineer may delete a user who holds the
-        engineer role.
+      * Privilege ceiling (#178): an actor may only delete a user whose highest
+        role is at or below the actor's own highest tier (ranked via
+        ROLE_ORDER) — so only an engineer may delete an engineer, and only
+        super_admin/engineer may delete a super_admin.
       * Last-holder guard: you cannot delete the final holder of a top role
         (super_admin / engineer), which would lock administration out for
         everyone.
@@ -444,9 +663,17 @@ async def delete_user(
     user = await _load_user(session, user_id)
     target_roles = {r.role_name for r in user.roles}
 
-    # Privilege ceiling: the engineer tier is managed exclusively by engineers.
-    if RoleName.ENGINEER.value in target_roles and not actor.is_engineer:
-        raise AuthorizationError("Only an engineer can delete an engineer.")
+    # Privilege ceiling (#178): never delete a user who holds a role above the
+    # actor's own highest tier. Ranking every role via ROLE_ORDER (not just
+    # special-casing engineer) blocks a lower role that was delegated the
+    # USER_ADMIN capability from deleting a super_admin/engineer.
+    highest_target = min(target_roles, key=_role_rank, default=None)
+    if highest_target is not None and _outranks_actor(actor, highest_target):
+        label = ROLE_LABELS.get(highest_target, highest_target)
+        raise AuthorizationError(
+            f"You cannot delete a user who holds the {label} role; "
+            "it is above your privilege tier."
+        )
 
     # System-wide last-holder guard: never delete the final holder of a top role,
     # which would lock user (or engineer-only vocab/database) administration out
@@ -502,7 +729,7 @@ async def delete_user(
 
 @router.post("/users/{user_id}/roles")
 async def assign_role(
-    user_id: int,
+    user_id: IdPath,
     payload: RoleAssign,
     actor: AssignRoleRateLimit,
     session: SessionDep,
@@ -510,14 +737,16 @@ async def assign_role(
     """Grant a role to an existing user (idempotent). super_admin and up.
 
     Rate-limited per actor (best-effort, in-process) to brake bulk privilege
-    changes. Privilege ceiling: only an ``engineer`` may grant the ``engineer``
-    role. A
-    ``super_admin`` (who is below engineer) cannot mint an account that outranks
-    them — that would be a privilege escalation above the actor's own ceiling.
+    changes. Privilege ceiling (#178): an actor may only grant a role at or
+    below their own highest tier (ranked via ROLE_ORDER). So only an
+    ``engineer`` may grant ``engineer``, and only ``super_admin``/``engineer``
+    may grant ``super_admin`` — a lower role that was delegated ``USER_ADMIN``
+    still cannot mint an account that outranks it.
     """
-    if payload.role_name == RoleName.ENGINEER and not actor.is_engineer:
+    if _outranks_actor(actor, payload.role_name.value):
+        label = ROLE_LABELS.get(payload.role_name.value, payload.role_name.value)
         raise AuthorizationError(
-            "Only an engineer can grant the engineer role."
+            f"You cannot grant the {label} role; it is above your privilege tier."
         )
     user = await _load_user(session, user_id)
     role = await session.scalar(
@@ -539,29 +768,37 @@ async def assign_role(
             )
         )
         await session.commit()
-    return _serialize(await _load_user(session, user_id))
+        # ``User.roles`` is a viewonly relationship and the session keeps objects
+        # alive across commit (expire_on_commit=False), so a plain reload returns
+        # the cached instance WITHOUT the just-added role. Reload with
+        # populate_existing to overwrite the cached collection (#175).
+        user = await _load_user(session, user_id, populate_existing=True)
+    return _serialize(user)
 
 
 @router.delete("/users/{user_id}/roles/{role_name}")
 async def remove_role(
-    user_id: int,
+    user_id: IdPath,
     role_name: RoleName,
     actor: RequireSuperAdmin,
     session: SessionDep,
 ) -> dict:
     """Revoke a role from an existing user (idempotent). super_admin and up.
 
-    Privilege ceiling (symmetric with assign_role): only an ``engineer`` may
-    remove the ``engineer`` role. A ``super_admin`` cannot demote an engineer —
-    the engineer tier is managed exclusively by engineers.
+    Privilege ceiling (symmetric with assign_role, #178): an actor may only
+    remove a role at or below their own highest tier (ranked via ROLE_ORDER).
+    So only an ``engineer`` may remove ``engineer``, and only
+    ``super_admin``/``engineer`` may remove ``super_admin`` — a lower role that
+    was delegated ``USER_ADMIN`` cannot strip a role that outranks it.
 
     Guards against an admin removing their OWN top role (super_admin or
     engineer), which would lock user administration (or, for engineer, vocab /
     database administration) out of the system if they were the last holder.
     """
-    if role_name == RoleName.ENGINEER and not actor.is_engineer:
+    if _outranks_actor(actor, role_name.value):
+        label = ROLE_LABELS.get(role_name.value, role_name.value)
         raise AuthorizationError(
-            "Only an engineer can remove the engineer role."
+            f"You cannot remove the {label} role; it is above your privilege tier."
         )
     await _load_user(session, user_id)  # 404 if the user doesn't exist
     role = await session.scalar(
@@ -614,7 +851,7 @@ async def remove_role(
 
 @router.post("/users/{user_id}/reset-password", response_model=ResetPasswordResponse)
 async def reset_password(
-    user_id: int,
+    user_id: IdPath,
     actor: ResetPasswordRateLimit,
     session: SessionDep,
 ) -> ResetPasswordResponse:
@@ -784,7 +1021,7 @@ async def create_user(
 
 @router.patch("/users/{user_id}/name")
 async def update_user_name(
-    user_id: int,
+    user_id: IdPath,
     payload: UpdateUserNameRequest,
     actor: RequireSuperAdmin,
     session: SessionDep,

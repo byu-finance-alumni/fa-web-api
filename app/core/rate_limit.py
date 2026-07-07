@@ -36,12 +36,12 @@ from app.schemas.auth import UserContext
 # check so the dict can't grow without bound for a steady caller.
 _WINDOWS: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
 
-_TOO_MANY_REQUESTS = {
-    "error": {
-        "code": "rate_limited",
-        "message": "Too many requests; please slow down and retry later.",
-    }
-}
+# A plain, client-safe message. It is intentionally NOT pre-wrapped in the
+# ``{"error": {...}}`` envelope: the app's ``StarletteHTTPException`` handler
+# (see ``app/main.py``) turns any raised ``HTTPException`` into the standard
+# envelope, deriving ``error.code`` from the 429 status. Passing a dict as
+# ``detail`` here would double-nest it as ``{"detail": {"error": {...}}}``.
+_TOO_MANY_REQUESTS_MESSAGE = "Too many requests; please slow down and retry later."
 
 
 def _check(bucket: str, actor_id: int, *, limit: int, window_seconds: float) -> None:
@@ -59,7 +59,7 @@ def _check(bucket: str, actor_id: int, *, limit: int, window_seconds: float) -> 
     if len(hits) >= limit:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=_TOO_MANY_REQUESTS,
+            detail=_TOO_MANY_REQUESTS_MESSAGE,
             headers={"Retry-After": str(int(window_seconds))},
         )
     hits.append(now)

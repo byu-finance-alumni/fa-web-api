@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.core.audit_context import audit_suppressed
 from app.core.database import Base
+from app.models.engineer_action import EngineerActionLog
 
 
 class AuditLog(Base):
@@ -33,14 +34,30 @@ class AuditLog(Base):
 
 
 @event.listens_for(Session, "before_flush")
-def _drop_engineer_audit_rows(session, flush_context, instances):
-    """Suppress ``audit_logs`` writes performed by an engineer actor (#199).
+def _reroute_engineer_audit_rows(session, flush_context, instances):
+    """Reroute an engineer actor's ``audit_logs`` writes into the tamper-resistant
+    ``engineer_action_log`` (#199, and the #199/#200 forensic blind spot).
 
-    The engineer is a maintenance / super-user role whose actions must not
-    clutter the FERPA audit trail. When the current request's actor is an
-    engineer -- recorded in a request-scoped contextvar by the auth layer (see
-    ``app/core/audit_context``) -- every pending AuditLog INSERT is expunged from
-    the flush, so no row is written. Non-engineer actors are unaffected.
+    The engineer is a maintenance / super-user role whose actions must not clutter
+    the FERPA record-change trail. When the current request's actor is an engineer
+    -- recorded in a request-scoped contextvar by the auth layer (see
+    ``app/core/audit_context``) -- every pending AuditLog INSERT is:
+
+      1. mirrored into an equivalent ``EngineerActionLog`` row, so the action is
+         still recorded in an append-only log the engineer cannot delete or
+         disable (there is no purge route and only super_admin can read it), then
+      2. expunged from the flush, so no ``audit_logs`` row is written and the
+         record-change UI stays uncluttered.
+
+    Originally (#199) the AuditLog was simply DROPPED; combined with the
+    engineer-only ``DELETE /admin/logins`` purge (#200) that left ZERO forensic
+    trace of engineer user-admin actions. Rerouting preserves the trail while
+    keeping the audit UI clean. Non-engineer actors are unaffected.
+
+    ``before_flush`` is the SQLAlchemy-sanctioned place to add objects: rows added
+    to the session here are picked up by the SAME flush and persist (verified in
+    ``tests/test_audit_engineer_suppression.py``). We iterate a snapshot
+    (``list(session.new)``) so adding EngineerActionLog rows mid-iteration is safe.
 
     Registering on the base ``Session`` (which the AsyncSession drives) makes the
     guard central: it covers every callsite that adds an AuditLog, present and
@@ -51,4 +68,21 @@ def _drop_engineer_audit_rows(session, flush_context, instances):
         return
     for obj in list(session.new):
         if isinstance(obj, AuditLog):
+            # Mirror the suppressed audit row into the append-only engineer log so
+            # the engineer's action leaves a tamper-resistant trace, then drop the
+            # AuditLog so it never reaches audit_logs / the record-change UI.
+            # actor_email is snapshotted by a DB trigger on INSERT (it is still
+            # NULL on the pending AuditLog here), so we carry the actor's user_id.
+            session.add(
+                EngineerActionLog(
+                    actor_user_id=obj.user_id,
+                    actor_email=obj.actor_email,
+                    action_type=obj.action_type,
+                    entity_type=obj.entity_type,
+                    entity_id=obj.entity_id,
+                    field_name=obj.field_name,
+                    old_value=obj.old_value,
+                    new_value=obj.new_value,
+                )
+            )
             session.expunge(obj)

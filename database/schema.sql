@@ -583,6 +583,53 @@ CREATE TRIGGER trg_audit_logs_snapshot_actor
     FOR EACH ROW
     EXECUTE FUNCTION audit_logs_snapshot_actor();
 
+-- engineer_action_log: append-only, tamper-resistant record of engineer-actor
+-- actions (#199 / #200 forensic blind spot). Engineer audit_logs writes are
+-- suppressed so they don't clutter the record-change trail; the before_flush guard
+-- reroutes each into a row here instead of dropping it (see app/models/audit.py).
+-- No delete/purge route exists and only super_admin can read it (GET
+-- /admin/engineer-actions) -- the engineer cannot read, delete, or disable it.
+-- actor_email is snapshotted at INSERT (trigger below) so a row survives the
+-- actor's later deletion (actor_user_id -> NULL). See migration
+-- 2026-07-07_engineer_action_log.sql.
+CREATE TABLE engineer_action_log (
+    engineer_action_log_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    actor_user_id bigint,
+    actor_email   varchar(255),
+    action_type   varchar(100) NOT NULL,
+    entity_type   varchar(100) NOT NULL,
+    entity_id     bigint,
+    field_name    varchar(255),
+    old_value     text,
+    new_value     text,
+    occurred_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_engineer_action_log_actor_user_id FOREIGN KEY (actor_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+CREATE INDEX idx_engineer_action_log_occurred_at ON engineer_action_log (occurred_at DESC);
+CREATE INDEX idx_engineer_action_log_actor_user_id ON engineer_action_log (actor_user_id);
+
+-- Snapshot the acting user's email onto each engineer_action_log row at write
+-- time (mirrors audit_logs_snapshot_actor), so a later user deletion
+-- (actor_user_id -> NULL) never erases who performed the action.
+CREATE OR REPLACE FUNCTION engineer_action_log_snapshot_actor()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.actor_email IS NULL AND NEW.actor_user_id IS NOT NULL THEN
+        SELECT u.email
+          INTO NEW.actor_email
+          FROM users u
+         WHERE u.user_id = NEW.actor_user_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_engineer_action_log_snapshot_actor ON engineer_action_log;
+CREATE TRIGGER trg_engineer_action_log_snapshot_actor
+    BEFORE INSERT ON engineer_action_log
+    FOR EACH ROW
+    EXECUTE FUNCTION engineer_action_log_snapshot_actor();
+
 CREATE TABLE duplicate_candidates (
     duplicate_candidate_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id_1            bigint NOT NULL,

@@ -61,6 +61,7 @@ ALTER TABLE public.donations             ENABLE ROW LEVEL SECURITY;
 -- Files, audit, duplicates ---------------------------------------------------
 ALTER TABLE public.attachments           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_logs            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.engineer_action_log   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.duplicate_candidates  ENABLE ROW LEVEL SECURITY;
 
 -- Program engagement ---------------------------------------------------------

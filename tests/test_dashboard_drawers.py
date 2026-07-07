@@ -228,9 +228,9 @@ def test_data_quality_returns_counts(client, role):
     # Data-quality is full-access only (matches the sidebar gate), like /tasks.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     # Scalars consumed in handler order: total, missing_email,
-    # missing_employer, duplicate_count.
+    # missing_employer, missing_phone, duplicate_count.
     app.dependency_overrides[get_session] = _with_session(
-        _FakeSession([], scalars=[100, 12, 9, 3])
+        _FakeSession([], scalars=[100, 12, 9, 7, 3])
     )
 
     response = client.get("/dashboard/data-quality")
@@ -239,6 +239,7 @@ def test_data_quality_returns_counts(client, role):
         "total_alumni": 100,
         "missing_email": 12,
         "missing_employer": 9,
+        "missing_phone": 7,
         "duplicate_count": 3,
     }
 
@@ -568,8 +569,9 @@ def test_data_quality_response_validates_against_model(client):
     from app.schemas.dashboard import DataQuality
 
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
-    # Four scalars: total_alumni, missing_email, missing_employer, duplicate_count.
-    session = _FakeSession([], scalars=[10, 3, 2, 1])
+    # Five scalars: total, missing_email, missing_employer, missing_phone,
+    # duplicate_count.
+    session = _FakeSession([], scalars=[10, 3, 2, 5, 1])
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/data-quality")

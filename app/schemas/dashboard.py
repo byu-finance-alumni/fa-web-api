@@ -116,6 +116,7 @@ class DataQuality(BaseModel):
     total_alumni: int
     missing_email: int
     missing_employer: int
+    missing_phone: int
     duplicate_count: int
 
 

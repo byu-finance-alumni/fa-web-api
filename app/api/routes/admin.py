@@ -20,7 +20,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.dependencies.auth import RequireEngineer, RequireSuperAdmin
+from app.api.dependencies.auth import (
+    CurrentDBUser,
+    RequireEngineer,
+    RequireSuperAdmin,
+)
 from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
@@ -33,6 +37,7 @@ from app.core.rate_limit import (
 from app.core.roles import ROLE_LABELS, ROLE_ORDER, RoleName
 from app.core.security import AuthorizationError
 from app.models.audit import AuditLog
+from app.models.engineer_action import EngineerActionLog
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
 from app.models.user import Role, User, UserRole
@@ -438,10 +443,138 @@ async def purge_logins(
     from the Admin -> Logins tab). Engineer-gated (RequireEngineer) like the
     listing. Since #199 stops auditing engineer actions, this purge is
     intentionally NOT written to the audit trail. Returns the row count removed.
+
+    SCOPE (security review, #199/#200): this deletes ONLY ``login_events``. It
+    deliberately does NOT touch ``engineer_action_log`` -- that append-only table
+    is the tamper-resistant record of engineer actions and has no purge path, so
+    an engineer cannot use this endpoint (or any other) to erase their own trail.
     """
     result = await session.execute(delete(LoginEvent))
     await session.commit()
     return LoginPurgeResult(deleted=result.rowcount or 0)
+
+
+# --- Engineer-action oversight log (#199 / #200 forensic blind spot) ----------
+#
+# ``engineer_action_log`` is the append-only, tamper-resistant record of actions
+# taken by an engineer actor (rerouted there from ``audit_logs`` by the
+# before_flush guard in app/models/audit.py). It is oversight *of* the engineer,
+# so the READ gate below is ROLE-based (super_admin) and explicitly EXCLUDES the
+# engineer -- unlike RequireSuperAdmin, which is capability-based (USER_ADMIN) and
+# which an engineer also satisfies (the engineer holds every capability via a hard
+# override in effective_capabilities). Gating on the capability would let the
+# audited party read their own oversight log; the strict role gate keeps the log
+# beyond engineer control (they cannot read, view-gate, delete, or disable it).
+
+
+async def require_super_admin_role_strict(actor: CurrentDBUser) -> UserContext:
+    """Require the ``super_admin`` role, explicitly denying ``engineer`` (403).
+
+    Used only for the engineer-action oversight log: the engineer is the audited
+    party and must not be able to read or otherwise control it, so the plain
+    capability-based RequireSuperAdmin (which the engineer satisfies) is too broad
+    here. Any actor holding ``engineer`` is rejected even if they also hold
+    ``super_admin``.
+    """
+    if (
+        RoleName.ENGINEER.value in actor.roles
+        or RoleName.SUPER_ADMIN.value not in actor.roles
+    ):
+        raise AuthorizationError()
+    return actor
+
+
+RequireSuperAdminStrict = Annotated[
+    UserContext, Depends(require_super_admin_role_strict)
+]
+
+
+class EngineerActionRow(BaseModel):
+    """One recorded engineer action for the super_admin oversight view.
+    ``actor_user_id`` is null once the engineer has been deleted; ``actor_email``
+    is the snapshot taken at write time, so the row still shows who acted."""
+
+    engineer_action_log_id: int
+    actor_user_id: int | None = None
+    actor_email: str | None = None
+    action_type: str
+    entity_type: str
+    entity_id: int | None = None
+    field_name: str | None = None
+    old_value: str | None = None
+    new_value: str | None = None
+    occurred_at: datetime.datetime
+
+
+class EngineerActionPage(BaseModel):
+    """A page of engineer actions, newest first, with the total for pagination."""
+
+    items: list[EngineerActionRow]
+    total: int
+    limit: int
+    offset: int
+
+
+@router.get("/engineer-actions", response_model=EngineerActionPage)
+async def list_engineer_actions(
+    actor: RequireSuperAdminStrict,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> EngineerActionPage:
+    """List recorded engineer actions, newest first (paginated). super_admin only.
+
+    Reads the append-only ``engineer_action_log`` -- the tamper-resistant oversight
+    trail of engineer actions (#199/#200). ROLE-gated to ``super_admin`` and
+    explicitly denied to the ``engineer`` (see require_super_admin_role_strict), so
+    the audited party can neither read nor disable it; there is no delete/purge
+    route for this table at all. Paginated (default 50, hard cap 200 -- mirrors the
+    users/logins/audit endpoints) so one request can't enumerate the whole log.
+
+    Reading the log is itself audited (``read_engineer_action_log``; actor +
+    applied limit/offset) -- the returned rows are not logged.
+    """
+    total = await session.scalar(
+        select(func.count()).select_from(EngineerActionLog)
+    )
+    rows = await session.scalars(
+        select(EngineerActionLog)
+        .order_by(
+            EngineerActionLog.occurred_at.desc(),
+            EngineerActionLog.engineer_action_log_id.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+    items = [
+        EngineerActionRow(
+            engineer_action_log_id=e.engineer_action_log_id,
+            actor_user_id=e.actor_user_id,
+            actor_email=e.actor_email,
+            action_type=e.action_type,
+            entity_type=e.entity_type,
+            entity_id=e.entity_id,
+            field_name=e.field_name,
+            old_value=e.old_value,
+            new_value=e.new_value,
+            occurred_at=e.occurred_at,
+        )
+        for e in rows.all()
+    ]
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_engineer_action_log",
+            entity_type="engineer_action_log",
+            field_name=f"limit={limit};offset={offset}",
+        )
+    )
+    await session.commit()
+
+    return EngineerActionPage(
+        items=items, total=int(total or 0), limit=limit, offset=offset
+    )
 
 
 # ``{user_id}`` is declared ``int`` (below), so string sub-paths like

@@ -22,6 +22,7 @@ from app.models.engagement import (
     AlumniProgramEngagement,
     FinanceSocietyLeadership,
 )
+from app.models.engineer_action import EngineerActionLog
 from app.models.event import Event, EventAttendance
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
@@ -46,6 +47,7 @@ __all__ = [
     "DuplicateCandidate",
     "EducationHistory",
     "EmploymentHistory",
+    "EngineerActionLog",
     "Event",
     "EventAttendance",
     "FinanceSocietyLeadership",

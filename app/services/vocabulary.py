@@ -133,3 +133,14 @@ async def deactivate_term(session: AsyncSession, term_id: int) -> VocabularyTerm
     term = await get_term(session, term_id)
     term.active = False
     return term
+
+
+async def delete_term(session: AsyncSession, term_id: int) -> VocabularyTerm:
+    """Hard-delete: remove the row entirely (permanent, unlike the soft
+    ``deactivate_term``). Existing records that stored this value keep it as free
+    text — only the managed option disappears. Returns the term so the caller can
+    read its attributes for an audit row before committing. Does NOT commit. 404
+    if missing."""
+    term = await get_term(session, term_id)
+    await session.delete(term)
+    return term

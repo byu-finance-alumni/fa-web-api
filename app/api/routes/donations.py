@@ -1,11 +1,19 @@
 """Pay It Forward Fund donation routes (#161).
 
-Field-level access (CRITICAL): donor IDENTITY (who gave, and in which years) is
-readable by any view-access role, but dollar AMOUNTS are gated to ``full_access``
-and up. The gate is enforced HERE, server-side — every amount field is nulled
-before serialization for a caller without the ``alumni.full`` capability, so a
-non-privileged client never receives a value (not merely a hidden one). Donation
-notes are gated alongside amounts (free text may reference figures).
+Read access (#278): the donation ledger (donor list / fund summary / a donor's
+history) requires the ``alumni.full`` capability — full_access and up. Students
+and view_only ("Professor") are DENIED (403) outright: Pay It Forward is a
+data-management surface, not part of the read-only directory. The frontend also
+hides the nav, but the boundary is enforced HERE, server-side.
+
+Field-level access (CRITICAL): dollar AMOUNTS are additionally gated to
+``full_access`` and up. The gate is enforced HERE, server-side — every amount
+field is nulled before serialization for a caller without the ``alumni.full``
+capability, so a non-privileged client never receives a value (not merely a
+hidden one). Donation notes are gated alongside amounts (free text may reference
+figures). With the read gate above now also requiring ``alumni.full``, this
+field gate is belt-and-suspenders that still holds if an engineer later widens
+who may read the ledger.
 
 Writes are admin-tier: add / edit / bulk import require the dedicated
 ``donations.manage`` capability (super_admin + engineer by default, #189) — split
@@ -31,7 +39,6 @@ from app.api.dependencies.auth import (
     PermissionConfig,
     RequireDonationsManage,
     RequireFullAccess,
-    RequireViewAccess,
 )
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
@@ -75,13 +82,13 @@ def _money(value, show: bool) -> float | None:
 
 @router.get("/donors")
 async def list_donors(
-    user: RequireViewAccess,
+    user: RequireFullAccess,
     config: PermissionConfig,
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
-    """List donors with per-year and lifetime roll-ups (view access, paginated).
+    """List donors with per-year and lifetime roll-ups (full_access+, paginated).
 
     Everyone sees who gave and in which years; ``lifetime_total`` and each
     ``per_year.total`` are non-null only for amount-viewers (full_access+).
@@ -171,11 +178,11 @@ async def list_donors(
 
 @router.get("/summary")
 async def donations_summary(
-    user: RequireViewAccess,
+    user: RequireFullAccess,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:
-    """Fund totals (view access). Donor / donation COUNTS are public; the dollar
+    """Fund totals (full_access+). Donor / donation COUNTS are public; the dollar
     ``total_raised`` and each ``per_year.total`` are gated to amount-viewers."""
     show = _can_view_amounts(user, config)
 
@@ -220,11 +227,11 @@ async def donations_summary(
 @router.get("/alumni/{alumni_id}")
 async def list_alumni_donations(
     alumni_id: IdPath,
-    user: RequireViewAccess,
+    user: RequireFullAccess,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:
-    """A single donor's donation history (view access). 404 if the alumnus is
+    """A single donor's donation history (full_access+). 404 if the alumnus is
     unknown. Each entry's ``amount`` and ``notes`` are gated to amount-viewers."""
     show = _can_view_amounts(user, config)
     alumni = await session.get(Alumni, alumni_id)

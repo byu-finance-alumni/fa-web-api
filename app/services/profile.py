@@ -443,24 +443,29 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     """Strip the FERPA-sensitive parts of a profile for a ``view_only`` caller.
 
     Nulls the sensitive core PII (via ``minimize_alumni_read``), redacts the
-    non-directory CONTACT fields (personal/work email, phone, street address,
-    ZIP — city/state/region/country stay, as directory-style location), strips all
-    free-text notes (interaction / survey / engagement / program-engagement
-    notes), and omits the embedded audit trail entirely. Returns a new
-    ``ProfileRead``; the input is left untouched.
+    home MAILING ADDRESS (street lines + ZIP — city/state/region/country stay,
+    as directory-style location), strips all free-text notes (interaction /
+    survey / engagement / program-engagement notes), and omits the embedded
+    audit trail entirely. Returns a new ``ProfileRead``; the input is left
+    untouched.
+
+    Contact reachability (#166 — INTENTIONAL PRODUCT DECISION): personal/work
+    email and phone are DELIBERATELY exposed to view_only so a "Professor" can
+    reach out to alumni for the outreach use-case. This reverses the earlier
+    full-redaction audit (which hid email/phone too); only the physical home
+    address (street + ZIP) stays protected here.
 
     Note: ``logged_by`` is already reduced to the logger's FIRST NAME upstream in
     ``get_profile`` (full name only for editors), so it is intentionally left
     untouched here — a view_only caller sees who made contact by first name.
     """
-    # Redact non-directory contact PII (email/phone/street/ZIP) for view_only;
-    # keep city/state/region/country (directory-style). Matches the frontend gate.
+    # Redact the home mailing address (street + ZIP) for view_only; keep
+    # city/state/region/country (directory-style location). Email and phone are
+    # INTENTIONALLY left visible (#166) so view_only can contact alumni for
+    # outreach — do NOT re-add personal_email/work_email/phone here.
     contact = (
         profile.contact.model_copy(
             update={
-                "personal_email": None,
-                "work_email": None,
-                "phone": None,
                 "address_line_1": None,
                 "address_line_2": None,
                 "zip": None,

@@ -138,6 +138,7 @@ def build_alumni_query(
     cpa: bool = False,
     missing_email: bool = False,
     missing_employer: bool = False,
+    missing_phone: bool = False,
     duplicate: bool = False,
     # Friends of the finance program (#218). ``True`` -> alumni only, ``False``
     # -> friends only, ``None`` -> both. The list route defaults this to ``True``
@@ -151,6 +152,7 @@ def build_alumni_query(
     "Review" deep-links land on the same population the dashboard counted:
       * ``missing_email``    — no contact-info row with a personal/work email
       * ``missing_employer`` — no current-employment row naming an employer
+      * ``missing_phone``    — no contact-info row with a phone number
       * ``duplicate``        — the alumnus appears on either side of a
         ``duplicate_candidates`` pair
     All conditions are correlated EXISTS subqueries so filtering stays in
@@ -486,6 +488,16 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(~has_employer)
+    if missing_phone:
+        has_phone = (
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                AlumniContactInfo.phone.is_not(None),
+            )
+            .exists()
+        )
+        conditions.append(~has_phone)
     if duplicate:
         is_duplicate = (
             select(DuplicateCandidate.duplicate_candidate_id)

@@ -217,6 +217,10 @@ async def list_alumni(
         bool,
         Query(description="Only alumni with no current employer on file."),
     ] = False,
+    missing_phone: Annotated[
+        bool,
+        Query(description="Only alumni with no phone number on file."),
+    ] = False,
     duplicate: Annotated[
         bool,
         Query(description="Only alumni flagged as duplicate candidates."),
@@ -304,6 +308,7 @@ async def list_alumni(
         cpa=cpa,
         missing_email=missing_email,
         missing_employer=missing_employer,
+        missing_phone=missing_phone,
         duplicate=duplicate,
         is_alumni=is_alumni_filter,
         include_archived=effective_include_archived,

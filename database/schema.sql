@@ -226,6 +226,9 @@ CREATE TABLE alumni_contact_info (
     zip             varchar(20),
     country         varchar(100),
     region          varchar(100),
+    -- Which contact method is flagged "preferred"; allowed values validated in
+    -- the app layer (personal_email/work_email/phone/linkedin, or NULL = none).
+    preferred_contact_method varchar(30),
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_alumni_contact_info_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,

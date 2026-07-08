@@ -35,3 +35,6 @@ class AlumniContactInfo(TimestampMixin, Base):
     zip: Mapped[str | None] = mapped_column(String(20))
     country: Mapped[str | None] = mapped_column(String(100))
     region: Mapped[str | None] = mapped_column(String(100))
+    # Which of this alum's contact methods is flagged "preferred" (or NULL for
+    # none). Allowed values are validated at the app layer (see ContactCreate).
+    preferred_contact_method: Mapped[str | None] = mapped_column(String(30))

@@ -48,6 +48,13 @@ _NET_ID_RE = re.compile(r"^[a-z0-9]{2,12}$")
 _YEAR_MIN = 1950
 _YEAR_MAX = datetime.date.today().year + 10
 
+# Which contact method an alum flags as "preferred". A single nullable string on
+# the contact record naming WHICH method is preferred (NULL/empty = none). Kept
+# in sync with the frontend star affordance; validated once via this set below.
+_PREFERRED_CONTACT_METHODS = frozenset(
+    {"personal_email", "work_email", "phone", "linkedin"}
+)
+
 # Birthdays: anyone in an alumni database was plausibly born no earlier than
 # 1900; a birth date can't be in the future. Same bounds apply to a spouse.
 _BIRTH_DATE_MIN = datetime.date(1900, 1, 1)
@@ -437,6 +444,18 @@ class ContactCreate(_Section):
     zip: str | None = Field(default=None, max_length=20)
     country: str | None = Field(default=None, max_length=100)
     region: str | None = Field(default=None, max_length=100)
+    preferred_contact_method: str | None = Field(default=None, max_length=30)
+
+    @field_validator("preferred_contact_method")
+    @classmethod
+    def _validate_preferred_contact_method(cls, value: str | None) -> str | None:
+        # _Section._trim_strings already normalized empty -> None ahead of this.
+        if value is None:
+            return None
+        if value not in _PREFERRED_CONTACT_METHODS:
+            allowed = ", ".join(sorted(_PREFERRED_CONTACT_METHODS))
+            raise ValueError(f"Must be one of: {allowed}.")
+        return value
 
 
 class CareerCreate(_Section):

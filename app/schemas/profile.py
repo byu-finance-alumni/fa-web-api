@@ -353,6 +353,7 @@ class ContactRead(_Orm):
     zip: str | None = None
     country: str | None = None
     region: str | None = None
+    preferred_contact_method: str | None = None
 
 
 class CurrentCareerRead(_Orm):

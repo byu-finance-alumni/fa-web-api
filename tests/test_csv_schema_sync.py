@@ -14,6 +14,33 @@ def test_all_csv_headers_map_to_real_columns():
     assert errors == [], "CSV/DB drift:\n" + "\n".join(errors)
 
 
+def test_friend_import_surface_is_covered():
+    """The friend template↔model binding is one of the guarded surfaces (#294)."""
+    assert guard._check_friend_import in guard.CHECKS
+    errors: list[str] = []
+    guard._check_friend_import(errors)
+    assert errors == [], "Friend CSV/DB drift:\n" + "\n".join(errors)
+
+
+def test_friend_headers_are_subset_without_academic_fields():
+    """Friend columns are a strict subset of alumni columns and exclude the
+    alumni-only academic / identity fields."""
+    from app.services import import_csv
+
+    friend = set(import_csv.FRIEND_EXPECTED_HEADERS)
+    assert friend
+    assert friend <= set(import_csv.EXPECTED_HEADERS)
+    for banned in (
+        "BYU ID (9 digits)",
+        "Net ID",
+        "Graduation year",
+        "Graduation month",
+        "Finance program year",
+        "Degree year",
+    ):
+        assert banned not in friend
+
+
 def test_check_column_flags_missing_column():
     errors: list[str] = []
     guard._check_column(errors, "surface", "Bogus", "core", "no_such_column")

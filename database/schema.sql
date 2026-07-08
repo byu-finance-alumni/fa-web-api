@@ -168,6 +168,7 @@ CREATE TABLE alumni (
     birth_year           int,
     birth_date           date,
     graduation_year      int,
+    graduation_month     int,
     finance_program_year int,
     graduate_degree      varchar(100),
     -- Secondary affiliation / education (#47, PRD section 6). Optional/nullable

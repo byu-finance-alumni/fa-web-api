@@ -35,6 +35,7 @@ def _row_values(**overrides) -> list[str]:
         "first_name": "First name",
         "last_name": "Last name",
         "graduation_year": "Graduation year",
+        "graduation_month": "Graduation month",
         "birth_date": "Birthday (YYYY-MM-DD)",
         "personal_email": "Personal email",
         "current_employer": "Current employer",
@@ -46,6 +47,25 @@ def _row_values(**overrides) -> list[str]:
     for field, value in overrides.items():
         values[by_field[field]] = value
     return [values[h] for h in HEADERS]
+
+
+FRIEND_HEADERS = import_csv.FRIEND_EXPECTED_HEADERS
+
+
+def _friend_row_values(**overrides) -> list[str]:
+    """A blank FRIEND row keyed by field name -> friend-template header."""
+    values = {h: "" for h in FRIEND_HEADERS}
+    by_field = {
+        "first_name": "First name",
+        "last_name": "Last name",
+        "gender": "Gender",
+        "personal_email": "Personal email",
+        "current_employer": "Current employer",
+        "mentor_willing": "Willing to mentor (Yes/No)",
+    }
+    for field, value in overrides.items():
+        values[by_field[field]] = value
+    return [values[h] for h in FRIEND_HEADERS]
 
 
 def _csv_bytes(*rows: list[str], headers: list[str] | None = None) -> bytes:
@@ -622,3 +642,105 @@ def test_route_template_download():
     assert "alumni_import_template.csv" in resp.headers["content-disposition"]
     first_line = resp.text.splitlines()[0]
     assert first_line.startswith("BYU ID (9 digits)")
+
+
+# --- Friend (non-alumni contact) import (#294) -------------------------------
+
+
+def test_friend_template_excludes_academic_and_identity_fields():
+    csv_text = import_csv.build_template_csv(friend=True)
+    header_line = csv_text.splitlines()[0]
+    headers = header_line.split(",")
+    # Includes the friend-relevant columns...
+    assert "First name" in headers
+    assert "Last name" in headers
+    assert "Current employer" in headers
+    assert "Personal email" in headers
+    assert "Willing to mentor (Yes/No)" in headers
+    assert "PIFF donor (Yes/No)" in headers
+    # ...and excludes the alumni-only academic / identity fields.
+    for banned in (
+        "BYU ID (9 digits)",
+        "Net ID",
+        "Graduation year",
+        "Graduation month",
+        "Finance program year",
+        "Graduate degree",
+        "University",
+        "Degree year",
+        "Spouse BYU ID (if also an alumnus)",
+    ):
+        assert banned not in headers
+
+
+def test_friend_row_commits_with_is_alumni_false():
+    csv = _csv_bytes(
+        _friend_row_values(
+            first_name="Rick",
+            last_name="Recruiter",
+            current_employer="Acme Capital",
+            personal_email="rick@acme.example.com",
+        ),
+        headers=FRIEND_HEADERS,
+    )
+    rows, errors = import_csv.parse_and_map(csv, friend=True)
+    assert errors == []
+    # The mapped payload carries the is_alumni=False stamp.
+    assert rows[0]["payload"]["is_alumni"] is False
+    session = FakeSession()
+    result = _run(import_csv.commit_import(session, rows))
+    assert result["imported"] == 1
+    # The persisted Alumni row is a friend.
+    created = [o for o in session.added if hasattr(o, "is_alumni")]
+    assert len(created) == 1
+    assert created[0].is_alumni is False
+    assert created[0].first_name == "Rick"
+
+
+def test_alumni_import_row_defaults_is_alumni_unset():
+    # A normal (non-friend) import must NOT stamp is_alumni, so the model default
+    # (True) / DB server_default applies.
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", graduation_year="2018")
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert "is_alumni" not in rows[0]["payload"]
+
+
+def test_friend_headers_reject_alumni_only_columns():
+    # Feeding a friend import the FULL alumni template must fail header validation
+    # (the academic columns are "unexpected" for the friend surface).
+    csv = _csv_bytes(_row_values(first_name="Jane", last_name="Doe"))
+    rows, errors = import_csv.parse_and_map(csv, friend=True)
+    assert rows == []
+    assert any("Unexpected column" in e for e in errors)
+
+
+def test_route_friend_template_download():
+    with _full_access_client(FakeSession()) as c:
+        resp = c.get("/alumni/import/template", params={"kind": "friend"})
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert "friend_import_template.csv" in resp.headers["content-disposition"]
+    first_line = resp.text.splitlines()[0]
+    assert first_line.startswith("First name")
+    assert "BYU ID (9 digits)" not in first_line
+
+
+def test_route_friend_import_kind_routes_and_flags_friend():
+    csv = _csv_bytes(
+        _friend_row_values(first_name="Rick", last_name="Recruiter"),
+        headers=FRIEND_HEADERS,
+    )
+    session = FakeSession()
+    with _full_access_client(session) as c:
+        resp = c.post(
+            "/alumni/import",
+            params={"kind": "friend"},
+            files={"file": ("friends.csv", csv, "text/csv")},
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json()["imported"] == 1
+    created = [o for o in session.added if hasattr(o, "is_alumni")]
+    assert created and created[0].is_alumni is False

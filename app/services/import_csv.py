@@ -44,7 +44,7 @@ from app.models.alumni import Alumni
 from app.schemas.alumni import AlumniCreateFull
 from app.services import alumni as alumni_service
 from app.services import hygiene
-from scripts.export_intake_template import _ALUMNI_COLUMNS
+from scripts.export_intake_template import _ALUMNI_COLUMNS, _FRIEND_COLUMNS
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +83,7 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "Gender": ("core", "gender", "str"),
     "Birthday (YYYY-MM-DD)": ("core", "birth_date", "date"),
     "Graduation year": ("core", "graduation_year", "int"),
+    "Graduation month": ("core", "graduation_month", "int"),
     "Finance program year": ("core", "finance_program_year", "int"),
     "Graduate degree": ("core", "graduate_degree", "str"),
     "LinkedIn URL": ("core", "linkedin_url", "str"),
@@ -189,6 +190,28 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
 EXPECTED_HEADERS: list[str] = [header for header, _ in _ALUMNI_COLUMNS]
 EXAMPLE_ROW: list[str] = [example for _, example in _ALUMNI_COLUMNS]
 
+# --- Friend (non-alumni contact) column set (#294) ---------------------------
+#
+# Friends are imported through this SAME pipeline; a friend row is just an alumni
+# row with ``is_alumni = False`` injected. The friend template is the curated
+# subset of alumni columns declared in the intake template (identity by name; no
+# academic / spouse-link fields). Its mapping is the matching slice of _MAPPING,
+# so friend headers bind to the exact same model columns — no parallel mapping to
+# drift.
+FRIEND_EXPECTED_HEADERS: list[str] = [header for header, _ in _FRIEND_COLUMNS]
+FRIEND_EXAMPLE_ROW: list[str] = [example for _, example in _FRIEND_COLUMNS]
+_FRIEND_MAPPING: dict[str, tuple[str, str, str]] = {
+    header: _MAPPING[header] for header in FRIEND_EXPECTED_HEADERS
+}
+
+
+def _expected_headers(friend: bool) -> list[str]:
+    return FRIEND_EXPECTED_HEADERS if friend else EXPECTED_HEADERS
+
+
+def _mapping_for(friend: bool) -> dict[str, tuple[str, str, str]]:
+    return _FRIEND_MAPPING if friend else _MAPPING
+
 _TRUE_TOKENS = frozenset({"yes", "true", "1", "y", "t"})
 # Empty cells are skipped by _map_row before coercion, so "" is intentionally
 # NOT a token here — a blank bool cell never reaches _coerce_bool.
@@ -258,7 +281,10 @@ def _display_name(core: dict) -> str:
 
 
 def parse_and_map(
-    file_bytes: bytes, max_rows: int | None = MAX_IMPORT_ROWS
+    file_bytes: bytes,
+    max_rows: int | None = MAX_IMPORT_ROWS,
+    *,
+    friend: bool = False,
 ) -> tuple[list[dict], list[str]]:
     """Parse a CSV and map each data row to an ``AlumniCreateFull`` payload dict.
 
@@ -283,8 +309,13 @@ def parse_and_map(
     cap); over the cap, a header-style error is returned instead of processing,
     so a hostile/huge file can't exhaust memory or DB time.
 
+    ``friend=True`` maps against the curated FRIEND column set (non-alumni
+    contacts, #294) and stamps ``is_alumni = False`` onto every row's payload.
+
     The CSV is decoded as ``utf-8-sig`` so an Excel BOM is stripped.
     """
+    expected = _expected_headers(friend)
+    mapping = _mapping_for(friend)
     try:
         text = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -299,7 +330,7 @@ def parse_and_map(
         return [], ["The file is empty."]
 
     headers = [h.strip() for h in header_row]
-    header_errors = _validate_headers(headers)
+    header_errors = _validate_headers(headers, expected)
     if header_errors:
         # Columns are wrong; don't attempt to map rows against a bad header.
         return [], header_errors
@@ -316,20 +347,20 @@ def parse_and_map(
                 f"File exceeds the {max_rows:,}-row import limit. Split into "
                 "smaller batches."
             ]
-        rows.append(_map_row(offset, headers, raw_row))
+        rows.append(_map_row(offset, headers, raw_row, mapping, friend))
     return rows, header_errors
 
 
-def _validate_headers(headers: list[str]) -> list[str]:
-    """Compare the file's headers to the expected Alumni columns."""
+def _validate_headers(headers: list[str], expected_headers: list[str]) -> list[str]:
+    """Compare the file's headers to the expected columns (alumni or friend)."""
     errors: list[str] = []
     seen = set(headers)
-    expected = set(EXPECTED_HEADERS)
+    expected = set(expected_headers)
     # Reject duplicated column names (last-wins would otherwise silently drop
     # the earlier column's data). Mirrors import_events / import_donations.
     for dup in sorted({h for h in headers if h and headers.count(h) > 1}):
         errors.append(f"Duplicate column: {dup!r}.")
-    for missing in EXPECTED_HEADERS:
+    for missing in expected_headers:
         if missing not in seen:
             errors.append(f"Missing required column: {missing!r}.")
     for extra in headers:
@@ -347,15 +378,25 @@ def _validate_headers(headers: list[str]) -> list[str]:
     return errors
 
 
-def _map_row(row_num: int, headers: list[str], raw_row: list[str]) -> dict:
-    """Map one CSV data row to a payload dict + metadata."""
+def _map_row(
+    row_num: int,
+    headers: list[str],
+    raw_row: list[str],
+    mapping: dict[str, tuple[str, str, str]],
+    friend: bool = False,
+) -> dict:
+    """Map one CSV data row to a payload dict + metadata.
+
+    ``mapping`` selects the header→target set (alumni or friend). ``friend=True``
+    stamps ``is_alumni = False`` onto the row's core payload so the shared create
+    path persists a non-alumni contact."""
     core: dict = {}
     sections: dict[str, dict] = {}
     spouse_byu_id: str | None = None
     error: str | None = None
 
     for col, header in enumerate(headers):
-        target = _MAPPING.get(header)
+        target = mapping.get(header)
         if target is None:
             continue
         raw = raw_row[col] if col < len(raw_row) else ""
@@ -381,6 +422,11 @@ def _map_row(row_num: int, headers: list[str], raw_row: list[str]) -> dict:
             core[field] = value
         else:
             sections.setdefault(section, {})[field] = value
+
+    if friend:
+        # Non-alumni contact: force is_alumni False so the shared create path
+        # writes a friend record instead of an alumnus (#294).
+        core["is_alumni"] = False
 
     payload = dict(core)
     payload.update(sections)
@@ -965,11 +1011,16 @@ def _reject_reason(evaluated: dict) -> str:
 # --- CSV template ------------------------------------------------------------
 
 
-def build_template_csv() -> str:
-    """Return the import template as CSV text: the exact Alumni headers plus one
-    example row. Derived from the same column source as the xlsx template."""
+def build_template_csv(friend: bool = False) -> str:
+    """Return the import template as CSV text: the exact headers plus one example
+    row. Derived from the same column source as the xlsx template. ``friend=True``
+    returns the curated friend (non-alumni contact) column set (#294)."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(EXPECTED_HEADERS)
-    writer.writerow(EXAMPLE_ROW)
+    if friend:
+        writer.writerow(FRIEND_EXPECTED_HEADERS)
+        writer.writerow(FRIEND_EXAMPLE_ROW)
+    else:
+        writer.writerow(EXPECTED_HEADERS)
+        writer.writerow(EXAMPLE_ROW)
     return buffer.getvalue()

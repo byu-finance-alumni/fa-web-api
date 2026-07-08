@@ -59,6 +59,7 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("Gender", "M"),
     ("Birthday (YYYY-MM-DD)", "1990-03-15"),
     ("Graduation year", "2012"),
+    ("Graduation month", "4"),
     ("Finance program year", "2011"),
     ("Graduate degree", ""),
     ("LinkedIn URL", "https://linkedin.com/in/mock-jdoe"),
@@ -114,6 +115,49 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("CFA designation (Yes/No)", "Yes"),
     ("Engagement notes", "Hosts NetTrek in NYC; active IB-track mentor."),
 ]
+
+# "Friends of the finance program" (#294) are non-alumni contacts
+# (``is_alumni = false``) imported through the SAME pipeline as alumni. Their
+# intake template is a CURATED SUBSET of the alumni columns: a friend's identity
+# is satisfied by name alone, so the alumni-only academic fields (BYU ID / Net
+# ID, graduation year/month, finance program year, graduate degree, and the whole
+# education block) plus the spouse-link fields are dropped. The contact, current
+# employment, and program-engagement columns are kept — a "friend" (e.g. a
+# recruiter or employer partner) still has an employer, contact info, and can be
+# willing to host events / hire / be a PIFF donor.
+_FRIEND_EXCLUDED_HEADERS: frozenset[str] = frozenset(
+    {
+        "BYU ID (9 digits)",
+        "Net ID",
+        "Birthday (YYYY-MM-DD)",
+        "Graduation year",
+        "Graduation month",
+        "Finance program year",
+        "Graduate degree",
+        "Deceased? (Yes/No)",
+        "Spouse first name",
+        "Spouse last name",
+        "Spouse birthday (YYYY-MM-DD)",
+        "Spouse BYU ID (if also an alumnus)",
+        "University",
+        "College",
+        "Department",
+        "Degree",
+        "Major",
+        "Degree status",
+        "Degree year",
+    }
+)
+
+_FRIEND_COLUMNS: list[tuple[str, str]] = [
+    col for col in _ALUMNI_COLUMNS if col[0] not in _FRIEND_EXCLUDED_HEADERS
+]
+
+
+def friend_columns() -> list[tuple[str, str]]:
+    """The curated friend intake columns (header, example), in template order."""
+    return list(_FRIEND_COLUMNS)
+
 
 _EVENT_COLUMNS: list[tuple[str, str]] = [
     ("Event name", "Spring NetTrek"),

@@ -90,6 +90,7 @@ class AlumniBase(BaseModel):
     birth_year: int | None = None
     birth_date: datetime.date | None = None
     graduation_year: int | None = None
+    graduation_month: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
     # Secondary affiliation / education (#47, PRD section 6). All optional.
@@ -207,6 +208,15 @@ class AlumniBase(BaseModel):
             return None
         if not (_YEAR_MIN <= value <= _YEAR_MAX):
             raise ValueError(f"Must be between {_YEAR_MIN} and {_YEAR_MAX}.")
+        return value
+
+    @field_validator("graduation_month")
+    @classmethod
+    def _validate_grad_month(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not (1 <= value <= 12):
+            raise ValueError("Must be between 1 and 12.")
         return value
 
     # --- Birthdays -----------------------------------------------------------
@@ -538,6 +548,7 @@ class AlumniRead(BaseModel):
     birth_year: int | None = None
     birth_date: datetime.date | None = None
     graduation_year: int | None = None
+    graduation_month: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
     mba_program: str | None = None

@@ -53,6 +53,7 @@ class Alumni(TimestampMixin, Base):
     birth_year: Mapped[int | None] = mapped_column(Integer)
     birth_date: Mapped[datetime.date | None] = mapped_column(Date)
     graduation_year: Mapped[int | None] = mapped_column(Integer)
+    graduation_month: Mapped[int | None] = mapped_column(Integer)
     finance_program_year: Mapped[int | None] = mapped_column(Integer)
     graduate_degree: Mapped[str | None] = mapped_column(String(100))
 

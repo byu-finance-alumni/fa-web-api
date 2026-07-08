@@ -90,6 +90,14 @@ CATALOG: list[_Col] = [
         "int",
     ),
     _Col(
+        "graduation_month",
+        "Graduation month",
+        "Identity",
+        _ALUMNI,
+        "graduation_month",
+        "int",
+    ),
+    _Col(
         "finance_program_year",
         "Finance program year",
         "Identity",
@@ -264,6 +272,7 @@ DEFAULT_SELECTED: list[str] = [
     "last_name",
     "preferred_first_name",
     "graduation_year",
+    "graduation_month",
     "current_employer",
     "current_title",
     "current_industry",

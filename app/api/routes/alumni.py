@@ -407,13 +407,20 @@ def _too_large_response() -> JSONResponse:
 
 
 @router.get("/import/template")
-async def alumni_import_template(_: RequireFullAccess) -> Response:
-    """Download the bulk-import CSV template: the exact Alumni columns plus one
-    example row (full_access). Same column source as the xlsx intake template."""
+async def alumni_import_template(
+    _: RequireFullAccess,
+    kind: Annotated[Literal["alumni", "friend"], Query()] = "alumni",
+) -> Response:
+    """Download the bulk-import CSV template (full_access). ``kind=alumni`` (the
+    default) returns the full Alumni columns; ``kind=friend`` returns the curated
+    friend (non-alumni contact) column set (#294). Same column source as the xlsx
+    intake template."""
+    friend = kind == "friend"
+    filename = "friend_import_template.csv" if friend else "alumni_import_template.csv"
     return Response(
-        content=import_csv.build_template_csv(),
+        content=import_csv.build_template_csv(friend=friend),
         media_type="text/csv",
-        headers={"Content-Disposition": ('attachment; filename="alumni_import_template.csv"')},
+        headers={"Content-Disposition": (f'attachment; filename="{filename}"')},
     )
 
 
@@ -422,17 +429,21 @@ async def preview_import_alumni(
     _: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
+    kind: Annotated[Literal["alumni", "friend"], Query()] = "alumni",
 ) -> dict | JSONResponse:
     """Dry-run a bulk CSV import (full_access, NO writes).
 
-    Parses + maps the uploaded CSV against the Alumni template columns, then
+    Parses + maps the uploaded CSV against the template columns for ``kind``
+    (``alumni`` default, or ``friend`` for non-alumni contacts, #294), then
     evaluates every row (clean + duplicate-detect against the DB and earlier
     rows in the file + completeness warnings). Returns the full preview report;
     a bad header set surfaces as ``columns_ok: false`` with ``header_errors``."""
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
-    rows, header_errors = import_csv.parse_and_map(file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS)
+    rows, header_errors = import_csv.parse_and_map(
+        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS, friend=kind == "friend"
+    )
     if header_errors:
         return {
             "columns_ok": False,
@@ -454,14 +465,19 @@ async def import_alumni(
     user: RequireFullAccess,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
+    kind: Annotated[Literal["alumni", "friend"], Query()] = "alumni",
 ) -> dict | JSONResponse:
-    """Commit a bulk CSV import (full_access). Re-evaluates and inserts every
-    importable row in one transaction (audit logging fires per row); rejected
-    rows are skipped and reported. A bad header set imports nothing."""
+    """Commit a bulk CSV import (full_access). ``kind=friend`` imports non-alumni
+    contacts (``is_alumni=false``, #294); ``kind=alumni`` (default) imports
+    alumni. Re-evaluates and inserts every importable row in one transaction
+    (audit logging fires per row); rejected rows are skipped and reported. A bad
+    header set imports nothing."""
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
-    rows, header_errors = import_csv.parse_and_map(file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS)
+    rows, header_errors = import_csv.parse_and_map(
+        file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS, friend=kind == "friend"
+    )
     if header_errors:
         return {
             "imported": 0,

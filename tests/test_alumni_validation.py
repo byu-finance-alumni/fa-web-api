@@ -150,6 +150,23 @@ def test_out_of_range_year_rejected(year):
         AlumniCreate(last_name="Doe", graduation_year=year)
 
 
+@pytest.mark.parametrize("month", [1, 4, 8, 12])
+def test_valid_graduation_month_accepted(month):
+    model = AlumniCreate(last_name="Doe", graduation_month=month)
+    assert model.graduation_month == month
+
+
+def test_graduation_month_defaults_to_none():
+    model = AlumniCreate(last_name="Doe")
+    assert model.graduation_month is None
+
+
+@pytest.mark.parametrize("month", [0, 13, -1, 99])
+def test_out_of_range_graduation_month_rejected(month):
+    with pytest.raises(ValidationError):
+        AlumniCreate(last_name="Doe", graduation_month=month)
+
+
 def test_empty_strings_normalize_to_none():
     model = AlumniUpdate(
         first_name="Doe",

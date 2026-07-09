@@ -114,10 +114,12 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "current_industry",
         "industry",
     ),
+    # Secondary industry is FREE TEXT (open response), not the controlled vocab —
+    # so it maps as a plain string; placeholders are blanked (see below).
     "Secondary industry (see Reference sheet)": (
         "career",
         "current_industry_secondary",
-        "industry",
+        "str",
     ),
     "Work Email": ("contact", "work_email", "str"),
     "Address line 1": ("contact", "address_line_1", "str"),
@@ -310,14 +312,24 @@ def _coerce_date(header: str, raw: str) -> str:
 
 
 # Tokens real intake sheets use to mean "not known". Import-only leniency (the
-# manual create/edit form stays strict): in an INDUSTRY cell we map them to the
-# catch-all "Other"; in an ADDRESS/LOCATION cell we blank them out (see the map
-# loop's _LOCATION_BLANK_FIELDS handling) rather than storing the literal text.
+# manual create/edit form's PRIMARY industry stays strict): in the primary
+# INDUSTRY cell we map them to the catch-all "Other"; in the free-text fields
+# below we blank them out (see the map loop) rather than storing the literal.
 _PLACEHOLDER_TOKENS = frozenset({"unknown", "n/a", "na"})
 
-# Address/location fields where a placeholder token means "leave blank".
-_LOCATION_BLANK_FIELDS = frozenset(
-    {"address_line_1", "address_line_2", "city", "state", "region", "country", "zip"}
+# Free-text fields where a placeholder token means "leave blank": the address/
+# location columns plus the open-response secondary industry.
+_PLACEHOLDER_BLANK_FIELDS = frozenset(
+    {
+        "address_line_1",
+        "address_line_2",
+        "city",
+        "state",
+        "region",
+        "country",
+        "zip",
+        "current_industry_secondary",
+    }
 )
 
 
@@ -479,9 +491,13 @@ def _map_row(
             spouse_byu_id = raw.strip()
             continue
 
-        # An address/location cell filled with a placeholder ("unknown", "n/a")
-        # means the location isn't known — store blank rather than the literal.
-        if field in _LOCATION_BLANK_FIELDS and raw.strip().lower() in _PLACEHOLDER_TOKENS:
+        # A free-text location / secondary-industry cell filled with a
+        # placeholder ("unknown", "n/a") isn't known — store blank, not the
+        # literal token.
+        if (
+            field in _PLACEHOLDER_BLANK_FIELDS
+            and raw.strip().lower() in _PLACEHOLDER_TOKENS
+        ):
             continue
 
         try:

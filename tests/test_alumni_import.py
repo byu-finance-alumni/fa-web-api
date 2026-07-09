@@ -346,15 +346,30 @@ def test_industry_placeholder_row_imports():
     assert row["error"] is None
 
 
-def test_secondary_industry_placeholder_maps_to_other():
+def test_secondary_industry_is_free_text():
+    # Secondary industry is open response — a value outside the controlled vocab
+    # is accepted and kept as-is (unlike the primary industry dropdown).
     csv = _csv_bytes(
         _row_values(
-            first_name="Jane", last_name="Doe", current_industry_secondary="n/a"
+            first_name="Jane", last_name="Doe", current_industry_secondary="Insurance"
+        )
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    report = _run(import_csv.evaluate(FakeSession(), rows))
+    assert report["rows"][0]["status"] != "rejected"
+    assert rows[0]["payload"]["career"]["current_industry_secondary"] == "Insurance"
+
+
+@pytest.mark.parametrize("token", ["unknown", "Unknown", "n/a", "N/A", "na"])
+def test_secondary_industry_placeholder_blanked(token):
+    csv = _csv_bytes(
+        _row_values(
+            first_name="Jane", last_name="Doe", current_industry_secondary=token
         )
     )
     rows, _ = import_csv.parse_and_map(csv)
     assert rows[0]["error"] is None
-    assert rows[0]["payload"]["career"]["current_industry_secondary"] == "Other"
+    assert "current_industry_secondary" not in rows[0]["payload"].get("career", {})
 
 
 @pytest.mark.parametrize("token", ["unknown", "Unknown", "n/a", "N/A", "na"])

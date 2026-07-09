@@ -534,9 +534,10 @@ class CareerCreate(_Section):
     current_zip: str | None = Field(default=None, max_length=20)
     seniority_level: str | None = Field(default=None, max_length=100)
 
-    @field_validator(
-        "current_industry", "current_industry_secondary", mode="before"
-    )
+    # Only the PRIMARY industry is a controlled dropdown. The secondary industry
+    # is free-text / open response (not restricted to the canonical list), so it
+    # is intentionally NOT validated against INDUSTRIES.
+    @field_validator("current_industry", mode="before")
     @classmethod
     def _validate_industry(cls, value: object) -> str | None:
         if value is not None and not isinstance(value, str):

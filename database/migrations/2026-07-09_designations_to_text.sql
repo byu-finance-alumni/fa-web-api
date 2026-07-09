@@ -9,6 +9,10 @@
 --
 -- Existing data converts: true -> the label ('CFP'/'CFA'/'CPA'), false -> NULL.
 --
+-- ORDER MATTERS: DROP NOT NULL must happen BEFORE the TYPE change, because the
+-- USING CASE produces NULLs for the false rows — converting the type while the
+-- column is still NOT NULL fails with "column ... contains null values".
+--
 -- SAFE TO RE-RUN: each column is guarded on data_type = 'boolean', so once a
 -- column has already been converted to varchar the block is skipped.
 -- =============================================================================
@@ -27,10 +31,10 @@ BEGIN
         ALTER TABLE alumni_program_engagement
             ALTER COLUMN cfp_designation DROP DEFAULT;
         ALTER TABLE alumni_program_engagement
+            ALTER COLUMN cfp_designation DROP NOT NULL;
+        ALTER TABLE alumni_program_engagement
             ALTER COLUMN cfp_designation TYPE varchar(100)
             USING (CASE WHEN cfp_designation THEN 'CFP' ELSE NULL END);
-        ALTER TABLE alumni_program_engagement
-            ALTER COLUMN cfp_designation DROP NOT NULL;
     END IF;
 END $$;
 
@@ -46,10 +50,10 @@ BEGIN
         ALTER TABLE alumni_program_engagement
             ALTER COLUMN cfa_designation DROP DEFAULT;
         ALTER TABLE alumni_program_engagement
+            ALTER COLUMN cfa_designation DROP NOT NULL;
+        ALTER TABLE alumni_program_engagement
             ALTER COLUMN cfa_designation TYPE varchar(100)
             USING (CASE WHEN cfa_designation THEN 'CFA' ELSE NULL END);
-        ALTER TABLE alumni_program_engagement
-            ALTER COLUMN cfa_designation DROP NOT NULL;
     END IF;
 END $$;
 
@@ -65,10 +69,10 @@ BEGIN
         ALTER TABLE alumni_program_engagement
             ALTER COLUMN cpa_designation DROP DEFAULT;
         ALTER TABLE alumni_program_engagement
+            ALTER COLUMN cpa_designation DROP NOT NULL;
+        ALTER TABLE alumni_program_engagement
             ALTER COLUMN cpa_designation TYPE varchar(100)
             USING (CASE WHEN cpa_designation THEN 'CPA' ELSE NULL END);
-        ALTER TABLE alumni_program_engagement
-            ALTER COLUMN cpa_designation DROP NOT NULL;
     END IF;
 END $$;
 

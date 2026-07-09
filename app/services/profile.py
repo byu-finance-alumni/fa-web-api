@@ -477,6 +477,9 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
                 "address_line_1": None,
                 "address_line_2": None,
                 "zip": None,
+                # best_contact holds the raw home/best phone-or-email value; the
+                # frontend hides it from view_only, so null it server-side too.
+                "best_contact": None,
             }
         )
         if profile.contact is not None
@@ -500,6 +503,10 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     return profile.model_copy(
         update={
             "alumni": minimize_alumni_read(profile.alumni, can_edit=False),
+            # Resolved name of the linked spouse's own record — spouse PII, so
+            # redact it for view_only (the raw spouse_first/last are already
+            # nulled via VIEW_ONLY_HIDDEN_FIELDS + spouse_alumni_id).
+            "spouse_alumni_name": None,
             "contact": contact,
             "interactions": interactions,
             "surveys": surveys,

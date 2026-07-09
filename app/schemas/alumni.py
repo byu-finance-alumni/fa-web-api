@@ -749,6 +749,17 @@ VIEW_ONLY_HIDDEN_FIELDS: frozenset[str] = frozenset(
         "spouse_first_name",
         "spouse_last_name",
         "spouse_birth_date",
+        # The addressable link to the spouse's own record (its resolved name is
+        # nulled separately in _minimize_profile_for_view_only).
+        "spouse_alumni_id",
+        # Demographic PII from the 2026-07-08 import fields — same sensitivity
+        # class as gender/birth_date above, so hidden from view_only. NOTE:
+        # employment_status + other_designations are intentionally NOT hidden
+        # (career/credential info, like employer/title/graduate_degree, which
+        # stay visible to view_only).
+        "citizenship",
+        "marital_status",
+        "home_country",
         # NOTE: this is the alumni record's import-provenance "Notes" column
         # (CSV intake), hidden from view_only. It is DISTINCT from the unified
         # CRM `notes` table (#39), whose engagement/interaction/event notes are

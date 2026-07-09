@@ -147,7 +147,12 @@ def _check_friend_import(errors: list[str]) -> None:
             f"[{surface}] friend headers {sorted(extra)} are not alumni columns — "
             f"the friend template must be a subset of the alumni columns."
         )
-    for banned in ("BYU ID (9 digits)", "Net ID", "Graduation year", "Graduation month"):
+    for banned in (
+        "BYU ID (9 digits)",
+        "Net ID",
+        "Graduation Year",
+        "Graduation Semester",
+    ):
         if banned in set(import_csv.FRIEND_EXPECTED_HEADERS):
             errors.append(
                 f"[{surface}] friend template unexpectedly includes alumni-only "

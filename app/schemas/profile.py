@@ -354,6 +354,10 @@ class ContactRead(_Orm):
     country: str | None = None
     region: str | None = None
     preferred_contact_method: str | None = None
+    # The literal best phone/email VALUE from the intake sheet (free text) —
+    # distinct from preferred_contact_method, which only names a method. Exposed
+    # so it round-trips onto the profile + edit form.
+    best_contact: str | None = None
 
 
 class CurrentCareerRead(_Orm):

@@ -450,7 +450,7 @@ def build_alumni_query(
             select(AlumniProgramEngagement.engagement_profile_id)
             .where(
                 AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
-                AlumniProgramEngagement.cfa_designation.is_(True),
+                AlumniProgramEngagement.cfa_designation.isnot(None),
             )
             .exists()
         )
@@ -460,7 +460,7 @@ def build_alumni_query(
             select(AlumniProgramEngagement.engagement_profile_id)
             .where(
                 AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
-                AlumniProgramEngagement.cpa_designation.is_(True),
+                AlumniProgramEngagement.cpa_designation.isnot(None),
             )
             .exists()
         )

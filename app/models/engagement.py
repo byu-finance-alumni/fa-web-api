@@ -88,15 +88,9 @@ class AlumniProgramEngagement(TimestampMixin, Base):
     piff_donor: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
-    cfp_designation: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("false")
-    )
-    cfa_designation: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("false")
-    )
-    cpa_designation: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("false")
-    )
+    cfp_designation: Mapped[str | None] = mapped_column(String(100))
+    cfa_designation: Mapped[str | None] = mapped_column(String(100))
+    cpa_designation: Mapped[str | None] = mapped_column(String(100))
     engagement_notes: Mapped[str | None] = mapped_column(Text)
 
 

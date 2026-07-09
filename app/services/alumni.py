@@ -165,7 +165,10 @@ async def filter_options(session: AsyncSession) -> dict:
     }
 
 # Nested write sections handled via related tables, not the alumni core row.
-SECTION_KEYS = frozenset({"contact", "career", "education", "engagement"})
+# former -> employment_history (a prior role); leadership -> finance_society_leadership.
+SECTION_KEYS = frozenset(
+    {"contact", "career", "education", "engagement", "former", "leadership"}
+)
 
 
 def _now() -> datetime.datetime:
@@ -355,6 +358,8 @@ async def create_alumni(
     career = getattr(payload, "career", None)
     education = getattr(payload, "education", None)
     engagement = getattr(payload, "engagement", None)
+    former = getattr(payload, "former", None)
+    leadership = getattr(payload, "leadership", None)
     if contact is not None and contact.has_values():
         session.add(
             AlumniContactInfo(
@@ -377,6 +382,22 @@ async def create_alumni(
         session.add(
             AlumniProgramEngagement(
                 alumni_id=alumnus.alumni_id, **cleaned.get("engagement", {})
+            )
+        )
+    # A prior role -> one employment_history row flagged is_current=False.
+    if former is not None and former.has_values():
+        session.add(
+            EmploymentHistory(
+                alumni_id=alumnus.alumni_id,
+                is_current=False,
+                **cleaned.get("former", {}),
+            )
+        )
+    # A student finance-society leadership role -> one leadership row.
+    if leadership is not None and leadership.has_values():
+        session.add(
+            FinanceSocietyLeadership(
+                alumni_id=alumnus.alumni_id, **cleaned.get("leadership", {})
             )
         )
 

@@ -39,8 +39,12 @@ from app.core.dropdowns import INDUSTRIES, validate_industry
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.donation import Donation
-from app.models.employment import CurrentEmployment, EducationHistory
-from app.models.engagement import AlumniProgramEngagement
+from app.models.employment import (
+    CurrentEmployment,
+    EducationHistory,
+    EmploymentHistory,
+)
+from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
 
 # Section keys used by the importers/exporter -> the model whose table columns
 # they must resolve against. ``import_csv`` uses "core"; ``alumni_export`` uses
@@ -52,6 +56,9 @@ SECTION_MODEL = {
     "career": CurrentEmployment,
     "education": EducationHistory,
     "engagement": AlumniProgramEngagement,
+    # A prior role -> employment_history; finance-society leadership row.
+    "former": EmploymentHistory,
+    "leadership": FinanceSocietyLeadership,
 }
 
 # Fields an importer payload carries that are intentionally NOT a direct column

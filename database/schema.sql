@@ -255,6 +255,10 @@ CREATE TABLE alumni_contact_info (
     -- Which contact method is flagged "preferred"; allowed values validated in
     -- the app layer (personal_email/work_email/phone/linkedin, or NULL = none).
     preferred_contact_method varchar(30),
+    -- The literal "best contact" value from the intake sheet (a phone or email
+    -- the alum flagged as best). Free text; distinct from preferred_contact_method
+    -- (which names a method, not a value). See migrations/2026-07-08_add_best_contact.sql.
+    best_contact    varchar(255),
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_alumni_contact_info_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,

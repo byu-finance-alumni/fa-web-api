@@ -51,17 +51,27 @@ _DEFAULT_OUT = (
 _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     # --- Identity ---
     ("BYU ID (9 digits)", "001000001"),
+    ("MSTID (from OneAccord)", "MST-000123"),
     ("Net ID", "jdoe1"),
     ("First name", "James"),
     ("Middle name", ""),
     ("Last name", "Doe"),
     ("Preferred first name", ""),
     ("Gender", "M"),
+    ("Citizenship", "USA"),
+    ("Marital status", "Married"),
+    ("Home country", "USA"),
+    ("Employment status", "Employed"),
     ("Birthday (YYYY-MM-DD)", "1990-03-15"),
     ("Graduation year", "2012"),
-    ("Graduation month", "4"),
+    # Graduation semester + Class of supersede the old Graduation month column.
+    ("Graduation semester", "Winter"),
+    ("Class of", "2012"),
     ("Finance program year", "2011"),
     ("Graduate degree", ""),
+    ("Other designations", "Series 7, Series 63"),
+    ("Filled out survey (YYYY-MM-DD)", "2026-01-15"),
+    ("Profile updated date (YYYY-MM-DD)", "2026-02-01"),
     ("LinkedIn URL", "https://linkedin.com/in/mock-jdoe"),
     ("Deceased? (Yes/No)", "No"),
     ("Notes", "Investment banking track."),
@@ -81,6 +91,7 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("ZIP", "10282"),
     ("Country", "USA"),
     ("Region", "Northeast"),
+    ("Best contact (phone or email)", "james.doe@example.com"),
     # --- Current career ---
     ("Current employer", "Goldman Sachs"),
     ("Current title", "Vice President"),
@@ -91,6 +102,10 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("Current country", "USA"),
     ("Current ZIP", ""),
     ("Seniority level", "Vice President"),
+    # --- Former (prior) role ---
+    ("Former company", "Morgan Stanley"),
+    ("Former title", "Analyst"),
+    ("Former industry", "Investment Banking"),
     # --- Education ---
     ("University", "Brigham Young University"),
     ("College", "Marriott School of Business"),
@@ -114,6 +129,8 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("CFP designation (Yes/No)", "No"),
     ("CFA designation (Yes/No)", "Yes"),
     ("Engagement notes", "Hosts NetTrek in NYC; active IB-track mentor."),
+    # --- Finance-society leadership ---
+    ("Finance leadership position", "Finance Society President"),
 ]
 
 # "Friends of the finance program" (#294) are non-alumni contacts
@@ -128,13 +145,18 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
 _FRIEND_EXCLUDED_HEADERS: frozenset[str] = frozenset(
     {
         "BYU ID (9 digits)",
+        # Alumni/OneAccord identity + academic + finance-society leadership are
+        # alumni-only, so they are dropped from the friend intake set too.
+        "MSTID (from OneAccord)",
         "Net ID",
         "Birthday (YYYY-MM-DD)",
         "Graduation year",
-        "Graduation month",
+        "Graduation semester",
+        "Class of",
         "Finance program year",
         "Graduate degree",
         "Deceased? (Yes/No)",
+        "Finance leadership position",
         "Spouse first name",
         "Spouse last name",
         "Spouse birthday (YYYY-MM-DD)",

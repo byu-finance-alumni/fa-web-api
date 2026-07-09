@@ -180,12 +180,30 @@ jobs:
         run: pip-audit -r requirements.txt
 
   # ---------------------------------------------------------------------------
-  # MIGRATION — applies pending database/migrations/*.sql to the PROD Supabase
-  # database (dev has its own database, migrated separately). Runs only on a push
-  # to prod (i.e. after a prod promotion merges) once the gating checks pass, and
-  # is held for manual approval by the `production` Environment's required
-  # reviewers. Skipped on pull_request events and on dev pushes.
+  # MIGRATION — applies pending database/migrations/*.sql to the Supabase DB that
+  # matches the branch pushed: a push to `dev` migrates the DEV database, a push
+  # to `prod` migrates the PROD database. Each job reads MIGRATIONS_DATABASE_URL
+  # from its matching GitHub Environment (dev / production), so the same secret
+  # name resolves to the correct database. Skipped on pull_request events.
+  #
+  # Set MIGRATIONS_DATABASE_URL on BOTH Environments (repo Settings →
+  # Environments) to that DB's session-pooler (:5432) connection string.
   # ---------------------------------------------------------------------------
+  migrate-dev:
+    name: Migrate database (dev)
+    if: github.event_name == 'push' && github.ref_name == 'dev'
+    needs: [lint, test, secret-scan]
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Apply pending migrations
+        env:
+          DATABASE_URL: ${{ secrets.MIGRATIONS_DATABASE_URL }}
+        run: bash database/migrate.sh
+
   migrate:
     name: Migrate database
     if: github.event_name == 'push' && github.ref_name == 'prod'
@@ -198,7 +216,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
       - name: Apply pending migrations
         env:
-          # Direct (non-pooled, port 5432) Supabase connection — set as a secret
-          # on the `production` Environment in repo Settings → Environments.
+          # Session-pooler (:5432) connection — set as a secret on the
+          # `production` Environment in repo Settings → Environments.
           DATABASE_URL: ${{ secrets.MIGRATIONS_DATABASE_URL }}
         run: bash database/migrate.sh

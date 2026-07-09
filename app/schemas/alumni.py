@@ -39,6 +39,15 @@ _NOTES_MAX = 10000
 _AFFILIATION_NAME_MAX = 255
 _AFFILIATION_TEXT_MAX = 10000
 
+# Survey / demographics + graduation-detail widths mirror database/schema.sql
+# (migrations/2026-07-08_add_alumni_survey_citizenship_grad_fields.sql).
+_CITIZENSHIP_MAX = 100
+_MARITAL_STATUS_MAX = 50
+_HOME_COUNTRY_MAX = 100
+_EMPLOYMENT_STATUS_MAX = 50
+_OTHER_DESIGNATIONS_MAX = 10000
+_GRADUATION_SEMESTER_MAX = 20
+
 # byu_id: no seed/mock data exists with a byu_id yet (checked database/ and
 # scripts/), so we enforce the canonical BYU NetID-card length of exactly 9
 # digits. If seeds later use 8 or 10, widen this to {8,10}.
@@ -98,8 +107,27 @@ class AlumniBase(BaseModel):
     birth_date: datetime.date | None = None
     graduation_year: int | None = None
     graduation_month: int | None = None
+    # Semester + graduating class supersede graduation_month in the API read
+    # schema; graduation_month + its validator stay for back-compat writes.
+    graduation_semester: str | None = Field(
+        default=None, max_length=_GRADUATION_SEMESTER_MAX
+    )
+    graduation_class: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    # Survey / demographics (all optional, nullable, additive). Free-text
+    # single-value fields; other_designations shares the generous notes-style cap.
+    citizenship: str | None = Field(default=None, max_length=_CITIZENSHIP_MAX)
+    marital_status: str | None = Field(default=None, max_length=_MARITAL_STATUS_MAX)
+    home_country: str | None = Field(default=None, max_length=_HOME_COUNTRY_MAX)
+    employment_status: str | None = Field(
+        default=None, max_length=_EMPLOYMENT_STATUS_MAX
+    )
+    other_designations: str | None = Field(
+        default=None, max_length=_OTHER_DESIGNATIONS_MAX
+    )
+    survey_completed_date: datetime.date | None = None
+    profile_updated_date: datetime.date | None = None
     # Secondary affiliation / education (#47, PRD section 6). All optional.
     mba_program: str | None = None
     law_school: str | None = None
@@ -208,7 +236,7 @@ class AlumniBase(BaseModel):
 
     # --- Years ---------------------------------------------------------------
 
-    @field_validator("graduation_year", "finance_program_year")
+    @field_validator("graduation_year", "finance_program_year", "graduation_class")
     @classmethod
     def _validate_year(cls, value: int | None) -> int | None:
         if value is None:
@@ -287,6 +315,32 @@ class AlumniBase(BaseModel):
             raise ValueError(
                 f"Must be at most {_GRADUATE_DEGREE_MAX} characters."
             )
+        return value
+
+    # --- Survey / demographics (additive, all optional) ----------------------
+
+    @field_validator(
+        "graduation_semester",
+        "citizenship",
+        "marital_status",
+        "home_country",
+        "employment_status",
+        "other_designations",
+        mode="before",
+    )
+    @classmethod
+    def _validate_survey_text(cls, value: object) -> str | None:
+        # Trim + normalize empty -> None; reject control chars. Length caps are
+        # enforced by each field's Field(max_length=...) after this runs.
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if _has_control_chars(value):
+            raise ValueError("Must not contain control characters.")
         return value
 
     # --- Secondary affiliation / education (#47) -----------------------------
@@ -445,6 +499,9 @@ class ContactCreate(_Section):
     country: str | None = Field(default=None, max_length=100)
     region: str | None = Field(default=None, max_length=100)
     preferred_contact_method: str | None = Field(default=None, max_length=30)
+    # The literal best phone/email VALUE from the intake sheet (free text) —
+    # distinct from preferred_contact_method, which only names a method.
+    best_contact: str | None = Field(default=None, max_length=255)
 
     @field_validator("preferred_contact_method")
     @classmethod
@@ -520,6 +577,36 @@ class EngagementCreate(_Section):
     engagement_notes: str | None = None
 
 
+class FormerCreate(_Section):
+    """A single PRIOR (non-current) role -> one ``employment_history`` row.
+
+    max_length mirrors database/schema.sql column widths (see ContactCreate).
+    The service persists this with ``is_current=False``.
+    """
+
+    employer_name: str | None = Field(default=None, max_length=255)
+    employment_title: str | None = Field(default=None, max_length=255)
+    employment_industry: str | None = Field(default=None, max_length=255)
+
+
+class LeadershipCreate(_Section):
+    """A student finance-society leadership role -> one
+    ``finance_society_leadership`` row. ``leadership_role`` is required on that
+    model; ``role_year`` is optional."""
+
+    leadership_role: str | None = Field(default=None, max_length=100)
+    role_year: int | None = None
+
+    @field_validator("role_year")
+    @classmethod
+    def _validate_role_year(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not (_YEAR_MIN <= value <= _YEAR_MAX):
+            raise ValueError(f"Must be between {_YEAR_MIN} and {_YEAR_MAX}.")
+        return value
+
+
 class AlumniCreateFull(AlumniCreate):
     """Create payload: required core fields plus optional nested sections.
 
@@ -532,6 +619,8 @@ class AlumniCreateFull(AlumniCreate):
     career: CareerCreate | None = None
     education: EducationCreate | None = None
     engagement: EngagementCreate | None = None
+    former: FormerCreate | None = None
+    leadership: LeadershipCreate | None = None
 
 
 class AlumniUpdateFull(AlumniUpdate):

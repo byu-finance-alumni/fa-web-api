@@ -75,17 +75,31 @@ MAX_IMPORT_ROWS = 2000
 _MAPPING: dict[str, tuple[str, str, str]] = {
     # --- Identity ---
     "BYU ID (9 digits)": ("core", "byu_id", "str"),
+    "MSTID (from OneAccord)": ("core", "mst_id", "str"),
     "Net ID": ("core", "net_id", "str"),
     "First name": ("core", "first_name", "str"),
     "Middle name": ("core", "middle_name", "str"),
     "Last name": ("core", "last_name", "str"),
     "Preferred first name": ("core", "preferred_first_name", "str"),
     "Gender": ("core", "gender", "str"),
+    "Citizenship": ("core", "citizenship", "str"),
+    "Marital status": ("core", "marital_status", "str"),
+    "Home country": ("core", "home_country", "str"),
+    "Employment status": ("core", "employment_status", "str"),
     "Birthday (YYYY-MM-DD)": ("core", "birth_date", "date"),
     "Graduation year": ("core", "graduation_year", "int"),
-    "Graduation month": ("core", "graduation_month", "int"),
+    # Graduation semester + class supersede the raw graduation month.
+    "Graduation semester": ("core", "graduation_semester", "str"),
+    "Class of": ("core", "graduation_class", "int"),
     "Finance program year": ("core", "finance_program_year", "int"),
     "Graduate degree": ("core", "graduate_degree", "str"),
+    "Other designations": ("core", "other_designations", "str"),
+    "Filled out survey (YYYY-MM-DD)": ("core", "survey_completed_date", "date"),
+    "Profile updated date (YYYY-MM-DD)": (
+        "core",
+        "profile_updated_date",
+        "date",
+    ),
     "LinkedIn URL": ("core", "linkedin_url", "str"),
     "Deceased? (Yes/No)": ("core", "deceased", "bool"),
     "Notes": ("core", "notes", "str"),
@@ -105,6 +119,7 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "ZIP": ("contact", "zip", "str"),
     "Country": ("contact", "country", "str"),
     "Region": ("contact", "region", "str"),
+    "Best contact (phone or email)": ("contact", "best_contact", "str"),
     # --- Current career ---
     "Current employer": ("career", "current_employer", "str"),
     "Current title": ("career", "current_title", "str"),
@@ -123,6 +138,10 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "Current country": ("career", "current_country", "str"),
     "Current ZIP": ("career", "current_zip", "str"),
     "Seniority level": ("career", "seniority_level", "str"),
+    # --- Former (prior) role -> employment_history ---
+    "Former company": ("former", "employer_name", "str"),
+    "Former title": ("former", "employment_title", "str"),
+    "Former industry": ("former", "employment_industry", "str"),
     # --- Education ---
     "University": ("education", "university", "str"),
     "College": ("education", "college", "str"),
@@ -182,6 +201,8 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "CFP designation (Yes/No)": ("engagement", "cfp_designation", "bool"),
     "CFA designation (Yes/No)": ("engagement", "cfa_designation", "bool"),
     "Engagement notes": ("engagement", "engagement_notes", "str"),
+    # --- Finance-society leadership -> finance_society_leadership ---
+    "Finance leadership position": ("leadership", "leadership_role", "str"),
 }
 
 # Ordered list of expected headers — same source + order as the xlsx Alumni

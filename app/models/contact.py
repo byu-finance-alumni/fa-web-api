@@ -38,3 +38,7 @@ class AlumniContactInfo(TimestampMixin, Base):
     # Which of this alum's contact methods is flagged "preferred" (or NULL for
     # none). Allowed values are validated at the app layer (see ContactCreate).
     preferred_contact_method: Mapped[str | None] = mapped_column(String(30))
+    # The literal "best contact" value from the intake sheet (a phone number or
+    # email the alum flagged as best). Stored verbatim as free text — distinct
+    # from preferred_contact_method, which only NAMES a method rather than a value.
+    best_contact: Mapped[str | None] = mapped_column(String(255))

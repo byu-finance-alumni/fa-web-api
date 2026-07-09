@@ -325,6 +325,24 @@ def test_invalid_industry_rejected():
     assert "industry" in row["error"].lower()
 
 
+@pytest.mark.parametrize("placeholder", ["unknown", "Unknown", "UNKNOWN", "n/a", "N/A", "na"])
+def test_industry_placeholder_maps_to_other(placeholder):
+    # Real intake sheets use these tokens for "no known industry" — map to Other
+    # instead of rejecting the row (import-only leniency).
+    assert import_csv._coerce_industry("Current industry", placeholder) == "Other"
+
+
+def test_industry_placeholder_row_imports():
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", current_industry="unknown")
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    report = _run(import_csv.evaluate(FakeSession(), rows))
+    row = report["rows"][0]
+    assert row["status"] != "rejected"
+    assert row["error"] is None
+
+
 def test_bad_date_rejected():
     csv = _csv_bytes(
         _row_values(first_name="Jane", last_name="Doe", birth_date="not a real date")

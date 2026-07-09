@@ -146,6 +146,12 @@ async def get_profile(
                 None,
             )
 
+    # Resolve the display name of the user who last manually updated this profile
+    # ("Profile updated by ...") for the hover label. None when unset/unknown.
+    profile_updated_by_name = await _actor_name(
+        session, alumnus.profile_updated_by_user_id
+    )
+
     contact = await session.scalar(
         select(AlumniContactInfo)
         .where(AlumniContactInfo.alumni_id == alumni_id)
@@ -301,7 +307,9 @@ async def get_profile(
             first_names[u.user_id] = u.first_name or None
 
     profile = ProfileRead(
-        alumni=AlumniRead.model_validate(alumnus),
+        alumni=AlumniRead.model_validate(alumnus).model_copy(
+            update={"profile_updated_by_name": profile_updated_by_name}
+        ),
         spouse_alumni_name=spouse_alumni_name,
         contact=ContactRead.model_validate(contact) if contact else None,
         current_career=CurrentCareerRead.model_validate(career) if career else None,

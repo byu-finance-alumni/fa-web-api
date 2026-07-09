@@ -567,9 +567,26 @@ class AlumniRead(BaseModel):
     birth_year: int | None = None
     birth_date: datetime.date | None = None
     graduation_year: int | None = None
-    graduation_month: int | None = None
+    # graduation_month is intentionally NOT exposed here anymore -- it is
+    # superseded by graduation_semester + graduation_class. The physical column
+    # remains on the model/table (dormant), just no longer in the API response.
+    graduation_semester: str | None = None
+    graduation_class: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    # Survey / demographics (nullable, additive).
+    citizenship: str | None = None
+    marital_status: str | None = None
+    home_country: str | None = None
+    employment_status: str | None = None
+    other_designations: str | None = None
+    survey_completed_date: datetime.date | None = None
+    # Manual-edit provenance ("Profile updated by ..."). profile_updated_by_name
+    # is the updater's resolved "First Last" for the hover; it is NOT a model
+    # column -- it is populated by the profile service via a join on
+    # profile_updated_by_user_id, so it defaults to None on plain reads.
+    profile_updated_date: datetime.date | None = None
+    profile_updated_by_name: str | None = None
     mba_program: str | None = None
     law_school: str | None = None
     medical_school: str | None = None

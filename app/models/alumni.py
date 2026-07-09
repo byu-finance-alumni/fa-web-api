@@ -53,9 +53,39 @@ class Alumni(TimestampMixin, Base):
     birth_year: Mapped[int | None] = mapped_column(Integer)
     birth_date: Mapped[datetime.date | None] = mapped_column(Date)
     graduation_year: Mapped[int | None] = mapped_column(Integer)
+    # graduation_month is retained physically but no longer exposed in the API
+    # read schema (superseded by graduation_semester + graduation_class below).
     graduation_month: Mapped[int | None] = mapped_column(Integer)
+    # Semester + graduating class replace the raw month in the API surface.
+    # graduation_semester is one of Fall / Winter / Spring / Summer; the
+    # graduation_class is the graduating cohort/class, which is DISTINCT from
+    # graduation_year (they usually match but need not).
+    graduation_semester: Mapped[str | None] = mapped_column(String(20))
+    graduation_class: Mapped[int | None] = mapped_column(Integer)
     finance_program_year: Mapped[int | None] = mapped_column(Integer)
     graduate_degree: Mapped[str | None] = mapped_column(String(100))
+
+    # Survey / demographics captured on the alumni survey. All optional/nullable
+    # additive fields. Short single-value fields are varchar; other_designations
+    # is free-text (multiple designations, e.g. "Series 7, Series 63").
+    # home_country is the country of ORIGIN (distinct from the current-address
+    # country on the contact record). employment_status is person-level status
+    # (Employed / Unemployed / Retired / Student / Seeking, ...).
+    citizenship: Mapped[str | None] = mapped_column(String(100))
+    marital_status: Mapped[str | None] = mapped_column(String(50))
+    home_country: Mapped[str | None] = mapped_column(String(100))
+    employment_status: Mapped[str | None] = mapped_column(String(50))
+    other_designations: Mapped[str | None] = mapped_column(Text)
+    survey_completed_date: Mapped[datetime.date | None] = mapped_column(Date)
+
+    # Manual-edit provenance for the profile ("Profile updated by Amy"): the date
+    # of the last manual profile update and the user who made it. The FK points
+    # to users.user_id ON DELETE SET NULL, mirroring the spouse_alumni_id pattern
+    # so deleting the updater just clears the pointer.
+    profile_updated_date: Mapped[datetime.date | None] = mapped_column(Date)
+    profile_updated_by_user_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("users.user_id", ondelete="SET NULL")
+    )
 
     # Secondary affiliation / education (#47, PRD section 6). All optional/
     # nullable additive fields that extend the alumni record beyond the core

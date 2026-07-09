@@ -309,7 +309,15 @@ def _coerce_date(header: str, raw: str) -> str:
     )
 
 
+# Import-only: real intake sheets use these placeholder tokens to mean "no known
+# industry". Map them to the catch-all "Other" instead of rejecting the row. The
+# manual create/edit form stays strict — this leniency is import-only.
+_INDUSTRY_PLACEHOLDERS = frozenset({"unknown", "n/a", "na"})
+
+
 def _coerce_industry(header: str, raw: str) -> str:
+    if raw.strip().lower() in _INDUSTRY_PLACEHOLDERS:
+        return "Other"
     try:
         validated = validate_industry(raw)
     except ValueError as exc:

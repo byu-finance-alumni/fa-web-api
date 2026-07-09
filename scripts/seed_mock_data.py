@@ -475,6 +475,7 @@ def _generate_records(start_index: int) -> tuple[list[dict], dict[str, dict]]:
             "gender": gender,
             "birth_date": birth_date,
             "graduation_year": grad_year,
+            "graduation_month": rng.choice((4, 8, 12)),
             "finance_program_year": finance_year,
             "is_alumni": is_alumni,
             "linkedin_url": f"https://www.linkedin.com/in/mock-{net_id}",

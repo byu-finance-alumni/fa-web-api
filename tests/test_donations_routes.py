@@ -411,12 +411,13 @@ def test_update_donation_rejects_year_9999(client):
     assert response.status_code == 422
 
 
-# --- H4: donation delete (full_access and up, audited, 204) --------------------
+# --- donation delete (donations.manage: super_admin / engineer, audited, 204) --
 
 
-@pytest.mark.parametrize("role", ["view_only", "student"])
-def test_delete_donation_forbidden_below_full_access(client, role):
-    # DELETE is gated to the full_access admin tier — view_only / student are 403.
+@pytest.mark.parametrize("role", ["view_only", "student", "full_access"])
+def test_delete_donation_forbidden_below_donations_manage(client, role):
+    # DELETE is gated to the donations.manage tier (super_admin / engineer),
+    # matching add / update — view_only / student / full_access are 403.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     response = client.delete("/donations/5")
     assert response.status_code == 403
@@ -428,7 +429,7 @@ def test_delete_donation_requires_auth(client):
 
 
 def test_delete_donation_missing_is_404(client):
-    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("super_admin")
     app.dependency_overrides[get_session] = _with_session(
         _SeqSession(get_obj=None)
     )
@@ -436,10 +437,10 @@ def test_delete_donation_missing_is_404(client):
     assert response.status_code == 404
 
 
-@pytest.mark.parametrize("role", ["full_access", "super_admin"])
+@pytest.mark.parametrize("role", ["super_admin", "engineer"])
 def test_delete_donation_succeeds_and_audits(client, role):
-    # full_access (and up) may delete; the row is removed, an audit entry is
-    # written (FERPA trail), and the response is a bare 204.
+    # donations.manage (super_admin / engineer) may delete; the row is removed,
+    # an audit entry is written (FERPA trail), and the response is a bare 204.
     donation = _donation(5, 2026, 4, 250, notes="memo")
     session = _SeqSession(get_obj=donation)
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)

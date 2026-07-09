@@ -33,19 +33,37 @@ def _row_values(**overrides) -> list[str]:
         "byu_id": "BYU ID (9 digits)",
         "net_id": "Net ID",
         "first_name": "First name",
-        "last_name": "Last name",
-        "graduation_year": "Graduation year",
+        "last_name": "Last Name",
+        "graduation_year": "Graduation Year",
         "birth_date": "Birthday (YYYY-MM-DD)",
-        "personal_email": "Personal email",
+        "personal_email": "Personal Email",
         "current_employer": "Current employer",
         "current_industry": "Current industry (see Reference sheet)",
         "deceased": "Deceased? (Yes/No)",
         "mentor_willing": "Willing to mentor (Yes/No)",
-        "spouse_byu_id": "Spouse BYU ID (if also an alumnus)",
     }
     for field, value in overrides.items():
         values[by_field[field]] = value
     return [values[h] for h in HEADERS]
+
+
+FRIEND_HEADERS = import_csv.FRIEND_EXPECTED_HEADERS
+
+
+def _friend_row_values(**overrides) -> list[str]:
+    """A blank FRIEND row keyed by field name -> friend-template header."""
+    values = {h: "" for h in FRIEND_HEADERS}
+    by_field = {
+        "first_name": "First name",
+        "last_name": "Last Name",
+        "gender": "Gender",
+        "personal_email": "Personal Email",
+        "current_employer": "Current employer",
+        "mentor_willing": "Willing to mentor (Yes/No)",
+    }
+    for field, value in overrides.items():
+        values[by_field[field]] = value
+    return [values[h] for h in FRIEND_HEADERS]
 
 
 def _csv_bytes(*rows: list[str], headers: list[str] | None = None) -> bytes:
@@ -382,25 +400,6 @@ def test_fuzzy_duplicate_within_file_warns():
     assert "possible_duplicate_in_file" in codes
 
 
-# --- Spouse link: unresolved -> warning, still importable --------------------
-
-
-def test_unresolved_spouse_warns_but_imports():
-    # spouse scalar resolve returns None (not found).
-    session = FakeSession(scalars=[None])
-    csv = _csv_bytes(
-        _row_values(
-            first_name="Jane", last_name="Doe", spouse_byu_id="999999999"
-        )
-    )
-    rows, _ = import_csv.parse_and_map(csv)
-    report = _run(import_csv.evaluate(session, rows))
-    row = report["rows"][0]
-    assert row["status"] == "importable"
-    codes = {w["code"] for w in row["warnings"]}
-    assert "spouse_not_found" in codes
-
-
 # --- commit_import: imports importable, skips rejects ------------------------
 
 
@@ -483,6 +482,83 @@ def test_commit_import_no_importable_does_not_commit():
 
 
 # --- Template endpoint content ----------------------------------------------
+
+
+FINALIZED_64_HEADERS = [
+    "Filled out Survey",
+    "MSTID (from OneAccord)",
+    "BYU ID (9 digits)",
+    "Net ID",
+    "Preferred first name",
+    "First name",
+    "Middle name",
+    "Last Name",
+    "Gender",
+    "Personal Email",
+    "Birthday (YYYY-MM-DD)",
+    "Graduation Semester",
+    "Graduation Year",
+    "Class of",
+    "LinkedIn URL",
+    "Finance program admitted year",
+    "Employment Status",
+    "Profile Updated By",
+    "Profile Updated Date",
+    "Finance Leadership Position",
+    "Graduate degree",
+    "Deceased? (Yes/No)",
+    "Notes",
+    "Citizenship",
+    "Marital Status",
+    "Spouse First Name",
+    "Spouse Last Name",
+    "Phone #",
+    "Current employer",
+    "Current title",
+    "Current industry (see Reference sheet)",
+    "Secondary industry (see Reference sheet)",
+    "Work Email",
+    "Address line 1",
+    "Address line 2",
+    "Current city",
+    "Current state",
+    "Region (Northeast, Southeast, Midwest, Southwest, and West)",
+    "Current country",
+    "Current ZIP",
+    "Home country",
+    "Degree",
+    "Major",
+    "Degree status",
+    "Degree year",
+    "Former Company",
+    "Former Title",
+    "Former Industry",
+    "Willing to host NetTrek (Yes/No)",
+    "Willing to attend finance conference (Yes/No)",
+    "Willing to mentor (Yes/No)",
+    "Willing to sponsor company event (Yes/No)",
+    "Willing to guest speak (Yes/No)",
+    "Willing to help at events (Yes/No)",
+    "Willing to host case competition (yes/no)",
+    "Willing to mentor — Women in Finance (Yes/No)",
+    "Hired a finance intern (Yes/No)",
+    "Hired finance full-time (Yes/No)",
+    "Willing to be a PIFF donor (Yes/No)",
+    "CFP designation (Yes/No)",
+    "CFA designation (Yes/No)",
+    "Other Designations:",
+    "Engagement notes",
+    "Best Contact",
+]
+
+
+def test_expected_headers_are_the_finalized_64_in_order():
+    # The intake template's EXPECTED_HEADERS must equal the finalized 64-column
+    # set VERBATIM and in order (header validation is exact-match both ways).
+    assert import_csv.EXPECTED_HEADERS == FINALIZED_64_HEADERS
+    assert len(import_csv.EXPECTED_HEADERS) == 64
+    # Every header is a mapping key (and vice-versa).
+    assert set(import_csv._MAPPING) == set(FINALIZED_64_HEADERS)
 
 
 def test_template_csv_has_expected_headers():
@@ -621,4 +697,106 @@ def test_route_template_download():
     assert resp.headers["content-type"].startswith("text/csv")
     assert "alumni_import_template.csv" in resp.headers["content-disposition"]
     first_line = resp.text.splitlines()[0]
-    assert first_line.startswith("BYU ID (9 digits)")
+    assert first_line.startswith("Filled out Survey")
+
+
+# --- Friend (non-alumni contact) import (#294) -------------------------------
+
+
+def test_friend_template_excludes_academic_and_identity_fields():
+    csv_text = import_csv.build_template_csv(friend=True)
+    header_line = csv_text.splitlines()[0]
+    headers = header_line.split(",")
+    # Includes the friend-relevant columns...
+    assert "First name" in headers
+    assert "Last Name" in headers
+    assert "Current employer" in headers
+    assert "Personal Email" in headers
+    assert "Willing to mentor (Yes/No)" in headers
+    assert "Willing to be a PIFF donor (Yes/No)" in headers
+    # ...and excludes the alumni-only academic / identity fields.
+    for banned in (
+        "BYU ID (9 digits)",
+        "Net ID",
+        "Graduation Year",
+        "Graduation Semester",
+        "Class of",
+        "Finance program admitted year",
+        "Graduate degree",
+        "Degree year",
+        "Spouse First Name",
+    ):
+        assert banned not in headers
+
+
+def test_friend_row_commits_with_is_alumni_false():
+    csv = _csv_bytes(
+        _friend_row_values(
+            first_name="Rick",
+            last_name="Recruiter",
+            current_employer="Acme Capital",
+            personal_email="rick@acme.example.com",
+        ),
+        headers=FRIEND_HEADERS,
+    )
+    rows, errors = import_csv.parse_and_map(csv, friend=True)
+    assert errors == []
+    # The mapped payload carries the is_alumni=False stamp.
+    assert rows[0]["payload"]["is_alumni"] is False
+    session = FakeSession()
+    result = _run(import_csv.commit_import(session, rows))
+    assert result["imported"] == 1
+    # The persisted Alumni row is a friend.
+    created = [o for o in session.added if hasattr(o, "is_alumni")]
+    assert len(created) == 1
+    assert created[0].is_alumni is False
+    assert created[0].first_name == "Rick"
+
+
+def test_alumni_import_row_defaults_is_alumni_unset():
+    # A normal (non-friend) import must NOT stamp is_alumni, so the model default
+    # (True) / DB server_default applies.
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", graduation_year="2018")
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert "is_alumni" not in rows[0]["payload"]
+
+
+def test_friend_headers_reject_alumni_only_columns():
+    # Feeding a friend import the FULL alumni template must fail header validation
+    # (the academic columns are "unexpected" for the friend surface).
+    csv = _csv_bytes(_row_values(first_name="Jane", last_name="Doe"))
+    rows, errors = import_csv.parse_and_map(csv, friend=True)
+    assert rows == []
+    assert any("Unexpected column" in e for e in errors)
+
+
+def test_route_friend_template_download():
+    with _full_access_client(FakeSession()) as c:
+        resp = c.get("/alumni/import/template", params={"kind": "friend"})
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert "friend_import_template.csv" in resp.headers["content-disposition"]
+    first_line = resp.text.splitlines()[0]
+    assert first_line.startswith("Filled out Survey")
+    assert "BYU ID (9 digits)" not in first_line
+
+
+def test_route_friend_import_kind_routes_and_flags_friend():
+    csv = _csv_bytes(
+        _friend_row_values(first_name="Rick", last_name="Recruiter"),
+        headers=FRIEND_HEADERS,
+    )
+    session = FakeSession()
+    with _full_access_client(session) as c:
+        resp = c.post(
+            "/alumni/import",
+            params={"kind": "friend"},
+            files={"file": ("friends.csv", csv, "text/csv")},
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json()["imported"] == 1
+    created = [o for o in session.added if hasattr(o, "is_alumni")]
+    assert created and created[0].is_alumni is False

@@ -48,72 +48,122 @@ _DEFAULT_OUT = (
 # Each sheet: (name, [(header, example_value), ...]). The example row mirrors the
 # fully-populated mock records so staff can see the expected format.
 
+# The finalized 64-column alumni intake set. Order + EXACT header text are the
+# contract: import_csv.EXPECTED_HEADERS is derived from these headers and header
+# validation is exact-match both ways, so any edit here must match the importer's
+# _MAPPING keys verbatim (capitalization, punctuation, the parenthetical on
+# Region, the trailing colon on "Other Designations:", the "#" on "Phone #", and
+# the em-dash in the Women-in-Finance header).
 _ALUMNI_COLUMNS: list[tuple[str, str]] = [
-    # --- Identity ---
+    ("Filled out Survey", "2026-01-15"),
+    ("MSTID (from OneAccord)", "MST-000123"),
     ("BYU ID (9 digits)", "001000001"),
     ("Net ID", "jdoe1"),
+    ("Preferred first name", ""),
     ("First name", "James"),
     ("Middle name", ""),
-    ("Last name", "Doe"),
-    ("Preferred first name", ""),
+    ("Last Name", "Doe"),
     ("Gender", "M"),
+    ("Personal Email", "james.doe@example.com"),
     ("Birthday (YYYY-MM-DD)", "1990-03-15"),
-    ("Graduation year", "2012"),
-    ("Finance program year", "2011"),
-    ("Graduate degree", ""),
+    ("Graduation Semester", "Winter"),
+    ("Graduation Year", "2012"),
+    ("Class of", "2012"),
     ("LinkedIn URL", "https://linkedin.com/in/mock-jdoe"),
+    ("Finance program admitted year", "2011"),
+    ("Employment Status", "Employed"),
+    ("Profile Updated By", "Amy Adams"),
+    ("Profile Updated Date", "2026-02-01"),
+    ("Finance Leadership Position", "Finance Society President"),
+    ("Graduate degree", ""),
     ("Deceased? (Yes/No)", "No"),
     ("Notes", "Investment banking track."),
-    # --- Spouse ---
-    ("Spouse first name", "Ava"),
-    ("Spouse last name", "Lee"),
-    ("Spouse birthday (YYYY-MM-DD)", "1993-07-22"),
-    ("Spouse BYU ID (if also an alumnus)", "001000002"),
-    # --- Contact ---
-    ("Personal email", "james.doe@example.com"),
-    ("Work email", "jdoe@goldmansachs.com"),
-    ("Phone", "+1 (212) 555-0142"),
-    ("Address line 1", "200 West St"),
-    ("Address line 2", ""),
-    ("City", "New York"),
-    ("State", "NY"),
-    ("ZIP", "10282"),
-    ("Country", "USA"),
-    ("Region", "Northeast"),
-    # --- Current career ---
+    ("Citizenship", "USA"),
+    ("Marital Status", "Married"),
+    ("Spouse First Name", "Ava"),
+    ("Spouse Last Name", "Lee"),
+    ("Phone #", "+1 (212) 555-0142"),
     ("Current employer", "Goldman Sachs"),
     ("Current title", "Vice President"),
     ("Current industry (see Reference sheet)", "Investment Banking"),
     ("Secondary industry (see Reference sheet)", "Private Equity"),
+    ("Work Email", "jdoe@goldmansachs.com"),
+    ("Address line 1", "200 West St"),
+    ("Address line 2", ""),
     ("Current city", "New York"),
     ("Current state", "NY"),
+    ("Region (Northeast, Southeast, Midwest, Southwest, and West)", "Northeast"),
     ("Current country", "USA"),
-    ("Current ZIP", ""),
-    ("Seniority level", "Vice President"),
-    # --- Education ---
-    ("University", "Brigham Young University"),
-    ("College", "Marriott School of Business"),
-    ("Department", "Finance"),
+    ("Current ZIP", "10282"),
+    ("Home country", "USA"),
     ("Degree", "BS"),
     ("Major", "Finance"),
     ("Degree status", "Completed"),
     ("Degree year", "2012"),
-    # --- Program engagement (Yes/No unless noted) ---
+    ("Former Company", "Morgan Stanley"),
+    ("Former Title", "Analyst"),
+    ("Former Industry", "Investment Banking"),
     ("Willing to host NetTrek (Yes/No)", "Yes"),
     ("Willing to attend finance conference (Yes/No)", "Yes"),
     ("Willing to mentor (Yes/No)", "Yes"),
     ("Willing to sponsor company event (Yes/No)", "No"),
     ("Willing to guest speak (Yes/No)", "Yes"),
     ("Willing to help at events (Yes/No)", "No"),
-    ("Willing to host case competition (Yes/No)", "No"),
+    ("Willing to host case competition (yes/no)", "No"),
     ("Willing to mentor — Women in Finance (Yes/No)", "No"),
     ("Hired a finance intern (Yes/No)", "Yes"),
     ("Hired finance full-time (Yes/No)", "No"),
-    ("PIFF donor (Yes/No)", "Yes"),
+    ("Willing to be a PIFF donor (Yes/No)", "Yes"),
     ("CFP designation (Yes/No)", "No"),
     ("CFA designation (Yes/No)", "Yes"),
+    ("Other Designations:", "Series 7, Series 63"),
     ("Engagement notes", "Hosts NetTrek in NYC; active IB-track mentor."),
+    ("Best Contact", "james.doe@example.com"),
 ]
+
+# "Friends of the finance program" (#294) are non-alumni contacts
+# (``is_alumni = false``) imported through the SAME pipeline as alumni. Their
+# intake template is a CURATED SUBSET of the alumni columns: a friend's identity
+# is satisfied by name alone, so the alumni-only academic fields (BYU ID / Net
+# ID, graduation year/month, finance program year, graduate degree, and the whole
+# education block) plus the spouse-link fields are dropped. The contact, current
+# employment, and program-engagement columns are kept — a "friend" (e.g. a
+# recruiter or employer partner) still has an employer, contact info, and can be
+# willing to host events / hire / be a PIFF donor.
+_FRIEND_EXCLUDED_HEADERS: frozenset[str] = frozenset(
+    {
+        # Alumni/OneAccord identity + academic + finance-society leadership are
+        # alumni-only, so they are dropped from the friend intake set too. Header
+        # text matches the finalized 64-column set exactly.
+        "MSTID (from OneAccord)",
+        "BYU ID (9 digits)",
+        "Net ID",
+        "Birthday (YYYY-MM-DD)",
+        "Graduation Semester",
+        "Graduation Year",
+        "Class of",
+        "Finance program admitted year",
+        "Finance Leadership Position",
+        "Graduate degree",
+        "Deceased? (Yes/No)",
+        "Spouse First Name",
+        "Spouse Last Name",
+        "Degree",
+        "Major",
+        "Degree status",
+        "Degree year",
+    }
+)
+
+_FRIEND_COLUMNS: list[tuple[str, str]] = [
+    col for col in _ALUMNI_COLUMNS if col[0] not in _FRIEND_EXCLUDED_HEADERS
+]
+
+
+def friend_columns() -> list[tuple[str, str]]:
+    """The curated friend intake columns (header, example), in template order."""
+    return list(_FRIEND_COLUMNS)
+
 
 _EVENT_COLUMNS: list[tuple[str, str]] = [
     ("Event name", "Spring NetTrek"),
@@ -151,10 +201,10 @@ _REFERENCE_ROWS: list[list[str]] = [
         ", ".join(_ATTENDANCE_STATUSES),
     ],
     ["All Yes/No columns", "Enter Yes or No"],
-    ["All date columns (birthdays, event date)", "Format YYYY-MM-DD, e.g. 1990-03-15"],
-    ["Birthday, Spouse birthday", "A real date in the past (1900 or later)"],
+    ["All date columns (birthday, event date)", "Format YYYY-MM-DD, e.g. 1990-03-15"],
+    ["Birthday (YYYY-MM-DD)", "A real date in the past (1900 or later)"],
     [
-        "Graduation year, Finance program year, Degree year",
+        "Graduation Year, Finance program admitted year, Degree year",
         f"4-digit year between 1950 and {_MAX_YEAR}",
     ],
     ["BYU ID, Attendee BYU ID", "Exactly 9 digits, e.g. 001000001"],
@@ -162,11 +212,6 @@ _REFERENCE_ROWS: list[list[str]] = [
     [
         "LinkedIn URL",
         "Full https://www.linkedin.com/... URL (must be a linkedin.com address)",
-    ],
-    [
-        "Spouse BYU ID (if also an alumnus)",
-        "Leave blank unless the spouse is ALSO in this database; "
-        "then enter their 9-digit BYU ID to link the two records.",
     ],
     [
         "Event name (Event attendance sheet)",

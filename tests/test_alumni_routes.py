@@ -373,6 +373,33 @@ def test_create_persists_and_returns_secondary_affiliation():
     assert body["secondary_employment"] == "Adjunct professor"
 
 
+def test_create_persists_preferred_contact_method():
+    # #301: POST /alumni with a contact section that flags preferred_contact_method
+    # writes it onto the AlumniContactInfo row (via **cleaned.get("contact")).
+    session = _FakeSession(scalars=[])
+    with _full_access_client(session) as c:
+        resp = c.post(
+            "/alumni",
+            json={
+                "last_name": "Doe",
+                "contact": {
+                    "personal_email": "jane@x.com",
+                    "preferred_contact_method": "phone",
+                },
+            },
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 201
+    # The contact row is added alongside the Alumni row; find it by attribute.
+    contact_written = next(
+        row
+        for row in session.added
+        if hasattr(row, "preferred_contact_method")
+    )
+    assert contact_written.preferred_contact_method == "phone"
+    assert contact_written.personal_email == "jane@x.com"
+
+
 def test_update_preview_excludes_self_from_dup_detection():
     # Updating alum 5's byu_id to a value: the only DB row with that id is alum
     # 5 itself, which the query excludes -> no blocker. get_alumni returns the

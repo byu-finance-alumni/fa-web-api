@@ -378,17 +378,17 @@ async def update_donation(
 @router.delete("/{donation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_donation(
     donation_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireDonationsManage,
     session: SessionDep,
 ) -> Response:
-    """Delete a donation (full_access and up). 404 if unknown. Audits the write
-    (entity_type "donation", action "delete") with the actor's user id — the
-    DB trigger snapshots the actor email for the FERPA trail. Returns 204.
+    """Delete a donation (donations.manage tier: super_admin / engineer). 404 if
+    unknown. Audits the write (entity_type "donation", action "delete") with the
+    actor's user id — the DB trigger snapshots the actor email for the FERPA
+    trail. Returns 204.
 
-    Gated to the ``alumni.full`` admin tier (full_access / super_admin /
-    engineer), matching the other destructive data-management writes (event
-    delete, alumni archive). Broadened from the original super_admin-only gate
-    during QA hardening (H4)."""
+    Gated to the ``donations.manage`` tier (super_admin / engineer), matching the
+    other donation writes (add / update). Tightened back from the temporary
+    ``alumni.full`` gate so full_access can no longer delete donations."""
     donation = await session.get(Donation, donation_id)
     if donation is None:
         raise NotFoundError(f"Donation {donation_id} not found.")

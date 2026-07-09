@@ -143,3 +143,32 @@ async def deactivate_vocabulary_term(
     await session.commit()
     await session.refresh(term)
     return VocabularyTermRead.model_validate(term)
+
+
+@admin_router.delete(
+    "/{term_id}/permanent", status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_vocabulary_term(
+    term_id: IdPath, actor: RequireVocabAdmin, session: SessionDep
+) -> Response:
+    """Permanently remove a term (hard delete), unlike the soft-delete DELETE
+    above. Existing records that already stored this value keep it — only the
+    managed option is removed, so it no longer appears in any admin list or
+    dropdown and cannot be restored. Writes an audit row. 404 if missing."""
+    term = await service.get_term(session, term_id)
+    # Snapshot for the audit row before the row is deleted (attributes are
+    # expired after commit).
+    category, value, entity_id = term.category, term.value, term.term_id
+    await service.delete_term(session, term_id)
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="delete_vocab",
+            entity_type="vocabulary",
+            entity_id=entity_id,
+            field_name=category,
+            old_value=value,
+        )
+    )
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -39,6 +39,16 @@ _NOTES_MAX = 10000
 _AFFILIATION_NAME_MAX = 255
 _AFFILIATION_TEXT_MAX = 10000
 
+# Survey / demographics + graduation-detail widths mirror database/schema.sql
+# (migrations/2026-07-08_add_alumni_survey_citizenship_grad_fields.sql).
+_CITIZENSHIP_MAX = 100
+_MARITAL_STATUS_MAX = 50
+_HOME_COUNTRY_MAX = 100
+_EMPLOYMENT_STATUS_MAX = 50
+_OTHER_DESIGNATIONS_MAX = 10000
+_GRADUATION_SEMESTER_MAX = 20
+_PROFILE_UPDATED_BY_MAX = 200
+
 # byu_id: no seed/mock data exists with a byu_id yet (checked database/ and
 # scripts/), so we enforce the canonical BYU NetID-card length of exactly 9
 # digits. If seeds later use 8 or 10, widen this to {8,10}.
@@ -47,6 +57,13 @@ _NET_ID_RE = re.compile(r"^[a-z0-9]{2,12}$")
 
 _YEAR_MIN = 1950
 _YEAR_MAX = datetime.date.today().year + 10
+
+# Which contact method an alum flags as "preferred". A single nullable string on
+# the contact record naming WHICH method is preferred (NULL/empty = none). Kept
+# in sync with the frontend star affordance; validated once via this set below.
+_PREFERRED_CONTACT_METHODS = frozenset(
+    {"personal_email", "work_email", "phone", "linkedin"}
+)
 
 # Birthdays: anyone in an alumni database was plausibly born no earlier than
 # 1900; a birth date can't be in the future. Same bounds apply to a spouse.
@@ -90,8 +107,33 @@ class AlumniBase(BaseModel):
     birth_year: int | None = None
     birth_date: datetime.date | None = None
     graduation_year: int | None = None
+    graduation_month: int | None = None
+    # Semester + graduating class supersede graduation_month in the API read
+    # schema; graduation_month + its validator stay for back-compat writes.
+    graduation_semester: str | None = Field(
+        default=None, max_length=_GRADUATION_SEMESTER_MAX
+    )
+    graduation_class: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    # Survey / demographics (all optional, nullable, additive). Free-text
+    # single-value fields; other_designations shares the generous notes-style cap.
+    citizenship: str | None = Field(default=None, max_length=_CITIZENSHIP_MAX)
+    marital_status: str | None = Field(default=None, max_length=_MARITAL_STATUS_MAX)
+    home_country: str | None = Field(default=None, max_length=_HOME_COUNTRY_MAX)
+    employment_status: str | None = Field(
+        default=None, max_length=_EMPLOYMENT_STATUS_MAX
+    )
+    other_designations: str | None = Field(
+        default=None, max_length=_OTHER_DESIGNATIONS_MAX
+    )
+    survey_completed_date: datetime.date | None = None
+    profile_updated_date: datetime.date | None = None
+    # Free-text "updated by" NAME from the intake sheet (as typed). DISTINCT from
+    # the profile_updated_by_user_id FK (set by the service, never the client).
+    profile_updated_by: str | None = Field(
+        default=None, max_length=_PROFILE_UPDATED_BY_MAX
+    )
     # Secondary affiliation / education (#47, PRD section 6). All optional.
     mba_program: str | None = None
     law_school: str | None = None
@@ -200,13 +242,22 @@ class AlumniBase(BaseModel):
 
     # --- Years ---------------------------------------------------------------
 
-    @field_validator("graduation_year", "finance_program_year")
+    @field_validator("graduation_year", "finance_program_year", "graduation_class")
     @classmethod
     def _validate_year(cls, value: int | None) -> int | None:
         if value is None:
             return None
         if not (_YEAR_MIN <= value <= _YEAR_MAX):
             raise ValueError(f"Must be between {_YEAR_MIN} and {_YEAR_MAX}.")
+        return value
+
+    @field_validator("graduation_month")
+    @classmethod
+    def _validate_grad_month(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not (1 <= value <= 12):
+            raise ValueError("Must be between 1 and 12.")
         return value
 
     # --- Birthdays -----------------------------------------------------------
@@ -270,6 +321,33 @@ class AlumniBase(BaseModel):
             raise ValueError(
                 f"Must be at most {_GRADUATE_DEGREE_MAX} characters."
             )
+        return value
+
+    # --- Survey / demographics (additive, all optional) ----------------------
+
+    @field_validator(
+        "graduation_semester",
+        "citizenship",
+        "marital_status",
+        "home_country",
+        "employment_status",
+        "other_designations",
+        "profile_updated_by",
+        mode="before",
+    )
+    @classmethod
+    def _validate_survey_text(cls, value: object) -> str | None:
+        # Trim + normalize empty -> None; reject control chars. Length caps are
+        # enforced by each field's Field(max_length=...) after this runs.
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Must be a string.")
+        value = _empty_to_none(value)
+        if value is None:
+            return None
+        if _has_control_chars(value):
+            raise ValueError("Must not contain control characters.")
         return value
 
     # --- Secondary affiliation / education (#47) -----------------------------
@@ -427,6 +505,21 @@ class ContactCreate(_Section):
     zip: str | None = Field(default=None, max_length=20)
     country: str | None = Field(default=None, max_length=100)
     region: str | None = Field(default=None, max_length=100)
+    preferred_contact_method: str | None = Field(default=None, max_length=30)
+    # The literal best phone/email VALUE from the intake sheet (free text) —
+    # distinct from preferred_contact_method, which only names a method.
+    best_contact: str | None = Field(default=None, max_length=255)
+
+    @field_validator("preferred_contact_method")
+    @classmethod
+    def _validate_preferred_contact_method(cls, value: str | None) -> str | None:
+        # _Section._trim_strings already normalized empty -> None ahead of this.
+        if value is None:
+            return None
+        if value not in _PREFERRED_CONTACT_METHODS:
+            allowed = ", ".join(sorted(_PREFERRED_CONTACT_METHODS))
+            raise ValueError(f"Must be one of: {allowed}.")
+        return value
 
 
 class CareerCreate(_Section):
@@ -491,6 +584,36 @@ class EngagementCreate(_Section):
     engagement_notes: str | None = None
 
 
+class FormerCreate(_Section):
+    """A single PRIOR (non-current) role -> one ``employment_history`` row.
+
+    max_length mirrors database/schema.sql column widths (see ContactCreate).
+    The service persists this with ``is_current=False``.
+    """
+
+    employer_name: str | None = Field(default=None, max_length=255)
+    employment_title: str | None = Field(default=None, max_length=255)
+    employment_industry: str | None = Field(default=None, max_length=255)
+
+
+class LeadershipCreate(_Section):
+    """A student finance-society leadership role -> one
+    ``finance_society_leadership`` row. ``leadership_role`` is required on that
+    model; ``role_year`` is optional."""
+
+    leadership_role: str | None = Field(default=None, max_length=100)
+    role_year: int | None = None
+
+    @field_validator("role_year")
+    @classmethod
+    def _validate_role_year(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not (_YEAR_MIN <= value <= _YEAR_MAX):
+            raise ValueError(f"Must be between {_YEAR_MIN} and {_YEAR_MAX}.")
+        return value
+
+
 class AlumniCreateFull(AlumniCreate):
     """Create payload: required core fields plus optional nested sections.
 
@@ -503,6 +626,8 @@ class AlumniCreateFull(AlumniCreate):
     career: CareerCreate | None = None
     education: EducationCreate | None = None
     engagement: EngagementCreate | None = None
+    former: FormerCreate | None = None
+    leadership: LeadershipCreate | None = None
 
 
 class AlumniUpdateFull(AlumniUpdate):
@@ -538,8 +663,30 @@ class AlumniRead(BaseModel):
     birth_year: int | None = None
     birth_date: datetime.date | None = None
     graduation_year: int | None = None
+    # graduation_month is intentionally NOT exposed here anymore -- it is
+    # superseded by graduation_semester + graduation_class. The physical column
+    # remains on the model/table (dormant), just no longer in the API response.
+    graduation_semester: str | None = None
+    graduation_class: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    # Survey / demographics (nullable, additive).
+    citizenship: str | None = None
+    marital_status: str | None = None
+    home_country: str | None = None
+    employment_status: str | None = None
+    other_designations: str | None = None
+    survey_completed_date: datetime.date | None = None
+    # Manual-edit provenance ("Profile updated by ..."). profile_updated_by_name
+    # is the updater's resolved "First Last" for the hover; it is NOT a model
+    # column -- it is populated by the profile service via a join on
+    # profile_updated_by_user_id, so it defaults to None on plain reads.
+    profile_updated_date: datetime.date | None = None
+    # Free-text "updated by" NAME from the intake sheet (a real column); the hover
+    # falls back to this when profile_updated_by_name (resolved from the user FK)
+    # is unset.
+    profile_updated_by: str | None = None
+    profile_updated_by_name: str | None = None
     mba_program: str | None = None
     law_school: str | None = None
     medical_school: str | None = None
@@ -602,6 +749,17 @@ VIEW_ONLY_HIDDEN_FIELDS: frozenset[str] = frozenset(
         "spouse_first_name",
         "spouse_last_name",
         "spouse_birth_date",
+        # The addressable link to the spouse's own record (its resolved name is
+        # nulled separately in _minimize_profile_for_view_only).
+        "spouse_alumni_id",
+        # Demographic PII from the 2026-07-08 import fields — same sensitivity
+        # class as gender/birth_date above, so hidden from view_only. NOTE:
+        # employment_status + other_designations are intentionally NOT hidden
+        # (career/credential info, like employer/title/graduate_degree, which
+        # stay visible to view_only).
+        "citizenship",
+        "marital_status",
+        "home_country",
         # NOTE: this is the alumni record's import-provenance "Notes" column
         # (CSV intake), hidden from view_only. It is DISTINCT from the unified
         # CRM `notes` table (#39), whose engagement/interaction/event notes are

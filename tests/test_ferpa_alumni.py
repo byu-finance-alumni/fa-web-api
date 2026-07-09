@@ -156,10 +156,12 @@ def test_minimize_exposes_email_phone_hides_home_address_for_view_only():
         zip="84604",
         country="USA",
         region="West",
+        best_contact="jane.personal@example.com",
     )
     profile = ProfileRead.model_construct(
         alumni=AlumniRead.model_validate(_alumni_model()),
         contact=contact,
+        spouse_alumni_name="John A. Doe",
         interactions=[],
         surveys=[],
         engagement_notes=[],
@@ -171,10 +173,14 @@ def test_minimize_exposes_email_phone_hides_home_address_for_view_only():
     assert scoped.contact.personal_email == "jane@example.com"
     assert scoped.contact.work_email == "jane@work.com"
     assert scoped.contact.phone == "555-1234"
-    # Home mailing address stays protected.
+    # Home mailing address (street + ZIP) and the raw best-contact value stay
+    # protected.
     assert scoped.contact.address_line_1 is None
     assert scoped.contact.address_line_2 is None
     assert scoped.contact.zip is None
+    assert scoped.contact.best_contact is None
+    # Linked spouse's resolved name is spouse PII — redacted for view_only.
+    assert scoped.spouse_alumni_name is None
     # Directory-style location survives.
     assert scoped.contact.city == "Provo"
     assert scoped.contact.state == "Utah"

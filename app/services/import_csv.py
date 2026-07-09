@@ -44,7 +44,7 @@ from app.models.alumni import Alumni
 from app.schemas.alumni import AlumniCreateFull
 from app.services import alumni as alumni_service
 from app.services import hygiene
-from scripts.export_intake_template import _ALUMNI_COLUMNS
+from scripts.export_intake_template import _ALUMNI_COLUMNS, _FRIEND_COLUMNS
 
 log = logging.getLogger(__name__)
 
@@ -59,52 +59,54 @@ MAX_IMPORT_ROWS = 2000
 #
 # Each Alumni-sheet header maps to a (section, field) target in the
 # AlumniCreateFull payload. ``section`` is "core" for top-level fields or one of
-# the nested-section keys (contact/career/education/engagement). ``kind`` selects
-# the value coercion applied to the raw CSV cell.
+# the nested-section keys (contact/career/education/former/leadership/engagement).
+# ``kind`` selects the value coercion applied to the raw CSV cell.
 #
 #   "str"      -> trimmed string (empty -> omitted)
 #   "int"      -> parsed integer (graduation_year, degree_year, ...)
 #   "date"     -> parsed YYYY-MM-DD date (kept as ISO string for the schema)
 #   "bool"     -> Yes/No/true/1 -> bool
 #   "industry" -> validated against the controlled vocab (invalid -> row error)
-#   "spouse"   -> Spouse BYU ID; resolved to spouse_alumni_id in evaluate()
 #
-# The (section, field, kind) tuples are keyed by the EXACT header text from the
-# xlsx template so a drift in the template surfaces as a header error here.
+# Section targets: core -> alumni; contact -> alumni_contact_info; career ->
+# current_employment (employer/title/industry only — the single address lives on
+# the CONTACT record, so "Current city/state/ZIP/country" map to contact.*, NOT
+# career, and drive the map); education -> education_history; former ->
+# employment_history (is_current=false); leadership -> finance_society_leadership;
+# engagement -> alumni_program_engagement.
+#
+# Keys are the EXACT header text from the finalized 64-column intake template, in
+# that order, so a drift in the template surfaces as a header error here.
 
 _MAPPING: dict[str, tuple[str, str, str]] = {
-    # --- Identity ---
+    "Filled out Survey": ("core", "survey_completed_date", "date"),
+    "MSTID (from OneAccord)": ("core", "mst_id", "str"),
     "BYU ID (9 digits)": ("core", "byu_id", "str"),
     "Net ID": ("core", "net_id", "str"),
+    "Preferred first name": ("core", "preferred_first_name", "str"),
     "First name": ("core", "first_name", "str"),
     "Middle name": ("core", "middle_name", "str"),
-    "Last name": ("core", "last_name", "str"),
-    "Preferred first name": ("core", "preferred_first_name", "str"),
+    "Last Name": ("core", "last_name", "str"),
     "Gender": ("core", "gender", "str"),
+    "Personal Email": ("contact", "personal_email", "str"),
     "Birthday (YYYY-MM-DD)": ("core", "birth_date", "date"),
-    "Graduation year": ("core", "graduation_year", "int"),
-    "Finance program year": ("core", "finance_program_year", "int"),
-    "Graduate degree": ("core", "graduate_degree", "str"),
+    "Graduation Semester": ("core", "graduation_semester", "str"),
+    "Graduation Year": ("core", "graduation_year", "int"),
+    "Class of": ("core", "graduation_class", "int"),
     "LinkedIn URL": ("core", "linkedin_url", "str"),
+    "Finance program admitted year": ("core", "finance_program_year", "int"),
+    "Employment Status": ("core", "employment_status", "str"),
+    "Profile Updated By": ("core", "profile_updated_by", "str"),
+    "Profile Updated Date": ("core", "profile_updated_date", "date"),
+    "Finance Leadership Position": ("leadership", "leadership_role", "str"),
+    "Graduate degree": ("core", "graduate_degree", "str"),
     "Deceased? (Yes/No)": ("core", "deceased", "bool"),
     "Notes": ("core", "notes", "str"),
-    # --- Spouse ---
-    "Spouse first name": ("core", "spouse_first_name", "str"),
-    "Spouse last name": ("core", "spouse_last_name", "str"),
-    "Spouse birthday (YYYY-MM-DD)": ("core", "spouse_birth_date", "date"),
-    "Spouse BYU ID (if also an alumnus)": ("core", "spouse_alumni_id", "spouse"),
-    # --- Contact ---
-    "Personal email": ("contact", "personal_email", "str"),
-    "Work email": ("contact", "work_email", "str"),
-    "Phone": ("contact", "phone", "str"),
-    "Address line 1": ("contact", "address_line_1", "str"),
-    "Address line 2": ("contact", "address_line_2", "str"),
-    "City": ("contact", "city", "str"),
-    "State": ("contact", "state", "str"),
-    "ZIP": ("contact", "zip", "str"),
-    "Country": ("contact", "country", "str"),
-    "Region": ("contact", "region", "str"),
-    # --- Current career ---
+    "Citizenship": ("core", "citizenship", "str"),
+    "Marital Status": ("core", "marital_status", "str"),
+    "Spouse First Name": ("core", "spouse_first_name", "str"),
+    "Spouse Last Name": ("core", "spouse_last_name", "str"),
+    "Phone #": ("contact", "phone", "str"),
     "Current employer": ("career", "current_employer", "str"),
     "Current title": ("career", "current_title", "str"),
     "Current industry (see Reference sheet)": (
@@ -117,20 +119,28 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "current_industry_secondary",
         "industry",
     ),
-    "Current city": ("career", "current_city", "str"),
-    "Current state": ("career", "current_state", "str"),
-    "Current country": ("career", "current_country", "str"),
-    "Current ZIP": ("career", "current_zip", "str"),
-    "Seniority level": ("career", "seniority_level", "str"),
-    # --- Education ---
-    "University": ("education", "university", "str"),
-    "College": ("education", "college", "str"),
-    "Department": ("education", "department", "str"),
+    "Work Email": ("contact", "work_email", "str"),
+    "Address line 1": ("contact", "address_line_1", "str"),
+    "Address line 2": ("contact", "address_line_2", "str"),
+    # The single address lives on the CONTACT record and drives the map, so the
+    # "Current city/state/ZIP/country" headers bind to contact.*, NOT career.
+    "Current city": ("contact", "city", "str"),
+    "Current state": ("contact", "state", "str"),
+    "Region (Northeast, Southeast, Midwest, Southwest, and West)": (
+        "contact",
+        "region",
+        "str",
+    ),
+    "Current country": ("contact", "country", "str"),
+    "Current ZIP": ("contact", "zip", "str"),
+    "Home country": ("core", "home_country", "str"),
     "Degree": ("education", "degree", "str"),
     "Major": ("education", "major", "str"),
     "Degree status": ("education", "degree_status", "str"),
     "Degree year": ("education", "degree_year", "int"),
-    # --- Program engagement ---
+    "Former Company": ("former", "employer_name", "str"),
+    "Former Title": ("former", "employment_title", "str"),
+    "Former Industry": ("former", "employment_industry", "str"),
     "Willing to host NetTrek (Yes/No)": (
         "engagement",
         "nettrek_host_willing",
@@ -157,7 +167,7 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "help_at_event_willing",
         "bool",
     ),
-    "Willing to host case competition (Yes/No)": (
+    "Willing to host case competition (yes/no)": (
         "engagement",
         "case_competition_host_willing",
         "bool",
@@ -177,10 +187,12 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "hired_finance_full_time",
         "bool",
     ),
-    "PIFF donor (Yes/No)": ("engagement", "piff_donor", "bool"),
+    "Willing to be a PIFF donor (Yes/No)": ("engagement", "piff_donor", "bool"),
     "CFP designation (Yes/No)": ("engagement", "cfp_designation", "bool"),
     "CFA designation (Yes/No)": ("engagement", "cfa_designation", "bool"),
+    "Other Designations:": ("core", "other_designations", "str"),
     "Engagement notes": ("engagement", "engagement_notes", "str"),
+    "Best Contact": ("contact", "best_contact", "str"),
 }
 
 # Ordered list of expected headers — same source + order as the xlsx Alumni
@@ -188,6 +200,28 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
 # and to build the downloadable CSV template.
 EXPECTED_HEADERS: list[str] = [header for header, _ in _ALUMNI_COLUMNS]
 EXAMPLE_ROW: list[str] = [example for _, example in _ALUMNI_COLUMNS]
+
+# --- Friend (non-alumni contact) column set (#294) ---------------------------
+#
+# Friends are imported through this SAME pipeline; a friend row is just an alumni
+# row with ``is_alumni = False`` injected. The friend template is the curated
+# subset of alumni columns declared in the intake template (identity by name; no
+# academic / spouse-link fields). Its mapping is the matching slice of _MAPPING,
+# so friend headers bind to the exact same model columns — no parallel mapping to
+# drift.
+FRIEND_EXPECTED_HEADERS: list[str] = [header for header, _ in _FRIEND_COLUMNS]
+FRIEND_EXAMPLE_ROW: list[str] = [example for _, example in _FRIEND_COLUMNS]
+_FRIEND_MAPPING: dict[str, tuple[str, str, str]] = {
+    header: _MAPPING[header] for header in FRIEND_EXPECTED_HEADERS
+}
+
+
+def _expected_headers(friend: bool) -> list[str]:
+    return FRIEND_EXPECTED_HEADERS if friend else EXPECTED_HEADERS
+
+
+def _mapping_for(friend: bool) -> dict[str, tuple[str, str, str]]:
+    return _FRIEND_MAPPING if friend else _MAPPING
 
 _TRUE_TOKENS = frozenset({"yes", "true", "1", "y", "t"})
 # Empty cells are skipped by _map_row before coercion, so "" is intentionally
@@ -258,7 +292,10 @@ def _display_name(core: dict) -> str:
 
 
 def parse_and_map(
-    file_bytes: bytes, max_rows: int | None = MAX_IMPORT_ROWS
+    file_bytes: bytes,
+    max_rows: int | None = MAX_IMPORT_ROWS,
+    *,
+    friend: bool = False,
 ) -> tuple[list[dict], list[str]]:
     """Parse a CSV and map each data row to an ``AlumniCreateFull`` payload dict.
 
@@ -283,8 +320,13 @@ def parse_and_map(
     cap); over the cap, a header-style error is returned instead of processing,
     so a hostile/huge file can't exhaust memory or DB time.
 
+    ``friend=True`` maps against the curated FRIEND column set (non-alumni
+    contacts, #294) and stamps ``is_alumni = False`` onto every row's payload.
+
     The CSV is decoded as ``utf-8-sig`` so an Excel BOM is stripped.
     """
+    expected = _expected_headers(friend)
+    mapping = _mapping_for(friend)
     try:
         text = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -299,7 +341,7 @@ def parse_and_map(
         return [], ["The file is empty."]
 
     headers = [h.strip() for h in header_row]
-    header_errors = _validate_headers(headers)
+    header_errors = _validate_headers(headers, expected)
     if header_errors:
         # Columns are wrong; don't attempt to map rows against a bad header.
         return [], header_errors
@@ -316,20 +358,20 @@ def parse_and_map(
                 f"File exceeds the {max_rows:,}-row import limit. Split into "
                 "smaller batches."
             ]
-        rows.append(_map_row(offset, headers, raw_row))
+        rows.append(_map_row(offset, headers, raw_row, mapping, friend))
     return rows, header_errors
 
 
-def _validate_headers(headers: list[str]) -> list[str]:
-    """Compare the file's headers to the expected Alumni columns."""
+def _validate_headers(headers: list[str], expected_headers: list[str]) -> list[str]:
+    """Compare the file's headers to the expected columns (alumni or friend)."""
     errors: list[str] = []
     seen = set(headers)
-    expected = set(EXPECTED_HEADERS)
+    expected = set(expected_headers)
     # Reject duplicated column names (last-wins would otherwise silently drop
     # the earlier column's data). Mirrors import_events / import_donations.
     for dup in sorted({h for h in headers if h and headers.count(h) > 1}):
         errors.append(f"Duplicate column: {dup!r}.")
-    for missing in EXPECTED_HEADERS:
+    for missing in expected_headers:
         if missing not in seen:
             errors.append(f"Missing required column: {missing!r}.")
     for extra in headers:
@@ -347,15 +389,25 @@ def _validate_headers(headers: list[str]) -> list[str]:
     return errors
 
 
-def _map_row(row_num: int, headers: list[str], raw_row: list[str]) -> dict:
-    """Map one CSV data row to a payload dict + metadata."""
+def _map_row(
+    row_num: int,
+    headers: list[str],
+    raw_row: list[str],
+    mapping: dict[str, tuple[str, str, str]],
+    friend: bool = False,
+) -> dict:
+    """Map one CSV data row to a payload dict + metadata.
+
+    ``mapping`` selects the header→target set (alumni or friend). ``friend=True``
+    stamps ``is_alumni = False`` onto the row's core payload so the shared create
+    path persists a non-alumni contact."""
     core: dict = {}
     sections: dict[str, dict] = {}
     spouse_byu_id: str | None = None
     error: str | None = None
 
     for col, header in enumerate(headers):
-        target = _MAPPING.get(header)
+        target = mapping.get(header)
         if target is None:
             continue
         raw = raw_row[col] if col < len(raw_row) else ""
@@ -381,6 +433,11 @@ def _map_row(row_num: int, headers: list[str], raw_row: list[str]) -> dict:
             core[field] = value
         else:
             sections.setdefault(section, {})[field] = value
+
+    if friend:
+        # Non-alumni contact: force is_alumni False so the shared create path
+        # writes a friend record instead of an alumnus (#294).
+        core["is_alumni"] = False
 
     payload = dict(core)
     payload.update(sections)
@@ -965,11 +1022,16 @@ def _reject_reason(evaluated: dict) -> str:
 # --- CSV template ------------------------------------------------------------
 
 
-def build_template_csv() -> str:
-    """Return the import template as CSV text: the exact Alumni headers plus one
-    example row. Derived from the same column source as the xlsx template."""
+def build_template_csv(friend: bool = False) -> str:
+    """Return the import template as CSV text: the exact headers plus one example
+    row. Derived from the same column source as the xlsx template. ``friend=True``
+    returns the curated friend (non-alumni contact) column set (#294)."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(EXPECTED_HEADERS)
-    writer.writerow(EXAMPLE_ROW)
+    if friend:
+        writer.writerow(FRIEND_EXPECTED_HEADERS)
+        writer.writerow(FRIEND_EXAMPLE_ROW)
+    else:
+        writer.writerow(EXPECTED_HEADERS)
+        writer.writerow(EXAMPLE_ROW)
     return buffer.getvalue()

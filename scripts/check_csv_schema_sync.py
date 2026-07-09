@@ -19,6 +19,7 @@ This check asserts, for each CSV surface, that:
 Covered surfaces (extend ``CHECKS`` for future ones):
 
   * Alumni  — import ``app.services.import_csv`` + export ``app.services.alumni_export``
+  * Friend  — import ``app.services.import_csv`` (curated friend column subset, #294)
   * Events  — import ``app.services.import_events``
   * Donations — import ``app.services.import_donations``
 
@@ -38,8 +39,12 @@ from app.core.dropdowns import INDUSTRIES, validate_industry
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.donation import Donation
-from app.models.employment import CurrentEmployment, EducationHistory
-from app.models.engagement import AlumniProgramEngagement
+from app.models.employment import (
+    CurrentEmployment,
+    EducationHistory,
+    EmploymentHistory,
+)
+from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
 
 # Section keys used by the importers/exporter -> the model whose table columns
 # they must resolve against. ``import_csv`` uses "core"; ``alumni_export`` uses
@@ -51,6 +56,9 @@ SECTION_MODEL = {
     "career": CurrentEmployment,
     "education": EducationHistory,
     "engagement": AlumniProgramEngagement,
+    # A prior role -> employment_history; finance-society leadership row.
+    "former": EmploymentHistory,
+    "leadership": FinanceSocietyLeadership,
 }
 
 # Fields an importer payload carries that are intentionally NOT a direct column
@@ -113,6 +121,42 @@ def _check_alumni_import(errors: list[str]) -> None:
             errors.append(
                 f"[{surface}] header {header!r} constrains to the industry vocab, "
                 f"but INDUSTRIES is empty — the canonical source is missing."
+            )
+
+
+def _check_friend_import(errors: list[str]) -> None:
+    from app.services import import_csv
+
+    surface = "friend import (import_csv)"
+    mapping = import_csv._FRIEND_MAPPING
+    _check_header_sets(
+        errors, surface, set(import_csv.FRIEND_EXPECTED_HEADERS), set(mapping)
+    )
+    for header, (section, field, kind) in mapping.items():
+        _check_column(errors, surface, header, section, field)
+        if kind == "industry" and not INDUSTRIES:
+            errors.append(
+                f"[{surface}] header {header!r} constrains to the industry vocab, "
+                f"but INDUSTRIES is empty — the canonical source is missing."
+            )
+    # The friend set MUST be a strict subset of the alumni columns (it reuses the
+    # alumni mapping), and must NOT carry alumni-only academic identity fields.
+    extra = set(import_csv.FRIEND_EXPECTED_HEADERS) - set(import_csv.EXPECTED_HEADERS)
+    if extra:
+        errors.append(
+            f"[{surface}] friend headers {sorted(extra)} are not alumni columns — "
+            f"the friend template must be a subset of the alumni columns."
+        )
+    for banned in (
+        "BYU ID (9 digits)",
+        "Net ID",
+        "Graduation Year",
+        "Graduation Semester",
+    ):
+        if banned in set(import_csv.FRIEND_EXPECTED_HEADERS):
+            errors.append(
+                f"[{surface}] friend template unexpectedly includes alumni-only "
+                f"column {banned!r}."
             )
 
 
@@ -189,6 +233,7 @@ def _check_industry_vocab(errors: list[str]) -> None:
 
 CHECKS = (
     _check_alumni_import,
+    _check_friend_import,
     _check_alumni_export,
     _check_events_import,
     _check_donations_import,

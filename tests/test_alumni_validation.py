@@ -18,7 +18,12 @@ from pydantic import ValidationError
 from app.api.dependencies.auth import get_current_db_user
 from app.core.database import get_session
 from app.main import app
-from app.schemas.alumni import AlumniCreate, AlumniRead, AlumniUpdate
+from app.schemas.alumni import (
+    AlumniCreate,
+    AlumniRead,
+    AlumniUpdate,
+    ContactCreate,
+)
 from app.schemas.auth import UserContext
 
 
@@ -150,6 +155,23 @@ def test_out_of_range_year_rejected(year):
         AlumniCreate(last_name="Doe", graduation_year=year)
 
 
+@pytest.mark.parametrize("month", [1, 4, 8, 12])
+def test_valid_graduation_month_accepted(month):
+    model = AlumniCreate(last_name="Doe", graduation_month=month)
+    assert model.graduation_month == month
+
+
+def test_graduation_month_defaults_to_none():
+    model = AlumniCreate(last_name="Doe")
+    assert model.graduation_month is None
+
+
+@pytest.mark.parametrize("month", [0, 13, -1, 99])
+def test_out_of_range_graduation_month_rejected(month):
+    with pytest.raises(ValidationError):
+        AlumniCreate(last_name="Doe", graduation_month=month)
+
+
 def test_empty_strings_normalize_to_none():
     model = AlumniUpdate(
         first_name="Doe",
@@ -162,6 +184,34 @@ def test_empty_strings_normalize_to_none():
     assert model.gender is None
     assert model.notes is None
     assert model.linkedin_url is None
+
+
+# --- Contact: preferred_contact_method (#301) --------------------------------
+
+
+@pytest.mark.parametrize(
+    "method", ["personal_email", "work_email", "phone", "linkedin"]
+)
+def test_preferred_contact_method_valid_accepted(method):
+    model = ContactCreate(personal_email="a@b.com", preferred_contact_method=method)
+    assert model.preferred_contact_method == method
+
+
+def test_preferred_contact_method_defaults_to_none():
+    model = ContactCreate(personal_email="a@b.com")
+    assert model.preferred_contact_method is None
+
+
+@pytest.mark.parametrize("value", ["fax", "email", "PHONE", "linked_in", "mail"])
+def test_preferred_contact_method_invalid_rejected(value):
+    with pytest.raises(ValidationError) as exc:
+        ContactCreate(preferred_contact_method=value)
+    assert "Must be one of" in str(exc.value)
+
+
+def test_preferred_contact_method_blank_normalizes_to_none():
+    model = ContactCreate(preferred_contact_method="   ")
+    assert model.preferred_contact_method is None
 
 
 # --- Secondary affiliation / education fields (#47) --------------------------

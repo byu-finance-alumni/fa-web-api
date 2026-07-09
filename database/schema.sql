@@ -168,8 +168,38 @@ CREATE TABLE alumni (
     birth_year           int,
     birth_date           date,
     graduation_year      int,
+    -- graduation_month retained physically but no longer exposed in the API read
+    -- schema (superseded by graduation_semester + graduation_class below).
+    graduation_month     int,
+    -- Semester + graduating class replace the raw month in the API surface.
+    -- graduation_semester is one of Fall / Winter / Spring / Summer; the
+    -- graduation_class is the graduating cohort/class, DISTINCT from
+    -- graduation_year (they usually match but need not).
+    graduation_semester  varchar(20),
+    graduation_class     int,
     finance_program_year int,
     graduate_degree      varchar(100),
+    -- Survey / demographics captured on the alumni survey. Optional/nullable
+    -- additive fields. home_country is the country of ORIGIN (distinct from the
+    -- current-address country on the contact record); employment_status is
+    -- person-level (Employed / Unemployed / Retired / Student / Seeking, ...);
+    -- other_designations is free-text (e.g. "Series 7, Series 63").
+    citizenship          varchar(100),
+    marital_status       varchar(50),
+    home_country         varchar(100),
+    employment_status    varchar(50),
+    other_designations   text,
+    survey_completed_date date,
+    -- Manual-edit provenance for the profile ("Profile updated by Amy"): the
+    -- date of the last manual profile update and the user who made it. FK ->
+    -- users(user_id) ON DELETE SET NULL, mirroring spouse_alumni_id.
+    profile_updated_date date,
+    profile_updated_by_user_id bigint,
+    -- Free-text "updated by" NAME from the intake sheet (as typed). DISTINCT from
+    -- profile_updated_by_user_id (the resolved app-user FK); backs the "Profile
+    -- updated by ..." hover fallback when no user FK is linked. See
+    -- migrations/2026-07-08_add_profile_updated_by.sql.
+    profile_updated_by   varchar(200),
     -- Secondary affiliation / education (#47, PRD section 6). Optional/nullable
     -- additive fields extending the record beyond the core program/employment
     -- fields. Short single-value fields are varchar; narrative fields are text.
@@ -194,10 +224,12 @@ CREATE TABLE alumni (
     updated_at           timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_alumni_source_id FOREIGN KEY (source_id) REFERENCES data_sources (source_id) ON DELETE SET NULL,
     CONSTRAINT fk_alumni_spouse_alumni_id FOREIGN KEY (spouse_alumni_id) REFERENCES alumni (alumni_id) ON DELETE SET NULL,
+    CONSTRAINT fk_alumni_profile_updated_by_user_id FOREIGN KEY (profile_updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
     CONSTRAINT ck_alumni_spouse_not_self CHECK (spouse_alumni_id IS NULL OR spouse_alumni_id <> alumni_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alumni_spouse_alumni_id ON alumni (spouse_alumni_id);
+CREATE INDEX IF NOT EXISTS idx_alumni_profile_updated_by_user_id ON alumni (profile_updated_by_user_id);
 
 -- Partial unique indexes: an active (non-archived) alum's byu_id / net_id must
 -- be unique. These are the authoritative guard behind the application-layer
@@ -225,6 +257,13 @@ CREATE TABLE alumni_contact_info (
     zip             varchar(20),
     country         varchar(100),
     region          varchar(100),
+    -- Which contact method is flagged "preferred"; allowed values validated in
+    -- the app layer (personal_email/work_email/phone/linkedin, or NULL = none).
+    preferred_contact_method varchar(30),
+    -- The literal "best contact" value from the intake sheet (a phone or email
+    -- the alum flagged as best). Free text; distinct from preferred_contact_method
+    -- (which names a method, not a value). See migrations/2026-07-08_add_best_contact.sql.
+    best_contact    varchar(255),
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_alumni_contact_info_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,

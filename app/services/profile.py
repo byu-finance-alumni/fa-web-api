@@ -146,6 +146,12 @@ async def get_profile(
                 None,
             )
 
+    # Resolve the display name of the user who last manually updated this profile
+    # ("Profile updated by ...") for the hover label. None when unset/unknown.
+    profile_updated_by_name = await _actor_name(
+        session, alumnus.profile_updated_by_user_id
+    )
+
     contact = await session.scalar(
         select(AlumniContactInfo)
         .where(AlumniContactInfo.alumni_id == alumni_id)
@@ -301,7 +307,9 @@ async def get_profile(
             first_names[u.user_id] = u.first_name or None
 
     profile = ProfileRead(
-        alumni=AlumniRead.model_validate(alumnus),
+        alumni=AlumniRead.model_validate(alumnus).model_copy(
+            update={"profile_updated_by_name": profile_updated_by_name}
+        ),
         spouse_alumni_name=spouse_alumni_name,
         contact=ContactRead.model_validate(contact) if contact else None,
         current_career=CurrentCareerRead.model_validate(career) if career else None,
@@ -469,6 +477,9 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
                 "address_line_1": None,
                 "address_line_2": None,
                 "zip": None,
+                # best_contact holds the raw home/best phone-or-email value; the
+                # frontend hides it from view_only, so null it server-side too.
+                "best_contact": None,
             }
         )
         if profile.contact is not None
@@ -492,6 +503,10 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     return profile.model_copy(
         update={
             "alumni": minimize_alumni_read(profile.alumni, can_edit=False),
+            # Resolved name of the linked spouse's own record — spouse PII, so
+            # redact it for view_only (the raw spouse_first/last are already
+            # nulled via VIEW_ONLY_HIDDEN_FIELDS + spouse_alumni_id).
+            "spouse_alumni_name": None,
             "contact": contact,
             "interactions": interactions,
             "surveys": surveys,

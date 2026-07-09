@@ -31,6 +31,11 @@ INDUSTRIES: tuple[str, ...] = (
     "Valuation & Advisory",
     "Venture Capital",
     "Wealth Management",
+    "Law",
+    "Corporate Banking",
+    "FP&A",
+    "Sales and Trading",
+    "Credit Risk",
     "Other",
 )
 

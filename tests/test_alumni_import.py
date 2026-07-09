@@ -41,6 +41,7 @@ def _row_values(**overrides) -> list[str]:
         "current_employer": "Current employer",
         "current_industry": "Current industry (see Reference sheet)",
         "current_industry_secondary": "Secondary industry (see Reference sheet)",
+        "linkedin_url": "LinkedIn URL",
         "city": "Current city",
         "state": "Current state",
         "deceased": "Deceased? (Yes/No)",
@@ -383,6 +384,28 @@ def test_location_placeholder_left_blank(token):
     contact = rows[0]["payload"].get("contact", {})
     assert "city" not in contact
     assert "state" not in contact
+
+
+@pytest.mark.parametrize("token", ["unknown", "Unknown", "n/a", "N/A", "na"])
+def test_linkedin_placeholder_left_blank(token):
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", linkedin_url=token)
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert rows[0]["error"] is None
+    assert "linkedin_url" not in rows[0]["payload"]
+
+
+def test_real_linkedin_still_kept():
+    csv = _csv_bytes(
+        _row_values(
+            first_name="Jane",
+            last_name="Doe",
+            linkedin_url="https://linkedin.com/in/jane",
+        )
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert rows[0]["payload"]["linkedin_url"] == "https://linkedin.com/in/jane"
 
 
 def test_real_city_still_kept():

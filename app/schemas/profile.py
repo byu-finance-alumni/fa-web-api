@@ -416,9 +416,9 @@ class ProgramEngagementRead(_Orm):
     hired_finance_intern: bool
     hired_finance_full_time: bool
     piff_donor: bool
-    cfp_designation: bool
-    cfa_designation: bool
-    cpa_designation: bool
+    cfp_designation: str | None = None
+    cfa_designation: str | None = None
+    cpa_designation: str | None = None
     engagement_notes: str | None = None
 
 

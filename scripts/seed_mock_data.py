@@ -153,7 +153,7 @@ MOCK_DETAIL: dict[str, dict] = {
             "mentor_willing": True,
             "guest_speaker_willing": True,
             "hired_finance_intern": True,
-            "cfa_designation": True,
+            "cfa_designation": "CFA all 3 levels",
             "piff_donor": True,
             "engagement_notes": "Hosts NetTrek in NYC; active IB-track mentor.",
         },

@@ -579,9 +579,9 @@ class EngagementCreate(_Section):
     hired_finance_intern: bool = False
     hired_finance_full_time: bool = False
     piff_donor: bool = False
-    cfp_designation: bool = False
-    cfa_designation: bool = False
-    cpa_designation: bool = False
+    cfp_designation: str | None = Field(default=None, max_length=100)
+    cfa_designation: str | None = Field(default=None, max_length=100)
+    cpa_designation: str | None = Field(default=None, max_length=100)
     engagement_notes: str | None = None
 
 

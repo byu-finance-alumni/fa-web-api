@@ -40,6 +40,9 @@ def _row_values(**overrides) -> list[str]:
         "personal_email": "Personal Email",
         "current_employer": "Current employer",
         "current_industry": "Current industry (see Reference sheet)",
+        "current_industry_secondary": "Secondary industry (see Reference sheet)",
+        "city": "Current city",
+        "state": "Current state",
         "deceased": "Deceased? (Yes/No)",
         "mentor_willing": "Willing to mentor (Yes/No)",
     }
@@ -341,6 +344,39 @@ def test_industry_placeholder_row_imports():
     row = report["rows"][0]
     assert row["status"] != "rejected"
     assert row["error"] is None
+
+
+def test_secondary_industry_placeholder_maps_to_other():
+    csv = _csv_bytes(
+        _row_values(
+            first_name="Jane", last_name="Doe", current_industry_secondary="n/a"
+        )
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert rows[0]["error"] is None
+    assert rows[0]["payload"]["career"]["current_industry_secondary"] == "Other"
+
+
+@pytest.mark.parametrize("token", ["unknown", "Unknown", "n/a", "N/A", "na"])
+def test_location_placeholder_left_blank(token):
+    # A placeholder in an address/location cell is stored blank, not literally.
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", city=token, state=token)
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert rows[0]["error"] is None
+    contact = rows[0]["payload"].get("contact", {})
+    assert "city" not in contact
+    assert "state" not in contact
+
+
+def test_real_city_still_kept():
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", city="Provo", state="UT")
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert rows[0]["payload"]["contact"]["city"] == "Provo"
+    assert rows[0]["payload"]["contact"]["state"] == "UT"
 
 
 def test_bad_date_rejected():

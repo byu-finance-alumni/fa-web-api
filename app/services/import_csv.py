@@ -309,14 +309,20 @@ def _coerce_date(header: str, raw: str) -> str:
     )
 
 
-# Import-only: real intake sheets use these placeholder tokens to mean "no known
-# industry". Map them to the catch-all "Other" instead of rejecting the row. The
-# manual create/edit form stays strict — this leniency is import-only.
-_INDUSTRY_PLACEHOLDERS = frozenset({"unknown", "n/a", "na"})
+# Tokens real intake sheets use to mean "not known". Import-only leniency (the
+# manual create/edit form stays strict): in an INDUSTRY cell we map them to the
+# catch-all "Other"; in an ADDRESS/LOCATION cell we blank them out (see the map
+# loop's _LOCATION_BLANK_FIELDS handling) rather than storing the literal text.
+_PLACEHOLDER_TOKENS = frozenset({"unknown", "n/a", "na"})
+
+# Address/location fields where a placeholder token means "leave blank".
+_LOCATION_BLANK_FIELDS = frozenset(
+    {"address_line_1", "address_line_2", "city", "state", "region", "country", "zip"}
+)
 
 
 def _coerce_industry(header: str, raw: str) -> str:
-    if raw.strip().lower() in _INDUSTRY_PLACEHOLDERS:
+    if raw.strip().lower() in _PLACEHOLDER_TOKENS:
         return "Other"
     try:
         validated = validate_industry(raw)
@@ -471,6 +477,11 @@ def _map_row(
         if kind == "spouse":
             # Captured for later DB resolution; not placed in the payload yet.
             spouse_byu_id = raw.strip()
+            continue
+
+        # An address/location cell filled with a placeholder ("unknown", "n/a")
+        # means the location isn't known — store blank rather than the literal.
+        if field in _LOCATION_BLANK_FIELDS and raw.strip().lower() in _PLACEHOLDER_TOKENS:
             continue
 
         try:

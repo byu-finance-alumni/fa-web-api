@@ -294,7 +294,7 @@ CATALOG: list[_Col] = [
         "Engagement",
         _ENGAGEMENT,
         "cfp_designation",
-        "bool",
+        "str",
     ),
     _Col(
         "cfa_designation",
@@ -302,7 +302,7 @@ CATALOG: list[_Col] = [
         "Engagement",
         _ENGAGEMENT,
         "cfa_designation",
-        "bool",
+        "str",
     ),
     _Col(
         "engagement_notes",

@@ -46,6 +46,8 @@ def _row_values(**overrides) -> list[str]:
         "state": "Current state",
         "deceased": "Deceased? (Yes/No)",
         "mentor_willing": "Willing to mentor (Yes/No)",
+        "cfp_designation": "CFP designation (Yes/No)",
+        "cfa_designation": "CFA designation (Yes/No)",
     }
     for field, value in overrides.items():
         values[by_field[field]] = value
@@ -308,6 +310,73 @@ def test_dirty_row_is_cleaned_with_changes():
     assert ("core", "first_name") in changed
     assert ("contact", "personal_email") in changed
     assert report["summary"]["cleaned"] == 1
+
+
+# --- Free-text CFP/CFA/CPA designations (formerly boolean) -------------------
+
+
+def test_free_text_designation_imports_and_persists_as_string():
+    # CFP/CFA/CPA are free-text varchar(100), not Yes/No booleans: a value like
+    # "CFP Level 1" must survive mapping verbatim into the engagement payload
+    # (under the old bool coercion this cell would have been rejected).
+    csv = _csv_bytes(
+        _row_values(
+            byu_id="123456789",
+            first_name="Jane",
+            last_name="Doe",
+            graduation_year="2018",
+            personal_email="jane@example.com",
+            cfp_designation="CFP Level 1",
+            cfa_designation="CFA all 3 levels",
+        )
+    )
+    rows, errors = import_csv.parse_and_map(csv)
+    assert errors == []
+    assert rows[0]["error"] is None
+    engagement = rows[0]["payload"]["engagement"]
+    assert engagement["cfp_designation"] == "CFP Level 1"
+    assert engagement["cfa_designation"] == "CFA all 3 levels"
+
+
+def test_designation_schema_round_trip_returns_string():
+    # EngagementCreate accepts free-text designations and ProgramEngagementRead
+    # serializes them back as the stored string (true -> label, never bool).
+    from app.schemas.alumni import EngagementCreate
+    from app.schemas.profile import ProgramEngagementRead
+
+    created = EngagementCreate(
+        cfp_designation="CFP Level 1",
+        cfa_designation="CFA all 3 levels",
+        cpa_designation="CPA (Utah)",
+    )
+    assert created.cfp_designation == "CFP Level 1"
+    assert created.cfa_designation == "CFA all 3 levels"
+    assert created.cpa_designation == "CPA (Utah)"
+    # Unset designation defaults to None (no cert), not False.
+    assert EngagementCreate().cfp_designation is None
+
+    read = ProgramEngagementRead.model_validate(
+        {
+            "engagement_profile_id": 1,
+            "nettrek_host_willing": False,
+            "finance_conference_willing": False,
+            "mentor_willing": False,
+            "company_event_sponsor_willing": False,
+            "guest_speaker_willing": False,
+            "help_at_event_willing": False,
+            "case_competition_host_willing": False,
+            "women_in_finance_mentor_willing": False,
+            "hired_finance_intern": False,
+            "hired_finance_full_time": False,
+            "piff_donor": False,
+            "cfp_designation": "CFP Level 1",
+            "cfa_designation": "CFA all 3 levels",
+            "cpa_designation": None,
+        }
+    )
+    assert read.cfp_designation == "CFP Level 1"
+    assert read.cfa_designation == "CFA all 3 levels"
+    assert read.cpa_designation is None
 
 
 # --- Invalid industry / bad date -> rejected ---------------------------------

@@ -318,7 +318,7 @@ def _coerce_date(header: str, raw: str) -> str:
 _PLACEHOLDER_TOKENS = frozenset({"unknown", "n/a", "na"})
 
 # Free-text fields where a placeholder token means "leave blank": the address/
-# location columns plus the open-response secondary industry.
+# location columns, the open-response secondary industry, and the LinkedIn URL.
 _PLACEHOLDER_BLANK_FIELDS = frozenset(
     {
         "address_line_1",
@@ -329,6 +329,7 @@ _PLACEHOLDER_BLANK_FIELDS = frozenset(
         "country",
         "zip",
         "current_industry_secondary",
+        "linkedin_url",
     }
 )
 

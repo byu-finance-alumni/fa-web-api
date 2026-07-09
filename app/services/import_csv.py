@@ -252,16 +252,61 @@ def _coerce_int(header: str, raw: str) -> int:
         raise _CellError(f"{header}: expected a whole number, got {raw!r}.") from exc
 
 
+# Date input forms accepted by the importer, tried in order and all normalized
+# to ISO (YYYY-MM-DD) for the schema. Zero-padded ISO is handled by the fast
+# path below; these cover the messy real-world spreadsheet forms. Named-month
+# formats (%b/%B) are unambiguous about day/month order. For the purely-numeric
+# slash/dash forms we assume US month/day/year ordering, matching the intake
+# spreadsheets. Two-digit years pivot per POSIX %y (00-68 -> 2000-2068,
+# 69-99 -> 1969-1999).
+_DATE_INPUT_FORMATS = (
+    "%Y-%m-%d",    # 2002-3-3   (unpadded ISO)
+    "%Y/%m/%d",    # 2002/03/03
+    "%d-%b-%Y",    # 3-Mar-2002
+    "%d-%b-%y",    # 3-Mar-02
+    "%d %b %Y",    # 3 Mar 2002
+    "%d %b %y",    # 3 Mar 02
+    "%d-%B-%Y",    # 3-March-2002
+    "%d-%B-%y",    # 3-March-02
+    "%d %B %Y",    # 3 March 2002
+    "%b %d, %Y",   # Mar 3, 2002
+    "%B %d, %Y",   # March 3, 2002
+    "%b %d %Y",    # Mar 3 2002
+    "%m/%d/%Y",    # 03/15/1990 (US month/day/year)
+    "%m/%d/%y",    # 03/15/90
+    "%m-%d-%Y",    # 03-15-1990
+    "%m-%d-%y",    # 03-15-90
+)
+
+
 def _coerce_date(header: str, raw: str) -> str:
+    """Normalize a spreadsheet date cell to an ISO (YYYY-MM-DD) string.
+
+    Accepts ISO plus common real-world forms (e.g. ``3-Mar-02``, ``3 Mar 2002``,
+    ``03/15/1990``). Hands the schema an ISO string; Pydantic then coerces +
+    range-validates it.
+    """
     value = raw.strip()
+    # Fast path: already zero-padded ISO.
     try:
-        datetime.date.fromisoformat(value)
-    except ValueError as exc:
-        raise _CellError(
-            f"{header}: expected a date as YYYY-MM-DD, got {raw!r}."
-        ) from exc
-    # Hand the schema an ISO string; Pydantic coerces + range-validates it.
-    return value
+        return datetime.date.fromisoformat(value).isoformat()
+    except ValueError:
+        pass
+    for fmt in _DATE_INPUT_FORMATS:
+        try:
+            parsed = datetime.datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+        # Guard against %Y greedily reading a 2-digit number as year 1-99
+        # (e.g. "01-02-03" must not become year 1). Every date this importer
+        # handles is a modern people-date, so anything outside this window is a
+        # misparse — fall through to the next candidate format.
+        if 1900 <= parsed.year <= 2100:
+            return parsed.isoformat()
+    raise _CellError(
+        f"{header}: unrecognized date {raw!r}. Use YYYY-MM-DD (e.g. 2002-03-03) "
+        f"or a common form like 3-Mar-2002, 3 Mar 2002, or 03/15/1990."
+    )
 
 
 def _coerce_industry(header: str, raw: str) -> str:

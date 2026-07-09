@@ -12,6 +12,7 @@ served from queued results.
 import asyncio
 import uuid
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.api.dependencies.auth import get_current_db_user
@@ -326,13 +327,35 @@ def test_invalid_industry_rejected():
 
 def test_bad_date_rejected():
     csv = _csv_bytes(
-        _row_values(first_name="Jane", last_name="Doe", birth_date="03/15/1990")
+        _row_values(first_name="Jane", last_name="Doe", birth_date="not a real date")
     )
     rows, _ = import_csv.parse_and_map(csv)
     report = _run(import_csv.evaluate(FakeSession(), rows))
     row = report["rows"][0]
     assert row["status"] == "rejected"
     assert "date" in row["error"].lower()
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("2002-03-03", "2002-03-03"),  # ISO (unchanged)
+        ("2002-3-3", "2002-03-03"),    # unpadded ISO
+        ("3-Mar-02", "2002-03-03"),    # the reported real-world case
+        ("3-Mar-2002", "2002-03-03"),
+        ("3 Mar 2002", "2002-03-03"),
+        ("March 3, 2002", "2002-03-03"),
+        ("03/15/1990", "1990-03-15"),  # US m/d/Y (was previously rejected)
+        ("03/15/90", "1990-03-15"),    # 2-digit year pivots to 1990
+    ],
+)
+def test_flexible_date_formats_normalized_to_iso(raw, expected):
+    assert import_csv._coerce_date("Birthday (YYYY-MM-DD)", raw) == expected
+
+
+def test_unparseable_date_still_raises():
+    with pytest.raises(import_csv._CellError):
+        import_csv._coerce_date("Birthday (YYYY-MM-DD)", "13/45/1990")
 
 
 def test_bad_int_rejected():

@@ -195,6 +195,11 @@ CREATE TABLE alumni (
     -- users(user_id) ON DELETE SET NULL, mirroring spouse_alumni_id.
     profile_updated_date date,
     profile_updated_by_user_id bigint,
+    -- Free-text "updated by" NAME from the intake sheet (as typed). DISTINCT from
+    -- profile_updated_by_user_id (the resolved app-user FK); backs the "Profile
+    -- updated by ..." hover fallback when no user FK is linked. See
+    -- migrations/2026-07-08_add_profile_updated_by.sql.
+    profile_updated_by   varchar(200),
     -- Secondary affiliation / education (#47, PRD section 6). Optional/nullable
     -- additive fields extending the record beyond the core program/employment
     -- fields. Short single-value fields are varchar; narrative fields are text.

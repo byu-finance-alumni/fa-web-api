@@ -47,6 +47,7 @@ _HOME_COUNTRY_MAX = 100
 _EMPLOYMENT_STATUS_MAX = 50
 _OTHER_DESIGNATIONS_MAX = 10000
 _GRADUATION_SEMESTER_MAX = 20
+_PROFILE_UPDATED_BY_MAX = 200
 
 # byu_id: no seed/mock data exists with a byu_id yet (checked database/ and
 # scripts/), so we enforce the canonical BYU NetID-card length of exactly 9
@@ -128,6 +129,11 @@ class AlumniBase(BaseModel):
     )
     survey_completed_date: datetime.date | None = None
     profile_updated_date: datetime.date | None = None
+    # Free-text "updated by" NAME from the intake sheet (as typed). DISTINCT from
+    # the profile_updated_by_user_id FK (set by the service, never the client).
+    profile_updated_by: str | None = Field(
+        default=None, max_length=_PROFILE_UPDATED_BY_MAX
+    )
     # Secondary affiliation / education (#47, PRD section 6). All optional.
     mba_program: str | None = None
     law_school: str | None = None
@@ -326,6 +332,7 @@ class AlumniBase(BaseModel):
         "home_country",
         "employment_status",
         "other_designations",
+        "profile_updated_by",
         mode="before",
     )
     @classmethod
@@ -675,6 +682,10 @@ class AlumniRead(BaseModel):
     # column -- it is populated by the profile service via a join on
     # profile_updated_by_user_id, so it defaults to None on plain reads.
     profile_updated_date: datetime.date | None = None
+    # Free-text "updated by" NAME from the intake sheet (a real column); the hover
+    # falls back to this when profile_updated_by_name (resolved from the user FK)
+    # is unset.
+    profile_updated_by: str | None = None
     profile_updated_by_name: str | None = None
     mba_program: str | None = None
     law_school: str | None = None

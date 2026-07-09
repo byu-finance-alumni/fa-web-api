@@ -86,6 +86,12 @@ class Alumni(TimestampMixin, Base):
     profile_updated_by_user_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("users.user_id", ondelete="SET NULL")
     )
+    # Free-text "updated by" NAME captured from the intake sheet (the person who
+    # updated the profile, as typed on the sheet). DISTINCT from
+    # profile_updated_by_user_id, which is the resolved app-user FK — this holds
+    # the raw name and backs the "Profile updated by ..." hover when no user FK
+    # is linked.
+    profile_updated_by: Mapped[str | None] = mapped_column(String(200))
 
     # Secondary affiliation / education (#47, PRD section 6). All optional/
     # nullable additive fields that extend the alumni record beyond the core

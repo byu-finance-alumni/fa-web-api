@@ -33,9 +33,9 @@ def test_friend_headers_are_subset_without_academic_fields():
     for banned in (
         "BYU ID (9 digits)",
         "Net ID",
-        "Graduation year",
-        "Graduation month",
-        "Finance program year",
+        "Graduation Year",
+        "Graduation Semester",
+        "Finance program admitted year",
         "Degree year",
     ):
         assert banned not in friend

@@ -59,68 +59,54 @@ MAX_IMPORT_ROWS = 2000
 #
 # Each Alumni-sheet header maps to a (section, field) target in the
 # AlumniCreateFull payload. ``section`` is "core" for top-level fields or one of
-# the nested-section keys (contact/career/education/engagement). ``kind`` selects
-# the value coercion applied to the raw CSV cell.
+# the nested-section keys (contact/career/education/former/leadership/engagement).
+# ``kind`` selects the value coercion applied to the raw CSV cell.
 #
 #   "str"      -> trimmed string (empty -> omitted)
 #   "int"      -> parsed integer (graduation_year, degree_year, ...)
 #   "date"     -> parsed YYYY-MM-DD date (kept as ISO string for the schema)
 #   "bool"     -> Yes/No/true/1 -> bool
 #   "industry" -> validated against the controlled vocab (invalid -> row error)
-#   "spouse"   -> Spouse BYU ID; resolved to spouse_alumni_id in evaluate()
 #
-# The (section, field, kind) tuples are keyed by the EXACT header text from the
-# xlsx template so a drift in the template surfaces as a header error here.
+# Section targets: core -> alumni; contact -> alumni_contact_info; career ->
+# current_employment (employer/title/industry only — the single address lives on
+# the CONTACT record, so "Current city/state/ZIP/country" map to contact.*, NOT
+# career, and drive the map); education -> education_history; former ->
+# employment_history (is_current=false); leadership -> finance_society_leadership;
+# engagement -> alumni_program_engagement.
+#
+# Keys are the EXACT header text from the finalized 64-column intake template, in
+# that order, so a drift in the template surfaces as a header error here.
 
 _MAPPING: dict[str, tuple[str, str, str]] = {
-    # --- Identity ---
-    "BYU ID (9 digits)": ("core", "byu_id", "str"),
+    "Filled out Survey": ("core", "survey_completed_date", "date"),
     "MSTID (from OneAccord)": ("core", "mst_id", "str"),
+    "BYU ID (9 digits)": ("core", "byu_id", "str"),
     "Net ID": ("core", "net_id", "str"),
+    "Preferred first name": ("core", "preferred_first_name", "str"),
     "First name": ("core", "first_name", "str"),
     "Middle name": ("core", "middle_name", "str"),
-    "Last name": ("core", "last_name", "str"),
-    "Preferred first name": ("core", "preferred_first_name", "str"),
+    "Last Name": ("core", "last_name", "str"),
     "Gender": ("core", "gender", "str"),
-    "Citizenship": ("core", "citizenship", "str"),
-    "Marital status": ("core", "marital_status", "str"),
-    "Home country": ("core", "home_country", "str"),
-    "Employment status": ("core", "employment_status", "str"),
+    "Personal Email": ("contact", "personal_email", "str"),
     "Birthday (YYYY-MM-DD)": ("core", "birth_date", "date"),
-    "Graduation year": ("core", "graduation_year", "int"),
-    # Graduation semester + class supersede the raw graduation month.
-    "Graduation semester": ("core", "graduation_semester", "str"),
+    "Graduation Semester": ("core", "graduation_semester", "str"),
+    "Graduation Year": ("core", "graduation_year", "int"),
     "Class of": ("core", "graduation_class", "int"),
-    "Finance program year": ("core", "finance_program_year", "int"),
-    "Graduate degree": ("core", "graduate_degree", "str"),
-    "Other designations": ("core", "other_designations", "str"),
-    "Filled out survey (YYYY-MM-DD)": ("core", "survey_completed_date", "date"),
-    "Profile updated date (YYYY-MM-DD)": (
-        "core",
-        "profile_updated_date",
-        "date",
-    ),
     "LinkedIn URL": ("core", "linkedin_url", "str"),
+    "Finance program admitted year": ("core", "finance_program_year", "int"),
+    "Employment Status": ("core", "employment_status", "str"),
+    "Profile Updated By": ("core", "profile_updated_by", "str"),
+    "Profile Updated Date": ("core", "profile_updated_date", "date"),
+    "Finance Leadership Position": ("leadership", "leadership_role", "str"),
+    "Graduate degree": ("core", "graduate_degree", "str"),
     "Deceased? (Yes/No)": ("core", "deceased", "bool"),
     "Notes": ("core", "notes", "str"),
-    # --- Spouse ---
-    "Spouse first name": ("core", "spouse_first_name", "str"),
-    "Spouse last name": ("core", "spouse_last_name", "str"),
-    "Spouse birthday (YYYY-MM-DD)": ("core", "spouse_birth_date", "date"),
-    "Spouse BYU ID (if also an alumnus)": ("core", "spouse_alumni_id", "spouse"),
-    # --- Contact ---
-    "Personal email": ("contact", "personal_email", "str"),
-    "Work email": ("contact", "work_email", "str"),
-    "Phone": ("contact", "phone", "str"),
-    "Address line 1": ("contact", "address_line_1", "str"),
-    "Address line 2": ("contact", "address_line_2", "str"),
-    "City": ("contact", "city", "str"),
-    "State": ("contact", "state", "str"),
-    "ZIP": ("contact", "zip", "str"),
-    "Country": ("contact", "country", "str"),
-    "Region": ("contact", "region", "str"),
-    "Best contact (phone or email)": ("contact", "best_contact", "str"),
-    # --- Current career ---
+    "Citizenship": ("core", "citizenship", "str"),
+    "Marital Status": ("core", "marital_status", "str"),
+    "Spouse First Name": ("core", "spouse_first_name", "str"),
+    "Spouse Last Name": ("core", "spouse_last_name", "str"),
+    "Phone #": ("contact", "phone", "str"),
     "Current employer": ("career", "current_employer", "str"),
     "Current title": ("career", "current_title", "str"),
     "Current industry (see Reference sheet)": (
@@ -133,24 +119,28 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "current_industry_secondary",
         "industry",
     ),
-    "Current city": ("career", "current_city", "str"),
-    "Current state": ("career", "current_state", "str"),
-    "Current country": ("career", "current_country", "str"),
-    "Current ZIP": ("career", "current_zip", "str"),
-    "Seniority level": ("career", "seniority_level", "str"),
-    # --- Former (prior) role -> employment_history ---
-    "Former company": ("former", "employer_name", "str"),
-    "Former title": ("former", "employment_title", "str"),
-    "Former industry": ("former", "employment_industry", "str"),
-    # --- Education ---
-    "University": ("education", "university", "str"),
-    "College": ("education", "college", "str"),
-    "Department": ("education", "department", "str"),
+    "Work Email": ("contact", "work_email", "str"),
+    "Address line 1": ("contact", "address_line_1", "str"),
+    "Address line 2": ("contact", "address_line_2", "str"),
+    # The single address lives on the CONTACT record and drives the map, so the
+    # "Current city/state/ZIP/country" headers bind to contact.*, NOT career.
+    "Current city": ("contact", "city", "str"),
+    "Current state": ("contact", "state", "str"),
+    "Region (Northeast, Southeast, Midwest, Southwest, and West)": (
+        "contact",
+        "region",
+        "str",
+    ),
+    "Current country": ("contact", "country", "str"),
+    "Current ZIP": ("contact", "zip", "str"),
+    "Home country": ("core", "home_country", "str"),
     "Degree": ("education", "degree", "str"),
     "Major": ("education", "major", "str"),
     "Degree status": ("education", "degree_status", "str"),
     "Degree year": ("education", "degree_year", "int"),
-    # --- Program engagement ---
+    "Former Company": ("former", "employer_name", "str"),
+    "Former Title": ("former", "employment_title", "str"),
+    "Former Industry": ("former", "employment_industry", "str"),
     "Willing to host NetTrek (Yes/No)": (
         "engagement",
         "nettrek_host_willing",
@@ -177,7 +167,7 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "help_at_event_willing",
         "bool",
     ),
-    "Willing to host case competition (Yes/No)": (
+    "Willing to host case competition (yes/no)": (
         "engagement",
         "case_competition_host_willing",
         "bool",
@@ -197,12 +187,12 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "hired_finance_full_time",
         "bool",
     ),
-    "PIFF donor (Yes/No)": ("engagement", "piff_donor", "bool"),
+    "Willing to be a PIFF donor (Yes/No)": ("engagement", "piff_donor", "bool"),
     "CFP designation (Yes/No)": ("engagement", "cfp_designation", "bool"),
     "CFA designation (Yes/No)": ("engagement", "cfa_designation", "bool"),
+    "Other Designations:": ("core", "other_designations", "str"),
     "Engagement notes": ("engagement", "engagement_notes", "str"),
-    # --- Finance-society leadership -> finance_society_leadership ---
-    "Finance leadership position": ("leadership", "leadership_role", "str"),
+    "Best Contact": ("contact", "best_contact", "str"),
 }
 
 # Ordered list of expected headers — same source + order as the xlsx Alumni

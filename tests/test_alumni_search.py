@@ -256,6 +256,19 @@ def test_cfa_filter():
     assert "cpa_designation" not in sql
 
 
+def test_graduate_degree_filter():
+    # Graduate degree lives on the alumni table (not the engagement profile), so
+    # it filters directly on a non-null, non-empty graduate_degree.
+    sql = _sql(build_alumni_query(graduate_degree=True))
+    assert "graduate_degree IS NOT NULL" in sql
+    assert "graduate_degree" in sql
+
+
+def test_graduate_degree_filter_absent_by_default():
+    sql = _sql(build_alumni_query())
+    assert "graduate_degree IS NOT NULL" not in sql
+
+
 def test_cpa_filter():
     sql = _sql(build_alumni_query(cpa=True))
     assert "EXISTS" in sql

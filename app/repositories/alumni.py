@@ -136,6 +136,8 @@ def build_alumni_query(
     # narrows to alumni who hold that designation (correlated EXISTS).
     cfa: bool = False,
     cpa: bool = False,
+    # Only alumni who have a graduate degree recorded.
+    graduate_degree: bool = False,
     missing_email: bool = False,
     missing_employer: bool = False,
     missing_phone: bool = False,
@@ -465,6 +467,13 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(is_cpa)
+    if graduate_degree:
+        conditions.append(
+            and_(
+                Alumni.graduate_degree.isnot(None),
+                func.trim(Alumni.graduate_degree) != "",
+            )
+        )
     if missing_email:
         has_email = (
             select(AlumniContactInfo.contact_info_id)

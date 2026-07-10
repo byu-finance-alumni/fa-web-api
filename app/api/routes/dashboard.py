@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
+# Lowercased values that are NOT real employers — filtered out of the Top
+# employers chart so placeholders don't rank as firms. Compared against
+# lower(trim(current_employer)).
+_NON_EMPLOYER_VALUES = ("graduate student", "unknown", "n/a", "na", "none")
+
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
@@ -330,7 +335,15 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         await session.execute(
             select(CurrentEmployment.current_employer, func.count())
             .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
-            .where(active, CurrentEmployment.current_employer.is_not(None))
+            .where(
+                active,
+                CurrentEmployment.current_employer.is_not(None),
+                # Exclude non-employer placeholders (e.g. "graduate student",
+                # "unknown", "n/a") so the Top employers chart shows real firms.
+                func.lower(func.trim(CurrentEmployment.current_employer)).not_in(
+                    _NON_EMPLOYER_VALUES
+                ),
+            )
             .group_by(CurrentEmployment.current_employer)
             .order_by(func.count().desc())
             .limit(8)

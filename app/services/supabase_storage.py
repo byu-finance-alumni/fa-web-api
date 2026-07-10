@@ -127,6 +127,40 @@ async def create_signed_upload_url(bucket: str, path: str) -> str:
     return f"{base}{signed}" if signed.startswith("/") else f"{base}/{signed}"
 
 
+async def probe_object(bucket: str, path: str) -> tuple[str | None, int | None]:
+    """Best-effort read of an object's ``(content_type, size)`` WITHOUT
+    downloading it, via a 1-byte ranged GET. Used as defense-in-depth on the
+    direct-upload path (the bucket's own allow-list/size-limit is the primary
+    guard). Returns ``(None, None)`` if the object is missing or unreadable so
+    callers FAIL OPEN — a probe hiccup must never reject a legitimate upload."""
+    base, key = _base_and_key()
+    url = f"{base}/object/{bucket}/{path}"
+    headers = _headers(key)
+    headers["Range"] = "bytes=0-0"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            response = await client.get(url, headers=headers)
+    except httpx.HTTPError:
+        return (None, None)
+    if response.status_code not in (200, 206):
+        return (None, None)
+    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    size: int | None = None
+    # A 206 carries the true total after the slash: "bytes 0-0/<total>".
+    content_range = response.headers.get("content-range")
+    if content_range and "/" in content_range:
+        try:
+            size = int(content_range.rsplit("/", 1)[1])
+        except ValueError:
+            size = None
+    if size is None:
+        try:
+            size = int(response.headers["content-length"])
+        except (KeyError, ValueError):
+            size = None
+    return (content_type or None, size)
+
+
 async def delete_object(bucket: str, path: str) -> None:
     """Delete an object. A missing object (404) is treated as success."""
     base, key = _base_and_key()

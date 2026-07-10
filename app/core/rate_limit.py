@@ -26,6 +26,7 @@ from fastapi import Depends, HTTPException, status
 from app.api.dependencies.auth import (
     get_current_db_user_allow_must_change,
     require_alumni_edit,
+    require_full_access,
     require_super_admin,
     require_view_only,
 )
@@ -157,6 +158,15 @@ EMPLOYMENT_WRITE_LIMITER = rate_limiter(
     window_seconds=_MUTATION_WINDOW,
     actor_guard=require_alumni_edit,
 )
+# Headshot direct-upload routes (mint signed URL + confirm). Each writes a DB
+# audit row and makes an outbound Supabase call, so brake them like the other
+# alumni mutations; full_access is the managing tier.
+HEADSHOT_WRITE_LIMITER = rate_limiter(
+    "alumni:headshot_write",
+    limit=_MUTATION_LIMIT,
+    window_seconds=_MUTATION_WINDOW,
+    actor_guard=require_full_access,
+)
 
 InteractionWriteRateLimit = Annotated[
     UserContext, Depends(INTERACTION_WRITE_LIMITER)
@@ -164,4 +174,7 @@ InteractionWriteRateLimit = Annotated[
 TaskWriteRateLimit = Annotated[UserContext, Depends(TASK_WRITE_LIMITER)]
 EmploymentWriteRateLimit = Annotated[
     UserContext, Depends(EMPLOYMENT_WRITE_LIMITER)
+]
+HeadshotWriteRateLimit = Annotated[
+    UserContext, Depends(HEADSHOT_WRITE_LIMITER)
 ]

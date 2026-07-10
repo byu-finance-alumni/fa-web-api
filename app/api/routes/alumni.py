@@ -27,6 +27,7 @@ from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.core.rate_limit import (
     EmploymentWriteRateLimit,
+    HeadshotWriteRateLimit,
     InteractionWriteRateLimit,
     TaskWriteRateLimit,
 )
@@ -460,6 +461,90 @@ async def upload_headshot(
         raise InvalidRequestError("The uploaded image is empty.")
     net_id = await _alumnus_net_id(session, alumni_id)
     await supabase_storage.upload_object(_HEADSHOT_BUCKET, net_id, data, content_type)
+    service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.post("/{alumni_id}/headshot/upload-url")
+async def create_headshot_upload_url(
+    alumni_id: IdPath,
+    user: HeadshotWriteRateLimit,
+    session: SessionDep,
+) -> dict:
+    """Mint a short-lived signed URL the browser PUTs the image to DIRECTLY
+    (full_access and up). This bypasses the ~4.5 MB request-body cap on our
+    serverless functions, so headshots up to the bucket limit (20 MB) work.
+
+    The token is scoped to exactly this alumnus's object key (their net ID), so
+    the browser can only write that one path and never sees the service key.
+    Supabase enforces the bucket's size + JPEG/PNG/WebP allow-list on the PUT.
+
+    We log an ``upload_headshot_started`` audit HERE: minting is the necessary
+    precondition for any image change and is fully attributable, so the FERPA
+    trail can't be lost if the browser never reaches confirm (dropped connection
+    / closed tab). Confirm writes the terminal ``upload_headshot`` (success) or
+    ``upload_headshot_rejected`` once the object is validated, so this "started"
+    row never masquerades as a completed, conforming upload.
+    """
+    net_id = await _alumnus_net_id(session, alumni_id)
+    upload_url = await supabase_storage.create_signed_upload_url(_HEADSHOT_BUCKET, net_id)
+    service._audit(
+        session, user.user_id, "upload_headshot_started", alumni_id, new_value=net_id
+    )
+    await session.commit()
+    return {"upload_url": upload_url, "object_key": net_id}
+
+
+@router.post("/{alumni_id}/headshot/confirm", status_code=204)
+async def confirm_headshot_upload(
+    alumni_id: IdPath,
+    user: HeadshotWriteRateLimit,
+    session: SessionDep,
+) -> Response:
+    """Validate + record the outcome of a direct-to-storage headshot upload
+    (full_access and up). Writes the terminal audit so the trail reflects reality:
+    ``upload_headshot`` when a conforming object is present, or
+    ``upload_headshot_rejected`` when the uploaded object violates the contract
+    (the attribution for the attempt is already on the mint's
+    ``upload_headshot_started`` row).
+
+    Defense-in-depth: the bucket's own allow-list/size-limit is the primary guard
+    on the direct PUT, but we re-check the object's type + size here and delete
+    anything outside the contract, so a bucket misconfig can't silently let a bad
+    file through. The probe FAILS OPEN — if it can't read the object we fall back
+    to a plain existence check rather than reject a legitimate upload."""
+    net_id = await _alumnus_net_id(session, alumni_id)
+    content_type, size = await supabase_storage.probe_object(_HEADSHOT_BUCKET, net_id)
+    if content_type is None and size is None:
+        # Couldn't read metadata — confirm the object at least exists so a
+        # never-uploaded key can't be "confirmed", then record completion.
+        if await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id) is None:
+            raise InvalidRequestError("No uploaded image was found to confirm.")
+    elif content_type is not None and content_type not in _HEADSHOT_MIME_TYPES:
+        await supabase_storage.delete_object(_HEADSHOT_BUCKET, net_id)
+        service._audit(
+            session,
+            user.user_id,
+            "upload_headshot_rejected",
+            alumni_id,
+            field_name="content_type",
+            new_value=content_type,
+        )
+        await session.commit()
+        raise InvalidRequestError("Headshot must be a JPEG, PNG, or WebP image.")
+    elif size is not None and size > _HEADSHOT_MAX_BYTES:
+        await supabase_storage.delete_object(_HEADSHOT_BUCKET, net_id)
+        service._audit(
+            session,
+            user.user_id,
+            "upload_headshot_rejected",
+            alumni_id,
+            field_name="size",
+            new_value=size,
+        )
+        await session.commit()
+        return _too_large_response(_HEADSHOT_MAX_BYTES)
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
     await session.commit()
     return Response(status_code=204)

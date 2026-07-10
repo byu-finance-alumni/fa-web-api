@@ -646,9 +646,14 @@ async def delete_user(
         role is at or below the actor's own highest tier (ranked via
         ROLE_ORDER) — so only an engineer may delete an engineer, and only
         super_admin/engineer may delete a super_admin.
-      * Last-holder guard: you cannot delete the final holder of a top role
-        (super_admin / engineer), which would lock administration out for
-        everyone.
+      * Last-holder guard: you cannot delete the final holder of a top role when
+        that would lock administration out of the system. The last ENGINEER is
+        always protected (the engineer holds unique vocab/database powers no
+        other role can). The last SUPER_ADMIN is protected only when NO engineer
+        remains — the engineer tier is a superset of super_admin (engineer ⊇
+        super_admin), so as long as an engineer exists, user administration is
+        still available and the sole super_admin CAN be deleted (notably, an
+        engineer deleting it).
 
     Order of operations: the DB row (plus a ``delete_user`` audit entry,
     attributed to the actor and recording the deleted user's email) is committed
@@ -675,21 +680,49 @@ async def delete_user(
             "it is above your privilege tier."
         )
 
-    # System-wide last-holder guard: never delete the final holder of a top role,
-    # which would lock user (or engineer-only vocab/database) administration out
-    # of the system for everyone.
-    for top_role in (RoleName.SUPER_ADMIN.value, RoleName.ENGINEER.value):
-        if top_role in target_roles:
-            role = await session.scalar(
-                select(Role).where(Role.role_name == top_role)
-            )
-            holders = await session.scalar(
+    # System-wide last-holder guard: never delete the final holder of a top role
+    # when that would leave the system with no one able to administer it. The two
+    # top tiers differ in what "locks administration out" means:
+    #   * ENGINEER holds capabilities NO other role can (vocab/database admin, the
+    #     engineer console), so the last engineer is irreplaceable and must never
+    #     be deletable.
+    #   * SUPER_ADMIN only holds USER_ADMIN + alumni capabilities, ALL of which the
+    #     engineer also holds (engineer ⊇ super_admin). So the last super_admin is
+    #     only truly the last user-administrator when there is ALSO no engineer.
+    #     Guarding it unconditionally was a MISFIRE: it blocked an engineer (the
+    #     top role, which retains every super_admin capability) from deleting the
+    #     sole super_admin, even though administration was never at risk.
+    async def _holder_count(role_name: str) -> int:
+        role = await session.scalar(
+            select(Role).where(Role.role_name == role_name)
+        )
+        if role is None:
+            return 0
+        return (
+            await session.scalar(
                 select(func.count())
                 .select_from(UserRole)
                 .where(UserRole.role_id == role.role_id)
             )
-            if (holders or 0) <= 1:
-                raise ConflictError(f"Cannot delete the last {top_role}.")
+            or 0
+        )
+
+    if RoleName.ENGINEER.value in target_roles:
+        if await _holder_count(RoleName.ENGINEER.value) <= 1:
+            raise ConflictError(
+                f"Cannot delete the last {RoleName.ENGINEER.value}."
+            )
+
+    if RoleName.SUPER_ADMIN.value in target_roles:
+        # Blocked only when this is the last super_admin AND there is no engineer
+        # to fall back on; otherwise the engineer tier still administers users.
+        if (
+            await _holder_count(RoleName.SUPER_ADMIN.value) <= 1
+            and await _holder_count(RoleName.ENGINEER.value) == 0
+        ):
+            raise ConflictError(
+                f"Cannot delete the last {RoleName.SUPER_ADMIN.value}."
+            )
 
     auth_user_id = user.auth_user_id
     email = user.email

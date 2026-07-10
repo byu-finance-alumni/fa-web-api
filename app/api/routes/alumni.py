@@ -465,6 +465,45 @@ async def upload_headshot(
     return Response(status_code=204)
 
 
+@router.post("/{alumni_id}/headshot/upload-url")
+async def create_headshot_upload_url(
+    alumni_id: IdPath,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> dict:
+    """Mint a short-lived signed URL the browser PUTs the image to DIRECTLY
+    (full_access and up). This bypasses the ~4.5 MB request-body cap on our
+    serverless functions, so headshots up to the bucket limit (20 MB) work.
+
+    The token is scoped to exactly this alumnus's object key (their net ID), so
+    the browser can only write that one path and never sees the service key.
+    Supabase enforces the bucket's size + JPEG/PNG/WebP allow-list on the PUT;
+    the caller then hits ``/headshot/confirm`` so the upload is audited.
+    """
+    net_id = await _alumnus_net_id(session, alumni_id)
+    upload_url = await supabase_storage.create_signed_upload_url(_HEADSHOT_BUCKET, net_id)
+    return {"upload_url": upload_url, "object_key": net_id}
+
+
+@router.post("/{alumni_id}/headshot/confirm", status_code=204)
+async def confirm_headshot_upload(
+    alumni_id: IdPath,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> Response:
+    """Record that a direct-to-storage headshot upload completed (full_access and
+    up). Verifies the object now exists before writing the audit entry so a
+    stray confirm can't forge an FERPA trail, then leaves the same
+    ``upload_headshot`` audit the classic PUT path writes."""
+    net_id = await _alumnus_net_id(session, alumni_id)
+    signed = await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id)
+    if signed is None:
+        raise InvalidRequestError("No uploaded image was found to confirm.")
+    service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
+    await session.commit()
+    return Response(status_code=204)
+
+
 @router.get("/{alumni_id}/headshot")
 async def get_headshot(
     alumni_id: IdPath,

@@ -508,3 +508,17 @@ def test_headshot_upload_rejects_non_image(client):
     )
     # InvalidRequestError -> 422 (the app's validation-error status).
     assert resp.status_code == 422
+
+
+def test_headshot_upload_url_requires_auth(client):
+    assert client.post("/alumni/1/headshot/upload-url").status_code == 401
+
+
+def test_headshot_upload_url_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    assert client.post("/alumni/1/headshot/upload-url").status_code == 403
+
+
+def test_headshot_confirm_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    assert client.post("/alumni/1/headshot/confirm").status_code == 403

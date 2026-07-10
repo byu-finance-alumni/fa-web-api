@@ -482,3 +482,29 @@ def test_out_of_range_alumni_id_returns_422(client, bad_id):
     body = response.json()
     assert body["error"]["code"] == "validation_error"
     assert any(f["field"] == "alumni_id" for f in body["error"]["fields"])
+
+
+# --- Headshots ---------------------------------------------------------------
+
+
+def test_headshot_get_requires_auth(client):
+    assert client.get("/alumni/1/headshot").status_code == 401
+
+
+def test_headshot_upload_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    resp = client.put(
+        "/alumni/1/headshot",
+        files={"file": ("h.png", b"\x89PNG", "image/png")},
+    )
+    assert resp.status_code == 403
+
+
+def test_headshot_upload_rejects_non_image(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    resp = client.put(
+        "/alumni/1/headshot",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+    # InvalidRequestError -> 422 (the app's validation-error status).
+    assert resp.status_code == 422

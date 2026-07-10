@@ -209,6 +209,9 @@ async def list_alumni(
     cpa: Annotated[
         bool, Query(description="Only alumni holding the CPA designation.")
     ] = False,
+    graduate_degree: Annotated[
+        bool, Query(description="Only alumni with a graduate degree recorded.")
+    ] = False,
     missing_email: Annotated[
         bool,
         Query(description="Only alumni with no contact-info email on file."),
@@ -306,6 +309,7 @@ async def list_alumni(
         guest_speaker_willing=guest_speaker_willing,
         cfa=cfa,
         cpa=cpa,
+        graduate_degree=graduate_degree,
         missing_email=missing_email,
         missing_employer=missing_employer,
         missing_phone=missing_phone,
@@ -346,6 +350,7 @@ async def list_alumni(
             "never_contacted": never_contacted or None,
             "cfa": cfa or None,
             "cpa": cpa or None,
+            "graduate_degree": graduate_degree or None,
             "spoke_after": spoke_after.isoformat() if spoke_after else None,
             "spoke_before": spoke_before.isoformat() if spoke_before else None,
             # Only record the friends/alumni split when it deviates from the

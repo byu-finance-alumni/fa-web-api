@@ -9,9 +9,20 @@ is applied uniformly. Nothing loads the full alumni set into memory.
 
 from __future__ import annotations
 
-from sqlalchemy import String, and_, cast, desc, exists, func, literal, select
+from sqlalchemy import (
+    String,
+    and_,
+    case,
+    cast,
+    desc,
+    exists,
+    func,
+    literal,
+    select,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.us_states import CODE_BY_NAME, to_code
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
@@ -36,24 +47,34 @@ STATE_NAMES: dict[str, str] = {
     "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
 }
 
-# Map common full-name / mixed-case state values to the 2-letter code, so data
-# entered either way ("UT" or "Utah") aggregates together.
-_NAME_TO_CODE = {name.lower(): code for code, name in STATE_NAMES.items()}
-_CODES = set(STATE_NAMES)
-
-
 def normalize_state(value: str | None) -> str | None:
-    if not value:
-        return None
-    v = value.strip()
-    if v.upper() in _CODES:
-        return v.upper()
-    return _NAME_TO_CODE.get(v.lower())
+    """Fold a full-name / mixed-case / code state value to its 2-letter code, so
+    data entered either way ("UT" or "Utah") aggregates together. Non-US -> None."""
+    return to_code(value)
 
 
-# A normalized 2-letter state expression usable in SQL GROUP BY: upper-cased,
-# trimmed. (Full-name normalization is best-effort in Python on read.)
-_STATE = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
+def _state_code_expr(col):
+    """SQL expression folding a stored state value to its 2-letter code.
+
+    State is now stored as a FULL name ("Utah"), but the ``city_geo`` crosswalk
+    and every GROUP BY key the map uses are 2-letter codes. This CASE maps a
+    recognized full name back to its code and passes anything else (an already-
+    2-letter code, or a non-US value) through as ``upper(trim(...))`` — so a row
+    stored as "Utah" and one stored as "UT" both resolve to "UT"."""
+    trimmed = func.trim(cast(col, String))
+    return case(
+        *[
+            (func.lower(trimmed) == full_lower, code)
+            for full_lower, code in CODE_BY_NAME.items()
+        ],
+        else_=func.upper(trimmed),
+    )
+
+
+# A normalized 2-letter state expression usable in SQL GROUP BY: folds a stored
+# full name ("Utah") back to its code ("UT"), passing codes/non-US through as
+# upper(trim). Keeps "UT" and "Utah" rows in the same group.
+_STATE = _state_code_expr(AlumniContactInfo.state)
 _ALUMNI = func.count(func.distinct(Alumni.alumni_id))
 
 # Normalized city expression (lower-cased, trimmed) for GROUP BY, so "Provo",
@@ -176,7 +197,9 @@ async def get_counties(session: AsyncSession, filters: dict) -> list[dict]:
     ``COUNT(DISTINCT alumni_id)`` so a duplicate contact/employment row can't
     inflate a county."""
     city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
-    state_up = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
+    # Fold a stored full-name state back to its 2-letter code so it joins the
+    # city_geo crosswalk (keyed on codes) — a row stored "Utah" still matches.
+    state_up = _state_code_expr(AlumniContactInfo.state)
     rows = (
         await session.execute(
             select(
@@ -520,7 +543,9 @@ def _radius_join(stmt, lat: float, lng: float, miles: float, filters: dict):
     """Apply the alumni -> contact -> city_geo (+ employment) joins and the
     radius/filters WHERE used by both the count and the page query."""
     city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
-    state_up = func.upper(func.trim(cast(AlumniContactInfo.state, String)))
+    # Fold a stored full-name state back to its 2-letter code so it joins the
+    # city_geo crosswalk (keyed on codes) — a row stored "Utah" still matches.
+    state_up = _state_code_expr(AlumniContactInfo.state)
     return (
         stmt.select_from(Alumni)
         .join(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
@@ -579,7 +604,8 @@ async def get_radius_alumni(
                 "alumni_id": a.alumni_id,
                 "name": _full_name(a),
                 "city": city,
-                "state": state,
+                # _STATE yields a 2-letter code; show the full name for display.
+                "state": STATE_NAMES.get(state, state),
                 "graduation_year": a.graduation_year,
                 "current_employer": employer,
                 "current_title": title,

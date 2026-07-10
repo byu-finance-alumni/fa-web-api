@@ -196,24 +196,31 @@ def test_particle_first_word_capitalized():
 # --- Cleaning: state ---------------------------------------------------------
 
 
-def test_full_state_name_to_code():
-    payload = AlumniCreateFull(last_name="Doe", contact={"state": "California"})
+def test_full_state_name_normalized_to_canonical_full_name():
+    payload = AlumniCreateFull(last_name="Doe", contact={"state": "california"})
     cleaned, _ = hygiene.clean_alumni_payload(payload)
-    assert cleaned["contact"]["state"] == "CA"
+    # State is now stored as the canonical FULL name, not the 2-letter code.
+    assert cleaned["contact"]["state"] == "California"
 
 
-def test_two_letter_state_uppercased():
+def test_two_letter_state_expanded_to_full_name():
     payload = AlumniCreateFull(last_name="Doe", contact={"state": "ut"})
     cleaned, _ = hygiene.clean_alumni_payload(payload)
-    assert cleaned["contact"]["state"] == "UT"
+    assert cleaned["contact"]["state"] == "Utah"
 
 
-def test_career_state_full_name_to_code():
+def test_career_state_expanded_to_full_name():
     payload = AlumniCreateFull(
         last_name="Doe", career={"current_state": "new york"}
     )
     cleaned, _ = hygiene.clean_alumni_payload(payload)
-    assert cleaned["career"]["current_state"] == "NY"
+    assert cleaned["career"]["current_state"] == "New York"
+
+
+def test_non_us_state_passes_through_trimmed():
+    payload = AlumniCreateFull(last_name="Doe", contact={"state": "  Ontario "})
+    cleaned, _ = hygiene.clean_alumni_payload(payload)
+    assert cleaned["contact"]["state"] == "Ontario"
 
 
 # --- Cleaning: byu/net id ----------------------------------------------------
@@ -240,7 +247,7 @@ def test_cleaning_is_idempotent():
         contact={
             "personal_email": "jane@example.com",
             "phone": "(801) 555-1234",
-            "state": "CA",
+            "state": "California",
         },
         linkedin_url="https://www.linkedin.com/in/janedoe",
     )

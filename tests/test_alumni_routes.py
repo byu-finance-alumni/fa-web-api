@@ -264,16 +264,16 @@ def test_preview_create_returns_changes_blockers_warnings():
                 "byu_id": "123456789",
                 "first_name": "JANE",
                 "last_name": "doe",
-                "contact": {"personal_email": "JANE@X.COM", "state": "Utah"},
+                "contact": {"personal_email": "JANE@X.COM", "state": "ut"},
             },
         )
     app.dependency_overrides.clear()
     assert resp.status_code == 200
     body = resp.json()
     assert set(body.keys()) == {"cleaned", "changes", "warnings", "blockers"}
-    # Cleaning normalized name + email + state.
+    # Cleaning normalized name + email + state (code -> canonical full name).
     assert body["cleaned"]["first_name"] == "Jane"
-    assert body["cleaned"]["contact"]["state"] == "UT"
+    assert body["cleaned"]["contact"]["state"] == "Utah"
     changed = {(c["section"], c["field"]) for c in body["changes"]}
     assert ("core", "first_name") in changed
     assert ("contact", "state") in changed

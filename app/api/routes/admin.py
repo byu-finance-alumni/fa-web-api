@@ -141,36 +141,24 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class CreateUserRequest(BaseModel):
-    """Provision a new login user. ``role_name`` is restricted to the
-    non-privileged roles (full_access / student / view_only) — the top roles
-    (engineer, super_admin) are NOT bootstrappable here — so an unknown or
-    disallowed role is a 422 before any query runs; names follow the alumni NAME
-    rules (≤100 chars). ``extra='forbid'`` rejects unknown keys."""
+    """Provision a new login user. ``role_name`` accepts any known role; WHICH
+    role the creator may actually assign is enforced in the handler by the
+    privilege-ceiling guard (an actor can only create a user at or below their
+    own tier) — mirroring the assign-role endpoint, so a super_admin still can't
+    bootstrap an engineer above their own tier. An unknown role is a 422; names
+    follow the alumni NAME rules (≤100 chars). ``extra='forbid'`` rejects unknown
+    keys."""
 
     model_config = ConfigDict(extra="forbid")
 
     email: str = Field(min_length=3, max_length=255)
     first_name: str | None = None
     last_name: str | None = None
-    # Typed as the plain ``RoleName`` enum (mirrors ``RoleAssign.role_name``) so
-    # an unknown role produces a clean Pydantic error listing the string values
-    # ('engineer', 'super_admin', ...) rather than the enum-member repr
-    # (``<RoleName.FULL_ACCESS: 'full_access'>``). The top roles (engineer,
-    # super_admin) must NOT be bootstrappable via account creation — they can
-    # only be granted to an EXISTING user through the assign-role endpoint — so
-    # the validator below restricts the create payload to the non-privileged
-    # roles (full_access / student / view_only); anything else is a clean 422.
+    # Typed as the plain ``RoleName`` enum so an unknown role produces a clean
+    # Pydantic 422. Any known role is accepted here; the create handler's
+    # privilege-ceiling guard (``_outranks_actor``) is what actually stops an
+    # actor from creating a user above their own tier.
     role_name: RoleName = RoleName.VIEW_ONLY
-
-    @field_validator("role_name")
-    @classmethod
-    def _restrict_role(cls, value: RoleName) -> RoleName:
-        allowed = {RoleName.FULL_ACCESS, RoleName.STUDENT, RoleName.VIEW_ONLY}
-        if value not in allowed:
-            raise ValueError(
-                "Must be one of: full_access, student, view_only."
-            )
-        return value
 
     @field_validator("email", mode="before")
     @classmethod
@@ -974,6 +962,16 @@ async def create_user(
     The temp password is returned ONCE for the super_admin to hand to the user;
     the user should change it on next login.
     """
+    # Privilege ceiling (#178): an actor may only create a user with a role at or
+    # below their own highest tier — mirrors the assign-role guard so a
+    # super_admin can't bootstrap an engineer (a tier above them).
+    if _outranks_actor(actor, payload.role_name.value):
+        label = ROLE_LABELS.get(payload.role_name.value, payload.role_name.value)
+        raise AuthorizationError(
+            f"You cannot create a user with the {label} role; it is above your "
+            "privilege tier."
+        )
+
     # Anti-enumeration: a duplicate email is a generic conflict, not a "user
     # already exists" disclosure beyond the 409 itself.
     existing = await session.scalar(

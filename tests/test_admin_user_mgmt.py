@@ -322,13 +322,32 @@ def test_create_user_db_failure_triggers_compensating_delete(
     assert session.commits == 0
 
 
-def test_create_user_rejects_super_admin_role(create_client):
-    """super_admin must not be bootstrappable via account creation -> 422."""
+def test_create_user_rejects_role_above_actor_tier(create_client):
+    """Privilege ceiling: a super_admin actor cannot create a user with a role
+    ABOVE their tier (engineer) -> 403."""
     test_client, _ = create_client
     resp = test_client.post(
-        "/admin/users", json={"email": "boss@byu.edu", "role_name": "super_admin"}
+        "/admin/users", json={"email": "boss@byu.edu", "role_name": "engineer"}
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+
+
+def test_create_user_allows_role_at_actor_tier(create_client, monkeypatch):
+    """The relaxation: a super_admin actor CAN now create another super_admin
+    (equal tier) — previously a hard 422. The ceiling guard passes and creation
+    proceeds (an engineer could likewise create any role below engineer)."""
+    test_client, _ = create_client
+
+    async def _fake_create_auth_user(email, password, email_confirm=True):
+        return uuid.UUID("44444444-4444-4444-4444-444444444444")
+
+    monkeypatch.setattr(admin_routes, "create_auth_user", _fake_create_auth_user)
+    resp = test_client.post(
+        "/admin/users",
+        json={"email": "peer@byu.edu", "role_name": "super_admin"},
+    )
+    assert resp.status_code == 201
 
 
 # --- edit user name ----------------------------------------------------------

@@ -14,6 +14,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
@@ -23,13 +24,14 @@ from app.api.dependencies.auth import (
 )
 from app.api.params import IdPath
 from app.core.database import get_session
-from app.core.errors import NotFoundError
+from app.core.errors import InvalidRequestError, NotFoundError
 from app.core.rate_limit import (
     EmploymentWriteRateLimit,
     InteractionWriteRateLimit,
     TaskWriteRateLimit,
 )
 from app.core.security import AuthorizationError
+from app.models.alumni import Alumni
 from app.repositories.alumni import SURVEY_CADENCE
 from app.schemas.alumni import (
     AlumniCreateFull,
@@ -69,7 +71,7 @@ from app.schemas.profile import (
     TaskRead,
 )
 from app.services import alumni as service
-from app.services import alumni_export, hygiene, import_csv
+from app.services import alumni_export, hygiene, import_csv, supabase_storage
 from app.services import profile as profile_service
 
 router = APIRouter(prefix="/alumni", tags=["alumni"])
@@ -409,6 +411,89 @@ def _too_large_response() -> JSONResponse:
             }
         },
     )
+
+
+# --- Headshots ---------------------------------------------------------------
+
+_HEADSHOT_BUCKET = "headshots"
+# We gate the type here too (the bucket enforces the same allow-list) so a bad
+# type never reaches storage.
+_HEADSHOT_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+
+
+async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
+    """Return the alumnus's net_id (the headshot object key), or raise 404/400."""
+    alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
+    if alumnus is None:
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    net_id = (alumnus.net_id or "").strip()
+    if not net_id:
+        raise InvalidRequestError(
+            "This alumnus has no net ID; a headshot is stored under the net ID."
+        )
+    return net_id
+
+
+@router.put("/{alumni_id}/headshot", status_code=204)
+async def upload_headshot(
+    alumni_id: IdPath,
+    user: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> Response:
+    """Upload or replace an alumnus's headshot (full_access and up).
+
+    Stored PRIVATELY in the ``headshots`` bucket, keyed by the alumnus's net ID,
+    overwriting any existing image. Only JPEG/PNG/WebP within the upload cap are
+    accepted; the image is only ever served back via a short-lived signed URL.
+    """
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    if content_type not in _HEADSHOT_MIME_TYPES:
+        raise InvalidRequestError("Headshot must be a JPEG, PNG, or WebP image.")
+    data = await _read_capped(file)
+    if data is None:
+        return _too_large_response()
+    if not data:
+        raise InvalidRequestError("The uploaded image is empty.")
+    net_id = await _alumnus_net_id(session, alumni_id)
+    await supabase_storage.upload_object(_HEADSHOT_BUCKET, net_id, data, content_type)
+    service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.get("/{alumni_id}/headshot")
+async def get_headshot(
+    alumni_id: IdPath,
+    user: RequireViewAccess,
+    session: SessionDep,
+) -> dict:
+    """Return a short-lived signed URL for the alumnus's headshot, or
+    ``{"url": null}`` when none is set. Any authenticated view role may fetch it
+    (the headshot shows on the profile); the bucket is private so the signed URL
+    is the only way to view the image and it expires within the hour."""
+    alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
+    if alumnus is None:
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    net_id = (alumnus.net_id or "").strip()
+    if not net_id:
+        return {"url": None}
+    return {"url": await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id)}
+
+
+@router.delete("/{alumni_id}/headshot", status_code=204)
+async def delete_headshot(
+    alumni_id: IdPath,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> Response:
+    """Remove an alumnus's headshot (full_access and up). A missing image is a
+    no-op (still 204)."""
+    net_id = await _alumnus_net_id(session, alumni_id)
+    await supabase_storage.delete_object(_HEADSHOT_BUCKET, net_id)
+    service._audit(session, user.user_id, "delete_headshot", alumni_id, old_value=net_id)
+    await session.commit()
+    return Response(status_code=204)
 
 
 @router.get("/import/template")

@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.us_states import to_full_name as _state_full_name
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
@@ -116,62 +117,6 @@ _NAME_FIELDS = {
         "spouse_last_name",
     ),
 }
-
-# US states + DC: full name -> 2-letter code (lower-cased keys for matching).
-_US_STATES: dict[str, str] = {
-    "alabama": "AL",
-    "alaska": "AK",
-    "arizona": "AZ",
-    "arkansas": "AR",
-    "california": "CA",
-    "colorado": "CO",
-    "connecticut": "CT",
-    "delaware": "DE",
-    "district of columbia": "DC",
-    "florida": "FL",
-    "georgia": "GA",
-    "hawaii": "HI",
-    "idaho": "ID",
-    "illinois": "IL",
-    "indiana": "IN",
-    "iowa": "IA",
-    "kansas": "KS",
-    "kentucky": "KY",
-    "louisiana": "LA",
-    "maine": "ME",
-    "maryland": "MD",
-    "massachusetts": "MA",
-    "michigan": "MI",
-    "minnesota": "MN",
-    "mississippi": "MS",
-    "missouri": "MO",
-    "montana": "MT",
-    "nebraska": "NE",
-    "nevada": "NV",
-    "new hampshire": "NH",
-    "new jersey": "NJ",
-    "new mexico": "NM",
-    "new york": "NY",
-    "north carolina": "NC",
-    "north dakota": "ND",
-    "ohio": "OH",
-    "oklahoma": "OK",
-    "oregon": "OR",
-    "pennsylvania": "PA",
-    "rhode island": "RI",
-    "south carolina": "SC",
-    "south dakota": "SD",
-    "tennessee": "TN",
-    "texas": "TX",
-    "utah": "UT",
-    "vermont": "VT",
-    "virginia": "VA",
-    "washington": "WA",
-    "west virginia": "WV",
-    "wisconsin": "WI",
-    "wyoming": "WY",
-}
-
 
 # --- Pure cleaning primitives ------------------------------------------------
 
@@ -272,17 +217,12 @@ def _clean_linkedin(value: str | None) -> str | None:
 
 
 def _clean_state(value: str | None) -> str | None:
-    """Map a full US state name to its 2-letter UPPER code; otherwise uppercase
-    a 2-letter input. Non-state values pass through trimmed."""
+    """Normalize a US state to its canonical FULL name (e.g. "UT"/"utah" ->
+    "Utah"). Non-US values pass through trimmed (whitespace collapsed)."""
     cleaned = _collapse(value)
     if cleaned is None:
         return None
-    mapped = _US_STATES.get(cleaned.lower())
-    if mapped is not None:
-        return mapped
-    if len(cleaned) == 2 and cleaned.isalpha():
-        return cleaned.upper()
-    return cleaned
+    return _state_full_name(cleaned)
 
 
 def _clean_byu_id(value: str | None) -> str | None:

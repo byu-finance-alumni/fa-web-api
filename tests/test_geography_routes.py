@@ -132,6 +132,56 @@ def test_city_group_by_normalizes_case_and_whitespace():
     assert "trim" in sql
 
 
+def test_state_code_expr_folds_full_name_to_code_in_sql():
+    # State is stored as a full name ("Utah"), but every map GROUP BY and the
+    # city_geo join key on 2-letter codes. _state_code_expr must emit a CASE that
+    # folds a recognized full name to its code and passes anything else through
+    # as upper(trim(...)), so a row stored "Utah" resolves to "UT".
+    from sqlalchemy.dialects import postgresql
+
+    from app.models.contact import AlumniContactInfo
+
+    expr = svc._state_code_expr(AlumniContactInfo.state)
+    sql = str(
+        expr.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).lower()
+    assert "case" in sql
+    assert "'utah'" in sql          # a full-name branch condition
+    assert "'ut'" in sql            # ...mapping to the 2-letter code
+    assert "upper" in sql           # else-branch pass-through
+    assert "trim" in sql
+
+
+def test_state_expr_used_by_map_is_the_code_fold():
+    # The module-level _STATE (used for GROUP BY + city_geo joins) is the
+    # code-fold expression, so "UT" and "Utah" rows collapse into one code.
+    from sqlalchemy.dialects import postgresql
+
+    sql = str(
+        svc._STATE.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).lower()
+    assert "case" in sql
+    assert "'utah'" in sql
+    assert "'ut'" in sql
+
+
+def test_get_state_detail_resolves_code_and_full_name_display():
+    # get_state_detail("UT") normalizes the requested state to its code and shows
+    # the full name; a row stored "Utah" would match via the _STATE code-fold.
+    # scalar()->0 (total); executes: cities _top, employers _top, industries
+    # _top, grad-year histogram.
+    executes = [[], [], [], []]
+    result = asyncio.run(svc.get_state_detail(_FakeSession(executes), "UT", {}))
+    assert result["state"] == "UT"
+    assert result["state_name"] == "Utah"
+
+
 def test_get_counties_maps_fips_to_counts():
     # get_counties runs one grouped query: (county_fips, count) rows -> dicts with
     # int counts, ready for the national county choropleth.

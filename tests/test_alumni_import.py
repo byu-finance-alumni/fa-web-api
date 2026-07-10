@@ -483,6 +483,8 @@ def test_real_city_still_kept():
     )
     rows, _ = import_csv.parse_and_map(csv)
     assert rows[0]["payload"]["contact"]["city"] == "Provo"
+    # parse_and_map only maps raw cells; hygiene cleaning (which expands "UT" ->
+    # "Utah") runs in the later preview/write stage, so the raw value is kept.
     assert rows[0]["payload"]["contact"]["state"] == "UT"
 
 

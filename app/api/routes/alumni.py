@@ -387,21 +387,21 @@ async def alumni_filter_options(_: RequireViewAccess, session: SessionDep) -> Fi
 # matching is declaration-ordered).
 
 
-async def _read_capped(file: UploadFile) -> bytes | None:
-    """Read an upload, capped at ``MAX_UPLOAD_BYTES``.
+async def _read_capped(file: UploadFile, cap: int = import_csv.MAX_UPLOAD_BYTES) -> bytes | None:
+    """Read an upload, capped at ``cap`` bytes (default ``MAX_UPLOAD_BYTES``).
 
     Reads one byte past the cap so we can tell "exactly at the limit" from "over".
     Returns the bytes, or ``None`` if the file exceeds the cap (the caller turns
     that into a 413 response). Bounds memory before any parsing happens (DoS).
     """
-    data = await file.read(import_csv.MAX_UPLOAD_BYTES + 1)
-    if len(data) > import_csv.MAX_UPLOAD_BYTES:
+    data = await file.read(cap + 1)
+    if len(data) > cap:
         return None
     return data
 
 
-def _too_large_response() -> JSONResponse:
-    mib = import_csv.MAX_UPLOAD_BYTES // (1024 * 1024)
+def _too_large_response(cap: int = import_csv.MAX_UPLOAD_BYTES) -> JSONResponse:
+    mib = cap // (1024 * 1024)
     return JSONResponse(
         status_code=413,  # Content Too Large
         content={
@@ -419,6 +419,9 @@ _HEADSHOT_BUCKET = "headshots"
 # We gate the type here too (the bucket enforces the same allow-list) so a bad
 # type never reaches storage.
 _HEADSHOT_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+# Headshots get a larger cap than CSV imports — high-res phone photos are easily
+# several MB. Independent of ``MAX_UPLOAD_BYTES`` so it doesn't loosen imports.
+_HEADSHOT_MAX_BYTES = 20 * 1024 * 1024  # 20 MiB
 
 
 async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
@@ -450,9 +453,9 @@ async def upload_headshot(
     content_type = (file.content_type or "").split(";")[0].strip().lower()
     if content_type not in _HEADSHOT_MIME_TYPES:
         raise InvalidRequestError("Headshot must be a JPEG, PNG, or WebP image.")
-    data = await _read_capped(file)
+    data = await _read_capped(file, _HEADSHOT_MAX_BYTES)
     if data is None:
-        return _too_large_response()
+        return _too_large_response(_HEADSHOT_MAX_BYTES)
     if not data:
         raise InvalidRequestError("The uploaded image is empty.")
     net_id = await _alumnus_net_id(session, alumni_id)

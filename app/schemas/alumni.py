@@ -720,6 +720,9 @@ class AlumniListItem(AlumniRead):
 
     current_employer: str | None = None
     current_industry: str | None = None
+    # Secondary industry (the actual non-finance industry) for alumni bucketed
+    # under "Other" — shown in the list's Other drill-down instead of "Other".
+    current_industry_secondary: str | None = None
     current_city: str | None = None
     current_state: str | None = None
 

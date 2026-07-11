@@ -42,6 +42,18 @@ INDUSTRIES: tuple[str, ...] = (
 # Mentor industries — the same list plus Law/Government (multi-select field).
 MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
 
+# Dashboard wheel: the 14 finance industries Tanya wants shown as their own slice
+# (2026-07-11). Everything else in INDUSTRIES (Law, Corporate Banking, FP&A,
+# Sales and Trading, Credit Risk) plus any non-vocab value folds into "Other".
+# Both the dashboard breakdown AND the alumni-list ``industry_group=other`` filter
+# key off this set so the wheel slice and its drill-down stay in sync.
+_NON_WHEEL_INDUSTRIES = frozenset(
+    {"Law", "Corporate Banking", "FP&A", "Sales and Trading", "Credit Risk", "Other"}
+)
+WHEEL_INDUSTRIES: tuple[str, ...] = tuple(
+    i for i in INDUSTRIES if i not in _NON_WHEEL_INDUSTRIES
+)
+
 _INDUSTRIES_SET = frozenset(INDUSTRIES)
 # Case-insensitive lookup -> canonical casing, so a CSV/HR export that varies
 # case ("investment banking") resolves to the stored value ("Investment Banking")

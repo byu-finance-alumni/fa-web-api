@@ -16,7 +16,7 @@ import datetime
 from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import INDUSTRIES
+from app.core.dropdowns import WHEEL_INDUSTRIES
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Interaction, Survey
@@ -34,15 +34,16 @@ from app.utils.sql import escape_like
 # the cutoff as ``now() - SURVEY_CADENCE`` and pass it as ``survey_due_before``.
 SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
 
-# Canonical FINANCE industries = the controlled ``INDUSTRIES`` vocabulary MINUS
-# the "Other" catch-all. Powers the ``industry_group`` bucket filters (#351/#352):
+# The 14 dashboard "wheel" industries. Powers the ``industry_group`` filters so
+# the alumni-list "Other" drill-down matches the dashboard "Other" slice exactly:
 #   * ``unknown`` — no current-employment row names a (non-blank) primary industry
-#   * ``other``   — has a primary industry, but it isn't one of these finance
-#                   industries (i.e. literal "Other" or any non-canonical value)
+#   * ``other``   — has a primary industry, but it isn't one of the 14 wheel
+#                   industries (literal "Other", a non-wheel finance value like
+#                   Law/Corporate Banking, or any non-canonical value)
 # Lower-cased for a case-insensitive DB comparison (industries are stored as
 # free-text varchars, so casing can drift on import).
 _FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
-    i.lower() for i in INDUSTRIES if i.lower() != "other"
+    i.lower() for i in WHEEL_INDUSTRIES
 )
 
 
@@ -656,6 +657,13 @@ async def list_page(
         .limit(1)
         .scalar_subquery()
     )
+    # Secondary (non-finance) industry — shown in the Other drill-down.
+    current_industry_secondary = (
+        select(CurrentEmployment.current_industry_secondary)
+        .where(CurrentEmployment.alumni_id == Alumni.alumni_id)
+        .limit(1)
+        .scalar_subquery()
+    )
     # Location for the list's City/State columns. Sourced from the contact-info
     # row (NOT current_employment.current_city/state) so the list matches the
     # geography map, which shades exclusively off alumni_contact_info.
@@ -672,7 +680,12 @@ async def list_page(
         .scalar_subquery()
     )
     rows_stmt = select(
-        Alumni, current_employer, current_industry, current_city, current_state
+        Alumni,
+        current_employer,
+        current_industry,
+        current_industry_secondary,
+        current_city,
+        current_state,
     )
     if base.whereclause is not None:
         rows_stmt = rows_stmt.where(base.whereclause)
@@ -695,9 +708,10 @@ async def list_page(
     )
     result = await session.execute(rows_stmt)
     items: list[Alumni] = []
-    for alumnus, employer, industry, city, state in result.all():
+    for alumnus, employer, industry, industry_secondary, city, state in result.all():
         alumnus.current_employer = employer
         alumnus.current_industry = industry
+        alumnus.current_industry_secondary = industry_secondary
         alumnus.current_city = city
         alumnus.current_state = state
         items.append(alumnus)

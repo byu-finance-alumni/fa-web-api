@@ -16,7 +16,7 @@ from sqlalchemy.orm import aliased
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
-from app.core.dropdowns import INDUSTRIES
+from app.core.dropdowns import WHEEL_INDUSTRIES
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -51,9 +51,7 @@ _NON_EMPLOYER_VALUES = ("graduate student", "unknown", "n/a", "na", "none")
 # bucket separate from "Unknown" (no industry on file). Every one of these is
 # returned even at count 0 so the legend can list them all. ``_FINANCE_BY_LOWER``
 # folds a stored value to its canonical casing case-insensitively.
-_FINANCE_INDUSTRIES: tuple[str, ...] = tuple(
-    i for i in INDUSTRIES if i.strip().lower() != "other"
-)
+_FINANCE_INDUSTRIES: tuple[str, ...] = WHEEL_INDUSTRIES
 _FINANCE_BY_LOWER = {v.lower(): v for v in _FINANCE_INDUSTRIES}
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]

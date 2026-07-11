@@ -417,6 +417,62 @@ def test_summary_includes_this_month_kpis(client):
     assert body["guest_speakers_this_month"] == 2
 
 
+def test_summary_industry_breakdown_separates_other_and_unknown(client):
+    # #351/#352/#353: the industry breakdown lists EVERY canonical finance
+    # industry (incl. zero-count), folds case variants, routes literal "Other"
+    # and any non-vocab value into a separate "other" bucket, and reports
+    # "unknown" (no industry on file) as its own count distinct from "other".
+    from app.api.routes.dashboard import _FINANCE_INDUSTRIES
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    # total = 100 (scalar #0); every other KPI scalar is 0.
+    scalars = [100] + [0] * 16
+    # execute() order in the handler: cohort, top_employers, industry, by_state.
+    industry_rows = [
+        ("Investment Banking", 30),
+        ("investment banking", 5),  # case-insensitive fold into the canonical
+        ("Other", 10),  # literal catch-all -> "other" bucket
+        ("Underwater Basket Weaving", 3),  # non-vocab value -> "other" bucket
+    ]
+    session = _FakeSession(
+        [], scalars=scalars, executes=[[], [], industry_rows, []]
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    breakdown = response.json()["industry_breakdown"]
+    # Every canonical finance industry appears, in canonical order.
+    assert [r["industry"] for r in breakdown["industries"]] == list(
+        _FINANCE_INDUSTRIES
+    )
+    counts = {r["industry"]: r["count"] for r in breakdown["industries"]}
+    assert counts["Investment Banking"] == 35  # 30 + 5 folded together
+    assert counts["Asset Management"] == 0  # zero-count industry still listed
+    assert breakdown["other"] == 13  # literal "Other" (10) + non-vocab (3)
+    # known = 35 + 13 = 48; unknown = active total (100) - known (48) = 52.
+    assert breakdown["unknown"] == 52
+
+
+def test_summary_top_employers_union_covers_history_and_current(client):
+    # #355: Top employers now aggregates over the last 5 years — a UNION of the
+    # current job and recent/ongoing employment_history, counted DISTINCT by
+    # alumnus. Assert the compiled statement references BOTH source tables and
+    # the recency predicate (start_year / is_current / end_year).
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 17)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    # execute() #2 (index 1) is the top-employers union query.
+    sql = _compiled(session.execute_args[1])
+    assert "current_employment" in sql
+    assert "employment_history" in sql
+    assert "start_year" in sql
+    assert "is_current" in sql
+
+
 def test_summary_guest_speaker_signal_uses_attendance_status_ilike(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     session = _FakeSession([], scalars=[0] * 17)

@@ -46,6 +46,9 @@ class CurrentEmployment(TimestampMixin, Base):
     current_title: Mapped[str | None] = mapped_column(String(255))
     current_industry: Mapped[str | None] = mapped_column(String(255))
     current_industry_secondary: Mapped[str | None] = mapped_column(String(255))
+    # Company street address (the "Company Address" line on the profile, #366).
+    # City/state/country/zip below are the finer-grained location fields.
+    company_address: Mapped[str | None] = mapped_column(String(255))
     current_city: Mapped[str | None] = mapped_column(String(100))
     current_state: Mapped[str | None] = mapped_column(String(100))
     current_country: Mapped[str | None] = mapped_column(String(100))

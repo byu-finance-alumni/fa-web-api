@@ -53,6 +53,10 @@ class AlumniExportFilters(BaseModel):
     grad_year_min: int | None = None
     grad_year_max: int | None = None
     deceased: bool | None = None
+    # Gender + industry-bucket facets (#360, #351/#352), kept in parity with
+    # GET /alumni so an export matches the filtered view the user is looking at.
+    gender: str | None = None
+    industry_group: str | None = None
     employer: list[str] | None = None
     past_employer: list[str] | None = None
     industry: list[str] | None = None

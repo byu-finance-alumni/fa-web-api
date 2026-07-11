@@ -37,6 +37,7 @@ from app.repositories.alumni import SURVEY_CADENCE
 from app.schemas.alumni import (
     AlumniCreateFull,
     AlumniListItem,
+    AlumniLocation,
     AlumniPage,
     AlumniRead,
     AlumniUpdateFull,
@@ -72,7 +73,13 @@ from app.schemas.profile import (
     TaskRead,
 )
 from app.services import alumni as service
-from app.services import alumni_export, hygiene, import_csv, supabase_storage
+from app.services import (
+    alumni_export,
+    geo_search,
+    hygiene,
+    import_csv,
+    supabase_storage,
+)
 from app.services import profile as profile_service
 
 router = APIRouter(prefix="/alumni", tags=["alumni"])
@@ -112,6 +119,28 @@ async def list_alumni(
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
     deceased: Annotated[bool | None, Query(description="Filter by deceased flag.")] = None,
+    gender: Annotated[
+        Literal["M", "F"] | None,
+        Query(
+            description=(
+                "Gender facet (#360): 'M' or 'F'. Combinable with the industry "
+                "filter (and every other filter). Matches on the first letter of "
+                "the stored gender value, so 'Male'/'M' and 'Female'/'F' both match."
+            )
+        ),
+    ] = None,
+    industry_group: Annotated[
+        Literal["unknown", "other"] | None,
+        Query(
+            description=(
+                "Industry-bucket facet (#351/#352) for the dashboard drill-downs: "
+                "'unknown' — alumni with a blank/missing primary industry; 'other' "
+                "— alumni whose primary industry is NOT one of the canonical "
+                "finance industries (the 'Other' bucket). Distinct from the exact "
+                "'industry' facet, which matches a specific industry name."
+            )
+        ),
+    ] = None,
     employer: Annotated[
         list[str] | None,
         Query(description="Current employer(s) — repeatable (OR), exact match."),
@@ -243,9 +272,37 @@ async def list_alumni(
             )
         ),
     ] = "alumni",
+    near: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Natural-language location search (#358): a place phrase such as "
+                "'near Los Angeles, CA', 'within 50 miles of Provo', or a region "
+                "alias like 'Bay Area'. Resolved to a set of nearby cities via the "
+                "geocoding module; results are restricted to alumni located there. "
+                "An unresolvable phrase falls back to the normal (non-location) "
+                "search and the response's 'location.resolved' is false."
+            )
+        ),
+    ] = None,
+    radius: Annotated[
+        float | None,
+        Query(
+            ge=1,
+            le=3000,
+            description=(
+                "Optional radius override (miles) for the 'near' location search. "
+                "When provided it overrides the radius inferred from the phrase."
+            ),
+        ),
+    ] = None,
     sort: Annotated[
-        Literal["name", "grad_desc", "grad_asc"],
-        Query(description="Sort order: name | grad_desc | grad_asc."),
+        Literal["name", "grad_desc", "grad_asc", "industry", "city", "state"],
+        Query(
+            description=(
+                "Sort order: name | grad_desc | grad_asc | industry | city | state."
+            )
+        ),
     ] = "name",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -274,6 +331,41 @@ async def list_alumni(
     # Map the friends/alumni split (#218) to the repository's tri-state filter:
     # alumni-only (True), friends-only (False), or both (None).
     is_alumni_filter = {"alumni": True, "friend": False, "all": None}[kind]
+    # Natural-language location search (#358). When a ``near`` phrase is present we
+    # ask the geocoding module to resolve it to a center + a set of nearby cities;
+    # a ``radius`` override is folded into the phrase so the resolved city set (and
+    # the human label) reflect it consistently. A resolved query yields a match-
+    # predicate we AND into the list filters; an unresolvable phrase falls back to
+    # the normal search, flagged ``resolved=false`` so the UI can show a soft note.
+    location_filter = None
+    location_envelope: dict | None = None
+    if near and near.strip():
+        near_text = near.strip()
+        # A ``radius`` override is encoded into the phrase so the geo module's
+        # resolved city set AND label reflect it. If that phrasing doesn't parse
+        # (e.g. an odd region alias), fall back to the raw phrase so a valid place
+        # still resolves; the override radius is then only echoed in the envelope.
+        resolved = None
+        if radius is not None:
+            resolved = await geo_search.resolve_location_query(
+                session, f"within {radius:g} miles of {near_text}"
+            )
+        if resolved is None:
+            resolved = await geo_search.resolve_location_query(session, near_text)
+        if resolved is not None:
+            match, keys = resolved
+            location_filter = geo_search.alumni_location_filter(keys)
+            location_envelope = {
+                "label": match.label,
+                "radius_miles": (
+                    radius if radius is not None else getattr(match, "radius_miles", None)
+                ),
+                "resolved": True,
+            }
+        else:
+            # Couldn't pinpoint the place — don't filter (normal search still runs)
+            # but tell the UI so it can surface a "couldn't pinpoint" note.
+            location_envelope = {"label": near_text, "resolved": False}
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -288,6 +380,9 @@ async def list_alumni(
         grad_year_min=grad_year_min,
         grad_year_max=grad_year_max,
         deceased=deceased,
+        gender=gender,
+        industry_group=industry_group,
+        location_filter=location_filter,
         employer=employer,
         past_employer=past_employer,
         industry=industry,
@@ -336,6 +431,10 @@ async def list_alumni(
             "graduation_year": graduation_year,
             "grad_year_min": grad_year_min,
             "grad_year_max": grad_year_max,
+            "gender": gender,
+            "industry_group": industry_group,
+            # Record the interpreted location phrase (never the resolved city set).
+            "near": (location_envelope.get("label") if location_envelope else None),
             "employer": "|".join(employer) if employer else None,
             "past_employer": "|".join(past_employer) if past_employer else None,
             "industry": "|".join(industry) if industry else None,
@@ -368,7 +467,12 @@ async def list_alumni(
         minimize_alumni_read(AlumniListItem.model_validate(item), can_edit=user.can_edit_alumni)
         for item in items
     ]
-    return AlumniPage(items=rows, total=total, limit=limit, offset=offset)
+    location = (
+        AlumniLocation.model_validate(location_envelope) if location_envelope else None
+    )
+    return AlumniPage(
+        items=rows, total=total, limit=limit, offset=offset, location=location
+    )
 
 
 @router.get("/filter-options", response_model=FilterOptions)

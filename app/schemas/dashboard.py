@@ -33,6 +33,28 @@ class DashboardStateCount(BaseModel):
     count: int
 
 
+class DashboardIndustryCount(BaseModel):
+    """One finance-industry bucket in the industry breakdown (#353)."""
+
+    industry: str
+    count: int
+
+
+class DashboardIndustryBreakdown(BaseModel):
+    """Industry breakdown for the dashboard wheel (#351/#352/#353).
+
+    ``industries`` covers EVERY canonical finance industry (from the controlled
+    vocab) — including ones with a count of 0 — so the legend can list them all.
+    ``other`` (the catch-all "Other" vocab value + any non-canonical value) and
+    ``unknown`` (active alumni with NO industry on file) are SEPARATE buckets,
+    distinct from each other.
+    """
+
+    industries: list[DashboardIndustryCount]
+    other: int
+    unknown: int
+
+
 class DashboardSummary(BaseModel):
     """KPIs + distributions for ``GET /dashboard/summary`` (aggregate counts
     only; no per-alumnus identity)."""
@@ -57,6 +79,7 @@ class DashboardSummary(BaseModel):
     by_graduation_year: list[DashboardGradYearCount]
     top_employers: list[DashboardEmployerCount]
     by_state: list[DashboardStateCount]
+    industry_breakdown: DashboardIndustryBreakdown
 
 
 class BirthdayRow(BaseModel):

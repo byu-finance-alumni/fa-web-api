@@ -16,6 +16,7 @@ import datetime
 from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import INDUSTRIES
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Interaction, Survey
@@ -32,6 +33,17 @@ from app.utils.sql import escape_like
 # staleness window is insensitive to leap-year calendar drift. Callers compute
 # the cutoff as ``now() - SURVEY_CADENCE`` and pass it as ``survey_due_before``.
 SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
+
+# Canonical FINANCE industries = the controlled ``INDUSTRIES`` vocabulary MINUS
+# the "Other" catch-all. Powers the ``industry_group`` bucket filters (#351/#352):
+#   * ``unknown`` — no current-employment row names a (non-blank) primary industry
+#   * ``other``   — has a primary industry, but it isn't one of these finance
+#                   industries (i.e. literal "Other" or any non-canonical value)
+# Lower-cased for a case-insensitive DB comparison (industries are stored as
+# free-text varchars, so casing can drift on import).
+_FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
+    i.lower() for i in INDUSTRIES if i.lower() != "other"
+)
 
 
 def _as_values(value: "str | list[str] | None") -> list[str]:
@@ -64,15 +76,29 @@ async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
 # grad_asc = oldest FIRST (ASC, nulls last). The frontend dropdown labels
 # ("newest" -> grad_desc, "oldest" -> grad_asc) and the route's `sort` enum stay
 # in lockstep with these tokens. Unknown/legacy values fall back to name.
-def alumni_order_by(sort: str | None) -> tuple:
-    """Return the ORDER BY tuple for a list ``sort`` token (name | grad_desc | grad_asc)."""
-    return {
+def alumni_order_by(
+    sort: str | None,
+    *,
+    industry=None,
+    city=None,
+    state=None,
+) -> tuple:
+    """Return the ORDER BY tuple for a list ``sort`` token.
+
+    Base tokens order by columns on the alumni row: ``name`` | ``grad_desc`` |
+    ``grad_asc``. The related-data tokens (#357) order by an expression the
+    caller supplies — ``industry`` (current industry), ``city``, ``state`` — each
+    a correlated scalar subquery built in ``list_page`` because those values live
+    on related tables, not the alumni row. Related tokens sort ASC with NULLs
+    last, always tie-broken by last name then the unique PK so tied rows have a
+    total order and OFFSET paging can't duplicate/skip across a page boundary
+    (#183). Unknown/legacy values — or a related token whose expression wasn't
+    supplied — fall back to name."""
+    mapping: dict[str, tuple] = {
         "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
         "grad_desc": (
             Alumni.graduation_year.desc().nulls_last(),
             Alumni.last_name.asc(),
-            # Final tiebreak on the unique PK so tied rows have a total order and
-            # OFFSET paging can't duplicate/skip across a page boundary (#183).
             Alumni.alumni_id.asc(),
         ),
         "grad_asc": (
@@ -80,7 +106,15 @@ def alumni_order_by(sort: str | None) -> tuple:
             Alumni.last_name.asc(),
             Alumni.alumni_id.asc(),
         ),
-    }.get(sort or "name", (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
+    }
+    for token, expr in (("industry", industry), ("city", city), ("state", state)):
+        if expr is not None:
+            mapping[token] = (
+                expr.asc().nulls_last(),
+                Alumni.last_name.asc(),
+                Alumni.alumni_id.asc(),
+            )
+    return mapping.get(sort or "name", (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
 
 
 def build_alumni_query(
@@ -98,6 +132,21 @@ def build_alumni_query(
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
     deceased: bool | None = None,
+    # Gender (#360): a coarse ``M`` / ``F`` facet, AND-combined with every other
+    # filter (e.g. the industry facet). Matches on the first letter of the stored
+    # gender value (case-insensitive) so "Male"/"M" and "Female"/"F" both match.
+    gender: str | None = None,
+    # Industry bucket (#351/#352): ``unknown`` (blank/missing primary industry)
+    # or ``other`` (a primary industry that isn't a canonical finance industry).
+    # Distinct from the exact ``industry`` facet below, which still matches a
+    # specific industry name (primary or secondary).
+    industry_group: str | None = None,
+    # Location proximity (#358). A SQLAlchemy predicate (built by
+    # ``geo_search.alumni_location_filter`` from a resolved location query) matched
+    # inside a correlated EXISTS over the alumnus's contact-info row. ``None`` ->
+    # no location filter; the geo module returns a match-nothing predicate for an
+    # empty city set, so a resolved-but-empty query never widens the results.
+    location_filter=None,
     # Text facets accept a single value (legacy / deep-link) OR a list
     # (multi-select). Each is matched case-insensitively, exact, literal-escaped.
     employer: "str | list[str] | None" = None,
@@ -224,6 +273,54 @@ def build_alumni_query(
         conditions.append(Alumni.graduation_year <= grad_year_max)
     if deceased is not None:
         conditions.append(Alumni.deceased.is_(deceased))
+    if gender and gender.strip():
+        # First-letter, case-insensitive match so "Male"/"M" and "Female"/"F"
+        # both match a single-letter ``M`` / ``F`` filter value. NULL/blank gender
+        # rows never match (substr of a trimmed empty string is empty).
+        conditions.append(
+            func.upper(func.substr(func.trim(Alumni.gender), 1, 1))
+            == gender.strip()[0].upper()
+        )
+    if industry_group == "unknown":
+        # No current-employment row names a non-blank PRIMARY industry.
+        has_industry = (
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                CurrentEmployment.current_industry.is_not(None),
+                func.trim(CurrentEmployment.current_industry) != "",
+            )
+            .exists()
+        )
+        conditions.append(~has_industry)
+    elif industry_group == "other":
+        # Has a primary industry, but it isn't one of the canonical finance
+        # industries (literal "Other" or any non-canonical free-text value).
+        conditions.append(
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                CurrentEmployment.current_industry.is_not(None),
+                func.trim(CurrentEmployment.current_industry) != "",
+                func.lower(func.trim(CurrentEmployment.current_industry)).notin_(
+                    _FINANCE_INDUSTRIES_LOWER
+                ),
+            )
+            .exists()
+        )
+    if location_filter is not None:
+        # Proximity search (#358): the geo module built the (city, state) match
+        # predicate; correlate it to THIS alumnus via a contact-info EXISTS,
+        # mirroring the ``city`` / ``state`` facets below. An empty-key predicate
+        # matches nothing, so a resolved-but-empty location never widens results.
+        conditions.append(
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                location_filter,
+            )
+            .exists()
+        )
     employers = _as_values(employer)
     if employers:
         conditions.append(
@@ -580,9 +677,22 @@ async def list_page(
     if base.whereclause is not None:
         rows_stmt = rows_stmt.where(base.whereclause)
 
-    # Sort options exposed by the list UI (see alumni_order_by). Unknown values
-    # fall back to name.
-    rows_stmt = rows_stmt.order_by(*alumni_order_by(sort)).limit(limit).offset(offset)
+    # Sort options exposed by the list UI (see alumni_order_by). The related-data
+    # sorts (industry / city / state, #357) order by the SAME correlated scalar
+    # subqueries the row projection uses, so the ordering matches the displayed
+    # column exactly. Unknown values fall back to name.
+    rows_stmt = (
+        rows_stmt.order_by(
+            *alumni_order_by(
+                sort,
+                industry=current_industry,
+                city=current_city,
+                state=current_state,
+            )
+        )
+        .limit(limit)
+        .offset(offset)
+    )
     result = await session.execute(rows_stmt)
     items: list[Alumni] = []
     for alumnus, employer, industry, city, state in result.all():

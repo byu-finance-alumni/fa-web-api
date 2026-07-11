@@ -73,6 +73,9 @@ class Alumni(TimestampMixin, Base):
     # (Employed / Unemployed / Retired / Student / Seeking, ...).
     citizenship: Mapped[str | None] = mapped_column(String(100))
     marital_status: Mapped[str | None] = mapped_column(String(50))
+    # Home town of ORIGIN (the "Hometown" line on the profile, #366) — paired with
+    # home_country (country of origin), distinct from the current-address city.
+    hometown: Mapped[str | None] = mapped_column(String(100))
     home_country: Mapped[str | None] = mapped_column(String(100))
     employment_status: Mapped[str | None] = mapped_column(String(50))
     other_designations: Mapped[str | None] = mapped_column(Text)

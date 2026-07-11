@@ -16,11 +16,12 @@ from sqlalchemy.orm import aliased
 
 from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
 from app.core.database import get_session
+from app.core.dropdowns import INDUSTRIES
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.crm import FollowUpTask, Interaction
-from app.models.employment import CurrentEmployment
+from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
@@ -44,6 +45,16 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 # employers chart so placeholders don't rank as firms. Compared against
 # lower(trim(current_employer)).
 _NON_EMPLOYER_VALUES = ("graduate student", "unknown", "n/a", "na", "none")
+
+# Canonical finance industries for the dashboard breakdown (#353) — the full
+# controlled vocab MINUS the "Other" catch-all, which is reported as its own
+# bucket separate from "Unknown" (no industry on file). Every one of these is
+# returned even at count 0 so the legend can list them all. ``_FINANCE_BY_LOWER``
+# folds a stored value to its canonical casing case-insensitively.
+_FINANCE_INDUSTRIES: tuple[str, ...] = tuple(
+    i for i in INDUSTRIES if i.strip().lower() != "other"
+)
+_FINANCE_BY_LOWER = {v.lower(): v for v in _FINANCE_INDUSTRIES}
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -331,24 +342,96 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         )
     ).all()
 
+    # Top employers over the LAST 5 YEARS (#355): aggregate every employment
+    # record that is ACTIVE in that window — the alumnus's current job (always
+    # ongoing) UNION any prior role that either started within the last 5 years
+    # OR is still current/ongoing (is_current, or no end year). COUNT(DISTINCT
+    # alumni_id) over the union so an alum with the same employer in both tables
+    # is only counted once. Employer names are trimmed and the same non-employer
+    # placeholders excluded so the chart shows real firms.
+    five_years_ago = today.year - 5
+    current_jobs = (
+        select(
+            CurrentEmployment.alumni_id.label("alumni_id"),
+            func.trim(CurrentEmployment.current_employer).label("employer"),
+        )
+        .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
+        .where(
+            active,
+            CurrentEmployment.current_employer.is_not(None),
+            func.trim(CurrentEmployment.current_employer) != "",
+        )
+    )
+    recent_history = (
+        select(
+            EmploymentHistory.alumni_id.label("alumni_id"),
+            func.trim(EmploymentHistory.employer_name).label("employer"),
+        )
+        .join(Alumni, Alumni.alumni_id == EmploymentHistory.alumni_id)
+        .where(
+            active,
+            EmploymentHistory.employer_name.is_not(None),
+            func.trim(EmploymentHistory.employer_name) != "",
+            or_(
+                EmploymentHistory.start_year >= five_years_ago,
+                EmploymentHistory.is_current.is_(True),
+                EmploymentHistory.end_year.is_(None),
+            ),
+        )
+    )
+    active_employment = current_jobs.union_all(recent_history).subquery()
+    _emp_count = func.count(func.distinct(active_employment.c.alumni_id))
     top_employers = (
         await session.execute(
-            select(CurrentEmployment.current_employer, func.count())
-            .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
+            select(active_employment.c.employer, _emp_count)
             .where(
-                active,
-                CurrentEmployment.current_employer.is_not(None),
-                # Exclude non-employer placeholders (e.g. "graduate student",
-                # "unknown", "n/a") so the Top employers chart shows real firms.
-                func.lower(func.trim(CurrentEmployment.current_employer)).not_in(
+                func.lower(active_employment.c.employer).not_in(
                     _NON_EMPLOYER_VALUES
-                ),
+                )
             )
-            .group_by(CurrentEmployment.current_employer)
-            .order_by(func.count().desc())
+            .group_by(active_employment.c.employer)
+            .order_by(_emp_count.desc())
             .limit(8)
         )
     ).all()
+
+    # Industry breakdown (#351/#352/#353): count active alumni by their current
+    # industry, then reconcile to the CANONICAL finance-industry vocab so every
+    # industry is represented (incl. zero-count ones). Two buckets are kept
+    # SEPARATE and distinct from each other: "Other" (the catch-all vocab value
+    # plus any stored value outside the finance vocab) and "Unknown" (active
+    # alumni with NO industry on file). current_employment is unique per alum, so
+    # the group counts sum to the alumni-with-industry population and Unknown is
+    # simply the remainder of the active total.
+    industry_rows = (
+        await session.execute(
+            select(
+                CurrentEmployment.current_industry,
+                func.count(func.distinct(Alumni.alumni_id)),
+            )
+            .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
+            .where(
+                active,
+                CurrentEmployment.current_industry.is_not(None),
+                func.trim(CurrentEmployment.current_industry) != "",
+            )
+            .group_by(CurrentEmployment.current_industry)
+        )
+    ).all()
+    industry_counts = {name: 0 for name in _FINANCE_INDUSTRIES}
+    other_count = 0
+    known_total = 0
+    for value, n in industry_rows:
+        n = int(n)
+        known_total += n
+        canonical = _FINANCE_BY_LOWER.get((value or "").strip().lower())
+        if canonical is not None:
+            industry_counts[canonical] += n
+        else:
+            # Literal "Other" or any value outside the finance vocab.
+            other_count += n
+    # Unknown = active alumni with no (non-blank) industry on file.
+    unknown_count = max(int(total or 0) - known_total, 0)
 
     by_state = (
         await session.execute(
@@ -384,6 +467,14 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             {"employer": r[0], "count": int(r[1])} for r in top_employers
         ],
         "by_state": [{"state": r[0], "count": int(r[1])} for r in by_state],
+        "industry_breakdown": {
+            "industries": [
+                {"industry": name, "count": industry_counts[name]}
+                for name in _FINANCE_INDUSTRIES
+            ],
+            "other": other_count,
+            "unknown": unknown_count,
+        },
     }
 
 

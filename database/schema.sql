@@ -186,6 +186,9 @@ CREATE TABLE alumni (
     -- other_designations is free-text (e.g. "Series 7, Series 63").
     citizenship          varchar(100),
     marital_status       varchar(50),
+    -- Home town of ORIGIN (paired with home_country); distinct from the
+    -- current-address city. Backs the profile "Hometown" line (#366).
+    hometown             varchar(100),
     home_country         varchar(100),
     employment_status    varchar(50),
     other_designations   text,
@@ -283,6 +286,9 @@ CREATE TABLE current_employment (
     current_title             varchar(255),
     current_industry          varchar(255),
     current_industry_secondary varchar(255),
+    -- Company street address line ("Company Address" on the profile, #366);
+    -- the city/state/country/zip below are the finer-grained location fields.
+    company_address           varchar(255),
     current_city              varchar(100),
     current_state             varchar(100),
     current_country           varchar(100),

@@ -6,10 +6,12 @@ clauses are asserted — no database needed.
 
 import datetime
 
-from sqlalchemy import select
+from sqlalchemy import literal, select
 from sqlalchemy.dialects import postgresql
 
 from app.models.alumni import Alumni
+from app.models.contact import AlumniContactInfo
+from app.models.employment import CurrentEmployment
 from app.repositories.alumni import alumni_order_by, build_alumni_query
 
 
@@ -511,3 +513,106 @@ def test_default_and_name_sort_by_last_name():
         order_by = sql.split("ORDER BY", 1)[1]
         assert order_by.startswith(" alumni.last_name ASC")
         assert "graduation_year" not in order_by
+
+
+# --- #357 related-data sorts (industry / city / state) -----------------------
+#
+# These tokens order by an expression the caller supplies (a correlated scalar
+# subquery in list_page). The unit test passes a plain column expression to prove
+# the token uses it, tie-broken by last_name then the unique PK.
+
+
+def _related_order_sql(sort, **exprs) -> str:
+    return _sql(select(Alumni).order_by(*alumni_order_by(sort, **exprs)))
+
+
+def test_industry_sort_orders_by_supplied_expression_nulls_last():
+    expr = CurrentEmployment.current_industry
+    order_by = _related_order_sql("industry", industry=expr).split("ORDER BY", 1)[1]
+    assert "current_employment.current_industry ASC NULLS LAST" in order_by
+    # Deterministic tiebreaks: last name then the unique PK (stable OFFSET paging).
+    assert "last_name ASC" in order_by
+    assert order_by.rstrip().endswith("alumni.alumni_id ASC")
+
+
+def test_city_and_state_sorts_order_by_supplied_expression():
+    city_order = _related_order_sql(
+        "city", city=AlumniContactInfo.city
+    ).split("ORDER BY", 1)[1]
+    assert "alumni_contact_info.city ASC NULLS LAST" in city_order
+    state_order = _related_order_sql(
+        "state", state=AlumniContactInfo.state
+    ).split("ORDER BY", 1)[1]
+    assert "alumni_contact_info.state ASC NULLS LAST" in state_order
+
+
+def test_related_sort_without_expression_falls_back_to_name():
+    # A related token with no expression supplied degrades to the name order,
+    # never an unfiltered/ambiguous order.
+    for token in ("industry", "city", "state"):
+        order_by = _order_sql(token).split("ORDER BY", 1)[1]
+        assert order_by.startswith(" alumni.last_name ASC")
+        assert "graduation_year" not in order_by
+
+
+# --- #360 gender facet -------------------------------------------------------
+
+
+def test_gender_filter_matches_first_letter_case_insensitively():
+    sql = _sql(build_alumni_query(gender="F"))
+    # First-letter match: upper(substr(trim(gender), 1, 1)) = 'F'.
+    assert "substr(trim(alumni.gender)" in sql
+    assert "upper(" in sql
+
+
+def test_gender_filter_absent_by_default():
+    # gender appears in the SELECT column list; assert the FIRST-LETTER match
+    # predicate is what's absent by default, not the column itself.
+    assert "substr(trim(alumni.gender)" not in _sql(build_alumni_query())
+
+
+def test_gender_combines_with_industry_via_and():
+    # #360: gender is AND-combined with the industry facet.
+    sql = _sql(build_alumni_query(gender="M", industry="Investment Banking"))
+    assert "substr(trim(alumni.gender)" in sql
+    assert "current_industry ILIKE" in sql
+    assert "archived IS false" in sql
+
+
+# --- #351 / #352 industry-bucket facets --------------------------------------
+
+
+def test_industry_group_unknown_is_not_exists_on_industry():
+    # "unknown" = no current-employment row names a non-blank primary industry.
+    sql = _sql(build_alumni_query(industry_group="unknown"))
+    assert "NOT (EXISTS" in sql
+    assert "current_employment" in sql
+    assert "current_industry IS NOT NULL" in sql
+
+
+def test_industry_group_other_excludes_finance_industries():
+    # "other" = has a primary industry that isn't a canonical finance industry.
+    sql = _sql(build_alumni_query(industry_group="other"))
+    assert "EXISTS" in sql
+    assert "current_industry IS NOT NULL" in sql
+    assert "NOT IN" in sql
+    assert "lower(trim(current_employment.current_industry))" in sql
+
+
+def test_industry_group_absent_by_default():
+    assert "current_employment" not in _sql(build_alumni_query())
+
+
+# --- #358 location proximity filter ------------------------------------------
+
+
+def test_location_filter_wraps_predicate_in_contact_exists():
+    # The geo module supplies the (city, state) match predicate; the builder
+    # correlates it to the alumnus via a contact-info EXISTS.
+    sql = _sql(build_alumni_query(location_filter=literal(True)))
+    assert "EXISTS" in sql
+    assert "alumni_contact_info" in sql
+
+
+def test_location_filter_absent_by_default():
+    assert "alumni_contact_info" not in _sql(build_alumni_query())

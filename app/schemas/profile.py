@@ -366,6 +366,8 @@ class CurrentCareerRead(_Orm):
     current_title: str | None = None
     current_industry: str | None = None
     current_industry_secondary: str | None = None
+    # Company street address line ("Company Address" on the profile, #366).
+    company_address: str | None = None
     current_city: str | None = None
     current_state: str | None = None
     current_country: str | None = None

@@ -674,6 +674,7 @@ class AlumniRead(BaseModel):
     # Survey / demographics (nullable, additive).
     citizenship: str | None = None
     marital_status: str | None = None
+    hometown: str | None = None
     home_country: str | None = None
     employment_status: str | None = None
     other_designations: str | None = None
@@ -723,6 +724,20 @@ class AlumniListItem(AlumniRead):
     current_state: str | None = None
 
 
+class AlumniLocation(BaseModel):
+    """Interpretation of a natural-language location search (#358).
+
+    Returned on ``AlumniPage.location`` only when the list request carried a
+    ``near`` phrase. ``label`` is a short human string ("Los Angeles, CA within
+    50 mi"); ``radius_miles`` is the effective radius; ``resolved`` is ``False``
+    when the phrase couldn't be pinpointed (the list then falls back to the
+    normal search and the UI shows a soft note)."""
+
+    label: str
+    radius_miles: float | None = None
+    resolved: bool = True
+
+
 class AlumniPage(BaseModel):
     """A page of alumni plus the pagination envelope."""
 
@@ -730,6 +745,9 @@ class AlumniPage(BaseModel):
     total: int
     limit: int
     offset: int
+    # Present only when the request included a ``near`` location search (#358);
+    # omitted (``None``) otherwise so a plain list response is unchanged.
+    location: AlumniLocation | None = None
 
 
 # --- FERPA role-scoping ------------------------------------------------------
@@ -760,6 +778,9 @@ VIEW_ONLY_HIDDEN_FIELDS: frozenset[str] = frozenset(
         # stay visible to view_only).
         "citizenship",
         "marital_status",
+        # Hometown / home country are origin PII (same class as citizenship),
+        # hidden from view_only like the other demographic origin fields.
+        "hometown",
         "home_country",
         # NOTE: this is the alumni record's import-provenance "Notes" column
         # (CSV intake), hidden from view_only. It is DISTINCT from the unified

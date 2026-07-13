@@ -519,6 +519,24 @@ def _map_row(
         # Non-alumni contact: force is_alumni False so the shared create path
         # writes a friend record instead of an alumnus (#294).
         core["is_alumni"] = False
+    else:
+        # The 64-column sheet carries a SINGLE location block ("Current
+        # city/state/country/ZIP") which maps to the CONTACT record (that drives
+        # the map). Mirror it onto the career section so the current_employment
+        # location columns are ALSO sourced from the sheet — the template has no
+        # separate company-location columns by design, and the sheet is the
+        # source of truth. Only fills a career location left empty above; never
+        # overwrites an explicit career value.
+        contact_loc = sections.get("contact", {})
+        for contact_field, career_field in (
+            ("city", "current_city"),
+            ("state", "current_state"),
+            ("country", "current_country"),
+            ("zip", "current_zip"),
+        ):
+            value = contact_loc.get(contact_field)
+            if value is not None and value != "":
+                sections.setdefault("career", {}).setdefault(career_field, value)
 
     payload = dict(core)
     payload.update(sections)

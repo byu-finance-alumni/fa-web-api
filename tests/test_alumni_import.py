@@ -488,6 +488,20 @@ def test_real_city_still_kept():
     assert rows[0]["payload"]["contact"]["state"] == "UT"
 
 
+def test_current_location_mirrors_onto_career():
+    """The sheet's single "Current city/state/country/ZIP" location block maps to
+    the contact record (drives the map) AND is mirrored onto the career section so
+    the current_employment location columns are sourced from the sheet too."""
+    csv = _csv_bytes(_row_values(first_name="Jane", last_name="Doe", city="Provo", state="UT"))
+    rows, _ = import_csv.parse_and_map(csv)
+    payload = rows[0]["payload"]
+    assert payload["contact"]["city"] == "Provo"
+    assert payload["contact"]["state"] == "UT"
+    # Mirrored onto current_employment (career) with the same raw values.
+    assert payload["career"]["current_city"] == "Provo"
+    assert payload["career"]["current_state"] == "UT"
+
+
 def test_bad_date_rejected():
     csv = _csv_bytes(
         _row_values(first_name="Jane", last_name="Doe", birth_date="not a real date")

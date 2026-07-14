@@ -167,6 +167,18 @@ HEADSHOT_WRITE_LIMITER = rate_limiter(
     window_seconds=_MUTATION_WINDOW,
     actor_guard=require_full_access,
 )
+# Bulk headshot import is far heavier than a single upload: one call can pull up
+# to _HEADSHOT_BULK_MAX_FILES images / 200 MB of decompressed data through the
+# server and issue that many storage writes + audit rows. So it gets its OWN,
+# tighter budget (a handful of batches per 10 min) rather than sharing the
+# per-upload bucket — enough for legitimate re-runs, a hard brake on a loop /
+# compromised session trying to churn the whole directory.
+BULK_HEADSHOT_LIMITER = rate_limiter(
+    "alumni:headshot_bulk",
+    limit=10,
+    window_seconds=600,
+    actor_guard=require_full_access,
+)
 
 InteractionWriteRateLimit = Annotated[
     UserContext, Depends(INTERACTION_WRITE_LIMITER)
@@ -177,4 +189,7 @@ EmploymentWriteRateLimit = Annotated[
 ]
 HeadshotWriteRateLimit = Annotated[
     UserContext, Depends(HEADSHOT_WRITE_LIMITER)
+]
+BulkHeadshotRateLimit = Annotated[
+    UserContext, Depends(BULK_HEADSHOT_LIMITER)
 ]

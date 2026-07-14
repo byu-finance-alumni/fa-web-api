@@ -9,13 +9,18 @@ shape are covered end to end without a real DATABASE_URL.
 """
 
 import datetime
+import io
+import struct
 import uuid
+import zipfile
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api.dependencies.auth import get_current_db_user
+from app.api.routes import alumni as alumni_routes
+from app.core import rate_limit
 from app.core.database import get_session
 from app.main import app
 from app.schemas.auth import UserContext
@@ -524,6 +529,105 @@ def test_headshot_confirm_forbidden_for_view_only(client):
     assert client.post("/alumni/1/headshot/confirm").status_code == 403
 
 
+# --- Bulk headshot import hardening (zip-bomb / content / limits) -------------
+
+# Minimal valid magic-byte payloads for the three accepted image types.
+_JPEG_BYTES = b"\xff\xd8\xff" + b"\x00" * 64
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def _build_zip(entries: list[tuple[str, bytes]]) -> bytes:
+    """Serialise ``(name, payload)`` pairs into a DEFLATE-compressed zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, payload in entries:
+            zf.writestr(name, payload)
+    return buf.getvalue()
+
+
+def test_bulk_zip_honest_archive_yields_valid_entries():
+    """An honest zip of real images expands to ready-to-upload entries — the
+    happy path must keep working after the hardening."""
+    archive = _build_zip([("jdoe.jpg", _JPEG_BYTES), ("asmith.png", _PNG_BYTES)])
+    entries = alumni_routes._prepare_zip_entries(archive)
+    assert isinstance(entries, list)
+    by_net = {e.net_id: e for e in entries}
+    assert by_net["jdoe"].error is None
+    assert by_net["jdoe"].data == _JPEG_BYTES
+    assert by_net["jdoe"].content_type == "image/jpeg"
+    assert by_net["asmith"].error is None
+    assert by_net["asmith"].content_type == "image/png"
+
+
+def test_bulk_zip_forged_file_size_reported_invalid_not_crash():
+    """A zip entry that lies about its (tiny) uncompressed size while shipping a
+    larger, undecompressable-at-that-size stream must be reported as one invalid
+    item — never crash the request, never be stored.
+
+    Without the fix the code trusts the forged ``file_size`` past the gate and
+    calls ``zf.read`` which raises ``BadZipFile`` (an unhandled 500)."""
+    payload = _JPEG_BYTES + b"\x00" * 8192
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("jdoe.jpg", payload)
+    raw = bytearray(buf.getvalue())
+    # Overwrite the central-directory "uncompressed size" field with a small lie.
+    idx = raw.find(b"PK\x01\x02")
+    struct.pack_into("<I", raw, idx + 24, 10)
+
+    entries = alumni_routes._prepare_zip_entries(bytes(raw))
+    assert isinstance(entries, list)
+    assert len(entries) == 1
+    assert entries[0].error is not None
+    assert entries[0].data is None  # nothing to upload
+
+
+def test_bulk_zip_entry_over_per_file_cap_streamed_and_capped(monkeypatch):
+    """An entry whose ACTUAL decompressed bytes exceed the per-file cap is aborted
+    mid-stream and reported invalid (exercises the real decompression path)."""
+    monkeypatch.setattr(alumni_routes, "_HEADSHOT_MAX_BYTES", 1024)
+    archive = _build_zip([("jdoe.jpg", _JPEG_BYTES + b"\x00" * 4096)])
+    entries = alumni_routes._prepare_zip_entries(archive)
+    assert isinstance(entries, list)
+    assert len(entries) == 1
+    assert entries[0].error is not None
+    assert entries[0].data is None
+
+
+def test_bulk_zip_non_image_content_rejected():
+    """A non-image blob named ``net_id.jpg`` (right extension, wrong magic bytes)
+    is rejected as invalid and never queued for upload."""
+    archive = _build_zip([("jdoe.jpg", b"this is definitely not an image")])
+    entries = alumni_routes._prepare_zip_entries(archive)
+    assert isinstance(entries, list)
+    assert len(entries) == 1
+    assert entries[0].data is None
+    assert entries[0].error is not None
+
+
+def test_bulk_zip_too_many_dir_entries_rejected_up_front(monkeypatch):
+    """An archive whose central directory holds more records than the scan ceiling
+    is rejected before the per-entry loop, regardless of how many are real."""
+    monkeypatch.setattr(alumni_routes, "_HEADSHOT_BULK_MAX_DIR_ENTRIES", 5)
+    archive = _build_zip([(f"junk{i}/", b"") for i in range(10)])
+    result = alumni_routes._prepare_zip_entries(archive)
+    assert not isinstance(result, list)
+    assert result.status_code == 413
+
+
+def test_bulk_upload_route_is_rate_limited(client):
+    """The bulk route is throttled per actor (previously unlimited)."""
+    rate_limit.reset()
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    files = {"files": ("notes.txt", b"hello", "text/plain")}
+    statuses = [
+        client.post("/alumni/headshots/bulk", files=files).status_code
+        for _ in range(12)
+    ]
+    rate_limit.reset()
+    assert 429 in statuses
+
+
 # --- #404 designation list filter (route validation + passthrough) -----------
 
 
@@ -628,8 +732,8 @@ def test_bulk_headshot_matched_uploads_and_audits(monkeypatch):
             resp = c.post(
                 "/alumni/headshots/bulk",
                 files=[
-                    ("files", ("jdoe12.png", b"\x89PNGdata", "image/png")),
-                    ("files", ("nobody99.png", b"\x89PNGdata", "image/png")),
+                    ("files", ("jdoe12.png", b"\x89PNG\r\n\x1a\ndata", "image/png")),
+                    ("files", ("nobody99.png", b"\x89PNG\r\n\x1a\ndata", "image/png")),
                 ],
             )
     finally:
@@ -644,7 +748,7 @@ def test_bulk_headshot_matched_uploads_and_audits(monkeypatch):
     assert by_file["jdoe12.png"]["net_id"] == "jdoe12"
     assert by_file["nobody99.png"]["status"] == "no_match"
     # Uploaded under the stored net_id key in the headshots bucket.
-    assert calls == [("headshots", "jdoe12", b"\x89PNGdata", "image/png")]
+    assert calls == [("headshots", "jdoe12", b"\x89PNG\r\n\x1a\ndata", "image/png")]
     # A matched upload is audited and the transaction committed.
     assert session.committed is True
     audits = [a for a in session.added if getattr(a, "action_type", None)]
@@ -667,7 +771,7 @@ def test_bulk_headshot_case_insensitive_net_id_match(monkeypatch):
         with TestClient(app) as c:
             resp = c.post(
                 "/alumni/headshots/bulk",
-                files={"files": ("JDOE12.JPG", b"\xff\xd8data", "image/jpeg")},
+                files={"files": ("JDOE12.JPG", b"\xff\xd8\xffdata", "image/jpeg")},
             )
     finally:
         app.dependency_overrides.clear()
@@ -717,8 +821,8 @@ def test_bulk_headshot_zip_input(monkeypatch):
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("jdoe12.jpg", b"\xff\xd8imagedata")
-        zf.writestr("nomatch.png", b"\x89PNGdata")
+        zf.writestr("jdoe12.jpg", b"\xff\xd8\xffimagedata")
+        zf.writestr("nomatch.png", b"\x89PNG\r\n\x1a\ndata")
         zf.writestr("readme.txt", b"ignore me")  # non-image -> invalid
     buf.seek(0)
 
@@ -756,7 +860,7 @@ def test_bulk_headshot_storage_error_reported_per_file(monkeypatch):
         with TestClient(app) as c:
             resp = c.post(
                 "/alumni/headshots/bulk",
-                files={"files": ("jdoe12.png", b"\x89PNGdata", "image/png")},
+                files={"files": ("jdoe12.png", b"\x89PNG\r\n\x1a\ndata", "image/png")},
             )
     finally:
         app.dependency_overrides.clear()

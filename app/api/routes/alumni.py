@@ -13,6 +13,7 @@ import datetime
 import io
 import posixpath
 import zipfile
+import zlib
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
@@ -31,6 +32,7 @@ from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.core.rate_limit import (
+    BulkHeadshotRateLimit,
     EmploymentWriteRateLimit,
     HeadshotWriteRateLimit,
     InteractionWriteRateLimit,
@@ -596,6 +598,17 @@ _HEADSHOT_ZIP_MIME_TYPES = frozenset(
 # zip) so one request can't exhaust memory. Per-file cap reuses _HEADSHOT_MAX_BYTES.
 _HEADSHOT_BULK_MAX_FILES = 1000
 _HEADSHOT_BULK_MAX_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MiB
+# Hard ceiling on the number of central-directory records we'll even scan. Junk
+# entries (dirs / dotfiles / __MACOSX) are skipped before the file-count cap
+# applies, so without this a zip padded with millions of zero-byte members would
+# force a multi-million-iteration loop. This bounds that scan up front; it's well
+# above _HEADSHOT_BULK_MAX_FILES so a legitimate batch (plus its dir/metadata
+# members) never trips it.
+_HEADSHOT_BULK_MAX_DIR_ENTRIES = 10_000
+# Chunk size for streaming a single zip entry out of the archive. We decompress
+# in bounded pieces and track ACTUAL bytes so a lying central-directory size
+# can't drive an unbounded read.
+_ZIP_READ_CHUNK = 1024 * 1024  # 1 MiB
 
 
 def _net_id_from_filename(name: str) -> str:
@@ -614,6 +627,66 @@ def _headshot_mime_for_ext(name: str) -> str | None:
     when the extension isn't an accepted image type."""
     ext = posixpath.splitext(name.replace("\\", "/"))[1].lower()
     return _HEADSHOT_EXT_MIME.get(ext)
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Return the image MIME implied by the leading magic bytes of ``data``
+    (JPEG / PNG / WebP), or None when the bytes are not a recognised image.
+
+    This NEVER trusts a caller-supplied file extension or ``Content-Type``: those
+    are attacker-controlled labels, so a ``.jpg`` name or an ``image/jpeg`` header
+    means nothing until the actual bytes are checked here."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _image_content_error(data: bytes, expected_mime: str) -> str | None:
+    """Validate that ``data`` really is a JPEG/PNG/WebP image whose true type
+    matches ``expected_mime`` (the type claimed by the extension / Content-Type).
+    Return an error message when the content is not an image or contradicts its
+    claimed type, or None when it checks out."""
+    sniffed = _sniff_image_mime(data)
+    if sniffed is None:
+        return "File content is not a JPEG, PNG, or WebP image."
+    if sniffed != expected_mime:
+        return "File content does not match its declared image type."
+    return None
+
+
+def _read_zip_entry_capped(
+    zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int
+) -> bytes | None:
+    """Stream-decompress a single zip entry, aborting the instant the ACTUAL
+    decompressed size exceeds ``cap``.
+
+    We deliberately never gate on ``info.file_size``: that value comes from the
+    archive's central directory and is fully attacker-controlled, so it can lie
+    (small, to slip past a size check, or huge, to trigger a giant read). Instead
+    we open the entry and read it in bounded chunks, counting real bytes, and bail
+    out with None once we cross ``cap``. Returns None (rather than raising) for an
+    over-cap entry OR a corrupt/undecompressable stream (e.g. CRC mismatch from a
+    forged size), so the caller reports it as one invalid item instead of failing
+    the whole request."""
+    total = 0
+    chunks: list[bytes] = []
+    try:
+        with zf.open(info) as fh:
+            while True:
+                chunk = fh.read(_ZIP_READ_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > cap:
+                    return None
+                chunks.append(chunk)
+    except (zipfile.BadZipFile, zlib.error, OSError, EOFError):
+        return None
+    return b"".join(chunks)
 
 
 async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
@@ -650,6 +723,11 @@ async def upload_headshot(
         return _too_large_response(_HEADSHOT_MAX_BYTES)
     if not data:
         raise InvalidRequestError("The uploaded image is empty.")
+    # The Content-Type above is just a client-supplied label; verify the actual
+    # bytes really are the image type they claim before anything reaches storage.
+    content_error = _image_content_error(data, content_type)
+    if content_error is not None:
+        raise InvalidRequestError(content_error)
     net_id = await _alumnus_net_id(session, alumni_id)
     await supabase_storage.upload_object(_HEADSHOT_BUCKET, net_id, data, content_type)
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
@@ -800,12 +878,16 @@ class _HeadshotEntry:
 def _prepare_zip_entries(archive: bytes) -> list[_HeadshotEntry] | JSONResponse:
     """Expand a bulk-import ZIP into per-image entries (validated, capped).
 
-    Skips directories and macOS metadata (``__MACOSX`` / dotfiles). Enforces the
-    per-file and total (uncompressed) byte caps and the max-file count to guard
-    against zip bombs; a file over the per-file cap or with a non-image extension
-    is kept as an ``invalid`` entry (so it shows up in the report) rather than
-    silently dropped. Returns a 413 response if the archive is unreadable or its
-    uncompressed contents exceed the total cap."""
+    Skips directories and macOS metadata (``__MACOSX`` / dotfiles). Guards against
+    zip bombs WITHOUT ever trusting the archive's self-declared sizes: each entry
+    is stream-decompressed in bounded chunks and aborted the instant its ACTUAL
+    bytes cross the per-file cap, and the running total of real bytes is held under
+    the batch cap. A file over the per-file cap, undecompressable, of a non-image
+    extension, or whose real content doesn't match its extension is kept as an
+    ``invalid`` entry (so it shows up in the report) rather than silently dropped
+    or crashing the request. Returns a 413 response if the archive holds too many
+    records / images or its real contents exceed the total cap, or 400 if it isn't
+    a readable ZIP."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(archive))
     except zipfile.BadZipFile:
@@ -821,6 +903,12 @@ def _prepare_zip_entries(archive: bytes) -> list[_HeadshotEntry] | JSONResponse:
     entries: list[_HeadshotEntry] = []
     total = 0
     with zf:
+        # Bound the central-directory scan up front: junk entries are skipped
+        # below before the file-count cap applies, so a zip padded with millions
+        # of zero-byte members would otherwise force a giant loop. Reject the
+        # whole archive if it declares more records than we'll ever scan.
+        if len(zf.infolist()) > _HEADSHOT_BULK_MAX_DIR_ENTRIES:
+            return _bulk_too_many_response()
         for info in zf.infolist():
             name = info.filename
             base = posixpath.basename(name.replace("\\", "/"))
@@ -841,24 +929,35 @@ def _prepare_zip_entries(archive: bytes) -> list[_HeadshotEntry] | JSONResponse:
                     )
                 )
                 continue
-            if info.file_size > _HEADSHOT_MAX_BYTES:
+            # Stream the entry with a hard per-file cap on REAL bytes; None means
+            # it blew the cap or couldn't be decompressed (e.g. a forged size /
+            # bad CRC) — either way it's one invalid item, never a crash.
+            data = _read_zip_entry_capped(zf, info, _HEADSHOT_MAX_BYTES)
+            if data is None:
                 entries.append(
                     _HeadshotEntry(
                         base,
                         net_id=net_id or None,
-                        error="Image exceeds the per-file size limit.",
+                        error="Image exceeds the per-file size limit or is unreadable.",
                     )
                 )
                 continue
-            total += info.file_size
-            if total > _HEADSHOT_BULK_MAX_TOTAL_BYTES:
-                return _bulk_too_large_response()
-            data = zf.read(info)
             if not data:
                 entries.append(
                     _HeadshotEntry(
                         base, net_id=net_id or None, error="The image is empty."
                     )
+                )
+                continue
+            total += len(data)
+            if total > _HEADSHOT_BULK_MAX_TOTAL_BYTES:
+                return _bulk_too_large_response()
+            # Zip entries carry no content-type; the extension is just a label, so
+            # verify the real bytes are that image type before trusting them.
+            content_error = _image_content_error(data, content_type)
+            if content_error is not None:
+                entries.append(
+                    _HeadshotEntry(base, net_id=net_id or None, error=content_error)
                 )
                 continue
             entries.append(
@@ -902,7 +1001,7 @@ def _bulk_too_many_response() -> JSONResponse:
 
 @router.post("/headshots/bulk", response_model=HeadshotBulkResult)
 async def bulk_upload_headshots(
-    user: RequireFullAccess,
+    user: BulkHeadshotRateLimit,
     session: SessionDep,
     files: Annotated[
         list[UploadFile],
@@ -980,6 +1079,16 @@ async def bulk_upload_headshots(
             total += len(data)
             if total > _HEADSHOT_BULK_MAX_TOTAL_BYTES:
                 return _bulk_too_large_response()
+            # The multipart Content-Type is a client-supplied label; verify the
+            # real bytes are that image type before trusting/storing them.
+            content_error = _image_content_error(data, content_type)
+            if content_error is not None:
+                entries.append(
+                    _HeadshotEntry(
+                        filename, net_id=net_id or None, error=content_error
+                    )
+                )
+                continue
             entries.append(
                 _HeadshotEntry(
                     filename,

@@ -66,6 +66,24 @@ def _ilike_any(column, values: list[str]):
     return or_(*[column.ilike(escape_like(v), escape="\\") for v in values])
 
 
+def _holds_designation(column):
+    """Predicate: a designation flag column holds a non-null, NON-EMPTY value.
+
+    The ``cfp/cfa/cpa_designation`` columns on ``alumni_program_engagement`` are
+    free-text flags — any non-null, non-blank value means the alumnus holds that
+    certification (#404). Trims so a whitespace-only cell doesn't count."""
+    return and_(column.isnot(None), func.trim(column) != "")
+
+
+# Professional certifications stored as flag columns on the program-engagement
+# profile (#404). Maps the canonical (upper-case) token to its column.
+_DESIGNATION_COLUMNS = {
+    "CFP": AlumniProgramEngagement.cfp_designation,
+    "CFA": AlumniProgramEngagement.cfa_designation,
+    "CPA": AlumniProgramEngagement.cpa_designation,
+}
+
+
 async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
     return await session.get(Alumni, alumni_id)
 
@@ -186,6 +204,11 @@ def build_alumni_query(
     # narrows to alumni who hold that designation (correlated EXISTS).
     cfa: bool = False,
     cpa: bool = False,
+    # Designation facet (#404): a list of certification tokens (CFP / CFA / CPA).
+    # Returns alumni holding ANY of the requested designations (OR). Accepts a
+    # single value (legacy / deep-link) or a list; tokens are matched
+    # case-insensitively.
+    designations: "str | list[str] | None" = None,
     # Only alumni who have a graduate degree recorded.
     graduate_degree: bool = False,
     missing_email: bool = False,
@@ -218,20 +241,41 @@ def build_alumni_query(
         conditions.append(Alumni.is_alumni.is_(is_alumni))
     if q:
         like = f"%{escape_like(q)}%"
-        conditions.append(
-            or_(
-                Alumni.first_name.ilike(like, escape="\\"),
-                Alumni.last_name.ilike(like, escape="\\"),
-                Alumni.preferred_first_name.ilike(like, escape="\\"),
-                # Maiden / birth name (#216): a last-name search must also find
-                # alumnae listed under their birth name. Matched case-insensitively
-                # like the other name columns.
-                Alumni.birth_name.ilike(like, escape="\\"),
-                Alumni.middle_name.ilike(like, escape="\\"),
-                Alumni.byu_id.ilike(like, escape="\\"),
-                Alumni.net_id.ilike(like, escape="\\"),
-            )
-        )
+        q_terms = [
+            Alumni.first_name.ilike(like, escape="\\"),
+            Alumni.last_name.ilike(like, escape="\\"),
+            Alumni.preferred_first_name.ilike(like, escape="\\"),
+            # Maiden / birth name (#216): a last-name search must also find
+            # alumnae listed under their birth name. Matched case-insensitively
+            # like the other name columns.
+            Alumni.birth_name.ilike(like, escape="\\"),
+            Alumni.middle_name.ilike(like, escape="\\"),
+            Alumni.byu_id.ilike(like, escape="\\"),
+            Alumni.net_id.ilike(like, escape="\\"),
+            # Free-text extra designations live on the alumni row (#404) — a
+            # ``q`` for "Series 7" should surface them.
+            Alumni.other_designations.ilike(like, escape="\\"),
+        ]
+        # A free-text search that names a professional certification (CFP / CFA /
+        # CPA) also matches alumni who HOLD it on their program-engagement profile
+        # (#404). The token match is decided here in Python (the builder receives
+        # the concrete ``q``), so a plain name search adds no engagement join.
+        q_lower = q.lower()
+        for token, column in (
+            ("cfp", AlumniProgramEngagement.cfp_designation),
+            ("cfa", AlumniProgramEngagement.cfa_designation),
+            ("cpa", AlumniProgramEngagement.cpa_designation),
+        ):
+            if token in q_lower:
+                q_terms.append(
+                    select(AlumniProgramEngagement.engagement_profile_id)
+                    .where(
+                        AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                        _holds_designation(column),
+                    )
+                    .exists()
+                )
+        conditions.append(or_(*q_terms))
     # Per-field partial matches (AND-combined; blanks ignored).
     def _field_like(value: str | None, column) -> None:
         if value and value.strip():
@@ -565,6 +609,23 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(is_cpa)
+    designation_tokens = {v.strip().upper() for v in _as_values(designations)}
+    designation_columns = [
+        column
+        for token, column in _DESIGNATION_COLUMNS.items()
+        if token in designation_tokens
+    ]
+    if designation_columns:
+        # ANY semantics (#404): an alumnus matches if they hold at least one of
+        # the requested designations. Single correlated EXISTS OR-ing the flags.
+        conditions.append(
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                or_(*[_holds_designation(c) for c in designation_columns]),
+            )
+            .exists()
+        )
     if graduate_degree:
         conditions.append(
             and_(

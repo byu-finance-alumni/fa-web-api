@@ -9,13 +9,18 @@ shape are covered end to end without a real DATABASE_URL.
 """
 
 import datetime
+import io
+import struct
 import uuid
+import zipfile
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api.dependencies.auth import get_current_db_user
+from app.api.routes import alumni as alumni_routes
+from app.core import rate_limit
 from app.core.database import get_session
 from app.main import app
 from app.schemas.auth import UserContext
@@ -522,3 +527,344 @@ def test_headshot_upload_url_forbidden_for_view_only(client):
 def test_headshot_confirm_forbidden_for_view_only(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     assert client.post("/alumni/1/headshot/confirm").status_code == 403
+
+
+# --- Bulk headshot import hardening (zip-bomb / content / limits) -------------
+
+# Minimal valid magic-byte payloads for the three accepted image types.
+_JPEG_BYTES = b"\xff\xd8\xff" + b"\x00" * 64
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def _build_zip(entries: list[tuple[str, bytes]]) -> bytes:
+    """Serialise ``(name, payload)`` pairs into a DEFLATE-compressed zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, payload in entries:
+            zf.writestr(name, payload)
+    return buf.getvalue()
+
+
+def test_bulk_zip_honest_archive_yields_valid_entries():
+    """An honest zip of real images expands to ready-to-upload entries — the
+    happy path must keep working after the hardening."""
+    archive = _build_zip([("jdoe.jpg", _JPEG_BYTES), ("asmith.png", _PNG_BYTES)])
+    entries = alumni_routes._prepare_zip_entries(archive)
+    assert isinstance(entries, list)
+    by_net = {e.net_id: e for e in entries}
+    assert by_net["jdoe"].error is None
+    assert by_net["jdoe"].data == _JPEG_BYTES
+    assert by_net["jdoe"].content_type == "image/jpeg"
+    assert by_net["asmith"].error is None
+    assert by_net["asmith"].content_type == "image/png"
+
+
+def test_bulk_zip_forged_file_size_reported_invalid_not_crash():
+    """A zip entry that lies about its (tiny) uncompressed size while shipping a
+    larger, undecompressable-at-that-size stream must be reported as one invalid
+    item — never crash the request, never be stored.
+
+    Without the fix the code trusts the forged ``file_size`` past the gate and
+    calls ``zf.read`` which raises ``BadZipFile`` (an unhandled 500)."""
+    payload = _JPEG_BYTES + b"\x00" * 8192
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("jdoe.jpg", payload)
+    raw = bytearray(buf.getvalue())
+    # Overwrite the central-directory "uncompressed size" field with a small lie.
+    idx = raw.find(b"PK\x01\x02")
+    struct.pack_into("<I", raw, idx + 24, 10)
+
+    entries = alumni_routes._prepare_zip_entries(bytes(raw))
+    assert isinstance(entries, list)
+    assert len(entries) == 1
+    assert entries[0].error is not None
+    assert entries[0].data is None  # nothing to upload
+
+
+def test_bulk_zip_entry_over_per_file_cap_streamed_and_capped(monkeypatch):
+    """An entry whose ACTUAL decompressed bytes exceed the per-file cap is aborted
+    mid-stream and reported invalid (exercises the real decompression path)."""
+    monkeypatch.setattr(alumni_routes, "_HEADSHOT_MAX_BYTES", 1024)
+    archive = _build_zip([("jdoe.jpg", _JPEG_BYTES + b"\x00" * 4096)])
+    entries = alumni_routes._prepare_zip_entries(archive)
+    assert isinstance(entries, list)
+    assert len(entries) == 1
+    assert entries[0].error is not None
+    assert entries[0].data is None
+
+
+def test_bulk_zip_non_image_content_rejected():
+    """A non-image blob named ``net_id.jpg`` (right extension, wrong magic bytes)
+    is rejected as invalid and never queued for upload."""
+    archive = _build_zip([("jdoe.jpg", b"this is definitely not an image")])
+    entries = alumni_routes._prepare_zip_entries(archive)
+    assert isinstance(entries, list)
+    assert len(entries) == 1
+    assert entries[0].data is None
+    assert entries[0].error is not None
+
+
+def test_bulk_zip_too_many_dir_entries_rejected_up_front(monkeypatch):
+    """An archive whose central directory holds more records than the scan ceiling
+    is rejected before the per-entry loop, regardless of how many are real."""
+    monkeypatch.setattr(alumni_routes, "_HEADSHOT_BULK_MAX_DIR_ENTRIES", 5)
+    archive = _build_zip([(f"junk{i}/", b"") for i in range(10)])
+    result = alumni_routes._prepare_zip_entries(archive)
+    assert not isinstance(result, list)
+    assert result.status_code == 413
+
+
+def test_bulk_upload_route_is_rate_limited(client):
+    """The bulk route is throttled per actor (previously unlimited)."""
+    rate_limit.reset()
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    files = {"files": ("notes.txt", b"hello", "text/plain")}
+    statuses = [
+        client.post("/alumni/headshots/bulk", files=files).status_code
+        for _ in range(12)
+    ]
+    rate_limit.reset()
+    assert 429 in statuses
+
+
+# --- #404 designation list filter (route validation + passthrough) -----------
+
+
+def test_designations_unknown_value_is_422(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    resp = client.get("/alumni", params={"designations": "MBA"})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+
+
+def test_designations_valid_values_forwarded(monkeypatch):
+    # Repeatable AND comma-separated tokens are accepted case-insensitively,
+    # normalized to canonical upper-case, de-duped, and forwarded to the repo.
+    captured: dict = {}
+
+    async def _fake_list(session, *, limit, offset, **filters):
+        captured.update(filters)
+        return [], 0
+
+    async def _fake_log(session, **kwargs):
+        return None
+
+    from app.api.routes import alumni as alumni_routes
+
+    monkeypatch.setattr(alumni_routes.service, "list_alumni", _fake_list)
+    monkeypatch.setattr(alumni_routes.service, "log_search", _fake_log)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _no_db_session
+    try:
+        with TestClient(app) as c:
+            resp = c.get("/alumni?designations=cfp&designations=CFA,cpa")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert captured["designations"] == ["CFP", "CFA", "CPA"]
+
+
+# --- #401 bulk headshot import -----------------------------------------------
+
+
+class _Scalars2:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class _BulkHeadshotSession:
+    """Returns the seeded alumni rows for the net_id lookup; records audit adds."""
+
+    def __init__(self, alumni_rows=()):
+        self._rows = list(alumni_rows)
+        self.added: list = []
+        self.committed = False
+
+    async def scalars(self, stmt):
+        return _Scalars2(self._rows)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+
+def _alumnus(net_id, alumni_id):
+    return SimpleNamespace(net_id=net_id, alumni_id=alumni_id)
+
+
+def test_bulk_headshot_requires_auth(client):
+    resp = client.post(
+        "/alumni/headshots/bulk",
+        files={"files": ("jdoe12.png", b"\x89PNG", "image/png")},
+    )
+    assert resp.status_code == 401
+
+
+def test_bulk_headshot_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    resp = client.post(
+        "/alumni/headshots/bulk",
+        files={"files": ("jdoe12.png", b"\x89PNG", "image/png")},
+    )
+    assert resp.status_code == 403
+
+
+def test_bulk_headshot_matched_uploads_and_audits(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    calls: list = []
+
+    async def _fake_upload(bucket, path, data, content_type):
+        calls.append((bucket, path, data, content_type))
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files=[
+                    ("files", ("jdoe12.png", b"\x89PNG\r\n\x1a\ndata", "image/png")),
+                    ("files", ("nobody99.png", b"\x89PNG\r\n\x1a\ndata", "image/png")),
+                ],
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert body["matched"] == 1
+    assert body["no_match"] == 1
+    by_file = {i["filename"]: i for i in body["items"]}
+    assert by_file["jdoe12.png"]["status"] == "matched"
+    assert by_file["jdoe12.png"]["net_id"] == "jdoe12"
+    assert by_file["nobody99.png"]["status"] == "no_match"
+    # Uploaded under the stored net_id key in the headshots bucket.
+    assert calls == [("headshots", "jdoe12", b"\x89PNG\r\n\x1a\ndata", "image/png")]
+    # A matched upload is audited and the transaction committed.
+    assert session.committed is True
+    audits = [a for a in session.added if getattr(a, "action_type", None)]
+    assert len(audits) == 1
+    assert audits[0].action_type == "upload_headshot"
+    assert audits[0].entity_id == 5
+
+
+def test_bulk_headshot_case_insensitive_net_id_match(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    async def _fake_upload(bucket, path, data, content_type):
+        return None
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("JDOE12.JPG", b"\xff\xd8\xffdata", "image/jpeg")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.json()["items"][0]["status"] == "matched"
+
+
+def test_bulk_headshot_invalid_mime_reported_without_upload(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    calls: list = []
+
+    async def _fake_upload(bucket, path, data, content_type):
+        calls.append(path)
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("jdoe12.txt", b"hello", "text/plain")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    body = resp.json()
+    assert body["invalid"] == 1
+    assert body["items"][0]["status"] == "invalid"
+    assert calls == []  # never reached storage
+    assert session.committed is False
+
+
+def test_bulk_headshot_zip_input(monkeypatch):
+    import io
+    import zipfile
+
+    from app.api.routes import alumni as alumni_routes
+
+    calls: list = []
+
+    async def _fake_upload(bucket, path, data, content_type):
+        calls.append((path, content_type))
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("jdoe12.jpg", b"\xff\xd8\xffimagedata")
+        zf.writestr("nomatch.png", b"\x89PNG\r\n\x1a\ndata")
+        zf.writestr("readme.txt", b"ignore me")  # non-image -> invalid
+    buf.seek(0)
+
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("photos.zip", buf.read(), "application/zip")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3
+    assert body["matched"] == 1
+    assert body["no_match"] == 1
+    assert body["invalid"] == 1
+    assert calls == [("jdoe12", "image/jpeg")]
+
+
+def test_bulk_headshot_storage_error_reported_per_file(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+    from app.core.errors import ServiceError
+
+    async def _boom(bucket, path, data, content_type):
+        raise ServiceError("nope")
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _boom)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("jdoe12.png", b"\x89PNG\r\n\x1a\ndata", "image/png")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    body = resp.json()
+    assert body["errors"] == 1
+    assert body["items"][0]["status"] == "error"
+    assert session.committed is False

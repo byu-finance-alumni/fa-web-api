@@ -308,6 +308,129 @@ def test_profile_edit_caller_full_fidelity():
     assert profile.alumni.notes == "private note"
 
 
+# --- #403 Pay It Forward summary on the profile aggregate --------------------
+
+
+class _PifFakeSession(_ProfileFakeSession):
+    """Like ``_ProfileFakeSession`` but returns the seeded donation rows for the
+    ledger query (detected by the selected entity) and empty for every other
+    aggregate query."""
+
+    def __init__(self, alumnus, donations):
+        super().__init__(alumnus)
+        self._donations = donations
+
+    async def scalars(self, stmt):
+        from app.models.donation import Donation
+
+        try:
+            entity = stmt.column_descriptions[0]["entity"]
+        except Exception:  # noqa: BLE001 - defensive; fall back to empty
+            entity = None
+        if entity is Donation:
+            return _Scalars(self._donations)
+        return _Scalars([])
+
+
+def _donation(donation_id, year, month, amount):
+    from decimal import Decimal
+
+    return SimpleNamespace(
+        donation_id=donation_id,
+        donation_year=year,
+        donation_month=month,
+        amount=Decimal(str(amount)),
+    )
+
+
+def test_pay_it_forward_amounts_visible_for_amount_viewer():
+    # Newest-first donation rows (the query orders them; the fake preserves order).
+    donations = [_donation(2, 2026, 4, "250.50"), _donation(1, 2025, 1, "100")]
+    session = _PifFakeSession(_alumni_model(), donations)
+    profile = asyncio.run(
+        profile_service.get_profile(
+            session, 1, show_pay_it_forward_amounts=True, actor_user_id=7
+        )
+    )
+    pif = profile.pay_it_forward
+    assert pif.donation_count == 2
+    assert pif.last_donation_amount == 250.5
+    assert pif.total_lifetime_amount == 350.5
+    # Month-level date: day is always 1.
+    assert pif.last_donation_date == datetime.date(2026, 4, 1)
+
+
+def test_pay_it_forward_amounts_nulled_for_non_amount_viewer():
+    # Dates + counts stay, dollar amounts are nulled (mirrors donations gating).
+    donations = [_donation(2, 2026, 4, "250.50"), _donation(1, 2025, 1, "100")]
+    session = _PifFakeSession(_alumni_model(), donations)
+    profile = asyncio.run(
+        profile_service.get_profile(
+            session, 1, show_pay_it_forward_amounts=False, actor_user_id=7
+        )
+    )
+    pif = profile.pay_it_forward
+    assert pif.donation_count == 2
+    assert pif.last_donation_date == datetime.date(2026, 4, 1)
+    assert pif.last_donation_amount is None
+    assert pif.total_lifetime_amount is None
+
+
+def test_pay_it_forward_non_donor_is_zero_count_null_fields():
+    session = _PifFakeSession(_alumni_model(), [])
+    profile = asyncio.run(
+        profile_service.get_profile(
+            session, 1, show_pay_it_forward_amounts=True, actor_user_id=7
+        )
+    )
+    pif = profile.pay_it_forward
+    assert pif.donation_count == 0
+    assert pif.last_donation_amount is None
+    assert pif.last_donation_date is None
+    assert pif.total_lifetime_amount is None
+
+
+def test_pay_it_forward_last_date_defaults_month_to_january():
+    # A gift with only a year on file -> day 1, month January.
+    donations = [_donation(1, 2024, None, "500")]
+    session = _PifFakeSession(_alumni_model(), donations)
+    profile = asyncio.run(
+        profile_service.get_profile(session, 1, actor_user_id=7)
+    )
+    assert profile.pay_it_forward.last_donation_date == datetime.date(2024, 1, 1)
+
+
+def test_profile_route_amount_gating_by_role():
+    # End-to-end through the route: full_access (holds alumni.full) sees amounts;
+    # view_only does not (nulled) but still sees the count/date.
+    donations = [_donation(2, 2026, 4, "250.50")]
+
+    def _run(role):
+        session = _PifFakeSession(_alumni_model(), donations)
+
+        async def _override():
+            yield session
+
+        app.dependency_overrides[get_session] = _override
+        app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+        with TestClient(app) as c:
+            resp = c.get("/alumni/1/profile")
+        app.dependency_overrides.clear()
+        assert resp.status_code == 200
+        return resp.json()["pay_it_forward"]
+
+    full = _run("full_access")
+    assert full["last_donation_amount"] == 250.5
+    assert full["total_lifetime_amount"] == 250.5
+    assert full["donation_count"] == 1
+
+    view = _run("view_only")
+    assert view["last_donation_amount"] is None
+    assert view["total_lifetime_amount"] is None
+    assert view["donation_count"] == 1
+    assert view["last_donation_date"] == "2026-04-01"
+
+
 class _ProfileInteractionFakeSession(_ProfileFakeSession):
     """Like ``_ProfileFakeSession`` but returns one interaction (logged by
     ``user``) and resolves that user, so ``logged_by`` name-building is covered."""

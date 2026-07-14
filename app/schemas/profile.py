@@ -524,6 +524,24 @@ class AuditEntryRead(_Orm):
     performed_by: str | None = None
 
 
+class PayItForwardSummary(BaseModel):
+    """Per-alumnus Pay It Forward Fund roll-up shown on the profile (#403).
+
+    Aggregated from the donations ledger. ``last_donation_amount`` and
+    ``total_lifetime_amount`` are DOLLAR amounts, gated to amount-viewers
+    (full_access+) exactly like the donations endpoints — they are ``null`` for a
+    caller without that capability, while ``donation_count`` and
+    ``last_donation_date`` stay visible. ``last_donation_date`` is month-level:
+    the ledger records a year + optional month (no day), so the day is always the
+    1st and the month defaults to January when only a year is on file. A
+    non-donor has ``donation_count == 0`` and every other field ``null``."""
+
+    last_donation_amount: float | None = None
+    last_donation_date: datetime.date | None = None
+    total_lifetime_amount: float | None = None
+    donation_count: int = 0
+
+
 class ProfileRead(BaseModel):
     """The full profile aggregate for one alumni."""
 
@@ -547,4 +565,8 @@ class ProfileRead(BaseModel):
     tasks: list[TaskRead] = []
     attachments: list[AttachmentRead] = []
     events: list[EventAttendedRead] = []
+    # Pay It Forward Fund roll-up (#403). Always present; a non-donor reads as
+    # ``donation_count == 0`` with null amounts/date. Amounts are gated to
+    # amount-viewers (full_access+) in the profile service.
+    pay_it_forward: PayItForwardSummary = Field(default_factory=PayItForwardSummary)
     audit: list[AuditEntryRead] = []

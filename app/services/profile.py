@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Attachment, FollowUpTask, Interaction, Survey
+from app.models.donation import Donation
 from app.models.employment import (
     CurrentEmployment,
     EducationHistory,
@@ -54,6 +56,7 @@ from app.schemas.profile import (
     LeadershipCreate,
     LeadershipRead,
     LeadershipUpdate,
+    PayItForwardSummary,
     ProfileRead,
     ProgramEngagementRead,
     StatusLabelCreate,
@@ -71,6 +74,43 @@ def _now() -> datetime.datetime:
 def _full_name(first: str | None, last: str | None, email: str | None) -> str | None:
     name = " ".join(p for p in (first, last) if p).strip()
     return name or email
+
+
+async def _pay_it_forward_summary(
+    session: AsyncSession, alumni_id: int, *, show_amounts: bool
+) -> PayItForwardSummary:
+    """Roll up an alumnus's Pay It Forward giving from the donations ledger (#403).
+
+    Returns last-gift amount/date, lifetime total, and gift count. DOLLAR amounts
+    are gated to amount-viewers (full_access+): when ``show_amounts`` is False the
+    amount fields are ``None`` while the count and last-gift DATE remain — mirrors
+    exactly how the donations endpoints null amounts for non-privileged callers.
+    ``last_donation_date`` is month-level (day always 1; month defaults to January
+    when only a year is recorded), matching the ledger's year + optional-month
+    precision. A non-donor comes back as ``donation_count == 0`` with null fields."""
+    rows = (
+        await session.scalars(
+            select(Donation)
+            .where(Donation.alumni_id == alumni_id)
+            .order_by(
+                Donation.donation_year.desc(),
+                Donation.donation_month.desc().nullslast(),
+                Donation.donation_id.desc(),
+            )
+        )
+    ).all()
+    if not rows:
+        return PayItForwardSummary(donation_count=0)
+
+    latest = rows[0]
+    last_date = datetime.date(latest.donation_year, latest.donation_month or 1, 1)
+    lifetime = sum((d.amount for d in rows), Decimal(0))
+    return PayItForwardSummary(
+        last_donation_amount=float(latest.amount) if show_amounts else None,
+        last_donation_date=last_date,
+        total_lifetime_amount=float(lifetime) if show_amounts else None,
+        donation_count=len(rows),
+    )
 
 
 async def _require_alumni(session: AsyncSession, alumni_id: int) -> Alumni:
@@ -112,6 +152,7 @@ async def get_profile(
     include_tasks: bool = True,
     include_archived: bool = False,
     can_edit: bool = True,
+    show_pay_it_forward_amounts: bool = True,
     actor_user_id: int | None = None,
 ) -> ProfileRead:
     """Assemble the full profile aggregate for one alumnus.
@@ -306,6 +347,10 @@ async def get_profile(
             names[u.user_id] = _full_name(u.first_name, u.last_name, u.email)
             first_names[u.user_id] = u.first_name or None
 
+    pay_it_forward = await _pay_it_forward_summary(
+        session, alumni_id, show_amounts=show_pay_it_forward_amounts
+    )
+
     profile = ProfileRead(
         alumni=AlumniRead.model_validate(alumnus).model_copy(
             update={"profile_updated_by_name": profile_updated_by_name}
@@ -385,6 +430,7 @@ async def get_profile(
             )
             for a in audit
         ],
+        pay_it_forward=pay_it_forward,
     )
 
     if not can_edit:

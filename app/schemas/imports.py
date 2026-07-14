@@ -186,3 +186,34 @@ class DonationImportResult(BaseModel):
     imported: int
     skipped: int
     rejects: list[ImportReject]
+
+
+# --- Bulk headshot import ----------------------------------------------------
+
+
+class HeadshotBulkItem(BaseModel):
+    """Per-file outcome in a bulk headshot import (#401).
+
+    ``status`` is one of:
+      * ``matched``  — net_id resolved to an alumnus and the image was uploaded;
+      * ``no_match`` — no alumnus has that net_id (nothing uploaded);
+      * ``invalid``  — bad MIME type, empty file, or over the per-file size cap;
+      * ``error``    — storage upload failed (transient / service error).
+    ``net_id`` is the value derived from the file name (basename minus extension),
+    echoed even when unmatched so the caller can reconcile."""
+
+    filename: str
+    net_id: str | None = None
+    status: str
+    message: str
+
+
+class HeadshotBulkResult(BaseModel):
+    """``POST /alumni/headshots/bulk`` per-file report + tallies."""
+
+    total: int
+    matched: int
+    no_match: int
+    invalid: int
+    errors: int
+    items: list[HeadshotBulkItem]

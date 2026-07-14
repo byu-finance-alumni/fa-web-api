@@ -44,10 +44,13 @@ def test_include_archived_and_all_kinds_has_no_where():
     assert "WHERE" not in sql
 
 
-def test_q_searches_seven_columns_with_ilike():
+def test_q_searches_eight_columns_with_ilike():
     sql = _sql(build_alumni_query(q="smith", is_alumni=None))
-    # names (5: first, last, preferred, birth_name, middle) + byu_id + net_id
-    assert sql.count("ILIKE") == 7
+    # names (5: first, last, preferred, birth_name, middle) + byu_id + net_id +
+    # other_designations (#404). A plain name query adds no designation EXISTS.
+    assert sql.count("ILIKE") == 8
+    assert "other_designations ILIKE" in sql
+    assert "alumni_program_engagement" not in sql
 
 
 def test_q_matches_birth_name():
@@ -303,6 +306,77 @@ def test_cert_filters_absent_by_default():
     sql = _sql(build_alumni_query())
     assert "cfa_designation" not in sql
     assert "cpa_designation" not in sql
+
+
+# --- #404 designation list filter (CFP / CFA / CPA, ANY semantics) ------------
+
+
+def test_designations_single_value_is_exists_on_that_flag():
+    sql = _sql(build_alumni_query(designations=["CFP"]))
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_program_engagement" in sql
+    assert "cfp_designation IS NOT NULL" in sql
+    # Non-empty check too (a whitespace-only flag doesn't count).
+    assert "trim(alumni_program_engagement.cfp_designation)" in sql
+    # Only the requested designation's column is referenced.
+    assert "cfa_designation" not in sql
+    assert "cpa_designation" not in sql
+
+
+def test_designations_are_case_insensitive():
+    # Lower-case input still matches the canonical CFA column.
+    sql = _sql(build_alumni_query(designations=["cfa"]))
+    assert "cfa_designation IS NOT NULL" in sql
+
+
+def test_designations_any_semantics_single_exists_ored():
+    # Multiple designations -> ONE correlated EXISTS OR-ing the flags (ANY),
+    # NOT one EXISTS per designation (that would be ALL).
+    sql = _sql(build_alumni_query(designations=["CFP", "CFA", "CPA"]))
+    assert sql.count("EXISTS (SELECT") == 1
+    assert "cfp_designation IS NOT NULL" in sql
+    assert "cfa_designation IS NOT NULL" in sql
+    assert "cpa_designation IS NOT NULL" in sql
+    assert " OR " in sql
+
+
+def test_designations_absent_by_default():
+    assert "cfp_designation" not in _sql(build_alumni_query())
+
+
+def test_designations_combine_with_other_filters_via_and():
+    sql = _sql(build_alumni_query(designations=["CFP"], graduation_year=2018))
+    assert "cfp_designation IS NOT NULL" in sql
+    assert "graduation_year =" in sql
+    assert "archived IS false" in sql
+
+
+# --- #404 free-text q also matches designations ------------------------------
+
+
+def test_q_matches_other_designations_column():
+    sql = _sql(build_alumni_query(q="Series 7"))
+    assert "other_designations ILIKE" in sql
+
+
+def test_q_naming_a_certification_adds_holder_exists():
+    # A q that names CFA also surfaces alumni who HOLD the CFA designation.
+    sql = _sql(build_alumni_query(q="cfa"))
+    assert "alumni_program_engagement" in sql
+    assert "cfa_designation IS NOT NULL" in sql
+    # Only the named cert's holder-EXISTS is added.
+    assert "cpa_designation" not in sql
+
+
+def test_q_naming_certification_is_case_insensitive():
+    sql = _sql(build_alumni_query(q="Holds a CPA"))
+    assert "cpa_designation IS NOT NULL" in sql
+
+
+def test_plain_q_adds_no_designation_holder_join():
+    sql = _sql(build_alumni_query(q="smith"))
+    assert "alumni_program_engagement" not in sql
 
 
 def test_missing_filters_default_off():

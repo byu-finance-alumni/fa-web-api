@@ -522,3 +522,245 @@ def test_headshot_upload_url_forbidden_for_view_only(client):
 def test_headshot_confirm_forbidden_for_view_only(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     assert client.post("/alumni/1/headshot/confirm").status_code == 403
+
+
+# --- #404 designation list filter (route validation + passthrough) -----------
+
+
+def test_designations_unknown_value_is_422(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    resp = client.get("/alumni", params={"designations": "MBA"})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+
+
+def test_designations_valid_values_forwarded(monkeypatch):
+    # Repeatable AND comma-separated tokens are accepted case-insensitively,
+    # normalized to canonical upper-case, de-duped, and forwarded to the repo.
+    captured: dict = {}
+
+    async def _fake_list(session, *, limit, offset, **filters):
+        captured.update(filters)
+        return [], 0
+
+    async def _fake_log(session, **kwargs):
+        return None
+
+    from app.api.routes import alumni as alumni_routes
+
+    monkeypatch.setattr(alumni_routes.service, "list_alumni", _fake_list)
+    monkeypatch.setattr(alumni_routes.service, "log_search", _fake_log)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _no_db_session
+    try:
+        with TestClient(app) as c:
+            resp = c.get("/alumni?designations=cfp&designations=CFA,cpa")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert captured["designations"] == ["CFP", "CFA", "CPA"]
+
+
+# --- #401 bulk headshot import -----------------------------------------------
+
+
+class _Scalars2:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class _BulkHeadshotSession:
+    """Returns the seeded alumni rows for the net_id lookup; records audit adds."""
+
+    def __init__(self, alumni_rows=()):
+        self._rows = list(alumni_rows)
+        self.added: list = []
+        self.committed = False
+
+    async def scalars(self, stmt):
+        return _Scalars2(self._rows)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+
+def _alumnus(net_id, alumni_id):
+    return SimpleNamespace(net_id=net_id, alumni_id=alumni_id)
+
+
+def test_bulk_headshot_requires_auth(client):
+    resp = client.post(
+        "/alumni/headshots/bulk",
+        files={"files": ("jdoe12.png", b"\x89PNG", "image/png")},
+    )
+    assert resp.status_code == 401
+
+
+def test_bulk_headshot_forbidden_for_view_only(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    resp = client.post(
+        "/alumni/headshots/bulk",
+        files={"files": ("jdoe12.png", b"\x89PNG", "image/png")},
+    )
+    assert resp.status_code == 403
+
+
+def test_bulk_headshot_matched_uploads_and_audits(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    calls: list = []
+
+    async def _fake_upload(bucket, path, data, content_type):
+        calls.append((bucket, path, data, content_type))
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files=[
+                    ("files", ("jdoe12.png", b"\x89PNGdata", "image/png")),
+                    ("files", ("nobody99.png", b"\x89PNGdata", "image/png")),
+                ],
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert body["matched"] == 1
+    assert body["no_match"] == 1
+    by_file = {i["filename"]: i for i in body["items"]}
+    assert by_file["jdoe12.png"]["status"] == "matched"
+    assert by_file["jdoe12.png"]["net_id"] == "jdoe12"
+    assert by_file["nobody99.png"]["status"] == "no_match"
+    # Uploaded under the stored net_id key in the headshots bucket.
+    assert calls == [("headshots", "jdoe12", b"\x89PNGdata", "image/png")]
+    # A matched upload is audited and the transaction committed.
+    assert session.committed is True
+    audits = [a for a in session.added if getattr(a, "action_type", None)]
+    assert len(audits) == 1
+    assert audits[0].action_type == "upload_headshot"
+    assert audits[0].entity_id == 5
+
+
+def test_bulk_headshot_case_insensitive_net_id_match(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    async def _fake_upload(bucket, path, data, content_type):
+        return None
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("JDOE12.JPG", b"\xff\xd8data", "image/jpeg")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.json()["items"][0]["status"] == "matched"
+
+
+def test_bulk_headshot_invalid_mime_reported_without_upload(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    calls: list = []
+
+    async def _fake_upload(bucket, path, data, content_type):
+        calls.append(path)
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("jdoe12.txt", b"hello", "text/plain")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    body = resp.json()
+    assert body["invalid"] == 1
+    assert body["items"][0]["status"] == "invalid"
+    assert calls == []  # never reached storage
+    assert session.committed is False
+
+
+def test_bulk_headshot_zip_input(monkeypatch):
+    import io
+    import zipfile
+
+    from app.api.routes import alumni as alumni_routes
+
+    calls: list = []
+
+    async def _fake_upload(bucket, path, data, content_type):
+        calls.append((path, content_type))
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _fake_upload)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("jdoe12.jpg", b"\xff\xd8imagedata")
+        zf.writestr("nomatch.png", b"\x89PNGdata")
+        zf.writestr("readme.txt", b"ignore me")  # non-image -> invalid
+    buf.seek(0)
+
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("photos.zip", buf.read(), "application/zip")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3
+    assert body["matched"] == 1
+    assert body["no_match"] == 1
+    assert body["invalid"] == 1
+    assert calls == [("jdoe12", "image/jpeg")]
+
+
+def test_bulk_headshot_storage_error_reported_per_file(monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+    from app.core.errors import ServiceError
+
+    async def _boom(bucket, path, data, content_type):
+        raise ServiceError("nope")
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _boom)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    try:
+        with TestClient(app) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk",
+                files={"files": ("jdoe12.png", b"\x89PNGdata", "image/png")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    body = resp.json()
+    assert body["errors"] == 1
+    assert body["items"][0]["status"] == "error"
+    assert session.committed is False

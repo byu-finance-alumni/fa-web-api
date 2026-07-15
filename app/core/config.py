@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     cors_origins: str = Field(
         default=(
             "http://localhost:3000,"
+            "https://finance.alumni.byu.edu,"
             "https://finance-alumni-database.vercel.app,"
             "https://dev-fa-web-app.vercel.app"
         ),

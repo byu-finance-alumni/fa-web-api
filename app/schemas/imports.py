@@ -91,6 +91,76 @@ class AlumniImportResult(BaseModel):
     rejects: list[ImportReject]
 
 
+# --- Alumni bulk UPDATE ("round-trip" edit) ----------------------------------
+
+
+class AlumniUpdateSummary(BaseModel):
+    total: int
+    matched: int
+    unmatched: int
+    with_changes: int
+    errors: int
+
+
+class AlumniUpdateFieldChange(BaseModel):
+    """One field a matched row would change: ``old`` -> ``new``. ``old``/``new``
+    are free-form (``Any``) since a cell can hold a string, int, bool, or date."""
+
+    field: str
+    section: str = "core"
+    old: Any = None
+    new: Any = None
+
+
+class AlumniUpdateRowReport(BaseModel):
+    """Per-row detail in an update preview.
+
+    ``status`` is one of ``update`` (matched, has changes), ``no_changes``
+    (matched, nothing differs), ``unmatched`` (no active match — not created),
+    ``unmatched_archived`` (matches only an archived record — not updated), or
+    ``error`` (mapping/validation failure). ``message`` explains an unmatched
+    row; ``error`` carries a mapping/validation message."""
+
+    row: int
+    name: str | None = None
+    alumni_id: int | None = None
+    status: str
+    changes: list[AlumniUpdateFieldChange] = []
+    error: str | None = None
+    message: str | None = None
+
+
+class AlumniUpdatePreview(BaseModel):
+    """``POST /alumni/import/update/preview`` dry-run report."""
+
+    columns_ok: bool
+    header_errors: list[str]
+    summary: AlumniUpdateSummary
+    rows: list[AlumniUpdateRowReport]
+
+
+class AlumniUpdateRowResult(BaseModel):
+    """Per-row outcome in an update commit. ``status`` is ``updated``,
+    ``unchanged``, ``unmatched``, ``unmatched_archived``, or ``error``."""
+
+    row: int
+    name: str | None = None
+    alumni_id: int | None = None
+    status: str
+    message: str | None = None
+
+
+class AlumniUpdateResult(BaseModel):
+    """``POST /alumni/import/update`` commit result."""
+
+    updated: int
+    unchanged: int
+    unmatched: int
+    errors: int
+    updated_ids: list[int]
+    results: list[AlumniUpdateRowResult]
+
+
 # --- Events (single-event attendee roster) bulk CSV import -------------------
 
 

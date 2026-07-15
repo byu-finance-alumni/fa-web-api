@@ -14,6 +14,7 @@ DISALLOWED_ORIGIN = "https://evil.example.com"
 def test_default_origins_include_local_and_frontend():
     origins = get_settings().cors_origins_list
     assert ALLOWED_ORIGIN in origins
+    assert "https://finance.alumni.byu.edu" in origins
     assert "https://finance-alumni-database.vercel.app" in origins
 
 

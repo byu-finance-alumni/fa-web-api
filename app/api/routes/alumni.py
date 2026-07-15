@@ -10,22 +10,29 @@ deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
 """
 
 import datetime
+import io
+import posixpath
+import zipfile
+import zlib
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
+    PermissionConfig,
     RequireAlumniEdit,
     RequireFullAccess,
     RequireViewAccess,
 )
 from app.api.params import IdPath
+from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
-from app.core.errors import InvalidRequestError, NotFoundError
+from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.core.rate_limit import (
+    BulkHeadshotRateLimit,
     EmploymentWriteRateLimit,
     HeadshotWriteRateLimit,
     InteractionWriteRateLimit,
@@ -49,6 +56,8 @@ from app.schemas.imports import (
     AlumniHygienePreview,
     AlumniImportPreview,
     AlumniImportResult,
+    HeadshotBulkItem,
+    HeadshotBulkResult,
 )
 from app.schemas.profile import (
     EducationCreate,
@@ -85,6 +94,34 @@ from app.services import profile as profile_service
 router = APIRouter(prefix="/alumni", tags=["alumni"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+# Professional designations accepted by the ``designations`` list filter (#404).
+_VALID_DESIGNATIONS = ("CFP", "CFA", "CPA")
+
+
+def _parse_designations(values: list[str] | None) -> list[str]:
+    """Normalize the repeatable/CSV ``designations`` query param (#404).
+
+    Splits comma-separated values, upper-cases + de-dupes, and validates every
+    token against CFP / CFA / CPA. An unknown value raises a 422 rather than
+    being silently dropped, so a typo surfaces instead of returning everyone."""
+    if not values:
+        return []
+    valid = set(_VALID_DESIGNATIONS)
+    out: list[str] = []
+    for raw in values:
+        for piece in raw.split(","):
+            token = piece.strip().upper()
+            if not token:
+                continue
+            if token not in valid:
+                raise InvalidRequestError(
+                    f"Unknown designation '{piece.strip()}'. "
+                    "Valid values: CFP, CFA, CPA."
+                )
+            if token not in out:
+                out.append(token)
+    return out
 
 
 @router.get("", response_model=AlumniPage)
@@ -241,6 +278,17 @@ async def list_alumni(
     cpa: Annotated[
         bool, Query(description="Only alumni holding the CPA designation.")
     ] = False,
+    designations: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Professional-designation filter (#404): repeatable or "
+                "comma-separated, values among CFP, CFA, CPA (case-insensitive). "
+                "Returns alumni holding ANY of the requested designations (OR). "
+                "An unknown value is a 422."
+            )
+        ),
+    ] = None,
     graduate_degree: Annotated[
         bool, Query(description="Only alumni with a graduate degree recorded.")
     ] = False,
@@ -331,6 +379,9 @@ async def list_alumni(
     # Map the friends/alumni split (#218) to the repository's tri-state filter:
     # alumni-only (True), friends-only (False), or both (None).
     is_alumni_filter = {"alumni": True, "friend": False, "all": None}[kind]
+    # Designation facet (#404): validate + normalize CFP/CFA/CPA tokens (422 on
+    # an unknown value) before they reach the query builder.
+    designation_filter = _parse_designations(designations)
     # Natural-language location search (#358). When a ``near`` phrase is present we
     # ask the geocoding module to resolve it to a center + a set of nearby cities;
     # a ``radius`` override is folded into the phrase so the resolved city set (and
@@ -407,6 +458,7 @@ async def list_alumni(
         guest_speaker_willing=guest_speaker_willing,
         cfa=cfa,
         cpa=cpa,
+        designations=designation_filter,
         graduate_degree=graduate_degree,
         missing_email=missing_email,
         missing_employer=missing_employer,
@@ -452,6 +504,7 @@ async def list_alumni(
             "never_contacted": never_contacted or None,
             "cfa": cfa or None,
             "cpa": cpa or None,
+            "designations": "|".join(designation_filter) if designation_filter else None,
             "graduate_degree": graduate_degree or None,
             "spoke_after": spoke_after.isoformat() if spoke_after else None,
             "spoke_before": spoke_before.isoformat() if spoke_before else None,
@@ -528,6 +581,113 @@ _HEADSHOT_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 # several MB. Independent of ``MAX_UPLOAD_BYTES`` so it doesn't loosen imports.
 _HEADSHOT_MAX_BYTES = 20 * 1024 * 1024  # 20 MiB
 
+# Bulk headshot import (#401). Extension -> MIME for images pulled out of a ZIP
+# (zip entries carry no content-type of their own). Keys are the canonical
+# allow-list; anything else is rejected as ``invalid``.
+_HEADSHOT_EXT_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+# Content types (or a .zip name) that mark the single-file archive path.
+_HEADSHOT_ZIP_MIME_TYPES = frozenset(
+    {"application/zip", "application/x-zip-compressed", "application/octet-stream"}
+)
+# Batch caps: bound the number of images and the TOTAL bytes (uncompressed for a
+# zip) so one request can't exhaust memory. Per-file cap reuses _HEADSHOT_MAX_BYTES.
+_HEADSHOT_BULK_MAX_FILES = 1000
+_HEADSHOT_BULK_MAX_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MiB
+# Hard ceiling on the number of central-directory records we'll even scan. Junk
+# entries (dirs / dotfiles / __MACOSX) are skipped before the file-count cap
+# applies, so without this a zip padded with millions of zero-byte members would
+# force a multi-million-iteration loop. This bounds that scan up front; it's well
+# above _HEADSHOT_BULK_MAX_FILES so a legitimate batch (plus its dir/metadata
+# members) never trips it.
+_HEADSHOT_BULK_MAX_DIR_ENTRIES = 10_000
+# Chunk size for streaming a single zip entry out of the archive. We decompress
+# in bounded pieces and track ACTUAL bytes so a lying central-directory size
+# can't drive an unbounded read.
+_ZIP_READ_CHUNK = 1024 * 1024  # 1 MiB
+
+
+def _net_id_from_filename(name: str) -> str:
+    """Derive the net_id from an image file name: basename minus extension.
+
+    Tolerates both POSIX and Windows separators (zip entries can carry either)
+    and trims surrounding whitespace. ``"jdoe12.jpg"`` -> ``"jdoe12"``;
+    ``"photos/jdoe12.PNG"`` -> ``"jdoe12"``."""
+    base = posixpath.basename(name.replace("\\", "/"))
+    stem = posixpath.splitext(base)[0]
+    return stem.strip()
+
+
+def _headshot_mime_for_ext(name: str) -> str | None:
+    """Return the allow-listed MIME for an image file name by extension, or None
+    when the extension isn't an accepted image type."""
+    ext = posixpath.splitext(name.replace("\\", "/"))[1].lower()
+    return _HEADSHOT_EXT_MIME.get(ext)
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Return the image MIME implied by the leading magic bytes of ``data``
+    (JPEG / PNG / WebP), or None when the bytes are not a recognised image.
+
+    This NEVER trusts a caller-supplied file extension or ``Content-Type``: those
+    are attacker-controlled labels, so a ``.jpg`` name or an ``image/jpeg`` header
+    means nothing until the actual bytes are checked here."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _image_content_error(data: bytes, expected_mime: str) -> str | None:
+    """Validate that ``data`` really is a JPEG/PNG/WebP image whose true type
+    matches ``expected_mime`` (the type claimed by the extension / Content-Type).
+    Return an error message when the content is not an image or contradicts its
+    claimed type, or None when it checks out."""
+    sniffed = _sniff_image_mime(data)
+    if sniffed is None:
+        return "File content is not a JPEG, PNG, or WebP image."
+    if sniffed != expected_mime:
+        return "File content does not match its declared image type."
+    return None
+
+
+def _read_zip_entry_capped(
+    zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int
+) -> bytes | None:
+    """Stream-decompress a single zip entry, aborting the instant the ACTUAL
+    decompressed size exceeds ``cap``.
+
+    We deliberately never gate on ``info.file_size``: that value comes from the
+    archive's central directory and is fully attacker-controlled, so it can lie
+    (small, to slip past a size check, or huge, to trigger a giant read). Instead
+    we open the entry and read it in bounded chunks, counting real bytes, and bail
+    out with None once we cross ``cap``. Returns None (rather than raising) for an
+    over-cap entry OR a corrupt/undecompressable stream (e.g. CRC mismatch from a
+    forged size), so the caller reports it as one invalid item instead of failing
+    the whole request."""
+    total = 0
+    chunks: list[bytes] = []
+    try:
+        with zf.open(info) as fh:
+            while True:
+                chunk = fh.read(_ZIP_READ_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > cap:
+                    return None
+                chunks.append(chunk)
+    except (zipfile.BadZipFile, zlib.error, OSError, EOFError):
+        return None
+    return b"".join(chunks)
+
 
 async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
     """Return the alumnus's net_id (the headshot object key), or raise 404/400."""
@@ -563,6 +723,11 @@ async def upload_headshot(
         return _too_large_response(_HEADSHOT_MAX_BYTES)
     if not data:
         raise InvalidRequestError("The uploaded image is empty.")
+    # The Content-Type above is just a client-supplied label; verify the actual
+    # bytes really are the image type they claim before anything reaches storage.
+    content_error = _image_content_error(data, content_type)
+    if content_error is not None:
+        raise InvalidRequestError(content_error)
     net_id = await _alumnus_net_id(session, alumni_id)
     await supabase_storage.upload_object(_HEADSHOT_BUCKET, net_id, data, content_type)
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
@@ -686,6 +851,340 @@ async def delete_headshot(
     service._audit(session, user.user_id, "delete_headshot", alumni_id, old_value=net_id)
     await session.commit()
     return Response(status_code=204)
+
+
+# One prepared image awaiting a net_id match + upload. ``error`` is set when the
+# file failed pre-upload validation (bad MIME / empty / too large), in which case
+# ``data`` is None and it is reported as ``invalid`` without a DB lookup.
+class _HeadshotEntry:
+    __slots__ = ("filename", "net_id", "data", "content_type", "error")
+
+    def __init__(
+        self,
+        filename: str,
+        *,
+        net_id: str | None = None,
+        data: bytes | None = None,
+        content_type: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.filename = filename
+        self.net_id = net_id
+        self.data = data
+        self.content_type = content_type
+        self.error = error
+
+
+def _prepare_zip_entries(archive: bytes) -> list[_HeadshotEntry] | JSONResponse:
+    """Expand a bulk-import ZIP into per-image entries (validated, capped).
+
+    Skips directories and macOS metadata (``__MACOSX`` / dotfiles). Guards against
+    zip bombs WITHOUT ever trusting the archive's self-declared sizes: each entry
+    is stream-decompressed in bounded chunks and aborted the instant its ACTUAL
+    bytes cross the per-file cap, and the running total of real bytes is held under
+    the batch cap. A file over the per-file cap, undecompressable, of a non-image
+    extension, or whose real content doesn't match its extension is kept as an
+    ``invalid`` entry (so it shows up in the report) rather than silently dropped
+    or crashing the request. Returns a 413 response if the archive holds too many
+    records / images or its real contents exceed the total cap, or 400 if it isn't
+    a readable ZIP."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(archive))
+    except zipfile.BadZipFile:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "invalid_request",
+                    "message": "The uploaded file is not a valid ZIP archive.",
+                }
+            },
+        )
+    entries: list[_HeadshotEntry] = []
+    total = 0
+    with zf:
+        # Bound the central-directory scan up front: junk entries are skipped
+        # below before the file-count cap applies, so a zip padded with millions
+        # of zero-byte members would otherwise force a giant loop. Reject the
+        # whole archive if it declares more records than we'll ever scan.
+        if len(zf.infolist()) > _HEADSHOT_BULK_MAX_DIR_ENTRIES:
+            return _bulk_too_many_response()
+        for info in zf.infolist():
+            name = info.filename
+            base = posixpath.basename(name.replace("\\", "/"))
+            if info.is_dir() or not base:
+                continue
+            if base.startswith(".") or name.startswith("__MACOSX"):
+                continue
+            if len(entries) >= _HEADSHOT_BULK_MAX_FILES:
+                return _bulk_too_many_response()
+            net_id = _net_id_from_filename(name)
+            content_type = _headshot_mime_for_ext(name)
+            if content_type is None:
+                entries.append(
+                    _HeadshotEntry(
+                        base,
+                        net_id=net_id or None,
+                        error="File must be a JPEG, PNG, or WebP image.",
+                    )
+                )
+                continue
+            # Stream the entry with a hard per-file cap on REAL bytes; None means
+            # it blew the cap or couldn't be decompressed (e.g. a forged size /
+            # bad CRC) — either way it's one invalid item, never a crash.
+            data = _read_zip_entry_capped(zf, info, _HEADSHOT_MAX_BYTES)
+            if data is None:
+                entries.append(
+                    _HeadshotEntry(
+                        base,
+                        net_id=net_id or None,
+                        error="Image exceeds the per-file size limit or is unreadable.",
+                    )
+                )
+                continue
+            if not data:
+                entries.append(
+                    _HeadshotEntry(
+                        base, net_id=net_id or None, error="The image is empty."
+                    )
+                )
+                continue
+            total += len(data)
+            if total > _HEADSHOT_BULK_MAX_TOTAL_BYTES:
+                return _bulk_too_large_response()
+            # Zip entries carry no content-type; the extension is just a label, so
+            # verify the real bytes are that image type before trusting them.
+            content_error = _image_content_error(data, content_type)
+            if content_error is not None:
+                entries.append(
+                    _HeadshotEntry(base, net_id=net_id or None, error=content_error)
+                )
+                continue
+            entries.append(
+                _HeadshotEntry(
+                    base, net_id=net_id or None, data=data, content_type=content_type
+                )
+            )
+    return entries
+
+
+def _bulk_too_large_response() -> JSONResponse:
+    mib = _HEADSHOT_BULK_MAX_TOTAL_BYTES // (1024 * 1024)
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": {
+                "code": "payload_too_large",
+                "message": (
+                    f"The images exceed the {mib} MB total upload limit. "
+                    "Split into smaller batches."
+                ),
+            }
+        },
+    )
+
+
+def _bulk_too_many_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": {
+                "code": "payload_too_large",
+                "message": (
+                    f"Too many images in one request (limit "
+                    f"{_HEADSHOT_BULK_MAX_FILES}). Split into smaller batches."
+                ),
+            }
+        },
+    )
+
+
+@router.post("/headshots/bulk", response_model=HeadshotBulkResult)
+async def bulk_upload_headshots(
+    user: BulkHeadshotRateLimit,
+    session: SessionDep,
+    files: Annotated[
+        list[UploadFile],
+        File(
+            description=(
+                "Either a single .zip of images OR multiple image files. Each "
+                "image's net_id is its file name minus extension."
+            )
+        ),
+    ],
+) -> HeadshotBulkResult | JSONResponse:
+    """Bulk-upload alumni headshots (full_access and up, #401).
+
+    Accepts EITHER a single ``.zip`` of images OR several image files in one
+    multipart request. For each image the net_id is the file name minus its
+    extension; the alumnus is looked up by net_id (case-insensitive) and, when
+    matched, the JPEG/PNG/WebP is stored in the private ``headshots`` bucket under
+    the net_id key (overwriting any existing image) — the SAME validation, bucket,
+    and key as the single-headshot upload. Returns a per-file report; a matched
+    upload is audited (``upload_headshot``). Per-file (20 MB) and total (200 MB)
+    size caps apply; an oversized batch or bad archive is a 413 / 400."""
+    if not files:
+        raise InvalidRequestError("No files were uploaded.")
+
+    is_zip = len(files) == 1 and (
+        (files[0].filename or "").lower().endswith(".zip")
+        or (files[0].content_type or "").split(";")[0].strip().lower()
+        in _HEADSHOT_ZIP_MIME_TYPES
+    )
+
+    entries: list[_HeadshotEntry]
+    if is_zip:
+        archive = await _read_capped(files[0], _HEADSHOT_BULK_MAX_TOTAL_BYTES)
+        if archive is None:
+            return _bulk_too_large_response()
+        prepared = _prepare_zip_entries(archive)
+        if isinstance(prepared, JSONResponse):
+            return prepared
+        entries = prepared
+    else:
+        if len(files) > _HEADSHOT_BULK_MAX_FILES:
+            return _bulk_too_many_response()
+        entries = []
+        total = 0
+        for upload in files:
+            filename = upload.filename or "(unnamed)"
+            net_id = _net_id_from_filename(filename)
+            content_type = (upload.content_type or "").split(";")[0].strip().lower()
+            if content_type not in _HEADSHOT_MIME_TYPES:
+                entries.append(
+                    _HeadshotEntry(
+                        filename,
+                        net_id=net_id or None,
+                        error="File must be a JPEG, PNG, or WebP image.",
+                    )
+                )
+                continue
+            data = await _read_capped(upload, _HEADSHOT_MAX_BYTES)
+            if data is None:
+                entries.append(
+                    _HeadshotEntry(
+                        filename,
+                        net_id=net_id or None,
+                        error="Image exceeds the per-file size limit.",
+                    )
+                )
+                continue
+            if not data:
+                entries.append(
+                    _HeadshotEntry(
+                        filename, net_id=net_id or None, error="The image is empty."
+                    )
+                )
+                continue
+            total += len(data)
+            if total > _HEADSHOT_BULK_MAX_TOTAL_BYTES:
+                return _bulk_too_large_response()
+            # The multipart Content-Type is a client-supplied label; verify the
+            # real bytes are that image type before trusting/storing them.
+            content_error = _image_content_error(data, content_type)
+            if content_error is not None:
+                entries.append(
+                    _HeadshotEntry(
+                        filename, net_id=net_id or None, error=content_error
+                    )
+                )
+                continue
+            entries.append(
+                _HeadshotEntry(
+                    filename,
+                    net_id=net_id or None,
+                    data=data,
+                    content_type=content_type,
+                )
+            )
+
+    # Batch-resolve every candidate net_id to its alumnus in one query (no N+1).
+    wanted = {e.net_id.lower() for e in entries if e.data is not None and e.net_id}
+    matches: dict[str, Alumni] = {}
+    if wanted:
+        rows = (
+            await session.scalars(
+                select(Alumni).where(func.lower(Alumni.net_id).in_(wanted))
+            )
+        ).all()
+        for alumnus in rows:
+            key = (alumnus.net_id or "").strip().lower()
+            if key:
+                matches[key] = alumnus
+
+    items: list[HeadshotBulkItem] = []
+    uploaded = 0
+    for entry in entries:
+        if entry.error is not None:
+            items.append(
+                HeadshotBulkItem(
+                    filename=entry.filename,
+                    net_id=entry.net_id,
+                    status="invalid",
+                    message=entry.error,
+                )
+            )
+            continue
+        if not entry.net_id:
+            items.append(
+                HeadshotBulkItem(
+                    filename=entry.filename,
+                    net_id=None,
+                    status="invalid",
+                    message="Could not derive a net ID from the file name.",
+                )
+            )
+            continue
+        alumnus = matches.get(entry.net_id.lower())
+        if alumnus is None:
+            items.append(
+                HeadshotBulkItem(
+                    filename=entry.filename,
+                    net_id=entry.net_id,
+                    status="no_match",
+                    message="No alumnus has this net ID.",
+                )
+            )
+            continue
+        key = (alumnus.net_id or "").strip()
+        try:
+            await supabase_storage.upload_object(
+                _HEADSHOT_BUCKET, key, entry.data, entry.content_type
+            )
+        except ServiceError:
+            items.append(
+                HeadshotBulkItem(
+                    filename=entry.filename,
+                    net_id=entry.net_id,
+                    status="error",
+                    message="The file storage service rejected the upload.",
+                )
+            )
+            continue
+        service._audit(
+            session, user.user_id, "upload_headshot", alumnus.alumni_id, new_value=key
+        )
+        uploaded += 1
+        items.append(
+            HeadshotBulkItem(
+                filename=entry.filename,
+                net_id=entry.net_id,
+                status="matched",
+                message="Headshot uploaded.",
+            )
+        )
+
+    if uploaded:
+        await session.commit()
+
+    return HeadshotBulkResult(
+        total=len(items),
+        matched=sum(1 for i in items if i.status == "matched"),
+        no_match=sum(1 for i in items if i.status == "no_match"),
+        invalid=sum(1 for i in items if i.status == "invalid"),
+        errors=sum(1 for i in items if i.status == "error"),
+        items=items,
+    )
 
 
 @router.get("/import/template")
@@ -842,23 +1341,33 @@ async def get_alumni(alumni_id: IdPath, user: RequireViewAccess, session: Sessio
 
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
 async def get_alumni_profile(
-    alumni_id: IdPath, user: RequireViewAccess, session: SessionDep
+    alumni_id: IdPath,
+    user: RequireViewAccess,
+    config: PermissionConfig,
+    session: SessionDep,
 ) -> ProfileRead:
     """Full profile aggregate (core + contact, career, employment, leadership,
-    engagement, surveys, interactions, tasks, attachments, audit) for the tabs.
+    engagement, surveys, interactions, tasks, attachments, Pay It Forward, audit)
+    for the tabs.
 
     Archived records 404. Follow-up tasks are edit-only: view_only ("Professor")
     users get an empty ``tasks`` list AND a FERPA-minimized aggregate (sensitive
     PII nulled, free-text notes and audit trail stripped) — enforced here, not
     just hidden in the UI. Anyone with edit access — engineer / super_admin /
     full_access / student — sees all. The disclosure is audit-logged
-    (``view_profile``)."""
+    (``view_profile``).
+
+    The ``pay_it_forward`` roll-up (#403) always includes the donation count and
+    last-gift date, but its dollar amounts are gated to amount-viewers
+    (``alumni.full`` — full_access+), mirroring the donations endpoints."""
     include_tasks = user.can_edit_alumni
+    show_amounts = Capability.ALUMNI_FULL in effective_capabilities(config, user.roles)
     return await profile_service.get_profile(
         session,
         alumni_id,
         include_tasks=include_tasks,
         can_edit=user.can_edit_alumni,
+        show_pay_it_forward_amounts=show_amounts,
         actor_user_id=user.user_id,
     )
 

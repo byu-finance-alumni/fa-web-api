@@ -179,6 +179,8 @@ CREATE TABLE alumni (
     graduation_class     int,
     finance_program_year int,
     graduate_degree      varchar(100),
+    -- Graduation year of a GRADUATE program (distinct from graduation_year).
+    graduate_graduation_year int,
     -- Survey / demographics captured on the alumni survey. Optional/nullable
     -- additive fields. home_country is the country of ORIGIN (distinct from the
     -- current-address country on the contact record); employment_status is

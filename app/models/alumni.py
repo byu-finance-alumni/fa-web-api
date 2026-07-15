@@ -64,6 +64,9 @@ class Alumni(TimestampMixin, Base):
     graduation_class: Mapped[int | None] = mapped_column(Integer)
     finance_program_year: Mapped[int | None] = mapped_column(Integer)
     graduate_degree: Mapped[str | None] = mapped_column(String(100))
+    # Graduation year of a GRADUATE program (distinct from the undergrad
+    # graduation_year above). Nullable additive column.
+    graduate_graduation_year: Mapped[int | None] = mapped_column(Integer)
 
     # Survey / demographics captured on the alumni survey. All optional/nullable
     # additive fields. Short single-value fields are varchar; other_designations

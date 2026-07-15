@@ -116,6 +116,9 @@ class AlumniBase(BaseModel):
     graduation_class: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    # Graduation year of a GRADUATE program (distinct from graduation_year);
+    # year-range validated alongside the other year fields below.
+    graduate_graduation_year: int | None = None
     # Survey / demographics (all optional, nullable, additive). Free-text
     # single-value fields; other_designations shares the generous notes-style cap.
     citizenship: str | None = Field(default=None, max_length=_CITIZENSHIP_MAX)
@@ -242,7 +245,12 @@ class AlumniBase(BaseModel):
 
     # --- Years ---------------------------------------------------------------
 
-    @field_validator("graduation_year", "finance_program_year", "graduation_class")
+    @field_validator(
+        "graduation_year",
+        "finance_program_year",
+        "graduation_class",
+        "graduate_graduation_year",
+    )
     @classmethod
     def _validate_year(cls, value: int | None) -> int | None:
         if value is None:
@@ -528,6 +536,10 @@ class CareerCreate(_Section):
     current_title: str | None = Field(default=None, max_length=255)
     current_industry: str | None = Field(default=None, max_length=255)
     current_industry_secondary: str | None = Field(default=None, max_length=255)
+    # Company street address (the "Company Address" line on the profile, #366).
+    # Exposed for READ via CurrentCareerRead; writable here so the edit form can
+    # persist it. max_length mirrors current_employment.company_address varchar(255).
+    company_address: str | None = Field(default=None, max_length=255)
     current_city: str | None = Field(default=None, max_length=100)
     current_state: str | None = Field(default=None, max_length=100)
     current_country: str | None = Field(default=None, max_length=100)
@@ -671,6 +683,8 @@ class AlumniRead(BaseModel):
     graduation_class: int | None = None
     finance_program_year: int | None = None
     graduate_degree: str | None = None
+    # Graduation year of a GRADUATE program (distinct from graduation_year).
+    graduate_graduation_year: int | None = None
     # Survey / demographics (nullable, additive).
     citizenship: str | None = None
     marital_status: str | None = None

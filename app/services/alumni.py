@@ -471,6 +471,12 @@ async def update_alumni(
     # Upsert each related section only when it carries a real value, so empty
     # sections never create rows. Mirrors create_alumni's section handling;
     # getattr keeps this tolerant of a core-only payload (direct callers/tests).
+    #
+    # model_dump(exclude_unset=True): write ONLY the section fields the caller
+    # actually sent, so a PARTIAL section update (e.g. the focused edit forms that
+    # submit just Employment or just Personal) can't null the sibling fields it
+    # omitted. A field sent as an explicit null IS "set", so intentional clears
+    # still apply; a merely-absent field is left untouched.
     contact = getattr(payload, "contact", None)
     career = getattr(payload, "career", None)
     education = getattr(payload, "education", None)
@@ -481,7 +487,7 @@ async def update_alumni(
             session,
             AlumniContactInfo,
             alumni_id,
-            hygiene.clean_section("contact", contact.model_dump()),
+            hygiene.clean_section("contact", contact.model_dump(exclude_unset=True)),
             order_by=AlumniContactInfo.contact_info_id,
         )
     if career is not None and career.has_values():
@@ -489,7 +495,7 @@ async def update_alumni(
             session,
             CurrentEmployment,
             alumni_id,
-            hygiene.clean_section("career", career.model_dump()),
+            hygiene.clean_section("career", career.model_dump(exclude_unset=True)),
             order_by=CurrentEmployment.current_employment_id.desc(),
         )
     if education is not None and education.has_values():
@@ -502,7 +508,7 @@ async def update_alumni(
             session,
             EducationHistory,
             alumni_id,
-            hygiene.clean_section("education", education.model_dump()),
+            hygiene.clean_section("education", education.model_dump(exclude_unset=True)),
             order_by=EducationHistory.degree_year.desc().nullslast(),
         )
     if engagement is not None and engagement.has_values():
@@ -510,7 +516,7 @@ async def update_alumni(
             session,
             AlumniProgramEngagement,
             alumni_id,
-            hygiene.clean_section("engagement", engagement.model_dump()),
+            hygiene.clean_section("engagement", engagement.model_dump(exclude_unset=True)),
         )
 
     if applied or section_written:

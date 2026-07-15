@@ -248,6 +248,40 @@ def test_update_engagement_toggles_true_flag_to_false(monkeypatch):
     assert session.committed == 1
 
 
+class _CareerSession(FakeSession):
+    """Fake session returning a pre-seeded current-employment row for the career
+    section upsert, so a partial update can be checked against sibling fields."""
+
+    def __init__(self, employment: CurrentEmployment) -> None:
+        super().__init__()
+        self._employment = employment
+
+    async def scalar(self, stmt: object) -> object | None:
+        if "current_employment" in str(stmt.compile(dialect=postgresql.dialect())):
+            return self._employment
+        return None
+
+
+def test_update_career_partial_preserves_omitted_siblings(monkeypatch):
+    """Regression: a focused-form save that sends ONLY current_title must leave
+    the other career fields intact (exclude_unset), not null them."""
+    existing = Alumni(alumni_id=1, first_name="Jane", last_name="Doe", archived=False)
+    _patch_get(monkeypatch, existing)
+    employment_row = CurrentEmployment(
+        current_employment_id=3,
+        alumni_id=1,
+        current_employer="Acme Corp",
+        current_title="Analyst",
+        current_city="Boston",
+    )
+    session = _CareerSession(employment_row)
+    payload = AlumniUpdateFull(career=CareerCreate(current_title="Associate"))
+    asyncio.run(service.update_alumni(session, 1, payload))
+    assert employment_row.current_title == "Associate"  # the one sent field changed
+    assert employment_row.current_employer == "Acme Corp"  # sibling preserved
+    assert employment_row.current_city == "Boston"  # sibling preserved
+
+
 def test_get_alumni_missing_raises(monkeypatch):
     _patch_get(monkeypatch, None)
     with pytest.raises(NotFoundError):

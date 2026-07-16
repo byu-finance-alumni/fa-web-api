@@ -684,7 +684,7 @@ def test_commit_import_no_importable_does_not_commit():
 # --- Template endpoint content ----------------------------------------------
 
 
-FINALIZED_64_HEADERS = [
+FINALIZED_ALUMNI_HEADERS = [
     "Filled out Survey",
     "MSTID (from OneAccord)",
     "BYU ID (9 digits)",
@@ -706,6 +706,8 @@ FINALIZED_64_HEADERS = [
     "Profile Updated Date",
     "Finance Leadership Position",
     "Graduate degree",
+    "Graduate university",
+    "Graduate graduation year",
     "Deceased? (Yes/No)",
     "Notes",
     "Citizenship",
@@ -752,13 +754,15 @@ FINALIZED_64_HEADERS = [
 ]
 
 
-def test_expected_headers_are_the_finalized_64_in_order():
-    # The intake template's EXPECTED_HEADERS must equal the finalized 64-column
-    # set VERBATIM and in order (header validation is exact-match both ways).
-    assert import_csv.EXPECTED_HEADERS == FINALIZED_64_HEADERS
-    assert len(import_csv.EXPECTED_HEADERS) == 64
+def test_expected_headers_are_the_finalized_set_in_order():
+    # The intake template's EXPECTED_HEADERS must equal the finalized column set
+    # VERBATIM and in order (header validation is exact-match both ways). The set
+    # grew from 64 to 66 when the graduate university + graduation-year columns
+    # were added (#269 follow-up) so the graduate program round-trips.
+    assert import_csv.EXPECTED_HEADERS == FINALIZED_ALUMNI_HEADERS
+    assert len(import_csv.EXPECTED_HEADERS) == 66
     # Every header is a mapping key (and vice-versa).
-    assert set(import_csv._MAPPING) == set(FINALIZED_64_HEADERS)
+    assert set(import_csv._MAPPING) == set(FINALIZED_ALUMNI_HEADERS)
 
 
 def test_template_csv_has_expected_headers():

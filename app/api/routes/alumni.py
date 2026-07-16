@@ -1869,6 +1869,24 @@ async def add_event_attendance(
     )
 
 
+def _drop_manual_updated_date(payload: AlumniCreateFull | AlumniUpdateFull):
+    """Strip the hand-typed ``profile_updated_date`` from a CLIENT write (#285).
+
+    "Last updated" is now driven by ``updated_at`` (auto-bumped) + the actor FK,
+    so the manual date must not be settable from the app — two dates that can
+    disagree is the bug. The column and its existing data are KEPT: they are the
+    provenance record of what the intake spreadsheet claimed, and the CSV importer
+    (which writes through the service, not this route) still populates them.
+
+    Discarding the key from ``__pydantic_fields_set__`` rather than nulling the
+    value is deliberate: the write path dumps with ``exclude_unset=True``, so an
+    explicit ``None`` would CLEAR the stored spreadsheet date on every save, while
+    an unset field is simply never written.
+    """
+    payload.__pydantic_fields_set__.discard("profile_updated_date")
+    return payload
+
+
 @router.post("/preview", response_model=AlumniHygienePreview)
 async def preview_create_alumni(
     payload: AlumniCreateFull, user: RequireFullAccess, session: SessionDep
@@ -1880,7 +1898,7 @@ async def preview_create_alumni(
     + fuzzy possible-duplicates), and exact-duplicate blockers (a non-empty list
     means the real POST would 409). The preview reads stored data, so it is
     audit-logged (``preview``)."""
-    result = await hygiene.build_preview(session, payload)
+    result = await hygiene.build_preview(session, _drop_manual_updated_date(payload))
     await service.log_preview(session, actor_user_id=user.user_id)
     return result
 
@@ -1902,7 +1920,10 @@ async def preview_update_alumni(
     if existing.archived:
         raise NotFoundError(f"Alumni {alumni_id} not found.")
     result = await hygiene.build_preview(
-        session, payload, existing=existing, exclude_alumni_id=alumni_id
+        session,
+        _drop_manual_updated_date(payload),
+        existing=existing,
+        exclude_alumni_id=alumni_id,
     )
     await service.log_preview(session, actor_user_id=user.user_id, alumni_id=alumni_id)
     return result
@@ -1912,7 +1933,9 @@ async def preview_update_alumni(
 async def create_alumni(
     payload: AlumniCreateFull, user: RequireFullAccess, session: SessionDep
 ) -> AlumniRead:
-    return await service.create_alumni(session, payload, actor_user_id=user.user_id)
+    return await service.create_alumni(
+        session, _drop_manual_updated_date(payload), actor_user_id=user.user_id
+    )
 
 
 @router.patch("/{alumni_id}", response_model=AlumniRead)
@@ -1922,7 +1945,9 @@ async def update_alumni(
     user: RequireAlumniEdit,
     session: SessionDep,
 ) -> AlumniRead:
-    return await service.update_alumni(session, alumni_id, payload, actor_user_id=user.user_id)
+    return await service.update_alumni(
+        session, alumni_id, _drop_manual_updated_date(payload), actor_user_id=user.user_id
+    )
 
 
 @router.delete("/{alumni_id}", response_model=AlumniRead)

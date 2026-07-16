@@ -12,6 +12,7 @@ callers.
 """
 
 import datetime
+import re
 
 from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,6 +46,43 @@ SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
 _FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
     i.lower() for i in WHEEL_INDUSTRIES
 )
+
+
+# Free-text ``q`` tokenization (#281). Names are stored atomized (first_name
+# 'Kyle', last_name 'Marsh'), so wrapping the whole raw query in %...% can never
+# match a full name — the space is matched literally, not as a separator. The
+# query is split on whitespace/commas ("Marsh, Kyle" == "Kyle Marsh") and the
+# tokens are AND-ed, each token OR-ing across every name column. Capped so a
+# pasted paragraph can't fan out into a huge AND chain of leading-wildcard
+# ILIKEs (none of which can use a btree index).
+_Q_TOKEN_SEPARATORS = re.compile(r"[\s,]+")
+_Q_TOKEN_LIMIT = 5
+
+# The columns EVERY token is matched against (single- or multi-token).
+#
+# Names: Tanya (#281) — "many times they also go by their middle names or females
+# got married and changed their last name so it should be searching all names in
+# their profile." A token may match ANY of these — "Kyle Marsh" matches with
+# 'Kyle' on first_name and 'Marsh' on last_name, so the OR set is per-token, not
+# per-column.
+#
+# other_designations (#404): free text that legitimately CONTAINS spaces
+# ("Series 7"), so it must stay in the per-token set — token 'Series' and token
+# '7' both match the same cell and the AND is satisfied. Restricting it to
+# single-token queries would break the "Series 7" search.
+_Q_TOKEN_COLUMNS = (
+    Alumni.first_name,
+    Alumni.middle_name,
+    Alumni.last_name,
+    Alumni.preferred_first_name,
+    Alumni.birth_name,
+    Alumni.other_designations,
+)
+
+
+def _q_tokens(q: str) -> list[str]:
+    """Split a free-text query into at most ``_Q_TOKEN_LIMIT`` search tokens."""
+    return [t for t in _Q_TOKEN_SEPARATORS.split(q.strip()) if t][:_Q_TOKEN_LIMIT]
 
 
 def _as_values(value: "str | list[str] | None") -> list[str]:
@@ -239,43 +277,48 @@ def build_alumni_query(
     # Alumni / friends split (#218). None -> no predicate (return both).
     if is_alumni is not None:
         conditions.append(Alumni.is_alumni.is_(is_alumni))
-    if q:
-        like = f"%{escape_like(q)}%"
-        q_terms = [
-            Alumni.first_name.ilike(like, escape="\\"),
-            Alumni.last_name.ilike(like, escape="\\"),
-            Alumni.preferred_first_name.ilike(like, escape="\\"),
-            # Maiden / birth name (#216): a last-name search must also find
-            # alumnae listed under their birth name. Matched case-insensitively
-            # like the other name columns.
-            Alumni.birth_name.ilike(like, escape="\\"),
-            Alumni.middle_name.ilike(like, escape="\\"),
-            Alumni.byu_id.ilike(like, escape="\\"),
-            Alumni.net_id.ilike(like, escape="\\"),
-            # Free-text extra designations live on the alumni row (#404) — a
-            # ``q`` for "Series 7" should surface them.
-            Alumni.other_designations.ilike(like, escape="\\"),
-        ]
-        # A free-text search that names a professional certification (CFP / CFA /
-        # CPA) also matches alumni who HOLD it on their program-engagement profile
-        # (#404). The token match is decided here in Python (the builder receives
-        # the concrete ``q``), so a plain name search adds no engagement join.
-        q_lower = q.lower()
-        for token, column in (
-            ("cfp", AlumniProgramEngagement.cfp_designation),
-            ("cfa", AlumniProgramEngagement.cfa_designation),
-            ("cpa", AlumniProgramEngagement.cpa_designation),
-        ):
-            if token in q_lower:
+    if q and (q_tokens := _q_tokens(q)):
+        # Tokens are AND-ed (every token must match SOMETHING), each token OR-ing
+        # across the searchable columns — not necessarily the same one (#281).
+        # The birth_name column keeps a maiden-name search working (#216).
+        single_token = len(q_tokens) == 1
+        for token in q_tokens:
+            like = f"%{escape_like(token)}%"
+            q_terms = [c.ilike(like, escape="\\") for c in _Q_TOKEN_COLUMNS]
+            # The external ids are single atomic values that never contain a
+            # space, so they only make sense for a single-token query: AND-ing an
+            # id column against a two-word name query could never match (#281).
+            if single_token:
+                q_terms += [
+                    Alumni.byu_id.ilike(like, escape="\\"),
+                    Alumni.net_id.ilike(like, escape="\\"),
+                ]
+            # A token that IS a professional certification (CFP / CFA / CPA) also
+            # matches alumni who HOLD it on their program-engagement profile
+            # (#404). The token match is decided here in Python (the builder
+            # receives the concrete ``q``), so a plain name search adds no
+            # engagement join. Kept INSIDE this token's OR group so "CFA Marsh"
+            # reads as "holds a CFA (or has 'CFA' written on the record) AND is
+            # named Marsh" — the cert token satisfies its own group via the
+            # EXISTS and never has to match a name column too.
+            #
+            # Matched on the WHOLE token, never as a substring: a surname like
+            # "Cpapadopoulos" contains "cpa" and would otherwise silently fold
+            # every CPA holder into a name search, with nothing in the result
+            # list explaining why they're there. Splitting on commas as well as
+            # whitespace means "CPA", "Holds a CPA" and "CFA, CPA" all still
+            # yield a clean, exactly-matching token.
+            cert_column = _DESIGNATION_COLUMNS.get(token.upper())
+            if cert_column is not None:
                 q_terms.append(
                     select(AlumniProgramEngagement.engagement_profile_id)
                     .where(
                         AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
-                        _holds_designation(column),
+                        _holds_designation(cert_column),
                     )
                     .exists()
                 )
-        conditions.append(or_(*q_terms))
+            conditions.append(or_(*q_terms))
     # Per-field partial matches (AND-combined; blanks ignored).
     def _field_like(value: str | None, column) -> None:
         if value and value.strip():

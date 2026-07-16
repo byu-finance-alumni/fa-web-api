@@ -523,8 +523,12 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
                 "address_line_1": None,
                 "address_line_2": None,
                 "zip": None,
-                # best_contact holds the raw home/best phone-or-email value; the
-                # frontend hides it from view_only, so null it server-side too.
+                # best_contact holds a raw phone-or-email value straight off the
+                # intake sheet — which may be a HOME number the address redaction
+                # above is meant to withhold. The frontend never renders it at
+                # all (it only round-trips through the edit form and CSV export),
+                # so nulling it here costs view_only nothing and keeps the
+                # unreviewed free text out of the payload.
                 "best_contact": None,
             }
         )

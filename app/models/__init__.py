@@ -26,6 +26,7 @@ from app.models.engineer_action import EngineerActionLog
 from app.models.event import Event, EventAttendance
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
+from app.models.login_failure import LoginFailure
 from app.models.note import Note
 from app.models.role_capability import RoleCapability
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
@@ -55,6 +56,7 @@ __all__ = [
     "Interaction",
     "LoginAttempt",
     "LoginEvent",
+    "LoginFailure",
     "Note",
     "Role",
     "RoleCapability",

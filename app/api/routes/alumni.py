@@ -42,6 +42,12 @@ from app.core.security import AuthorizationError
 from app.models.alumni import Alumni
 from app.repositories.alumni import SURVEY_CADENCE
 from app.schemas.alumni import (
+    _YEAR_MAX as _GRAD_YEAR_MAX,
+)
+from app.schemas.alumni import (
+    _YEAR_MIN as _GRAD_YEAR_MIN,
+)
+from app.schemas.alumni import (
     AlumniCreateFull,
     AlumniListItem,
     AlumniLocation,
@@ -1352,6 +1358,42 @@ async def update_import_alumni(
             ],
         }
     return await import_csv.commit_update(session, rows, actor_user_id=user.user_id)
+
+
+@router.get("/import/update/export", response_model=None)
+async def export_cohort_update_template(
+    user: RequireFullAccess,
+    session: SessionDep,
+    grad_year: Annotated[int, Query(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+) -> Response | JSONResponse:
+    """Download an ACTIVE graduation-year cohort as a FILLED intake-template CSV
+    (full_access).
+
+    Powers the round-trip: pick a grad year, download that cohort in the EXACT
+    import-template column format, edit cells offline, then re-upload through
+    ``POST /alumni/import/update`` (which matches by BYU ID / Net ID and applies
+    only the changed cells). ``grad_year`` is validated to the same year bounds as
+    the alumni schema. A cohort larger than the export cap is a 413 asking the
+    caller to narrow it down. Audit-logged (``export_alumni``) like the other
+    exports."""
+    try:
+        csv_text = await import_csv.build_cohort_update_csv(
+            session, grad_year, actor_user_id=user.user_id
+        )
+    except import_csv.CohortTooLargeError as exc:
+        return JSONResponse(
+            status_code=413,
+            content={"error": {"code": "payload_too_large", "message": str(exc)}},
+        )
+    return Response(
+        content=csv_text,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="alumni_cohort_{grad_year}.csv"'
+            )
+        },
+    )
 
 
 # --- Customizable CSV export (full_access) -----------------------------------

@@ -35,15 +35,17 @@ import logging
 import re
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dropdowns import validate_industry
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
+from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment, EducationHistory
 from app.models.engagement import AlumniProgramEngagement
+from app.repositories.alumni import build_alumni_query
 from app.schemas.alumni import (
     AlumniCreateFull,
     AlumniUpdateFull,
@@ -53,7 +55,7 @@ from app.schemas.alumni import (
     EngagementCreate,
 )
 from app.services import alumni as alumni_service
-from app.services import hygiene
+from app.services import alumni_export, hygiene
 from scripts.export_intake_template import _ALUMNI_COLUMNS, _FRIEND_COLUMNS
 
 log = logging.getLogger(__name__)
@@ -1555,3 +1557,149 @@ def build_template_csv(friend: bool = False) -> str:
         writer.writerow(EXPECTED_HEADERS)
         writer.writerow(EXAMPLE_ROW)
     return buffer.getvalue()
+
+
+# --- Cohort round-trip export (a FILLED update template) ---------------------
+#
+# The inverse of the empty template above: emit a FILLED intake-template CSV for
+# one graduation-year cohort, so staff can download the cohort, edit cells
+# offline, and re-upload through ``POST /alumni/import/update`` (the bulk-update
+# path above). The header row is EXACTLY :data:`EXPECTED_HEADERS` and every cell
+# is formatted to the template's TEXT form (dates -> YYYY-MM-DD, bools -> Yes/No,
+# ints -> str), so the file round-trips: a value written here re-parses via
+# ``_map_row`` back to the same value.
+#
+# Column reverse-map: for each header, ``_MAPPING[header]`` gives
+# ``(section, field, kind)``. ``core`` fields read off the ``Alumni`` row;
+# ``contact`` / ``career`` / ``education`` / ``engagement`` read off that
+# alumnus's loaded 1:1 side row (blank if the alumnus has none). Headers with no
+# ``_MAPPING`` entry, or whose section is a multi-row history table with no clean
+# single-field source (``former`` -> employment_history, ``leadership`` ->
+# finance_society_leadership), export EMPTY. BYU ID + Net ID are ``core`` entries
+# in ``_MAPPING`` so they always populate — they are the re-import match keys.
+
+# The 1:1 side tables we can reverse-map a single row from, same load machinery
+# as the customizable export. ``former`` / ``leadership`` are intentionally
+# absent, so their columns export blank.
+_COHORT_SIDE_MODELS: dict[str, type] = {
+    "contact": AlumniContactInfo,
+    "career": CurrentEmployment,
+    "engagement": AlumniProgramEngagement,
+}
+
+
+class CohortTooLargeError(Exception):
+    """A cohort export exceeds the export row cap (route -> 413).
+
+    Uses the SAME cap and "narrow it down" wording as the customizable export so
+    an over-large cohort fails clearly instead of streaming the whole table."""
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+        super().__init__(
+            f"This cohort matches {total:,} alumni, over the "
+            f"{alumni_export.MAX_EXPORT_ROWS:,}-row export limit. "
+            "Narrow it down and try again."
+        )
+
+
+def _cohort_cell(value: object, kind: str) -> str:
+    """Format one reverse-mapped value to the template's text form.
+
+    Reuses the export formatter (dates -> ISO, bools -> Yes/No, ints -> str, plus
+    the spreadsheet formula-injection guard). ``industry`` and any other kind fall
+    through as plain text — the stored industry is already a canonical vocab value
+    that re-parses cleanly."""
+    fmt_kind = kind if kind in ("bool", "date", "int") else "str"
+    return alumni_export._fmt(value, fmt_kind)
+
+
+async def build_cohort_update_csv(
+    session: AsyncSession,
+    graduation_year: int,
+    actor_user_id: int | None = None,
+) -> str:
+    """Build a FILLED intake-template CSV for one active graduation-year cohort.
+
+    Loads every ACTIVE alumnus with ``graduation_year`` (via the shared
+    ``build_alumni_query`` — same archived / alumni-vs-friend gating the list and
+    export use), plus their 1:1 contact / career / education / engagement rows
+    (batch-loaded once each, no N+1). Emits a CSV whose header row is EXACTLY
+    ``EXPECTED_HEADERS`` and whose cells are reverse-mapped through ``_MAPPING``
+    and formatted for a clean re-import.
+
+    Enforces the SAME hard row cap as the customizable export
+    (:data:`alumni_export.MAX_EXPORT_ROWS`); over the cap it raises
+    :class:`CohortTooLargeError` (the route maps that to a 413). Writes an
+    ``export_alumni`` disclosure audit row (actor + cohort + row count, never the
+    data) and commits, mirroring the export path."""
+    base = build_alumni_query(graduation_year=graduation_year)
+    total = await session.scalar(select(func.count()).select_from(base.subquery()))
+    if total and total > alumni_export.MAX_EXPORT_ROWS:
+        raise CohortTooLargeError(int(total))
+
+    stmt = base.order_by(Alumni.last_name.asc(), Alumni.alumni_id.asc()).limit(
+        alumni_export.MAX_EXPORT_ROWS
+    )
+    alumni = (await session.execute(stmt)).scalars().all()
+    ids = [a.alumni_id for a in alumni]
+
+    side: dict[str, dict[int, object]] = {
+        section: await alumni_export._load_side(session, model, ids)
+        for section, model in _COHORT_SIDE_MODELS.items()
+    }
+    # Education keeps the latest entry (greatest degree_year, newest on ties),
+    # exactly as the customizable export does.
+    side["education"] = await alumni_export._load_side(
+        session, EducationHistory, ids, latest_by="degree_year", pk_attr="education_id"
+    )
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(EXPECTED_HEADERS)
+    for alumnus in alumni:
+        row_out: list[str] = []
+        for header in EXPECTED_HEADERS:
+            target = _MAPPING.get(header)
+            if target is None:
+                row_out.append("")  # no clean single-field source -> blank
+                continue
+            section, field, kind = target
+            if section == "core":
+                source_row = alumnus
+            else:
+                source_row = side.get(section, {}).get(alumnus.alumni_id)
+            value = getattr(source_row, field, None) if source_row is not None else None
+            row_out.append(_cohort_cell(value, kind))
+        writer.writerow(row_out)
+
+    _audit_cohort_export(session, actor_user_id, graduation_year, len(alumni))
+    await session.commit()
+    return buffer.getvalue()
+
+
+def _audit_cohort_export(
+    session: AsyncSession,
+    actor_user_id: int | None,
+    graduation_year: int,
+    row_count: int,
+) -> None:
+    """Disclosure audit for a cohort round-trip export — actor + WHAT left the
+    system (the cohort year and row count), never the data itself. Mirrors
+    ``alumni_export._audit_export``; a missing actor is logged, not silently
+    dropped."""
+    if actor_user_id is None:
+        log.warning("Cohort export audit skipped: no actor (rows=%s)", row_count)
+        return
+    summary = (
+        f"cohort update template; grad_year={graduation_year}; rows={row_count}"
+    )
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="export_alumni",
+            entity_type="alumni",
+            entity_id=None,
+            new_value=summary[:2000],
+        )
+    )

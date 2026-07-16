@@ -289,8 +289,16 @@ def test_route_cohort_export_rejects_out_of_range_year():
     from fastapi.testclient import TestClient
 
     from app.api.dependencies.auth import get_current_db_user
+    from app.core.database import get_session
     from app.main import app
 
+    # Override get_session too: without a DATABASE_URL (CI) the real session
+    # dependency raises during setup and 500s before the 1800 -> 422 query
+    # validation is reached. The fake is never used (422 fires first).
+    async def _override():
+        yield FakeExportSession([])
+
+    app.dependency_overrides[get_session] = _override
     app.dependency_overrides[get_current_db_user] = _override_user(["full_access"])
     with TestClient(app, raise_server_exceptions=False) as c:
         resp = c.get("/alumni/import/update/export", params={"grad_year": 1800})

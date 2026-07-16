@@ -135,10 +135,13 @@ def test_cohort_export_populates_keys_and_section_fields():
     session = FakeExportSession(
         alumni,
         contact=[AlumniContactInfo(alumni_id=1, personal_email="jane@x.com",
-                                   phone="801-555-0100", city="Provo")],
+                                   phone="801-555-0100")],
+        # "Current city" is the EMPLOYER's city (#287), so it round-trips out of
+        # the career row — the same column the importer now binds there.
         career=[CurrentEmployment(alumni_id=1, current_employment_id=5,
                                   current_employer="Acme Corp",
-                                  current_title="Analyst")],
+                                  current_title="Analyst",
+                                  current_city="Provo")],
         engagement=[AlumniProgramEngagement(alumni_id=1, mentor_willing=True)],
     )
     text = _run(import_csv.build_cohort_update_csv(session, 2018, actor_user_id=7))

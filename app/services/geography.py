@@ -1,10 +1,19 @@
 """Geographic aggregation for the Alumni Geography dashboard.
 
-Location comes from ``alumni_contact_info`` (city/state/country/region); employer,
-title, and industry from ``current_employment``; tags via ``alumni_tags``. Every
-metric is computed in PostgreSQL with ``COUNT(DISTINCT alumni_id)`` (so a stray
-duplicate contact/employment row can't inflate a count) and the same filter set
-is applied uniformly. Nothing loads the full alumni set into memory.
+WHAT THIS MAP PLOTS: where alumni **WORK**, not where they live. Location comes
+from ``current_employment`` (current_city / current_state / current_country) —
+the employer's address, which is the only address the intake sheet collects.
+There is NO residence data in this system; nothing populates one (#287).
+(Historically these queries read ``alumni_contact_info.city/state/country``,
+which the importer filled with the EMPLOYER's address under a residence label —
+so the map already plotted work locations, just via a misleading column.)
+
+``alumni_contact_info`` is still joined, but only for ``region`` — a derived
+catchment label, not an address. Employer, title, and industry also come from
+``current_employment``; tags via ``alumni_tags``. Every metric is computed in
+PostgreSQL with ``COUNT(DISTINCT alumni_id)`` (so a stray duplicate
+contact/employment row can't inflate a count) and the same filter set is applied
+uniformly. Nothing loads the full alumni set into memory.
 """
 
 from __future__ import annotations
@@ -73,28 +82,29 @@ def _state_code_expr(col):
 
 # A normalized 2-letter state expression usable in SQL GROUP BY: folds a stored
 # full name ("Utah") back to its code ("UT"), passing codes/non-US through as
-# upper(trim). Keeps "UT" and "Utah" rows in the same group.
-_STATE = _state_code_expr(AlumniContactInfo.state)
+# upper(trim). Keeps "UT" and "Utah" rows in the same group. Reads the WORK
+# state (current_employment.current_state) — see the module docstring.
+_STATE = _state_code_expr(CurrentEmployment.current_state)
 _ALUMNI = func.count(func.distinct(Alumni.alumni_id))
 
-# Normalized city expression (lower-cased, trimmed) for GROUP BY, so "Provo",
-# "provo", and "Provo " collapse into one hub instead of fragmenting the count.
-# Paired with _STATE it keeps same-named cities in different states apart
-# (Springfield IL vs MO). ``_CITY_DISPLAY`` picks a representative human
+# Normalized WORK city expression (lower-cased, trimmed) for GROUP BY, so
+# "Provo", "provo", and "Provo " collapse into one hub instead of fragmenting
+# the count. Paired with _STATE it keeps same-named cities in different states
+# apart (Springfield IL vs MO). ``_CITY_DISPLAY`` picks a representative human
 # spelling for each normalized group (min of the trimmed values).
-_CITY = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
-_CITY_DISPLAY = func.min(func.trim(cast(AlumniContactInfo.city, String)))
+_CITY = func.lower(func.trim(cast(CurrentEmployment.current_city, String)))
+_CITY_DISPLAY = func.min(func.trim(cast(CurrentEmployment.current_city, String)))
 # Reusable "city present" guard (non-null and not blank after trimming).
 _CITY_PRESENT = (
-    AlumniContactInfo.city.is_not(None),
-    func.trim(cast(AlumniContactInfo.city, String)) != "",
+    CurrentEmployment.current_city.is_not(None),
+    func.trim(cast(CurrentEmployment.current_city, String)) != "",
 )
 
-# Normalized country expression (upper-cased, trimmed) for the world map's
+# Normalized WORK country expression (upper-cased, trimmed) for the world map's
 # per-country grouping, plus the set of values that all mean "United States" —
 # the world view plots INTERNATIONAL alumni only, so the US is excluded (the US
 # view already covers domestic alumni by state/county).
-_COUNTRY = func.upper(func.trim(cast(AlumniContactInfo.country, String)))
+_COUNTRY = func.upper(func.trim(cast(CurrentEmployment.current_country, String)))
 _USA_ALIASES = {
     "USA", "US", "U.S.", "U.S.A.", "UNITED STATES",
     "UNITED STATES OF AMERICA", "AMERICA",
@@ -104,7 +114,7 @@ _USA_ALIASES = {
 def _filter_conditions(filters: dict, *, require_state: bool = True) -> list:
     """Shared WHERE conditions for every geography query.
 
-    ``require_state`` gates to alumni with a non-empty US state — every
+    ``require_state`` gates to alumni with a non-empty US WORK state — every
     US-centric query (states/counties/radius/city) needs it. The world/country
     aggregation (``get_countries``) opts out with ``require_state=False`` because
     international alumni have no US state."""
@@ -114,8 +124,10 @@ def _filter_conditions(filters: dict, *, require_state: bool = True) -> list:
         Alumni.is_alumni.is_(True),
     ]
     if require_state:
-        conds.append(AlumniContactInfo.state.is_not(None))
-        conds.append(func.trim(cast(AlumniContactInfo.state, String)) != "")
+        conds.append(CurrentEmployment.current_state.is_not(None))
+        conds.append(
+            func.trim(cast(CurrentEmployment.current_state, String)) != ""
+        )
     if filters.get("employer"):
         conds.append(CurrentEmployment.current_employer == filters["employer"])
     if filters.get("industry"):
@@ -123,6 +135,9 @@ def _filter_conditions(filters: dict, *, require_state: bool = True) -> list:
     if filters.get("year"):
         conds.append(Alumni.graduation_year == filters["year"])
     if filters.get("region"):
+        # ``region`` is NOT an address — it is a derived catchment label that
+        # already keys off the work state, so it stays on alumni_contact_info
+        # (the only field there this module still reads).
         conds.append(AlumniContactInfo.region == filters["region"])
     if filters.get("tag"):
         conds.append(
@@ -139,17 +154,27 @@ def _filter_conditions(filters: dict, *, require_state: bool = True) -> list:
 
 
 def _base():
-    """Alumni joined to their location (inner) and current employment (outer)."""
+    """Alumni joined to their WORK location + employer (``current_employment``,
+    inner) and to contact info (outer).
+
+    ``current_employment`` is the location record now (#287), so it is the INNER
+    join — an alumnus with no current-employment row has no location and is not
+    on the map. That is not a new exclusion: every query either requires a
+    non-empty ``current_state`` or a non-empty ``current_country``, both of which
+    are NULL without an employment row, so such an alumnus was already filtered
+    out. ``alumni_contact_info`` is now only consulted for the ``region`` filter,
+    so it drops to an OUTER join — a located alumnus with no contact row stays on
+    the map."""
     return (
         select(Alumni.alumni_id)
         .select_from(Alumni)
         .join(
-            AlumniContactInfo,
-            AlumniContactInfo.alumni_id == Alumni.alumni_id,
-        )
-        .outerjoin(
             CurrentEmployment,
             CurrentEmployment.alumni_id == Alumni.alumni_id,
+        )
+        .outerjoin(
+            AlumniContactInfo,
+            AlumniContactInfo.alumni_id == Alumni.alumni_id,
         )
     )
 
@@ -192,14 +217,15 @@ async def get_states(session: AsyncSession, filters: dict) -> list[dict]:
 async def get_counties(session: AsyncSession, filters: dict) -> list[dict]:
     """Per-county alumni counts (5-digit FIPS) for the national county map.
 
-    Location is city-level: an alumnus is attributed to the county of their city
-    via the ``city_geo`` crosswalk (the only geographic signal stored). Uses
+    Location is city-level and is the alumnus's WORK city (#287): they are
+    attributed to the county of ``current_employment.current_city`` via the
+    ``city_geo`` crosswalk (the only geographic signal stored). Uses
     ``COUNT(DISTINCT alumni_id)`` so a duplicate contact/employment row can't
     inflate a county."""
-    city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
+    city_norm = func.lower(func.trim(cast(CurrentEmployment.current_city, String)))
     # Fold a stored full-name state back to its 2-letter code so it joins the
     # city_geo crosswalk (keyed on codes) — a row stored "Utah" still matches.
-    state_up = _state_code_expr(AlumniContactInfo.state)
+    state_up = _state_code_expr(CurrentEmployment.current_state)
     rows = (
         await session.execute(
             select(
@@ -207,15 +233,16 @@ async def get_counties(session: AsyncSession, filters: dict) -> list[dict]:
             )
             .select_from(Alumni)
             .join(
-                AlumniContactInfo,
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                CurrentEmployment,
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
             )
             .join(
                 CityGeo,
                 and_(CityGeo.city_norm == city_norm, CityGeo.state == state_up),
             )
             .outerjoin(
-                CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
             )
             .where(*_filter_conditions(filters), CityGeo.county_fips.is_not(None))
             .group_by(CityGeo.county_fips)
@@ -233,15 +260,16 @@ async def get_countries(session: AsyncSession, filters: dict) -> list[dict]:
     the US, while the US view already covers domestic alumni by state/county.
     Unlike the US-centric queries this does NOT require a US state (international
     alumni have none), so it opts out via ``require_state=False``. The same
-    employer/industry/year/region/tag filters apply uniformly."""
-    country = func.trim(cast(AlumniContactInfo.country, String))
+    employer/industry/year/region/tag filters apply uniformly. The country is the
+    alumnus's WORK country (``current_employment.current_country``) (#287)."""
+    country = func.trim(cast(CurrentEmployment.current_country, String))
     rows = (
         await session.execute(
             _base()
             .with_only_columns(country.label("country"), _ALUMNI.label("count"))
             .where(
                 *_filter_conditions(filters, require_state=False),
-                AlumniContactInfo.country.is_not(None),
+                CurrentEmployment.current_country.is_not(None),
                 country != "",
                 _COUNTRY.notin_(_USA_ALIASES),
             )
@@ -361,7 +389,7 @@ async def get_state_detail(session, state: str, filters: dict) -> dict:
         .where(*_filter_conditions(filters), state_match)
     )
     cities = await _top(
-        session, filters, AlumniContactInfo.city, "city", extra=state_match
+        session, filters, CurrentEmployment.current_city, "city", extra=state_match
     )
     employers = await _top(
         session, filters, CurrentEmployment.current_employer, "employer",
@@ -402,7 +430,7 @@ async def get_state_detail(session, state: str, filters: dict) -> dict:
 _SORTS = {
     "name": (Alumni.last_name, Alumni.first_name),
     "year": (desc(Alumni.graduation_year), Alumni.last_name),
-    "city": (AlumniContactInfo.city, Alumni.last_name),
+    "city": (CurrentEmployment.current_city, Alumni.last_name),
 }
 
 
@@ -421,18 +449,18 @@ async def get_state_alumni(
         await session.execute(
             select(
                 Alumni,
-                AlumniContactInfo.city,
+                CurrentEmployment.current_city,
                 CurrentEmployment.current_employer,
                 CurrentEmployment.current_title,
             )
             .select_from(Alumni)
             .join(
-                AlumniContactInfo,
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
-            )
-            .outerjoin(
                 CurrentEmployment,
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
+            )
+            .outerjoin(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
             )
             .where(*conds)
             .order_by(*order)
@@ -480,18 +508,18 @@ async def get_country_alumni(
         await session.execute(
             select(
                 Alumni,
-                AlumniContactInfo.city,
+                CurrentEmployment.current_city,
                 CurrentEmployment.current_employer,
                 CurrentEmployment.current_title,
             )
             .select_from(Alumni)
             .join(
-                AlumniContactInfo,
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
-            )
-            .outerjoin(
                 CurrentEmployment,
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
+            )
+            .outerjoin(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
             )
             .where(*conds)
             .order_by(*order)
@@ -540,21 +568,23 @@ def _distance_mi(lat: float, lng: float):
 
 
 def _radius_join(stmt, lat: float, lng: float, miles: float, filters: dict):
-    """Apply the alumni -> contact -> city_geo (+ employment) joins and the
-    radius/filters WHERE used by both the count and the page query."""
-    city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
+    """Apply the alumni -> employment -> city_geo (+ contact) joins and the
+    radius/filters WHERE used by both the count and the page query.
+
+    Distance is measured from the alumnus's WORK city (#287)."""
+    city_norm = func.lower(func.trim(cast(CurrentEmployment.current_city, String)))
     # Fold a stored full-name state back to its 2-letter code so it joins the
     # city_geo crosswalk (keyed on codes) — a row stored "Utah" still matches.
-    state_up = _state_code_expr(AlumniContactInfo.state)
+    state_up = _state_code_expr(CurrentEmployment.current_state)
     return (
         stmt.select_from(Alumni)
-        .join(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        .join(CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id)
         .join(
             CityGeo,
             and_(CityGeo.city_norm == city_norm, CityGeo.state == state_up),
         )
         .outerjoin(
-            CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
+            AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id
         )
         .where(*_filter_conditions(filters), _distance_mi(lat, lng) <= miles)
     )
@@ -563,9 +593,9 @@ def _radius_join(stmt, lat: float, lng: float, miles: float, filters: dict):
 async def get_radius_alumni(
     session, lat: float, lng: float, miles: float, filters: dict, *, limit, offset
 ) -> dict:
-    """Alumni whose (city, state) falls within ``miles`` of (lat, lng).
+    """Alumni whose WORK (city, state) falls within ``miles`` of (lat, lng).
 
-    Location is city-level: an alumnus's distance is their city's distance
+    Location is city-level: an alumnus's distance is their work city's distance
     (the only geographic signal we store). Sorted nearest-first."""
     total = await session.scalar(
         _radius_join(
@@ -582,7 +612,7 @@ async def get_radius_alumni(
             _radius_join(
                 select(
                     Alumni,
-                    AlumniContactInfo.city,
+                    CurrentEmployment.current_city,
                     _STATE.label("state"),
                     CurrentEmployment.current_employer,
                     CurrentEmployment.current_title,
@@ -626,14 +656,14 @@ async def get_city_detail(session, state: str, city: str, filters: dict) -> dict
     code = normalize_state(state)
     conds = [
         *_filter_conditions(filters),
-        AlumniContactInfo.city == city,
+        CurrentEmployment.current_city == city,
     ]
     if code is not None:
         conds.append(_STATE == code)
     total = await session.scalar(
         _base().with_only_columns(_ALUMNI).where(*conds)
     )
-    city_match = AlumniContactInfo.city == city
+    city_match = CurrentEmployment.current_city == city
     state_match = (_STATE == code) if code is not None else None
     extra = and_(city_match, state_match) if state_match is not None else city_match
 
@@ -661,12 +691,12 @@ async def get_city_detail(session, state: str, city: str, filters: dict) -> dict
             select(Alumni, CurrentEmployment.current_employer)
             .select_from(Alumni)
             .join(
-                AlumniContactInfo,
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
-            )
-            .outerjoin(
                 CurrentEmployment,
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
+            )
+            .outerjoin(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
             )
             .where(*conds)
             .order_by(Alumni.last_name, Alumni.first_name)
@@ -704,17 +734,21 @@ _OPTIONS_CAP = 200
 
 
 async def _distinct(session, column, *, limit: int = _OPTIONS_CAP) -> list:
+    """Distinct filter-dropdown values over the mappable alumni set.
+
+    Mirrors ``_base()``'s join shape (employment inner = the location record,
+    contact outer) so every offered option is one the map can actually filter on."""
     rows = (
         await session.execute(
             select(column)
             .select_from(Alumni)
             .join(
-                AlumniContactInfo,
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
-            )
-            .outerjoin(
                 CurrentEmployment,
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
+            )
+            .outerjoin(
+                AlumniContactInfo,
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
             )
             .where(
                 Alumni.archived.is_(False),
@@ -855,7 +889,7 @@ async def get_summary(session, filters: dict) -> dict:
             "employers": await _distinct(
                 session, CurrentEmployment.current_employer
             ),
-            "cities": await _distinct(session, AlumniContactInfo.city),
+            "cities": await _distinct(session, CurrentEmployment.current_city),
             "industries": await _distinct(
                 session, CurrentEmployment.current_industry
             ),

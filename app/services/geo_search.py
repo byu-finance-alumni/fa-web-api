@@ -21,11 +21,13 @@ Identifier contract
 A city is identified by a :data:`CityKey` = ``(city_norm, state)`` where
 ``city_norm = lower(trim(city))`` and ``state`` is the 2-letter uppercase code —
 exactly the composite primary key of ``city_geo``. This lines up with how alumni
-rows join to geography today: an alum's location is ``alumni_contact_info.city``
-(free text) + ``.state`` (stored as a full name like "Utah"). To filter alumni
-by a resolved key set, compare ``lower(trim(city))`` and the folded 2-letter
-state code against the keys — :func:`alumni_location_filter` builds exactly that
-predicate for the caller.
+rows join to geography today: an alum's location is where they **WORK** —
+``current_employment.current_city`` (free text) + ``.current_state`` (stored as a
+full name like "Utah"). That is the employer's address, the only address this
+system holds; there is no residence data (#287). To filter alumni by a resolved
+key set, compare ``lower(trim(current_city))`` and the folded 2-letter state code
+against the keys — :func:`alumni_location_filter` builds exactly that predicate
+for the caller.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from sqlalchemy import ColumnElement, String, case, cast, func, literal, select,
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.us_states import CODE_BY_NAME, to_code
-from app.models.contact import AlumniContactInfo
+from app.models.employment import CurrentEmployment
 from app.models.geo import CityGeo
 from app.services.geo_regions import CityKey, Region, lookup_region
 
@@ -346,10 +348,10 @@ async def resolve_location_query(
 
 
 def _alumni_state_code_expr() -> ColumnElement[str]:
-    """Fold ``alumni_contact_info.state`` (stored as a full name) to its 2-letter
-    code, so it can be compared to a ``city_geo`` key's state. Mirrors
-    ``app.services.geography._state_code_expr``."""
-    trimmed = func.trim(cast(AlumniContactInfo.state, String))
+    """Fold ``current_employment.current_state`` (the alum's WORK state, stored as
+    a full name) to its 2-letter code, so it can be compared to a ``city_geo``
+    key's state. Mirrors ``app.services.geography._state_code_expr``."""
+    trimmed = func.trim(cast(CurrentEmployment.current_state, String))
     return case(
         *[
             (func.lower(trimmed) == full_lower, code)
@@ -360,17 +362,18 @@ def _alumni_state_code_expr() -> ColumnElement[str]:
 
 
 def alumni_location_filter(keys: list[CityKey]) -> ColumnElement[bool]:
-    """A SQLAlchemy predicate selecting ``AlumniContactInfo`` rows whose location
-    is one of ``keys``.
+    """A SQLAlchemy predicate selecting ``CurrentEmployment`` rows whose WORK
+    location is one of ``keys``.
 
-    Compares ``(lower(trim(city)), folded 2-letter state code)`` against the
-    resolved key set with a single ``IN (tuple, ...)`` — the exact mapping
-    between a ``city_geo`` key and how alumni store their location. An empty key
-    set yields a ``false`` predicate (matches nothing), so a location search that
-    resolved to zero cities returns no alumni rather than every alumnus.
+    Compares ``(lower(trim(current_city)), folded 2-letter state code)`` against
+    the resolved key set with a single ``IN (tuple, ...)`` — the exact mapping
+    between a ``city_geo`` key and how alumni store their location (#287). An
+    empty key set yields a ``false`` predicate (matches nothing), so a location
+    search that resolved to zero cities returns no alumni rather than every
+    alumnus.
     """
     if not keys:
         return literal(False)
-    city_norm = func.lower(func.trim(cast(AlumniContactInfo.city, String)))
+    city_norm = func.lower(func.trim(cast(CurrentEmployment.current_city, String)))
     state_code = _alumni_state_code_expr()
     return tuple_(city_norm, state_code).in_([(cn, st) for cn, st in keys])

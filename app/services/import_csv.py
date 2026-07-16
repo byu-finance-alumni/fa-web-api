@@ -35,15 +35,27 @@ import logging
 import re
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dropdowns import validate_industry
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
-from app.schemas.alumni import AlumniCreateFull
+from app.models.audit import AuditLog
+from app.models.contact import AlumniContactInfo
+from app.models.employment import CurrentEmployment, EducationHistory
+from app.models.engagement import AlumniProgramEngagement
+from app.repositories.alumni import build_alumni_query
+from app.schemas.alumni import (
+    AlumniCreateFull,
+    AlumniUpdateFull,
+    CareerCreate,
+    ContactCreate,
+    EducationCreate,
+    EngagementCreate,
+)
 from app.services import alumni as alumni_service
-from app.services import hygiene
+from app.services import alumni_export, hygiene
 from scripts.export_intake_template import _ALUMNI_COLUMNS, _FRIEND_COLUMNS
 
 log = logging.getLogger(__name__)
@@ -1118,6 +1130,417 @@ def _reject_reason(evaluated: dict) -> str:
     return "Rejected."
 
 
+# --- Update mode ("round-trip" bulk edit) ------------------------------------
+#
+# Staff export a graduation-year cohort to CSV (the same 64-column intake sheet),
+# edit cells, and upload it back to mass-UPDATE the existing profiles. This is
+# distinct from the CREATE-ONLY import above (which treats existing BYU/Net IDs
+# as duplicate BLOCKERS). Rules:
+#   * match each row to an existing alumnus by BYU ID first (digit-stripped),
+#     then fall back to Net ID (lowercased); ACTIVE records only. A row matching
+#     only an ARCHIVED record is reported as ``unmatched_archived`` (never
+#     updated).
+#   * blank cell = leave unchanged (``_map_row`` already omits empty cells, so a
+#     mapped payload only carries the cells the user filled in — a PARTIAL update).
+#   * unmatched rows are REPORTED, never created (no inserts in update mode).
+#   * preview (dry-run diff) then commit, mirroring the create-mode split.
+#
+# Each matched row is applied through ``alumni_service.update_alumni`` so update
+# semantics + provenance stamping + per-field audit match a single-record edit.
+# Rows are validated against the all-optional ``AlumniUpdateFull`` (NOT the
+# create schema), so a row carrying only a BYU ID + one changed cell never trips
+# a required-field error.
+
+# The intake sheet also carries "Former Company/Title/Industry" and "Finance
+# Leadership Position" columns, which map to the ``former`` / ``leadership``
+# sections. Those sections are NOT part of the single-record edit schema
+# (``AlumniUpdateFull`` only exposes contact/career/education/engagement), so the
+# update path cannot apply them; they are dropped from the update payload.
+_UPDATE_UNSUPPORTED_SECTIONS = frozenset({"former", "leadership"})
+
+# The nested sections the single-record edit path (and thus update mode) applies,
+# mapped to their write-schema and ORM model. Order/model mirror
+# ``alumni_service.update_alumni`` + ``_upsert_section`` so preview reads and the
+# write path see the SAME related row.
+_UPDATE_SECTION_SCHEMAS: dict[str, type] = {
+    "contact": ContactCreate,
+    "career": CareerCreate,
+    "education": EducationCreate,
+    "engagement": EngagementCreate,
+}
+_UPDATE_SECTION_MODELS: dict[str, type] = {
+    "contact": AlumniContactInfo,
+    "career": CurrentEmployment,
+    "education": EducationHistory,
+    "engagement": AlumniProgramEngagement,
+}
+
+
+def _to_jsonable(value: object) -> object:
+    """Serialize a diff value (dates -> ISO) so old/new are JSON-safe."""
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    return value
+
+
+def _match_keys(payload: dict) -> tuple[str, str]:
+    """Digit-stripped BYU key + lowercased Net key from a mapped row payload.
+
+    Normalized the SAME way as ``_load_existing_index`` builds its keys, so a
+    formatted "123-45-6789" or an upper-case " JDoe " still resolves."""
+    byu_raw = payload.get("byu_id") or ""
+    net_raw = payload.get("net_id") or ""
+    byu_key = re.sub(r"\D", "", str(byu_raw).strip())
+    net_key = str(net_raw).strip().lower()
+    return byu_key, net_key
+
+
+def _resolve_update_match(payload: dict, existing: dict) -> tuple[int | None, str]:
+    """Resolve a mapped row to an existing alumnus for update.
+
+    BYU ID first (digit-stripped), then Net ID (lowercased); ACTIVE records win.
+    Returns ``(alumni_id, status)`` where status is one of ``"matched"`` (active),
+    ``"unmatched_archived"`` (matches only an archived record — never updated), or
+    ``"unmatched"`` (no match — never created)."""
+    byu_key, net_key = _match_keys(payload)
+    if byu_key and byu_key in existing["active_byu"]:
+        return existing["active_byu"][byu_key][0], "matched"
+    if net_key and net_key in existing["active_net"]:
+        return existing["active_net"][net_key][0], "matched"
+    if byu_key and byu_key in existing["archived_byu"]:
+        return existing["archived_byu"][byu_key][0], "unmatched_archived"
+    if net_key and net_key in existing["archived_net"]:
+        return existing["archived_net"][net_key][0], "unmatched_archived"
+    return None, "unmatched"
+
+
+def _unmatched_message(payload: dict, status: str) -> str:
+    """Human reason a row wasn't updated (unmatched / archived-only)."""
+    byu_key, net_key = _match_keys(payload)
+    if byu_key:
+        ident = f"BYU ID {payload.get('byu_id')}"
+    elif net_key:
+        ident = f"Net ID {payload.get('net_id')}"
+    else:
+        ident = None
+    if status == "unmatched_archived":
+        base = "matches only an archived record, which update mode does not modify."
+        return f"{ident} {base}" if ident else f"Row {base}"
+    if ident is None:
+        return "Row has no BYU ID or Net ID to match on; not created (update mode)."
+    return f"No active alumnus matches {ident}; not created (update mode)."
+
+
+def _update_payload_from_row(row: dict) -> dict:
+    """The mapped payload minus sections/flags the update path cannot apply.
+
+    Drops the ``former`` / ``leadership`` sections (not on ``AlumniUpdateFull``)
+    and any ``is_alumni`` stamp; the remaining core + contact/career/education/
+    engagement cells form the PARTIAL update payload."""
+    return {
+        key: value
+        for key, value in row["payload"].items()
+        if key not in _UPDATE_UNSUPPORTED_SECTIONS and key != "is_alumni"
+    }
+
+
+async def _current_section_row(session: AsyncSession, section: str, alumni_id: int):
+    """Load the current related-section row for *alumni_id* (or None).
+
+    Order-by mirrors ``alumni_service._upsert_section`` so the row we diff against
+    (preview) is the SAME row the write path upserts."""
+    model = _UPDATE_SECTION_MODELS[section]
+    stmt = select(model).where(model.alumni_id == alumni_id)
+    if section == "contact":
+        stmt = stmt.order_by(model.contact_info_id)
+    elif section == "career":
+        stmt = stmt.order_by(model.current_employment_id.desc())
+    elif section == "education":
+        stmt = stmt.order_by(model.degree_year.desc().nullslast())
+    return await session.scalar(stmt.limit(1))
+
+
+async def _diff_against_current(
+    session: AsyncSession, alumnus: Alumni, cleaned: dict
+) -> list[dict]:
+    """Per-field diff of the cleaned partial payload against stored values.
+
+    Only fields the user actually filled in appear in ``cleaned`` (blank cells
+    were dropped by ``_map_row`` and ``exclude_unset``), and only fields whose new
+    value differs from the current stored value are reported. Each entry is
+    ``{"field","section","old","new"}`` with old/new JSON-serialized."""
+    changes: list[dict] = []
+    for field, new in cleaned.items():
+        if field in _UPDATE_SECTION_SCHEMAS:
+            continue  # nested section handled below
+        old = getattr(alumnus, field, None)
+        if old != new:
+            changes.append(
+                {
+                    "field": field,
+                    "section": "core",
+                    "old": _to_jsonable(old),
+                    "new": _to_jsonable(new),
+                }
+            )
+    for section in _UPDATE_SECTION_SCHEMAS:
+        section_data = cleaned.get(section)
+        if not section_data:
+            continue
+        current_row = await _current_section_row(session, section, alumnus.alumni_id)
+        for field, new in section_data.items():
+            old = getattr(current_row, field, None) if current_row is not None else None
+            if old != new:
+                changes.append(
+                    {
+                        "field": field,
+                        "section": section,
+                        "old": _to_jsonable(old),
+                        "new": _to_jsonable(new),
+                    }
+                )
+    return changes
+
+
+async def _evaluate_update_row(
+    session: AsyncSession, row: dict, existing: dict
+) -> dict:
+    """Evaluate one mapped row into an update-preview entry."""
+    base = {
+        "row": row["row"],
+        "name": row["name"],
+        "alumni_id": None,
+        "status": "error",
+        "changes": [],
+        "error": None,
+        "message": None,
+    }
+
+    # A mapping-stage coercion error (bad date/number/industry) rejects the row.
+    if row["error"]:
+        base["error"] = row["error"]
+        return base
+
+    alumni_id, match_status = _resolve_update_match(row["payload"], existing)
+    if match_status != "matched":
+        base["status"] = match_status
+        base["alumni_id"] = alumni_id  # archived id for unmatched_archived, else None
+        base["message"] = _unmatched_message(row["payload"], match_status)
+        return base
+
+    base["alumni_id"] = alumni_id
+    # Validate the non-blank cells against the PARTIAL (all-optional) update schema
+    # — never the create schema, so a required-field error can't fire on update.
+    try:
+        model = AlumniUpdateFull(**_update_payload_from_row(row))
+    except ValidationError as exc:
+        base["error"] = _format_validation_error(exc)
+        return base
+
+    alumnus = await alumni_service.get_alumni(session, alumni_id)
+    # jsonable=False keeps dates as date objects so they compare equal to the ORM
+    # values; _to_jsonable serializes them for the report.
+    cleaned, _changes = hygiene.clean_alumni_payload(model, jsonable=False)
+    changes = await _diff_against_current(session, alumnus, cleaned)
+    base["changes"] = changes
+    base["status"] = "update" if changes else "no_changes"
+    return base
+
+
+async def evaluate_update(session: AsyncSession, rows: list[dict]) -> dict:
+    """Dry-run report for a bulk UPDATE ("round-trip") of already-parsed *rows*.
+
+    For each row: resolve the match (BYU -> Net, active only); for matched rows
+    validate the non-blank cells against ``AlumniUpdateFull`` and compute a
+    per-field diff against the CURRENT stored values. Reports summary counts plus
+    per-row detail. NO writes."""
+    existing = await _load_existing_index(session)
+
+    out_rows: list[dict] = []
+    matched = unmatched = with_changes = errors = 0
+    for row in rows:
+        report = await _evaluate_update_row(session, row, existing)
+        out_rows.append(report)
+        status = report["status"]
+        if status in ("update", "no_changes"):
+            matched += 1
+        elif status in ("unmatched", "unmatched_archived"):
+            unmatched += 1
+        if status == "update":
+            with_changes += 1
+        elif status == "error":
+            errors += 1
+
+    return {
+        "columns_ok": True,
+        "header_errors": [],
+        "summary": {
+            "total": len(rows),
+            "matched": matched,
+            "unmatched": unmatched,
+            "with_changes": with_changes,
+            "errors": errors,
+        },
+        "rows": out_rows,
+    }
+
+
+async def _build_update_model(
+    session: AsyncSession, alumni_id: int, row: dict
+) -> AlumniUpdateFull:
+    """Build the ``AlumniUpdateFull`` applied for a matched row.
+
+    Core cells pass through as the partial payload (``update_alumni`` only touches
+    the fields present). For each section the user filled in, the provided cells
+    are MERGED on top of the record's CURRENT section values — because
+    ``update_alumni`` overwrites the whole related row from the section, merging
+    the current values back in is what keeps a blank cell from clearing an
+    existing value."""
+    partial = _update_payload_from_row(row)
+    for section, schema in _UPDATE_SECTION_SCHEMAS.items():
+        provided = partial.get(section)
+        if not provided:
+            continue
+        current_row = await _current_section_row(session, section, alumni_id)
+        merged = {
+            field: (getattr(current_row, field, None) if current_row is not None else None)
+            for field in schema.model_fields
+        }
+        merged.update(provided)
+        partial[section] = merged
+    return AlumniUpdateFull(**partial)
+
+
+async def commit_update(
+    session: AsyncSession,
+    rows: list[dict],
+    actor_user_id: int | None = None,
+) -> dict:
+    """Re-evaluate *rows* and apply every matched, changed row in ONE transaction.
+
+    Mirrors ``commit_import``'s stance: re-evaluate rather than trust a client
+    preview; apply each matched row via ``alumni_service.update_alumni`` (so
+    cleaning + provenance stamping + per-field audit fire exactly as for a manual
+    edit). ``update_alumni`` commits internally; as in ``commit_import`` we
+    temporarily neutralize its commit/refresh (flush instead) and run one real
+    commit after the loop. Each row runs inside its OWN SAVEPOINT so a mid-batch
+    failure rolls back only that row. Unmatched rows are reported, never created;
+    rows with no effective change are reported ``unchanged``. Returns:
+        ``{"updated": int, "unchanged": int, "unmatched": int, "errors": int,
+           "updated_ids": [int],
+           "results": [{"row","name","alumni_id","status","message"}]}``
+    """
+    report = await evaluate_update(session, rows)
+    parsed_by_row = {r["row"]: r for r in rows}
+
+    updated_ids: list[int] = []
+    results: list[dict] = []
+    updated = unchanged = unmatched = errors = 0
+
+    real_commit = session.commit
+    real_refresh = getattr(session, "refresh", None)
+
+    async def _noop_commit() -> None:
+        await session.flush()
+
+    async def _noop_refresh(_obj: object) -> None:
+        return None
+
+    for evaluated in report["rows"]:
+        row_num = evaluated["row"]
+        status = evaluated["status"]
+        if status == "error":
+            errors += 1
+            results.append(
+                {
+                    "row": row_num,
+                    "name": evaluated["name"],
+                    "alumni_id": evaluated["alumni_id"],
+                    "status": "error",
+                    "message": evaluated["error"] or "Rejected.",
+                }
+            )
+            continue
+        if status in ("unmatched", "unmatched_archived"):
+            unmatched += 1
+            results.append(
+                {
+                    "row": row_num,
+                    "name": evaluated["name"],
+                    "alumni_id": evaluated["alumni_id"],
+                    "status": status,
+                    "message": evaluated["message"],
+                }
+            )
+            continue
+        if status == "no_changes":
+            unchanged += 1
+            results.append(
+                {
+                    "row": row_num,
+                    "name": evaluated["name"],
+                    "alumni_id": evaluated["alumni_id"],
+                    "status": "unchanged",
+                    "message": "No changes.",
+                }
+            )
+            continue
+
+        # status == "update": apply through the single-record edit path.
+        parsed = parsed_by_row[row_num]
+        alumni_id = evaluated["alumni_id"]
+        async with session.begin_nested() as savepoint:
+            try:
+                model = await _build_update_model(session, alumni_id, parsed)
+                session.commit = _noop_commit  # type: ignore[method-assign]
+                if real_refresh is not None:
+                    session.refresh = _noop_refresh  # type: ignore[method-assign]
+                try:
+                    await alumni_service.update_alumni(
+                        session, alumni_id, model, actor_user_id=actor_user_id
+                    )
+                finally:
+                    session.commit = real_commit  # type: ignore[method-assign]
+                    if real_refresh is not None:
+                        session.refresh = real_refresh  # type: ignore[method-assign]
+                updated_ids.append(alumni_id)
+                updated += 1
+                results.append(
+                    {
+                        "row": row_num,
+                        "name": evaluated["name"],
+                        "alumni_id": alumni_id,
+                        "status": "updated",
+                        "message": "Updated.",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - record + continue per row
+                await savepoint.rollback()
+                errors += 1
+                results.append(
+                    {
+                        "row": row_num,
+                        "name": evaluated["name"],
+                        "alumni_id": alumni_id,
+                        "status": "error",
+                        "message": _classify_reject(exc, row_num),
+                    }
+                )
+
+    # One real commit for the whole updated batch.
+    if updated:
+        await session.commit()
+
+    return {
+        "updated": updated,
+        "unchanged": unchanged,
+        "unmatched": unmatched,
+        "errors": errors,
+        "updated_ids": updated_ids,
+        "results": results,
+    }
+
+
 # --- CSV template ------------------------------------------------------------
 
 
@@ -1134,3 +1557,149 @@ def build_template_csv(friend: bool = False) -> str:
         writer.writerow(EXPECTED_HEADERS)
         writer.writerow(EXAMPLE_ROW)
     return buffer.getvalue()
+
+
+# --- Cohort round-trip export (a FILLED update template) ---------------------
+#
+# The inverse of the empty template above: emit a FILLED intake-template CSV for
+# one graduation-year cohort, so staff can download the cohort, edit cells
+# offline, and re-upload through ``POST /alumni/import/update`` (the bulk-update
+# path above). The header row is EXACTLY :data:`EXPECTED_HEADERS` and every cell
+# is formatted to the template's TEXT form (dates -> YYYY-MM-DD, bools -> Yes/No,
+# ints -> str), so the file round-trips: a value written here re-parses via
+# ``_map_row`` back to the same value.
+#
+# Column reverse-map: for each header, ``_MAPPING[header]`` gives
+# ``(section, field, kind)``. ``core`` fields read off the ``Alumni`` row;
+# ``contact`` / ``career`` / ``education`` / ``engagement`` read off that
+# alumnus's loaded 1:1 side row (blank if the alumnus has none). Headers with no
+# ``_MAPPING`` entry, or whose section is a multi-row history table with no clean
+# single-field source (``former`` -> employment_history, ``leadership`` ->
+# finance_society_leadership), export EMPTY. BYU ID + Net ID are ``core`` entries
+# in ``_MAPPING`` so they always populate — they are the re-import match keys.
+
+# The 1:1 side tables we can reverse-map a single row from, same load machinery
+# as the customizable export. ``former`` / ``leadership`` are intentionally
+# absent, so their columns export blank.
+_COHORT_SIDE_MODELS: dict[str, type] = {
+    "contact": AlumniContactInfo,
+    "career": CurrentEmployment,
+    "engagement": AlumniProgramEngagement,
+}
+
+
+class CohortTooLargeError(Exception):
+    """A cohort export exceeds the export row cap (route -> 413).
+
+    Uses the SAME cap and "narrow it down" wording as the customizable export so
+    an over-large cohort fails clearly instead of streaming the whole table."""
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+        super().__init__(
+            f"This cohort matches {total:,} alumni, over the "
+            f"{alumni_export.MAX_EXPORT_ROWS:,}-row export limit. "
+            "Narrow it down and try again."
+        )
+
+
+def _cohort_cell(value: object, kind: str) -> str:
+    """Format one reverse-mapped value to the template's text form.
+
+    Reuses the export formatter (dates -> ISO, bools -> Yes/No, ints -> str, plus
+    the spreadsheet formula-injection guard). ``industry`` and any other kind fall
+    through as plain text — the stored industry is already a canonical vocab value
+    that re-parses cleanly."""
+    fmt_kind = kind if kind in ("bool", "date", "int") else "str"
+    return alumni_export._fmt(value, fmt_kind)
+
+
+async def build_cohort_update_csv(
+    session: AsyncSession,
+    graduation_year: int,
+    actor_user_id: int | None = None,
+) -> str:
+    """Build a FILLED intake-template CSV for one active graduation-year cohort.
+
+    Loads every ACTIVE alumnus with ``graduation_year`` (via the shared
+    ``build_alumni_query`` — same archived / alumni-vs-friend gating the list and
+    export use), plus their 1:1 contact / career / education / engagement rows
+    (batch-loaded once each, no N+1). Emits a CSV whose header row is EXACTLY
+    ``EXPECTED_HEADERS`` and whose cells are reverse-mapped through ``_MAPPING``
+    and formatted for a clean re-import.
+
+    Enforces the SAME hard row cap as the customizable export
+    (:data:`alumni_export.MAX_EXPORT_ROWS`); over the cap it raises
+    :class:`CohortTooLargeError` (the route maps that to a 413). Writes an
+    ``export_alumni`` disclosure audit row (actor + cohort + row count, never the
+    data) and commits, mirroring the export path."""
+    base = build_alumni_query(graduation_year=graduation_year)
+    total = await session.scalar(select(func.count()).select_from(base.subquery()))
+    if total and total > alumni_export.MAX_EXPORT_ROWS:
+        raise CohortTooLargeError(int(total))
+
+    stmt = base.order_by(Alumni.last_name.asc(), Alumni.alumni_id.asc()).limit(
+        alumni_export.MAX_EXPORT_ROWS
+    )
+    alumni = (await session.execute(stmt)).scalars().all()
+    ids = [a.alumni_id for a in alumni]
+
+    side: dict[str, dict[int, object]] = {
+        section: await alumni_export._load_side(session, model, ids)
+        for section, model in _COHORT_SIDE_MODELS.items()
+    }
+    # Education keeps the latest entry (greatest degree_year, newest on ties),
+    # exactly as the customizable export does.
+    side["education"] = await alumni_export._load_side(
+        session, EducationHistory, ids, latest_by="degree_year", pk_attr="education_id"
+    )
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(EXPECTED_HEADERS)
+    for alumnus in alumni:
+        row_out: list[str] = []
+        for header in EXPECTED_HEADERS:
+            target = _MAPPING.get(header)
+            if target is None:
+                row_out.append("")  # no clean single-field source -> blank
+                continue
+            section, field, kind = target
+            if section == "core":
+                source_row = alumnus
+            else:
+                source_row = side.get(section, {}).get(alumnus.alumni_id)
+            value = getattr(source_row, field, None) if source_row is not None else None
+            row_out.append(_cohort_cell(value, kind))
+        writer.writerow(row_out)
+
+    _audit_cohort_export(session, actor_user_id, graduation_year, len(alumni))
+    await session.commit()
+    return buffer.getvalue()
+
+
+def _audit_cohort_export(
+    session: AsyncSession,
+    actor_user_id: int | None,
+    graduation_year: int,
+    row_count: int,
+) -> None:
+    """Disclosure audit for a cohort round-trip export — actor + WHAT left the
+    system (the cohort year and row count), never the data itself. Mirrors
+    ``alumni_export._audit_export``; a missing actor is logged, not silently
+    dropped."""
+    if actor_user_id is None:
+        log.warning("Cohort export audit skipped: no actor (rows=%s)", row_count)
+        return
+    summary = (
+        f"cohort update template; grad_year={graduation_year}; rows={row_count}"
+    )
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="export_alumni",
+            entity_type="alumni",
+            entity_id=None,
+            new_value=summary[:2000],
+        )
+    )

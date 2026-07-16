@@ -8,11 +8,22 @@ without touching Postgres.
 import asyncio
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.dialects import postgresql
 
 from app.core.errors import NotFoundError
 from app.models.alumni import Alumni
-from app.schemas.alumni import AlumniCreate, AlumniUpdate
+from app.models.employment import CurrentEmployment
+from app.models.engagement import AlumniProgramEngagement
+from app.schemas.alumni import (
+    AlumniCreate,
+    AlumniCreateFull,
+    AlumniUpdate,
+    AlumniUpdateFull,
+    CareerCreate,
+    EngagementCreate,
+)
+from app.schemas.profile import CurrentCareerRead
 from app.services import alumni as service
 
 
@@ -111,6 +122,164 @@ def test_update_alumni_persists_secondary_affiliation(monkeypatch):
     assert obj.advisory_roles == "Advisor, X"
     assert obj.manually_edited_at is not None
     assert session.committed == 1
+
+
+# --- graduate_graduation_year (distinct from undergrad graduation_year) ------
+
+
+def test_create_alumni_persists_graduate_graduation_year():
+    # The new core column flows through create onto the Alumni row unchanged,
+    # independent of the undergrad graduation_year.
+    session = FakeSession()
+    payload = AlumniCreate(
+        first_name="Jane",
+        last_name="Doe",
+        graduation_year=2018,
+        graduate_graduation_year=2021,
+    )
+    obj = asyncio.run(service.create_alumni(session, payload))
+    assert obj.graduation_year == 2018
+    assert obj.graduate_graduation_year == 2021
+
+
+def test_update_alumni_persists_graduate_graduation_year(monkeypatch):
+    existing = Alumni(alumni_id=1, first_name="Jane", last_name="Doe", archived=False)
+    _patch_get(monkeypatch, existing)
+    session = FakeSession()
+    obj = asyncio.run(
+        service.update_alumni(session, 1, AlumniUpdate(graduate_graduation_year=2022))
+    )
+    assert obj.graduate_graduation_year == 2022
+    assert obj.manually_edited_at is not None
+    assert session.committed == 1
+
+
+def test_graduate_graduation_year_out_of_range_is_422():
+    # Same year-range validator as graduation_year: below _YEAR_MIN and above
+    # _YEAR_MAX both raise a pydantic ValidationError (surfaced as a 422).
+    with pytest.raises(ValidationError):
+        AlumniCreate(first_name="Jane", graduate_graduation_year=1800)
+    with pytest.raises(ValidationError):
+        AlumniCreate(first_name="Jane", graduate_graduation_year=99999)
+
+
+# --- company_address is now writable via the career section ------------------
+
+
+def test_create_alumni_persists_company_address():
+    # #366: company_address is exposed for READ but was not writable. Now that
+    # CareerCreate carries it, the create path persists it onto the current-
+    # employment row, and CurrentCareerRead reads it straight back.
+    session = FakeSession()
+    payload = AlumniCreateFull(
+        first_name="Jane",
+        last_name="Doe",
+        career=CareerCreate(
+            current_employer="Acme Capital",
+            company_address="123 Market St, San Francisco, CA",
+        ),
+    )
+    asyncio.run(service.create_alumni(session, payload))
+    employment = next(o for o in session.added if isinstance(o, CurrentEmployment))
+    assert employment.company_address == "123 Market St, San Francisco, CA"
+    # Round-trips back out through the read schema (the DB would assign the PK on
+    # insert; the fake session doesn't, so stand one in for validation).
+    employment.current_employment_id = 1
+    read = CurrentCareerRead.model_validate(employment)
+    assert read.company_address == "123 Market St, San Francisco, CA"
+
+
+def test_update_alumni_persists_company_address(monkeypatch):
+    existing = Alumni(alumni_id=1, first_name="Jane", last_name="Doe", archived=False)
+    _patch_get(monkeypatch, existing)
+    session = FakeSession()
+    payload = AlumniUpdateFull(
+        career=CareerCreate(company_address="500 Boylston St, Boston, MA")
+    )
+    asyncio.run(service.update_alumni(session, 1, payload))
+    # No existing employment row (fake scalar returns None), so the upsert inserts
+    # one carrying the address.
+    employment = next(o for o in session.added if isinstance(o, CurrentEmployment))
+    assert employment.company_address == "500 Boylston St, Boston, MA"
+    assert existing.manually_edited_at is not None
+
+
+# --- engagement boolean toggle-off persists (all-explicit section) -----------
+
+
+class _EngagementSession(FakeSession):
+    """Fake session that returns a pre-seeded program-engagement row for the
+    section upsert query, so an update can flip an existing True flag to False."""
+
+    def __init__(self, engagement: AlumniProgramEngagement) -> None:
+        super().__init__()
+        self._engagement = engagement
+
+    async def scalar(self, stmt: object) -> object | None:
+        # Only the engagement section's SELECT targets alumni_program_engagement;
+        # the byu/net-id duplicate lookups target the alumni table (-> None).
+        if "alumni_program_engagement" in str(
+            stmt.compile(dialect=postgresql.dialect())
+        ):
+            return self._engagement
+        return None
+
+
+def test_update_engagement_toggles_true_flag_to_false(monkeypatch):
+    existing = Alumni(alumni_id=1, first_name="Jane", last_name="Doe", archived=False)
+    _patch_get(monkeypatch, existing)
+    # Seed an engagement profile with two flags already True.
+    engagement_row = AlumniProgramEngagement(
+        engagement_profile_id=7,
+        alumni_id=1,
+        mentor_willing=True,
+        piff_donor=True,
+    )
+    session = _EngagementSession(engagement_row)
+    # The frontend sends the FULL explicit set: mentor_willing flipped to False,
+    # piff_donor left True. has_values() is True (piff_donor), so the whole
+    # section is applied and the explicit False persists.
+    payload = AlumniUpdateFull(
+        engagement=EngagementCreate(mentor_willing=False, piff_donor=True)
+    )
+    asyncio.run(service.update_alumni(session, 1, payload))
+    assert engagement_row.mentor_willing is False
+    assert engagement_row.piff_donor is True
+    assert session.committed == 1
+
+
+class _CareerSession(FakeSession):
+    """Fake session returning a pre-seeded current-employment row for the career
+    section upsert, so a partial update can be checked against sibling fields."""
+
+    def __init__(self, employment: CurrentEmployment) -> None:
+        super().__init__()
+        self._employment = employment
+
+    async def scalar(self, stmt: object) -> object | None:
+        if "current_employment" in str(stmt.compile(dialect=postgresql.dialect())):
+            return self._employment
+        return None
+
+
+def test_update_career_partial_preserves_omitted_siblings(monkeypatch):
+    """Regression: a focused-form save that sends ONLY current_title must leave
+    the other career fields intact (exclude_unset), not null them."""
+    existing = Alumni(alumni_id=1, first_name="Jane", last_name="Doe", archived=False)
+    _patch_get(monkeypatch, existing)
+    employment_row = CurrentEmployment(
+        current_employment_id=3,
+        alumni_id=1,
+        current_employer="Acme Corp",
+        current_title="Analyst",
+        current_city="Boston",
+    )
+    session = _CareerSession(employment_row)
+    payload = AlumniUpdateFull(career=CareerCreate(current_title="Associate"))
+    asyncio.run(service.update_alumni(session, 1, payload))
+    assert employment_row.current_title == "Associate"  # the one sent field changed
+    assert employment_row.current_employer == "Acme Corp"  # sibling preserved
+    assert employment_row.current_city == "Boston"  # sibling preserved
 
 
 def test_get_alumni_missing_raises(monkeypatch):

@@ -26,6 +26,7 @@ ALTER TABLE public.user_roles            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.role_capabilities     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_attempts        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_events          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.login_failures        ENABLE ROW LEVEL SECURITY;
 
 -- Provenance -----------------------------------------------------------------
 ALTER TABLE public.data_sources          ENABLE ROW LEVEL SECURITY;

@@ -1,4 +1,4 @@
-"""US state -> region crosswalk (50 states + DC -> the 5 alumni regions).
+"""US state -> region crosswalk (50 states + DC -> the 6 alumni regions).
 
 Single source of truth for deriving an alum's ``region`` from the state they
 WORK in (``career.current_state``). Per issue #283 the employment state drives
@@ -6,11 +6,18 @@ region: for anyone who lives and works in different states, region now means
 *where they work*, not *where they live*. The field still physically lives on the
 contact/residence row (``AlumniContactInfo.region``) — only its meaning changed.
 
-The five regions are the ones the edit form already offers and the intake sheet
-already documents: Northeast, Southeast, Midwest, Southwest, West. There is
-deliberately no "Mountain West" — it appears in dev seed data but has never been
-a valid region, so this map does not reintroduce it (the Mountain states fold
-into ``West``).
+The six regions: Northeast, Southeast, Midwest, Southwest, West, Mountain West.
+
+"Mountain West" was added as a 6th region on 2026-07-16 at the stakeholder's
+direction. This is a BYU database, so the Mountain states are not a long tail —
+they are the bulk of it (on dev, 84 of the 122 "West" alumni worked in Utah,
+Colorado or Nevada), and folding them into ``West`` lumped roughly a third of all
+alumni in with California. ``West`` is now the Pacific coast + AK/HI only.
+
+Existing records were deliberately NOT backfilled: region is user-overridable and
+a bulk rewrite could stomp deliberate overrides, so a stored region only moves
+when someone edits that alum's work state. Until then a Utah alum keeps reading
+"West" even though this map now says "Mountain West".
 
 Keys are the canonical FULL state names from :mod:`app.core.us_states`, because
 the hygiene cleaner normalizes state values to full names (``to_full_name``)
@@ -26,15 +33,27 @@ from __future__ import annotations
 
 from app.core.us_states import to_full_name
 
-# The five valid regions (matches the frontend AlumniForm dropdown + the intake
-# sheet's "Region (Northeast, Southeast, Midwest, Southwest, and West)" column).
+# The six valid regions (matches the intake sheet's "Region (Northeast,
+# Southeast, Midwest, Southwest, West, and Mountain West)" column).
 NORTHEAST = "Northeast"
 SOUTHEAST = "Southeast"
 MIDWEST = "Midwest"
 SOUTHWEST = "Southwest"
 WEST = "West"
+MOUNTAIN_WEST = "Mountain West"
 
-REGIONS: tuple[str, ...] = (NORTHEAST, SOUTHEAST, MIDWEST, SOUTHWEST, WEST)
+# ORDER IS THE DISPLAY ORDER: GET /vocabulary/state-regions serves this tuple as
+# ``regions`` and the frontend sources the Region dropdown's options from it, so
+# Mountain West goes last (appended, not alphabetized) rather than reshuffling an
+# order staff already read.
+REGIONS: tuple[str, ...] = (
+    NORTHEAST,
+    SOUTHEAST,
+    MIDWEST,
+    SOUTHWEST,
+    WEST,
+    MOUNTAIN_WEST,
+)
 
 # Region -> its member states. Grouped as region -> [states] (rather than the
 # flat state -> region the lookup needs) because that is the shape a human
@@ -91,14 +110,16 @@ STATES_BY_REGION: dict[str, tuple[str, ...]] = {
     WEST: (
         "Alaska",
         "California",
-        "Colorado",
         "Hawaii",
+        "Oregon",
+        "Washington",
+    ),
+    MOUNTAIN_WEST: (
+        "Colorado",
         "Idaho",
         "Montana",
         "Nevada",
-        "Oregon",
         "Utah",
-        "Washington",
         "Wyoming",
     ),
 }

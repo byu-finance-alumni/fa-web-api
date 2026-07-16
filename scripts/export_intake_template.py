@@ -94,7 +94,10 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("Address line 2", ""),
     ("Current city", "New York"),
     ("Current state", "NY"),
-    ("Region (Northeast, Southeast, Midwest, Southwest, and West)", "Northeast"),
+    (
+        "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)",
+        "Northeast",
+    ),
     ("Current country", "USA"),
     ("Current ZIP", "10282"),
     ("Home country", "USA"),

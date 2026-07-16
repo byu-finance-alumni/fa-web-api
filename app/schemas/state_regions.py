@@ -29,13 +29,15 @@ class StateRegionMap(BaseModel):
                     "Midwest",
                     "Southwest",
                     "West",
+                    "Mountain West",
                 ],
                 "region_by_state": {
                     "Connecticut": "Northeast",
                     "Florida": "Southeast",
                     "Ohio": "Midwest",
                     "Texas": "Southwest",
-                    "Utah": "West",
+                    "California": "West",
+                    "Utah": "Mountain West",
                 },
             }
         }

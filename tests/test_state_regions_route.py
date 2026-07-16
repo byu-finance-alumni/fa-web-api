@@ -84,8 +84,22 @@ def test_every_state_agrees_with_region_for_state(client):
 def test_regions_list_matches_module_and_covers_every_value(client):
     body = client.get("/vocabulary/state-regions").json()
     assert body["regions"] == list(REGIONS)
-    # "Mountain West" et al. must never leak in via a stray map entry.
+    # No region may leak in via a stray map entry that the dropdown can't offer.
     assert set(body["region_by_state"].values()) <= set(REGIONS)
+
+
+def test_regions_list_is_the_dropdown_options_in_display_order(client):
+    """The frontend sources the Region dropdown's options from this list, so its
+    ORDER is a contract, not incidental."""
+    body = client.get("/vocabulary/state-regions").json()
+    assert body["regions"] == [
+        "Northeast",
+        "Southeast",
+        "Midwest",
+        "Southwest",
+        "West",
+        "Mountain West",
+    ]
 
 
 # --- contract / posture -------------------------------------------------------

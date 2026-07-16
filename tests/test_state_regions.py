@@ -22,32 +22,67 @@ def test_map_covers_all_50_states_plus_dc_exactly_once():
     assert set(mapped) == set(STATE_NAME_BY_CODE.values())
 
 
-def test_only_the_five_valid_regions_exist():
+def test_only_the_six_valid_regions_exist_in_display_order():
     assert set(state_regions.STATES_BY_REGION) == set(state_regions.REGIONS)
+    # Order is the Region dropdown's option order (served by
+    # GET /vocabulary/state-regions): Mountain West is APPENDED, not sorted in.
     assert state_regions.REGIONS == (
         "Northeast",
         "Southeast",
         "Midwest",
         "Southwest",
         "West",
+        "Mountain West",
     )
 
 
-def test_mountain_west_is_not_reintroduced():
-    # Dev seed data carries a "Mountain West" region that was never valid; the
-    # Mountain states must fold into West instead.
-    assert "Mountain West" not in state_regions.STATES_BY_REGION
+def test_mountain_states_are_their_own_region_not_west():
+    # This is a BYU database: the Mountain states are ~1/3 of all alumni, so
+    # folding them into West buried them with California (stakeholder, 7/16).
+    assert state_regions.STATES_BY_REGION["Mountain West"] == (
+        "Colorado",
+        "Idaho",
+        "Montana",
+        "Nevada",
+        "Utah",
+        "Wyoming",
+    )
     for state in ("Utah", "Colorado", "Idaho", "Montana", "Wyoming", "Nevada"):
-        assert state_regions.region_for_state(state) == "West"
+        assert state_regions.region_for_state(state) == "Mountain West"
+
+
+def test_west_is_the_pacific_coast_plus_alaska_and_hawaii():
+    assert state_regions.STATES_BY_REGION["West"] == (
+        "Alaska",
+        "California",
+        "Hawaii",
+        "Oregon",
+        "Washington",
+    )
+
+
+def test_delaware_maryland_and_dc_stay_in_the_southeast():
+    # Confirmed by the stakeholder; a recurring "shouldn't these be Northeast?"
+    # question, so it is pinned rather than left to the map's reader.
+    for state in ("Delaware", "Maryland", "District of Columbia"):
+        assert state_regions.region_for_state(state) == "Southeast"
 
 
 def test_region_for_state_accepts_full_name_code_and_any_casing():
-    assert state_regions.region_for_state("Utah") == "West"
-    assert state_regions.region_for_state("utah") == "West"
-    assert state_regions.region_for_state("UTAH") == "West"
-    assert state_regions.region_for_state("UT") == "West"
-    assert state_regions.region_for_state("ut") == "West"
-    assert state_regions.region_for_state("  Utah  ") == "West"
+    assert state_regions.region_for_state("Utah") == "Mountain West"
+    assert state_regions.region_for_state("utah") == "Mountain West"
+    assert state_regions.region_for_state("UTAH") == "Mountain West"
+    assert state_regions.region_for_state("UT") == "Mountain West"
+    assert state_regions.region_for_state("ut") == "Mountain West"
+    assert state_regions.region_for_state("  Utah  ") == "Mountain West"
+
+
+def test_seed_mock_data_locations_agree_with_the_map():
+    # Dev seed data must not contradict the map the write path enforces.
+    from scripts.seed_mock_data import _LOCATIONS
+
+    for city, state, region in _LOCATIONS:
+        assert state_regions.region_for_state(state) == region, city
 
 
 def test_region_for_state_spot_checks_each_region():
@@ -273,7 +308,7 @@ def test_derivation_is_idempotent():
 
 
 def test_derive_region_helper_is_directly_callable():
-    assert hygiene.derive_region({"career": {"current_state": "Utah"}}) == "West"
+    assert hygiene.derive_region({"career": {"current_state": "Utah"}}) == "Mountain West"
     assert hygiene.derive_region({"career": {}}) is None
     assert hygiene.derive_region({}) is None
 
@@ -283,6 +318,6 @@ def test_derive_region_helper_honors_the_stored_state():
     # Unchanged -> nothing derived; changed -> the new region.
     assert hygiene.derive_region(cleaned, stored_state="Utah") is None
     assert hygiene.derive_region(cleaned, stored_state="UT") is None
-    assert hygiene.derive_region(cleaned, stored_state="Texas") == "West"
+    assert hygiene.derive_region(cleaned, stored_state="Texas") == "Mountain West"
     # None means "the record has no work state", which a real state differs from.
-    assert hygiene.derive_region(cleaned, stored_state=None) == "West"
+    assert hygiene.derive_region(cleaned, stored_state=None) == "Mountain West"

@@ -142,7 +142,7 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     # "Current city/state/ZIP/country" headers bind to contact.*, NOT career.
     "Current city": ("contact", "city", "str"),
     "Current state": ("contact", "state", "str"),
-    "Region (Northeast, Southeast, Midwest, Southwest, and West)": (
+    "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)": (
         "contact",
         "region",
         "str",
@@ -230,6 +230,34 @@ FRIEND_EXAMPLE_ROW: list[str] = [example for _, example in _FRIEND_COLUMNS]
 _FRIEND_MAPPING: dict[str, tuple[str, str, str]] = {
     header: _MAPPING[header] for header in FRIEND_EXPECTED_HEADERS
 }
+
+
+# --- Legacy header aliases ---------------------------------------------------
+#
+# Header validation is exact-match both ways, so RENAMING a template column would
+# hard-reject every sheet already filled in under the old name (the old header
+# reads as "Unexpected column", the new one as "Missing required column"). Staff
+# work off copies of the template that were downloaded months ago, so a rename
+# must not invalidate work already in progress.
+#
+# Each retired header therefore maps to its current name and is canonicalized on
+# read, BEFORE validation and mapping. This is deliberately a rename-only table:
+# both spellings mean the identical field, so there is no parallel mapping to
+# drift and _MAPPING stays keyed solely by the current template headers.
+#
+#   "Region (…, and West)" -> "Region (…, West, and Mountain West)"
+#       The Region header enumerates the valid regions, so adding the 6th region
+#       (Mountain West, 2026-07-16) forced the header text to change.
+_LEGACY_HEADER_ALIASES: dict[str, str] = {
+    "Region (Northeast, Southeast, Midwest, Southwest, and West)": (
+        "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)"
+    ),
+}
+
+
+def _canonicalize_header(header: str) -> str:
+    """Map a retired header spelling to its current one (others pass through)."""
+    return _LEGACY_HEADER_ALIASES.get(header, header)
 
 
 def _expected_headers(friend: bool) -> list[str]:
@@ -509,7 +537,10 @@ def parse_and_map(
     except StopIteration:
         return [], ["The file is empty."]
 
-    headers = [h.strip() for h in header_row]
+    # Retired header spellings are folded to their current names here, so every
+    # downstream step (validation, duplicate detection, _map_row) sees one
+    # canonical header set and a sheet on the old template still imports.
+    headers = [_canonicalize_header(h.strip()) for h in header_row]
     header_errors = _validate_headers(headers, expected)
     if header_errors:
         # Columns are wrong; don't attempt to map rows against a bad header.

@@ -112,6 +112,8 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "Profile Updated Date": ("core", "profile_updated_date", "date"),
     "Finance Leadership Position": ("leadership", "leadership_role", "str"),
     "Graduate degree": ("core", "graduate_degree", "str"),
+    "Graduate university": ("core", "graduate_school", "str"),
+    "Graduate graduation year": ("core", "graduate_graduation_year", "int"),
     "Deceased? (Yes/No)": ("core", "deceased", "bool"),
     "Notes": ("core", "notes", "str"),
     "Citizenship": ("core", "citizenship", "str"),

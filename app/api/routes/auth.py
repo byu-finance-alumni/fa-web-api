@@ -1,6 +1,7 @@
 """Authentication routes."""
 
 import datetime
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -19,9 +20,12 @@ from app.core.database import get_session
 from app.core.rate_limit import RecordLoginRateLimit
 from app.models.audit import AuditLog
 from app.models.login_event import LoginEvent
+from app.models.login_failure import LoginFailure
 from app.models.user import User
 from app.schemas.auth import AuthenticatedUser, UserContext
 from app.services import login_lockout
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -34,6 +38,22 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 _EmailField = Field(min_length=3, max_length=255)
 
 
+class LoginContext(BaseModel):
+    """Optional client context for a sign-in attempt, forwarded by the frontend
+    login action from the incoming request — the client IP (``x-forwarded-for``)
+    and Vercel's IP-geolocation headers. All optional and length-bounded; purely
+    informational (never trusted for authorization), stored on the
+    ``login_events`` row (success) or ``login_failures`` row (failure) for the
+    engineer Logins tabs. ``extra='forbid'`` rejects unknown keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ip_address: str | None = Field(default=None, max_length=64)
+    city: str | None = Field(default=None, max_length=128)
+    region: str | None = Field(default=None, max_length=128)
+    country: str | None = Field(default=None, max_length=64)
+
+
 class LoginPrecheckRequest(BaseModel):
     """Email to evaluate the pre-login throttle/lock state for."""
 
@@ -43,12 +63,19 @@ class LoginPrecheckRequest(BaseModel):
 
 
 class LoginRecordRequest(BaseModel):
-    """Outcome of a login attempt, to update the rolling failed-login counter."""
+    """Outcome of a login attempt, to update the rolling failed-login counter.
+
+    On a FAILURE the optional ``context`` (client IP + geo) and coarse ``reason``
+    are also logged as a per-attempt ``login_failures`` row (the engineer
+    Login-failures tab). Both are ignored on success. ``extra='forbid'`` rejects
+    unknown keys."""
 
     model_config = ConfigDict(extra="forbid")
 
     email: str = _EmailField
     success: bool
+    context: LoginContext | None = None
+    reason: str | None = Field(default=None, max_length=64)
 
 
 class LoginThrottleStatus(BaseModel):
@@ -111,22 +138,6 @@ def _clean(value: str | None) -> str | None:
         return None
     value = value.strip()
     return value or None
-
-
-class LoginContext(BaseModel):
-    """Optional client context for a sign-in, forwarded by the frontend login
-    action from the incoming request — the client IP (``x-forwarded-for``) and
-    Vercel's IP-geolocation headers. All optional and length-bounded; purely
-    informational (never trusted for authorization), stored on the
-    ``login_events`` row for the engineer Logins tab. ``extra='forbid'`` rejects
-    unknown keys."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    ip_address: str | None = Field(default=None, max_length=64)
-    city: str | None = Field(default=None, max_length=128)
-    region: str | None = Field(default=None, max_length=128)
-    country: str | None = Field(default=None, max_length=64)
 
 
 class LoginRecordedResponse(BaseModel):
@@ -284,6 +295,42 @@ async def password_complete(
 # message the frontend shows for both `cooldown` and `locked`.
 
 
+async def _record_login_failure(
+    session: AsyncSession, payload: LoginRecordRequest
+) -> None:
+    """Log one per-attempt ``login_failures`` row for a failed sign-in.
+
+    BEST-EFFORT: this is a pure side-effect for the engineer Login-failures tab
+    and must never break the throttle response, so any error (a DB hiccup, the
+    table missing) is swallowed after a rollback. The attempted email is
+    snapshotted lowercased to match the throttle's case-insensitive keying
+    (login_attempts); IP/geo are cleaned like the success path (login_events).
+    Runs in its OWN commit — ``record_attempt`` has already committed the
+    counter, so a failure here can't roll that back.
+    """
+    context = payload.context
+    try:
+        session.add(
+            LoginFailure(
+                email=payload.email.strip().lower(),
+                ip_address=_clean(context.ip_address) if context else None,
+                city=_clean(context.city) if context else None,
+                region=_clean(context.region) if context else None,
+                country=_clean(context.country) if context else None,
+                reason=_clean(payload.reason),
+            )
+        )
+        await session.commit()
+    except Exception:
+        # Never let a logging failure surface to the (unauthenticated) caller or
+        # change the anti-enumeration response. Roll back best-effort and move on.
+        logger.warning("Failed to record a login_failures row", exc_info=True)
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+
+
 @router.post("/login/precheck", response_model=LoginThrottleStatus)
 async def login_precheck(
     payload: LoginPrecheckRequest, session: SessionDep
@@ -315,10 +362,18 @@ async def login_record(
 
     The ``locked`` flag the service returns is intentionally NOT echoed to the
     client (anti-enumeration); only the coarse ``reason`` is.
+
+    On a failure, in addition to bumping the rolling counter, a per-attempt
+    ``login_failures`` row is logged (attempted email snapshotted + forwarded IP /
+    geo / reason) so the engineer Login-failures tab can show who failed, when,
+    and from where. That insert is BEST-EFFORT: a logging failure is swallowed so
+    it can never break the throttle response, and it is a pure side-effect — the
+    response body is unchanged, preserving the anti-enumeration behavior.
     """
     if payload.success:
         # Do NOT clear/delete the login_attempts row for an unauthenticated
         # "success" claim. Report the benign status without mutating state.
+        # Also log NOTHING: only failures are recorded to login_failures.
         return LoginThrottleStatus(
             allowed=True, reason="ok", retry_after_seconds=None
         )
@@ -326,6 +381,7 @@ async def login_record(
     status_dict = await login_lockout.record_attempt(
         session, payload.email, success=False
     )
+    await _record_login_failure(session, payload)
     return LoginThrottleStatus(
         allowed=status_dict["allowed"],
         reason=status_dict["reason"],

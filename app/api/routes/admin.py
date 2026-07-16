@@ -40,6 +40,7 @@ from app.models.audit import AuditLog
 from app.models.engineer_action import EngineerActionLog
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
+from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
 from app.services.supabase_admin import create_user as create_auth_user
@@ -254,6 +255,32 @@ class LoginPurgeResult(BaseModel):
     deleted: int
 
 
+class LoginFailureRow(BaseModel):
+    """One recorded FAILED sign-in for the engineer Login-failures tab. ``email``
+    is the attempted address, snapshotted at the attempt (it may not belong to any
+    account — a probe/typo). ``ip_address`` + ``city``/``region``/``country`` are
+    the approximate (IP-based) origin, and ``reason`` a coarse failure code; any
+    may be null."""
+
+    login_failure_id: int
+    email: str
+    occurred_at: datetime.datetime
+    ip_address: str | None = None
+    city: str | None = None
+    region: str | None = None
+    country: str | None = None
+    reason: str | None = None
+
+
+class LoginFailurePage(BaseModel):
+    """A page of login failures, newest first, with the total for pagination."""
+
+    items: list[LoginFailureRow]
+    total: int
+    limit: int
+    offset: int
+
+
 class RoleAssign(BaseModel):
     """Assign a canonical role to a user. ``role_name`` is validated against the
     RoleName enum, so an unknown role is a 422 before any query runs."""
@@ -440,6 +467,71 @@ async def purge_logins(
     result = await session.execute(delete(LoginEvent))
     await session.commit()
     return LoginPurgeResult(deleted=result.rowcount or 0)
+
+
+@router.get("/login-failures", response_model=LoginFailurePage)
+async def list_login_failures(
+    actor: RequireEngineer,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> LoginFailurePage:
+    """List recorded FAILED sign-in attempts, newest first (paginated). Engineer
+    only.
+
+    Backs the Admin -> Login-failures tab. Rows come from ``login_failures``
+    (written by POST /auth/login/record on each failure); the snapshotted email
+    is the address that was ATTEMPTED, which may not belong to any account (a
+    probe/typo). Engineer-gated (RequireEngineer) exactly like GET /admin/logins,
+    and paginated (default 50, hard cap 200 — mirrors the logins/users/audit
+    endpoints) so one request can't enumerate the whole log. Reading the log is
+    itself audited (``read_login_failure_log``; actor + applied limit/offset) —
+    the returned rows are not logged.
+
+    Unlike GET /admin/logins (which filters to rows WITH a captured IP), this
+    returns ALL failures: an attempt with no IP (local dev, or a client that
+    forwarded no context) is still a meaningful failure to surface, and dropping
+    it would hide real activity from a security log.
+    """
+    total = await session.scalar(
+        select(func.count()).select_from(LoginFailure)
+    )
+    rows = await session.scalars(
+        select(LoginFailure)
+        .order_by(
+            LoginFailure.occurred_at.desc(),
+            LoginFailure.login_failure_id.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+    items = [
+        LoginFailureRow(
+            login_failure_id=f.login_failure_id,
+            email=f.email,
+            occurred_at=f.occurred_at,
+            ip_address=f.ip_address,
+            city=f.city,
+            region=f.region,
+            country=f.country,
+            reason=f.reason,
+        )
+        for f in rows.all()
+    ]
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_login_failure_log",
+            entity_type="login_failure",
+            field_name=f"limit={limit};offset={offset}",
+        )
+    )
+    await session.commit()
+
+    return LoginFailurePage(
+        items=items, total=int(total or 0), limit=limit, offset=offset
+    )
 
 
 # --- Engineer-action oversight log (#199 / #200 forensic blind spot) ----------

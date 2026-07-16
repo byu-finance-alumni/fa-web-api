@@ -87,6 +87,25 @@ CREATE INDEX idx_login_events_email ON login_events (email);
 -- 90 days daily — IP + location are personal data and shouldn't be kept forever.
 -- See migration 2026-06-18_login_events_retention.sql.
 
+-- Per-attempt FAILED-login security log (the counterpart to login_events). One
+-- row per failed sign-in, written by POST /auth/login/record on a failure, so an
+-- engineer can see who failed, when, and from what IP. Separate from
+-- login_attempts (the rolling counter that drives cooldown/lock). email is the
+-- attempted address, snapshotted; intentionally NOT a FK to users because a
+-- failure may be for an email with no account (a probe). See migration
+-- 2026-07-16_add_login_failures.sql.
+CREATE TABLE login_failures (
+    login_failure_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email            varchar(255) NOT NULL,
+    occurred_at      timestamptz NOT NULL DEFAULT now(),
+    ip_address       varchar(64),
+    city             varchar(128),
+    region           varchar(128),
+    country          varchar(64),
+    reason           varchar(64)
+);
+CREATE INDEX idx_login_failures_occurred_at ON login_failures (occurred_at DESC);
+
 CREATE TABLE roles (
     role_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     role_name        varchar(100) NOT NULL UNIQUE,

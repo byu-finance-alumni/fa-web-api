@@ -183,7 +183,9 @@ def test_cohort_export_blank_when_no_section_row():
 def test_cohort_export_round_trips_through_import_parser():
     alumni = [
         Alumni(alumni_id=1, byu_id="123456789", net_id="jdoe",
-               first_name="Jane", last_name="Doe", graduation_year=2018),
+               first_name="Jane", last_name="Doe", graduation_year=2018,
+               graduate_degree="MBA", graduate_school="Harvard Business School",
+               graduate_graduation_year=2022),
     ]
     session = FakeExportSession(
         alumni,
@@ -206,6 +208,10 @@ def test_cohort_export_round_trips_through_import_parser():
     assert payload["net_id"] == "jdoe"
     assert payload["first_name"] == "Jane"
     assert payload["graduation_year"] == 2018  # int coerced back
+    # Graduate program columns (the newly-added template fields) round-trip.
+    assert payload["graduate_degree"] == "MBA"
+    assert payload["graduate_school"] == "Harvard Business School"
+    assert payload["graduate_graduation_year"] == 2022  # int coerced back
     # Section values round-trip.
     assert payload["contact"]["personal_email"] == "jane@x.com"
     assert payload["career"]["current_employer"] == "Acme Corp"

@@ -1364,35 +1364,52 @@ async def update_import_alumni(
 async def export_cohort_update_template(
     user: RequireFullAccess,
     session: SessionDep,
-    grad_year: Annotated[int, Query(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    grad_year: Annotated[int | None, Query(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)] = None,
+    class_year: Annotated[
+        int | None, Query(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)
+    ] = None,
 ) -> Response | JSONResponse:
-    """Download an ACTIVE graduation-year cohort as a FILLED intake-template CSV
-    (full_access).
+    """Download an ACTIVE cohort as a FILLED intake-template CSV (full_access).
 
-    Powers the round-trip: pick a grad year, download that cohort in the EXACT
-    import-template column format, edit cells offline, then re-upload through
-    ``POST /alumni/import/update`` (which matches by BYU ID / Net ID and applies
-    only the changed cells). ``grad_year`` is validated to the same year bounds as
-    the alumni schema. A cohort larger than the export cap is a 413 asking the
-    caller to narrow it down. Audit-logged (``export_alumni``) like the other
-    exports."""
+    Pick the cohort by EITHER ``grad_year`` (the BYU graduation year) OR
+    ``class_year`` (the Marriott "Class of" year) — provide exactly one. Powers
+    the round-trip: download the cohort in the EXACT import-template column
+    format, edit cells offline, then re-upload through ``POST
+    /alumni/import/update`` (which matches by BYU ID / Net ID and applies only
+    the changed cells). Both years are validated to the alumni-schema bounds. A
+    cohort larger than the export cap is a 413 asking the caller to narrow it
+    down. Audit-logged (``export_alumni``) like the other exports."""
+    if (grad_year is None) == (class_year is None):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "invalid_request",
+                    "message": "Provide exactly one of grad_year or class_year.",
+                }
+            },
+        )
     try:
         csv_text = await import_csv.build_cohort_update_csv(
-            session, grad_year, actor_user_id=user.user_id
+            session,
+            graduation_year=grad_year,
+            graduation_class=class_year,
+            actor_user_id=user.user_id,
         )
     except import_csv.CohortTooLargeError as exc:
         return JSONResponse(
             status_code=413,
             content={"error": {"code": "payload_too_large", "message": str(exc)}},
         )
+    fname = (
+        f"alumni_cohort_gradyear_{grad_year}.csv"
+        if grad_year is not None
+        else f"alumni_cohort_classof_{class_year}.csv"
+    )
     return Response(
         content=csv_text,
         media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="alumni_cohort_{grad_year}.csv"'
-            )
-        },
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 

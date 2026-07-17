@@ -201,6 +201,9 @@ def build_alumni_query(
     graduation_year: int | None = None,
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
+    # Exact "Class of" (Marriott) year — used by the cohort-update export to pull a
+    # cohort by class year instead of graduation_year.
+    graduation_class: int | None = None,
     deceased: bool | None = None,
     # Gender (#360): a coarse ``M`` / ``F`` facet, AND-combined with every other
     # filter (e.g. the industry facet). Matches on the first letter of the stored
@@ -372,6 +375,8 @@ def build_alumni_query(
         conditions.append(Alumni.graduation_year >= grad_year_min)
     if grad_year_max is not None:
         conditions.append(Alumni.graduation_year <= grad_year_max)
+    if graduation_class is not None:
+        conditions.append(Alumni.graduation_class == graduation_class)
     if deceased is not None:
         conditions.append(Alumni.deceased.is_(deceased))
     if gender and gender.strip():

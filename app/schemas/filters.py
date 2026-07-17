@@ -23,3 +23,6 @@ class FilterOptions(BaseModel):
     leadership_roles: list[str]
     survey_statuses: list[str]
     graduation_years: list[int]
+    # Distinct "Class of" (Marriott) years on file — the cohort-update export can
+    # pick a cohort by this OR by graduation_year.
+    graduation_classes: list[int]

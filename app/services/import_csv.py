@@ -1820,7 +1820,9 @@ def _cohort_cell(value: object, kind: str) -> str:
 
 async def build_cohort_update_csv(
     session: AsyncSession,
-    graduation_year: int,
+    *,
+    graduation_year: int | None = None,
+    graduation_class: int | None = None,
     actor_user_id: int | None = None,
 ) -> str:
     """Build a FILLED intake-template CSV for one active graduation-year cohort.
@@ -1837,7 +1839,11 @@ async def build_cohort_update_csv(
     :class:`CohortTooLargeError` (the route maps that to a 413). Writes an
     ``export_alumni`` disclosure audit row (actor + cohort + row count, never the
     data) and commits, mirroring the export path."""
-    base = build_alumni_query(graduation_year=graduation_year)
+    if (graduation_year is None) == (graduation_class is None):
+        raise ValueError("Pass exactly one of graduation_year or graduation_class.")
+    base = build_alumni_query(
+        graduation_year=graduation_year, graduation_class=graduation_class
+    )
     total = await session.scalar(select(func.count()).select_from(base.subquery()))
     if total and total > alumni_export.MAX_EXPORT_ROWS:
         raise CohortTooLargeError(int(total))
@@ -1877,7 +1883,12 @@ async def build_cohort_update_csv(
             row_out.append(_cohort_cell(value, kind))
         writer.writerow(row_out)
 
-    _audit_cohort_export(session, actor_user_id, graduation_year, len(alumni))
+    cohort_label = (
+        f"grad_year={graduation_year}"
+        if graduation_year is not None
+        else f"class_year={graduation_class}"
+    )
+    _audit_cohort_export(session, actor_user_id, cohort_label, len(alumni))
     await session.commit()
     return buffer.getvalue()
 
@@ -1885,7 +1896,7 @@ async def build_cohort_update_csv(
 def _audit_cohort_export(
     session: AsyncSession,
     actor_user_id: int | None,
-    graduation_year: int,
+    cohort_label: str,
     row_count: int,
 ) -> None:
     """Disclosure audit for a cohort round-trip export — actor + WHAT left the
@@ -1895,9 +1906,7 @@ def _audit_cohort_export(
     if actor_user_id is None:
         log.warning("Cohort export audit skipped: no actor (rows=%s)", row_count)
         return
-    summary = (
-        f"cohort update template; grad_year={graduation_year}; rows={row_count}"
-    )
+    summary = f"cohort update template; {cohort_label}; rows={row_count}"
     session.add(
         AuditLog(
             user_id=actor_user_id,

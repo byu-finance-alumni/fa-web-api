@@ -98,7 +98,6 @@ async def filter_options(session: AsyncSession) -> dict:
     # its association table) references the alumni row via ``alumni_id``.
     employment_scope = [_visible_alumni_exists(CurrentEmployment.alumni_id)]
     history_scope = [_visible_alumni_exists(EmploymentHistory.alumni_id)]
-    contact_scope = [_visible_alumni_exists(AlumniContactInfo.alumni_id)]
     leadership_scope = [_visible_alumni_exists(FinanceSocietyLeadership.alumni_id)]
     survey_scope = [_visible_alumni_exists(Survey.alumni_id)]
     # graduation_year lives on the alumni row itself, so the guard is a plain
@@ -151,11 +150,17 @@ async def filter_options(session: AsyncSession) -> dict:
             session, CurrentEmployment.seniority_level, scope=employment_scope
         ),
         "industries": industries,
+        # City/State options come off the EMPLOYMENT record, matching what the
+        # list filter matches on (repositories.alumni.build_alumni_query) and
+        # what the map plots (#287). They used to read AlumniContactInfo, which
+        # only ever agreed because the import mirrored the work address onto the
+        # contact row — offering options the filter couldn't match the moment
+        # that stopped being true.
         "cities": await _distinct_values(
-            session, AlumniContactInfo.city, scope=contact_scope
+            session, CurrentEmployment.current_city, scope=employment_scope
         ),
         "states": await _distinct_values(
-            session, AlumniContactInfo.state, scope=contact_scope
+            session, CurrentEmployment.current_state, scope=employment_scope
         ),
         "tags": await _distinct_values(session, Tag.tag_name, scope=tag_scope),
         "status_labels": await _distinct_values(

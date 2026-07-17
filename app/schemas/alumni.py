@@ -556,10 +556,12 @@ class CareerCreate(_Section):
     current_title: str | None = Field(default=None, max_length=255)
     current_industry: str | None = Field(default=None, max_length=255)
     current_industry_secondary: str | None = Field(default=None, max_length=255)
-    # Company street address (the "Company Address" line on the profile, #366).
-    # Exposed for READ via CurrentCareerRead; writable here so the edit form can
-    # persist it. max_length mirrors current_employment.company_address varchar(255).
-    company_address: str | None = Field(default=None, max_length=255)
+    # `company_address` was retired here (#287): it is not on the intake sheet, so
+    # no import path ever fed it and it was empty for every alum. The column still
+    # exists on current_employment (see app/models/employment.py) pending a
+    # separate drop migration; it is deliberately off the API surface, so this
+    # schema neither reads nor writes it. Work location lives in
+    # current_city/current_state/current_zip/current_country below.
     current_city: str | None = Field(default=None, max_length=100)
     current_state: str | None = Field(default=None, max_length=100)
     current_country: str | None = Field(default=None, max_length=100)

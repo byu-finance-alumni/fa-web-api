@@ -431,12 +431,17 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     # Unknown = active alumni with no (non-blank) industry on file.
     unknown_count = max(int(total or 0) - known_total, 0)
 
+    # Geographic distribution: alumni by the state they WORK in
+    # (current_employment.current_state) — the employer's address is the only
+    # address this system holds, and it is what the geography map plots (#287).
+    # current_employment is unique per alum, so a plain count is a per-alumnus
+    # count and matches app/services/geography.py's by-state aggregation.
     by_state = (
         await session.execute(
-            select(AlumniContactInfo.state, func.count())
-            .join(Alumni, Alumni.alumni_id == AlumniContactInfo.alumni_id)
-            .where(active, AlumniContactInfo.state.is_not(None))
-            .group_by(AlumniContactInfo.state)
+            select(CurrentEmployment.current_state, func.count())
+            .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
+            .where(active, CurrentEmployment.current_state.is_not(None))
+            .group_by(CurrentEmployment.current_state)
             .order_by(func.count().desc())
             .limit(8)
         )

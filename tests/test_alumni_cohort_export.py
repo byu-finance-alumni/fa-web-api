@@ -109,7 +109,7 @@ def test_cohort_export_headers_and_one_row_each():
                first_name="John", last_name="Smith", graduation_year=2018),
     ]
     session = FakeExportSession(alumni)
-    text = _run(import_csv.build_cohort_update_csv(session, 2018, actor_user_id=7))
+    text = _run(import_csv.build_cohort_update_csv(session, graduation_year=2018, actor_user_id=7))
 
     header_row, data_rows = _parse(text)
     assert header_row == import_csv.EXPECTED_HEADERS
@@ -144,7 +144,7 @@ def test_cohort_export_populates_keys_and_section_fields():
                                   current_city="Provo")],
         engagement=[AlumniProgramEngagement(alumni_id=1, mentor_willing=True)],
     )
-    text = _run(import_csv.build_cohort_update_csv(session, 2018, actor_user_id=7))
+    text = _run(import_csv.build_cohort_update_csv(session, graduation_year=2018, actor_user_id=7))
     header_row, data_rows = _parse(text)
     row = data_rows[0]
 
@@ -173,7 +173,7 @@ def test_cohort_export_blank_when_no_section_row():
     alumni = [Alumni(alumni_id=1, byu_id="123456789", first_name="Jane",
                      last_name="Doe", graduation_year=2018)]
     session = FakeExportSession(alumni)  # no contact/career/engagement rows
-    text = _run(import_csv.build_cohort_update_csv(session, 2018, actor_user_id=7))
+    text = _run(import_csv.build_cohort_update_csv(session, graduation_year=2018, actor_user_id=7))
     header_row, data_rows = _parse(text)
     row = data_rows[0]
     assert _cell(header_row, row, "Personal Email") == ""
@@ -197,7 +197,7 @@ def test_cohort_export_round_trips_through_import_parser():
                                   current_employer="Acme Corp")],
         engagement=[AlumniProgramEngagement(alumni_id=1, mentor_willing=True)],
     )
-    text = _run(import_csv.build_cohort_update_csv(session, 2018, actor_user_id=7))
+    text = _run(import_csv.build_cohort_update_csv(session, graduation_year=2018, actor_user_id=7))
 
     # Feed the exported CSV straight back through the import parser/mapper.
     rows, header_errors = import_csv.parse_and_map(text.encode("utf-8"))
@@ -227,7 +227,7 @@ def test_cohort_export_round_trips_through_import_parser():
 def test_cohort_export_over_cap_raises():
     session = FakeExportSession([], total=alumni_export.MAX_EXPORT_ROWS + 1)
     try:
-        _run(import_csv.build_cohort_update_csv(session, 2018, actor_user_id=7))
+        _run(import_csv.build_cohort_update_csv(session, graduation_year=2018, actor_user_id=7))
     except import_csv.CohortTooLargeError as exc:
         assert exc.total == alumni_export.MAX_EXPORT_ROWS + 1
         assert "narrow" in str(exc).lower()
@@ -288,7 +288,10 @@ def test_route_cohort_export_returns_csv_attachment():
 
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/csv")
-    assert 'filename="alumni_cohort_2018.csv"' in resp.headers["content-disposition"]
+    assert (
+        'filename="alumni_cohort_gradyear_2018.csv"'
+        in resp.headers["content-disposition"]
+    )
     header_row, data_rows = _parse(resp.text)
     assert header_row == import_csv.EXPECTED_HEADERS
     assert len(data_rows) == 1

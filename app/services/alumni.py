@@ -175,6 +175,9 @@ async def filter_options(session: AsyncSession) -> dict:
         "graduation_years": await _distinct_values(
             session, Alumni.graduation_year, desc=True, scope=alumni_scope
         ),
+        "graduation_classes": await _distinct_values(
+            session, Alumni.graduation_class, desc=True, scope=alumni_scope
+        ),
     }
 
 # Nested write sections handled via related tables, not the alumni core row.

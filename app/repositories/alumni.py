@@ -36,15 +36,28 @@ from app.utils.sql import escape_like
 SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
 
 # The 14 dashboard "wheel" industries. Powers the ``industry_group`` filters so
-# the alumni-list "Other" drill-down matches the dashboard "Other" slice exactly:
-#   * ``unknown`` — no current-employment row names a (non-blank) primary industry
+# the alumni-list drill-downs match the dashboard bars exactly:
+#   * ``unknown`` — no current-employment row names a (non-blank) primary industry,
+#                   OR the primary industry is the explicit "Unknown" value (#295),
+#                   which the dashboard merges into the same "Unknown" bar.
 #   * ``other``   — has a primary industry, but it isn't one of the 14 wheel
 #                   industries (literal "Other", a non-wheel finance value like
-#                   Law/Corporate Banking, or any non-canonical value)
+#                   Law/Corporate Banking, or any non-canonical value) — EXCLUDING
+#                   the two values the dashboard breaks out into their own buckets:
+#                   "Graduate Student" (#294, own bar) and "Unknown" (#295, merged
+#                   into the Unknown bar).
 # Lower-cased for a case-insensitive DB comparison (industries are stored as
 # free-text varchars, so casing can drift on import).
 _FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
     i.lower() for i in WHEEL_INDUSTRIES
+)
+# Non-wheel values the dashboard pulls OUT of the "Other" bucket into their own
+# bars, so ``industry_group=other`` must exclude them and their own drill-downs
+# (exact ``industry=Graduate Student`` / ``industry_group=unknown``) own them.
+_GRADUATE_STUDENT_LOWER = "graduate student"
+_EXPLICIT_UNKNOWN_LOWER = "unknown"
+_OTHER_EXCLUDED_LOWER: frozenset[str] = frozenset(
+    {_GRADUATE_STUDENT_LOWER, _EXPLICIT_UNKNOWN_LOWER}
 )
 
 
@@ -370,7 +383,9 @@ def build_alumni_query(
             == gender.strip()[0].upper()
         )
     if industry_group == "unknown":
-        # No current-employment row names a non-blank PRIMARY industry.
+        # Merged "Unknown" bar (#295): either NO current-employment row names a
+        # non-blank primary industry, OR the primary industry is the explicit
+        # "Unknown" value — matching how the dashboard counts this bar.
         has_industry = (
             select(CurrentEmployment.current_employment_id)
             .where(
@@ -380,10 +395,21 @@ def build_alumni_query(
             )
             .exists()
         )
-        conditions.append(~has_industry)
+        has_explicit_unknown = (
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                func.lower(func.trim(CurrentEmployment.current_industry))
+                == _EXPLICIT_UNKNOWN_LOWER,
+            )
+            .exists()
+        )
+        conditions.append(or_(~has_industry, has_explicit_unknown))
     elif industry_group == "other":
         # Has a primary industry, but it isn't one of the canonical finance
-        # industries (literal "Other" or any non-canonical free-text value).
+        # industries AND isn't one of the values the dashboard breaks out into
+        # their own bars ("Graduate Student", "Unknown") — so this drill-down
+        # matches the dashboard "Other" bar exactly.
         conditions.append(
             select(CurrentEmployment.current_employment_id)
             .where(
@@ -391,7 +417,7 @@ def build_alumni_query(
                 CurrentEmployment.current_industry.is_not(None),
                 func.trim(CurrentEmployment.current_industry) != "",
                 func.lower(func.trim(CurrentEmployment.current_industry)).notin_(
-                    _FINANCE_INDUSTRIES_LOWER
+                    _FINANCE_INDUSTRIES_LOWER | _OTHER_EXCLUDED_LOWER
                 ),
             )
             .exists()

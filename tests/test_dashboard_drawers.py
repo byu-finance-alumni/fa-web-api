@@ -110,8 +110,15 @@ def test_drilldowns_require_auth(client, path):
 # --- happy path (stubbed session) ---------------------------------------------
 
 
-def _alumni():
-    return SimpleNamespace(alumni_id=7, first_name="Jane", last_name="Doe")
+def _alumni(preferred_first_name=None):
+    # Real Alumni ORM rows always carry preferred_first_name; the drawer
+    # serializers prefer it over first_name for the displayed alumni_name.
+    return SimpleNamespace(
+        alumni_id=7,
+        first_name="Jane",
+        last_name="Doe",
+        preferred_first_name=preferred_first_name,
+    )
 
 
 def _user():

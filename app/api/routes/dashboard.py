@@ -90,7 +90,16 @@ async def _audit_view(
             pass
 
 
-def _full_name(first: str | None, last: str | None, email: str | None) -> str | None:
+def _full_name(
+    first: str | None,
+    last: str | None,
+    email: str | None,
+    preferred: str | None = None,
+) -> str | None:
+    # Prefer the alumnus's preferred first name when present, matching the profile
+    # header and every other alumni name display. Callers rendering a USER/actor
+    # name (users have no preferred name) simply omit ``preferred``.
+    first = (preferred or "").strip() or first
     name = " ".join(p for p in (first, last) if p).strip()
     return name or email
 
@@ -162,7 +171,7 @@ def _serialize_interaction(i, a, u) -> dict:
     return {
         "interaction_id": i.interaction_id,
         "alumni_id": i.alumni_id,
-        "alumni_name": _full_name(a.first_name, a.last_name, None)
+        "alumni_name": _full_name(a.first_name, a.last_name, None, a.preferred_first_name)
         or f"Alumni #{a.alumni_id}",
         "type": i.interaction_type,
         "when": (
@@ -418,18 +427,34 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     ).all()
     industry_counts = {name: 0 for name in _FINANCE_INDUSTRIES}
     other_count = 0
+    graduate_student_count = 0
+    unknown_explicit = 0
     known_total = 0
     for value, n in industry_rows:
         n = int(n)
         known_total += n
-        canonical = _FINANCE_BY_LOWER.get((value or "").strip().lower())
+        lowered = (value or "").strip().lower()
+        if lowered == "graduate student":
+            # Graduate Student (#294) is its own dashboard bar, split out of the
+            # "Other" catch-all so it can be counted and drilled into separately.
+            graduate_student_count += n
+            continue
+        if lowered == "unknown":
+            # Explicit "Unknown" (#295) is merged INTO the "Unknown" data-gap bar
+            # below, alongside alumni with no industry on file — so the dashboard
+            # shows a single "Unknown". Not counted under "Other".
+            unknown_explicit += n
+            continue
+        canonical = _FINANCE_BY_LOWER.get(lowered)
         if canonical is not None:
             industry_counts[canonical] += n
         else:
             # Literal "Other" or any value outside the finance vocab.
             other_count += n
-    # Unknown = active alumni with no (non-blank) industry on file.
-    unknown_count = max(int(total or 0) - known_total, 0)
+    # Unknown = active alumni with no (non-blank) industry on file, PLUS those
+    # explicitly marked "Unknown" (#295). ``known_total`` already counts the
+    # explicit-unknown rows, so the blank remainder excludes them; add them back.
+    unknown_count = max(int(total or 0) - known_total, 0) + unknown_explicit
 
     # Geographic distribution: alumni by the state they WORK in
     # (current_employment.current_state) — the employer's address is the only
@@ -477,6 +502,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             ],
             "other": other_count,
             "unknown": unknown_count,
+            "graduate_student": graduate_student_count,
         },
     }
 
@@ -890,7 +916,7 @@ async def upcoming_follow_ups_list(
         {
             "task_id": t.follow_up_task_id,
             "alumni_id": t.alumni_id,
-            "alumni_name": _full_name(a.first_name, a.last_name, None)
+            "alumni_name": _full_name(a.first_name, a.last_name, None, a.preferred_first_name)
             or f"Alumni #{a.alumni_id}",
             "title": t.task_title,
             "due_date": t.due_date.isoformat() if t.due_date else None,

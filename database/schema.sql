@@ -830,6 +830,13 @@ CREATE INDEX idx_current_employment_alumni_id    ON current_employment (alumni_i
 CREATE INDEX idx_current_employment_employer      ON current_employment (current_employer);
 CREATE INDEX idx_current_employment_industry      ON current_employment (current_industry);
 CREATE INDEX IF NOT EXISTS idx_current_employment_state ON current_employment (current_state);
+-- Work-location indexes (#287): current_employment is the location record the
+-- geography map / geocoded search / dashboard by-state read, so it carries the
+-- same query load alumni_contact_info's geography indexes above used to.
+CREATE INDEX IF NOT EXISTS idx_current_employment_city_state   ON current_employment (current_city, current_state);
+CREATE INDEX IF NOT EXISTS idx_current_employment_country      ON current_employment (current_country);
+CREATE INDEX IF NOT EXISTS idx_current_employment_state_norm      ON current_employment (upper(trim(current_state)));
+CREATE INDEX IF NOT EXISTS idx_current_employment_city_state_norm ON current_employment (lower(trim(current_city)), upper(trim(current_state)));
 CREATE INDEX idx_education_history_alumni_id     ON education_history (alumni_id);
 CREATE INDEX idx_employment_history_alumni_id    ON employment_history (alumni_id);
 CREATE INDEX idx_verification_log_alumni_id      ON verification_log (alumni_id);

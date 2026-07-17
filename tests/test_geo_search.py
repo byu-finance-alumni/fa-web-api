@@ -261,3 +261,16 @@ def test_alumni_location_filter_builds_tuple_in_with_state_fold():
     assert "in (" in sql
     assert "'provo'" in sql
     assert "'ut'" in sql
+
+
+def test_alumni_location_filter_reads_the_work_location():
+    # #287: an alum's location is where they WORK (current_employment), not the
+    # residence-labeled contact record — nothing ever populates a residence.
+    sql = str(
+        gs.alumni_location_filter([("provo", "UT")]).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+    assert "current_employment.current_city" in sql
+    assert "current_employment.current_state" in sql
+    assert "alumni_contact_info" not in sql

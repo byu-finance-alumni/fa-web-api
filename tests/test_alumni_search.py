@@ -265,11 +265,14 @@ def test_industry_filter_checks_primary_and_secondary():
 
 def test_city_filter():
     sql = _sql(build_alumni_query(city="Provo"))
-    # Correlated EXISTS against the contact-info table, case-insensitive.
+    # Correlated EXISTS against current_employment -- city is the alumnus's WORK
+    # city (#287), not a residence; nothing populates a residence.
     assert "EXISTS" in sql
     assert "NOT (EXISTS" not in sql
-    assert "alumni_contact_info" in sql
-    assert "city ILIKE" in sql
+    assert "current_employment" in sql
+    assert "current_city ILIKE" in sql
+    # The location must NOT be read off the residence-labeled contact record.
+    assert "alumni_contact_info" not in sql
 
 
 def test_tag_filter():
@@ -286,7 +289,7 @@ def test_tag_filter():
 def test_city_and_tag_compose_with_archived_default():
     sql = _sql(build_alumni_query(city="Provo", tag="Highly Engaged"))
     assert "archived IS false" in sql
-    assert "city ILIKE" in sql
+    assert "current_city ILIKE" in sql
     assert "tag_name ILIKE" in sql
 
 
@@ -559,8 +562,11 @@ def test_seniority_filter():
 
 
 def test_state_filter():
+    # State is the alumnus's WORK state (#287) -- current_employment, not the
+    # residence-labeled contact record.
     sql = _sql(build_alumni_query(state=["UT", "CA"]))
-    assert sql.count("alumni_contact_info.state ILIKE") == 2
+    assert sql.count("current_employment.current_state ILIKE") == 2
+    assert "alumni_contact_info" not in sql
 
 
 def test_status_label_filter():
@@ -810,13 +816,15 @@ def test_industry_group_absent_by_default():
 # --- #358 location proximity filter ------------------------------------------
 
 
-def test_location_filter_wraps_predicate_in_contact_exists():
-    # The geo module supplies the (city, state) match predicate; the builder
-    # correlates it to the alumnus via a contact-info EXISTS.
+def test_location_filter_wraps_predicate_in_employment_exists():
+    # The geo module supplies the (city, state) match predicate over the WORK
+    # location; the builder correlates it to the alumnus via a
+    # current_employment EXISTS (#287), not a contact-info one.
     sql = _sql(build_alumni_query(location_filter=literal(True)))
     assert "EXISTS" in sql
-    assert "alumni_contact_info" in sql
+    assert "current_employment" in sql
+    assert "alumni_contact_info" not in sql
 
 
 def test_location_filter_absent_by_default():
-    assert "alumni_contact_info" not in _sql(build_alumni_query())
+    assert "current_employment" not in _sql(build_alumni_query())

@@ -46,8 +46,12 @@ class CurrentEmployment(TimestampMixin, Base):
     current_title: Mapped[str | None] = mapped_column(String(255))
     current_industry: Mapped[str | None] = mapped_column(String(255))
     current_industry_secondary: Mapped[str | None] = mapped_column(String(255))
-    # Company street address (the "Company Address" line on the profile, #366).
-    # City/state/country/zip below are the finer-grained location fields.
+    # RETIRED (#287), PENDING DROP — do not read, write, or expose this.
+    # Added for #366 with a UI write path but no import path: it is not on the
+    # intake sheet, so nothing ever fed it (0 populated rows on dev). It has been
+    # removed from the API schemas and the UI; the mapping stays only so the model
+    # still matches the live table until a follow-up migration drops the column.
+    # Work location is current_city/current_state/current_country/current_zip below.
     company_address: Mapped[str | None] = mapped_column(String(255))
     current_city: Mapped[str | None] = mapped_column(String(100))
     current_state: Mapped[str | None] = mapped_column(String(100))

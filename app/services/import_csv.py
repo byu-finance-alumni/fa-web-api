@@ -81,13 +81,21 @@ MAX_IMPORT_ROWS = 2000
 #   "industry" -> validated against the controlled vocab (invalid -> row error)
 #
 # Section targets: core -> alumni; contact -> alumni_contact_info; career ->
-# current_employment (employer/title/industry only — the single address lives on
-# the CONTACT record, so "Current city/state/ZIP/country" map to contact.*, NOT
-# career, and drive the map); education -> education_history; former ->
-# employment_history (is_current=false); leadership -> finance_society_leadership;
-# engagement -> alumni_program_engagement.
+# current_employment (employer/title/industry AND the work location — see below);
+# education -> education_history; former -> employment_history (is_current=false);
+# leadership -> finance_society_leadership; engagement ->
+# alumni_program_engagement.
 #
-# Keys are the EXACT header text from the finalized 64-column intake template, in
+# The sheet's location block is the EMPLOYER's address (#287). The sheet's own
+# column order says so — it sits immediately after Current employer / title /
+# industry / Work Email, and Tanya fills it in with where the alum WORKS. So
+# "Current city/state/ZIP/country" bind to career.current_* (current_employment),
+# NOT to contact.* (the residence row). Nothing in this system populates a
+# residence: the concept exists in the schema, but no sheet column feeds it.
+# ("Home country" is NOT part of this block — it's the country of ORIGIN, about
+# the alum, and stays on core.home_country.)
+#
+# Keys are the EXACT header text from the finalized 66-column intake template, in
 # that order, so a drift in the template surfaces as a header error here.
 
 _MAPPING: dict[str, tuple[str, str, str]] = {
@@ -136,19 +144,25 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "str",
     ),
     "Work Email": ("contact", "work_email", "str"),
+    # UNRESOLVED (#287): these two are the employer's street, but they are the one
+    # column pair whose destination is still being decided, so they stay bound to
+    # contact.address_line_1/_2 exactly as before. Do not move or drop them until
+    # that call is made — the rest of the block moved to career.* below.
     "Address line 1": ("contact", "address_line_1", "str"),
     "Address line 2": ("contact", "address_line_2", "str"),
-    # The single address lives on the CONTACT record and drives the map, so the
-    # "Current city/state/ZIP/country" headers bind to contact.*, NOT career.
-    "Current city": ("contact", "city", "str"),
-    "Current state": ("contact", "state", "str"),
+    # The location block is the EMPLOYER's (#287) -> career.current_*, not contact.
+    "Current city": ("career", "current_city", "str"),
+    "Current state": ("career", "current_state", "str"),
+    # Region is NOT an address — it's a US bucket DERIVED from the work state
+    # (#283, see hygiene.derive_region). It physically lives on the contact row
+    # and stays there; only the address columns above moved.
     "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)": (
         "contact",
         "region",
         "str",
     ),
-    "Current country": ("contact", "country", "str"),
-    "Current ZIP": ("contact", "zip", "str"),
+    "Current country": ("career", "current_country", "str"),
+    "Current ZIP": ("career", "current_zip", "str"),
     "Home country": ("core", "home_country", "str"),
     "Degree": ("education", "degree", "str"),
     "Major": ("education", "major", "str"),
@@ -361,15 +375,19 @@ _PLACEHOLDER_TOKENS = frozenset({"unknown", "n/a", "na"})
 
 # Free-text fields where a placeholder token means "leave blank": the address/
 # location columns, the open-response secondary industry, and the LinkedIn URL.
+#
+# Matched on the payload FIELD name (the section is not part of the key), so the
+# work-location entries are the career.current_* names the sheet now binds to
+# (#287) — "city"/"state"/"zip"/"country" would no longer match anything.
 _PLACEHOLDER_BLANK_FIELDS = frozenset(
     {
         "address_line_1",
         "address_line_2",
-        "city",
-        "state",
+        "current_city",
+        "current_state",
         "region",
-        "country",
-        "zip",
+        "current_country",
+        "current_zip",
         "current_industry_secondary",
         "linkedin_url",
     }
@@ -647,24 +665,12 @@ def _map_row(
         # Non-alumni contact: force is_alumni False so the shared create path
         # writes a friend record instead of an alumnus (#294).
         core["is_alumni"] = False
-    else:
-        # The 64-column sheet carries a SINGLE location block ("Current
-        # city/state/country/ZIP") which maps to the CONTACT record (that drives
-        # the map). Mirror it onto the career section so the current_employment
-        # location columns are ALSO sourced from the sheet — the template has no
-        # separate company-location columns by design, and the sheet is the
-        # source of truth. Only fills a career location left empty above; never
-        # overwrites an explicit career value.
-        contact_loc = sections.get("contact", {})
-        for contact_field, career_field in (
-            ("city", "current_city"),
-            ("state", "current_state"),
-            ("country", "current_country"),
-            ("zip", "current_zip"),
-        ):
-            value = contact_loc.get(contact_field)
-            if value is not None and value != "":
-                sections.setdefault("career", {}).setdefault(career_field, value)
+
+    # NOTE (#287): a contact->career location mirror used to run here, copying
+    # contact.city/state/country/zip onto career.current_*. The location columns
+    # now bind straight to career.current_* above, so it had nothing left to copy
+    # — and removing it is what makes a blank work location honestly blank
+    # instead of a value laundered in from the residence row.
 
     # Resolve the free-text "Best Contact" cell against this row's own contact
     # fields (#284). Kept raw below for update mode, which must re-reconcile

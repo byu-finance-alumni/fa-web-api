@@ -17,7 +17,6 @@ from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.schemas.alumni import (
     AlumniCreate,
-    AlumniCreateFull,
     AlumniUpdate,
     AlumniUpdateFull,
     CareerCreate,
@@ -163,45 +162,31 @@ def test_graduate_graduation_year_out_of_range_is_422():
         AlumniCreate(first_name="Jane", graduate_graduation_year=99999)
 
 
-# --- company_address is now writable via the career section ------------------
+# --- company_address is retired: off the write AND read surface (#287) -------
 
 
-def test_create_alumni_persists_company_address():
-    # #366: company_address is exposed for READ but was not writable. Now that
-    # CareerCreate carries it, the create path persists it onto the current-
-    # employment row, and CurrentCareerRead reads it straight back.
-    session = FakeSession()
-    payload = AlumniCreateFull(
-        first_name="Jane",
-        last_name="Doe",
-        career=CareerCreate(
-            current_employer="Acme Capital",
-            company_address="123 Market St, San Francisco, CA",
-        ),
+def test_career_create_rejects_company_address():
+    # #366 gave company_address a UI write path, but it is not on the intake
+    # sheet, so no import ever fed it (0 populated rows on dev) and #287 retired
+    # it. CareerCreate is extra="forbid", so it is not merely ignored on write --
+    # a stale client still sending career.company_address gets a 422 rather than
+    # silently having the value dropped.
+    with pytest.raises(ValidationError):
+        CareerCreate(company_address="123 Market St, San Francisco, CA")
+
+
+def test_current_career_read_omits_company_address():
+    # The column still exists on the model (dropped by a later migration), so the
+    # ORM object carries the attribute. The read schema must not surface it --
+    # that is what keeps it off the OpenAPI contract the frontend generates from.
+    employment = CurrentEmployment(
+        current_employment_id=1,
+        current_employer="Acme Capital",
+        company_address="123 Market St, San Francisco, CA",
     )
-    asyncio.run(service.create_alumni(session, payload))
-    employment = next(o for o in session.added if isinstance(o, CurrentEmployment))
-    assert employment.company_address == "123 Market St, San Francisco, CA"
-    # Round-trips back out through the read schema (the DB would assign the PK on
-    # insert; the fake session doesn't, so stand one in for validation).
-    employment.current_employment_id = 1
     read = CurrentCareerRead.model_validate(employment)
-    assert read.company_address == "123 Market St, San Francisco, CA"
-
-
-def test_update_alumni_persists_company_address(monkeypatch):
-    existing = Alumni(alumni_id=1, first_name="Jane", last_name="Doe", archived=False)
-    _patch_get(monkeypatch, existing)
-    session = FakeSession()
-    payload = AlumniUpdateFull(
-        career=CareerCreate(company_address="500 Boylston St, Boston, MA")
-    )
-    asyncio.run(service.update_alumni(session, 1, payload))
-    # No existing employment row (fake scalar returns None), so the upsert inserts
-    # one carrying the address.
-    employment = next(o for o in session.added if isinstance(o, CurrentEmployment))
-    assert employment.company_address == "500 Boylston St, Boston, MA"
-    assert existing.manually_edited_at is not None
+    assert not hasattr(read, "company_address")
+    assert "company_address" not in read.model_dump()
 
 
 # --- engagement boolean toggle-off persists (all-explicit section) -----------

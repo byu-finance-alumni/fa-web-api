@@ -42,8 +42,17 @@ def _row_values(**overrides) -> list[str]:
         "current_industry": "Current industry (see Reference sheet)",
         "current_industry_secondary": "Secondary industry (see Reference sheet)",
         "linkedin_url": "LinkedIn URL",
-        "city": "Current city",
-        "state": "Current state",
+        "address_line_1": "Address line 1",
+        "address_line_2": "Address line 2",
+        # The sheet's location block is the EMPLOYER's address (#287): these
+        # cells bind to career.current_*, so they are keyed by that name here.
+        "current_city": "Current city",
+        "current_state": "Current state",
+        "current_country": "Current country",
+        "current_zip": "Current ZIP",
+        "region": (
+            "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)"
+        ),
         "deceased": "Deceased? (Yes/No)",
         "mentor_willing": "Willing to mentor (Yes/No)",
         "cfp_designation": "CFP designation (Yes/No)",
@@ -528,14 +537,27 @@ def test_secondary_industry_placeholder_blanked(token):
 @pytest.mark.parametrize("token", ["unknown", "Unknown", "n/a", "N/A", "na"])
 def test_location_placeholder_left_blank(token):
     # A placeholder in an address/location cell is stored blank, not literally.
+    # The work-location cells land on career (#287), so the placeholder-blanking
+    # must follow them there — it is keyed by the payload field name.
     csv = _csv_bytes(
-        _row_values(first_name="Jane", last_name="Doe", city=token, state=token)
+        _row_values(
+            first_name="Jane",
+            last_name="Doe",
+            current_city=token,
+            current_state=token,
+            current_country=token,
+            current_zip=token,
+            address_line_1=token,
+        )
     )
     rows, _ = import_csv.parse_and_map(csv)
     assert rows[0]["error"] is None
-    contact = rows[0]["payload"].get("contact", {})
-    assert "city" not in contact
-    assert "state" not in contact
+    career = rows[0]["payload"].get("career", {})
+    assert "current_city" not in career
+    assert "current_state" not in career
+    assert "current_country" not in career
+    assert "current_zip" not in career
+    assert "address_line_1" not in rows[0]["payload"].get("contact", {})
 
 
 @pytest.mark.parametrize("token", ["unknown", "Unknown", "n/a", "N/A", "na"])
@@ -562,27 +584,132 @@ def test_real_linkedin_still_kept():
 
 def test_real_city_still_kept():
     csv = _csv_bytes(
-        _row_values(first_name="Jane", last_name="Doe", city="Provo", state="UT")
+        _row_values(first_name="Jane", last_name="Doe", current_city="Provo",
+                    current_state="UT")
     )
     rows, _ = import_csv.parse_and_map(csv)
-    assert rows[0]["payload"]["contact"]["city"] == "Provo"
+    assert rows[0]["payload"]["career"]["current_city"] == "Provo"
     # parse_and_map only maps raw cells; hygiene cleaning (which expands "UT" ->
     # "Utah") runs in the later preview/write stage, so the raw value is kept.
-    assert rows[0]["payload"]["contact"]["state"] == "UT"
+    assert rows[0]["payload"]["career"]["current_state"] == "UT"
 
 
-def test_current_location_mirrors_onto_career():
-    """The sheet's single "Current city/state/country/ZIP" location block maps to
-    the contact record (drives the map) AND is mirrored onto the career section so
-    the current_employment location columns are sourced from the sheet too."""
-    csv = _csv_bytes(_row_values(first_name="Jane", last_name="Doe", city="Provo", state="UT"))
+# --- The location block is the EMPLOYER's address (#287) ----------------------
+
+
+def test_work_location_binds_to_the_employment_record():
+    """The sheet's "Current city/state/ZIP/country" block is the EMPLOYER's
+    address (it sits immediately after the employment columns and Tanya fills in
+    where the alum WORKS), so it binds to current_employment — not to the
+    residence row, which nothing in this system populates."""
+    csv = _csv_bytes(
+        _row_values(
+            first_name="Jane",
+            last_name="Doe",
+            current_city="Provo",
+            current_state="UT",
+            current_country="USA",
+            current_zip="84604",
+        )
+    )
     rows, _ = import_csv.parse_and_map(csv)
     payload = rows[0]["payload"]
-    assert payload["contact"]["city"] == "Provo"
-    assert payload["contact"]["state"] == "UT"
-    # Mirrored onto current_employment (career) with the same raw values.
+
     assert payload["career"]["current_city"] == "Provo"
     assert payload["career"]["current_state"] == "UT"
+    assert payload["career"]["current_country"] == "USA"
+    assert payload["career"]["current_zip"] == "84604"
+
+    # And NOT onto the residence record.
+    contact = payload.get("contact", {})
+    for residence_field in ("city", "state", "country", "zip"):
+        assert residence_field not in contact
+
+
+def test_no_contact_to_career_mirror_runs():
+    """The old contact->career location mirror is gone (#287). With the columns
+    bound straight to career.*, a blank work location must stay honestly blank
+    rather than being back-filled from the residence row."""
+    csv = _csv_bytes(_row_values(first_name="Jane", last_name="Doe"))
+    rows, _ = import_csv.parse_and_map(csv)
+    payload = rows[0]["payload"]
+    # No location cells filled -> no career location keys invented.
+    career = payload.get("career", {})
+    for field in ("current_city", "current_state", "current_country", "current_zip"):
+        assert field not in career
+
+
+def test_address_lines_still_bind_to_contact():
+    """Address line 1/2 are the one column pair whose destination is still being
+    decided (#287), so they stay on the contact record exactly as before. This
+    test is the tripwire: it must be a deliberate decision to move them."""
+    csv = _csv_bytes(
+        _row_values(
+            first_name="Jane",
+            last_name="Doe",
+            address_line_1="200 West St",
+            address_line_2="Floor 4",
+        )
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    contact = rows[0]["payload"]["contact"]
+    assert contact["address_line_1"] == "200 West St"
+    assert contact["address_line_2"] == "Floor 4"
+    assert "address_line_1" not in rows[0]["payload"].get("career", {})
+
+
+def test_region_still_binds_to_contact():
+    """Region is not an address — it's a US bucket derived from the work state
+    (#283) that physically lives on the contact row. The rebind must not move
+    it."""
+    csv = _csv_bytes(
+        _row_values(first_name="Jane", last_name="Doe", region="West")
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert rows[0]["payload"]["contact"]["region"] == "West"
+    assert "region" not in rows[0]["payload"].get("career", {})
+
+
+def test_home_country_untouched_by_the_rebind():
+    """"Home country" is the country of ORIGIN (about the alum), not part of the
+    employer address block — it stays on the core record."""
+    values = {h: "" for h in HEADERS}
+    values["First name"] = "Jane"
+    values["Last Name"] = "Doe"
+    values["Home country"] = "Brazil"
+    values["Current country"] = "USA"
+    rows, _ = import_csv.parse_and_map(_csv_bytes([values[h] for h in HEADERS]))
+    payload = rows[0]["payload"]
+    assert payload["home_country"] == "Brazil"
+    # The work country is a separate, unrelated value on the employment record.
+    assert payload["career"]["current_country"] == "USA"
+
+
+def test_old_region_caption_still_imports_after_rebind():
+    """A sheet Tanya downloaded before the Mountain West rename must keep working
+    — the rebind changed bindings, not captions, so the legacy alias still
+    canonicalizes and the moved columns still land on career."""
+    legacy_headers = [
+        "Region (Northeast, Southeast, Midwest, Southwest, and West)"
+        if h.startswith("Region (")
+        else h
+        for h in HEADERS
+    ]
+    values = {h: "" for h in HEADERS}
+    values["First name"] = "Jane"
+    values["Last Name"] = "Doe"
+    values["Current city"] = "Provo"
+    values["Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)"] = "West"
+    row = [values[h] for h in HEADERS]
+
+    rows, errors = import_csv.parse_and_map(
+        _csv_bytes(row, headers=legacy_headers)
+    )
+
+    assert errors == []
+    payload = rows[0]["payload"]
+    assert payload["contact"]["region"] == "West"
+    assert payload["career"]["current_city"] == "Provo"
 
 
 def test_bad_date_rejected():

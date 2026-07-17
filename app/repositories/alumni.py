@@ -398,13 +398,14 @@ def build_alumni_query(
         )
     if location_filter is not None:
         # Proximity search (#358): the geo module built the (city, state) match
-        # predicate; correlate it to THIS alumnus via a contact-info EXISTS,
-        # mirroring the ``city`` / ``state`` facets below. An empty-key predicate
-        # matches nothing, so a resolved-but-empty location never widens results.
+        # predicate over the alumnus's WORK location (#287); correlate it to THIS
+        # alumnus via a current-employment EXISTS, mirroring the ``city`` /
+        # ``state`` facets below. An empty-key predicate matches nothing, so a
+        # resolved-but-empty location never widens results.
         conditions.append(
-            select(AlumniContactInfo.contact_info_id)
+            select(CurrentEmployment.current_employment_id)
             .where(
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
                 location_filter,
             )
             .exists()
@@ -464,23 +465,26 @@ def build_alumni_query(
             )
             .exists()
         )
+    # City / state are the alumnus's WORK location (current_employment) — the
+    # employer's address is the only address this system holds, and it is what
+    # the geography map plots and the List's City/State columns show (#287).
     cities = _as_values(city)
     if cities:
         conditions.append(
-            select(AlumniContactInfo.contact_info_id)
+            select(CurrentEmployment.current_employment_id)
             .where(
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
-                _ilike_any(AlumniContactInfo.city, cities),
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                _ilike_any(CurrentEmployment.current_city, cities),
             )
             .exists()
         )
     states = _as_values(state)
     if states:
         conditions.append(
-            select(AlumniContactInfo.contact_info_id)
+            select(CurrentEmployment.current_employment_id)
             .where(
-                AlumniContactInfo.alumni_id == Alumni.alumni_id,
-                _ilike_any(AlumniContactInfo.state, states),
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                _ilike_any(CurrentEmployment.current_state, states),
             )
             .exists()
         )
@@ -768,18 +772,20 @@ async def list_page(
         .limit(1)
         .scalar_subquery()
     )
-    # Location for the list's City/State columns. Sourced from the contact-info
-    # row (NOT current_employment.current_city/state) so the list matches the
-    # geography map, which shades exclusively off alumni_contact_info.
+    # Location for the list's City/State columns: the alumnus's WORK city/state
+    # (current_employment.current_city/current_state). The employer's address is
+    # the only address this system holds — there is no residence data — and this
+    # is the same column the geography map shades off, so the list and the map
+    # agree (#287).
     current_city = (
-        select(AlumniContactInfo.city)
-        .where(AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        select(CurrentEmployment.current_city)
+        .where(CurrentEmployment.alumni_id == Alumni.alumni_id)
         .limit(1)
         .scalar_subquery()
     )
     current_state = (
-        select(AlumniContactInfo.state)
-        .where(AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        select(CurrentEmployment.current_state)
+        .where(CurrentEmployment.alumni_id == Alumni.alumni_id)
         .limit(1)
         .scalar_subquery()
     )

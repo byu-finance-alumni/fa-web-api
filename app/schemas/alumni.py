@@ -131,7 +131,27 @@ class AlumniBase(BaseModel):
         default=None, max_length=_OTHER_DESIGNATIONS_MAX
     )
     survey_completed_date: datetime.date | None = None
-    profile_updated_date: datetime.date | None = None
+    # Schema-LEGAL but client-READ-ONLY, and that split is deliberate (#285).
+    #
+    # Do NOT delete this field to "stop the API advertising it". This schema does
+    # double duty: it is the client write contract AND the CSV importer's DTO.
+    # The importer maps the intake sheet's "Profile Updated Date" cell into a core
+    # payload key and builds THIS model server-side (services/import_csv.py — see
+    # _COLUMN_MAP and ``AlumniCreateFull(**row["payload"])``). Because AlumniBase
+    # sets ``extra='forbid'``, removing the field turns every intake row carrying
+    # that column into a validation_error blocker — i.e. it breaks the import, it
+    # does not merely tighten the contract. The date is provenance we keep: it is
+    # what the spreadsheet CLAIMED, distinct from our own updated_at.
+    #
+    # Over HTTP the field genuinely is read-only: the route strips it from client
+    # writes (routes/alumni.py::_drop_manual_updated_date), so ``readOnly`` here is
+    # an accurate description of the HTTP contract, not a fudge. The importer is
+    # not an HTTP client of this schema, so it is unaffected by the annotation.
+    # Accept-and-drop (rather than 422) is also what keeps backend-first deploys
+    # safe: an older frontend still sending this field must not start erroring.
+    profile_updated_date: datetime.date | None = Field(
+        default=None, json_schema_extra={"readOnly": True}
+    )
     # Free-text "updated by" NAME from the intake sheet (as typed). DISTINCT from
     # the profile_updated_by_user_id FK (set by the service, never the client).
     profile_updated_by: str | None = Field(

@@ -4,6 +4,14 @@ Owns the rules that aren't just data access:
   * soft-delete — ``archived`` is flipped, rows are never hard-deleted
   * manual-edit provenance — any client edit stamps ``manually_edited_at`` so
     later imports won't clobber it (manual edits win)
+  * last-updated provenance (#285) — any write that actually changes something
+    stamps ``profile_updated_by_user_id`` with the acting user, so the profile
+    can render "Last updated <updated_at> by <name>" off ONE trustworthy pair:
+    ``updated_at`` (bumped by ``TimestampMixin.onupdate``) + this FK. The
+    hand-typed ``profile_updated_date`` / ``profile_updated_by`` columns are
+    intake-sheet provenance only and are no longer part of the client write path
+    (stripped at the route boundary; the CSV importer still records what the
+    spreadsheet claimed).
 """
 
 import contextlib
@@ -341,6 +349,14 @@ async def create_alumni(
     # Alumni row (they map to related tables, not the alumni table).
     core = {k: v for k, v in cleaned.items() if k not in SECTION_KEYS}
     await _validate_spouse_link(session, core.get("spouse_alumni_id"))
+    # Last-updated provenance (#285): stamp the creator as the updater so a brand
+    # new record reads "Last updated <created> by <name>" instead of falling back
+    # to the intake sheet's free-text name. Never set from the client — the FK is
+    # absent from the write schema, so the actor is the only source. Left untouched
+    # when the actor is unknown (direct service callers / tests) rather than
+    # writing NULL over a resolved user.
+    if actor_user_id is not None:
+        core["profile_updated_by_user_id"] = actor_user_id
     alumnus = Alumni(**core)
     session.add(alumnus)
     # Need the generated alumni_id to attach the related rows; flush gets it
@@ -406,6 +422,56 @@ async def create_alumni(
     return alumnus
 
 
+def _as_datetime(value: object) -> datetime.datetime | None:
+    """A ``date``/``datetime`` as an aware UTC ``datetime``, else ``None``.
+
+    Naive datetimes are read as UTC and a bare ``date`` as its UTC midnight, so
+    the two never compare unequal purely because of their type. ``bool`` is
+    checked first: it is an ``int``, not a date, but being explicit keeps the
+    intent obvious.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, datetime.datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=datetime.UTC)
+    if isinstance(value, datetime.date):
+        return datetime.datetime(
+            value.year, value.month, value.day, tzinfo=datetime.UTC
+        )
+    return None
+
+
+def _is_blank(value: object) -> bool:
+    """True for the values that all mean "nothing here": ``None`` and whitespace.
+
+    Legacy rows (pre-hygiene imports) can hold ``""`` where a cleaned payload now
+    sends ``None``. Both render as an empty field, so calling that a change would
+    bump "last updated" on a save the user can see changed nothing.
+    """
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _unchanged(old: object, new: object) -> bool:
+    """True when writing *new* over *old* would not actually change anything.
+
+    A FALSE "changed" here is permanent — the field would re-report as changed on
+    every single save forever — so the comparison is deliberately careful about
+    values that are equal but not identically typed:
+
+      * blank-vs-blank (``None`` / ``""``) is not a change; blank-vs-value is.
+      * ``date`` vs ``datetime``, and naive vs aware, are compared as UTC instants
+        rather than by type (``date(2020,1,1) != datetime(2020,1,1)`` in Python).
+      * numerics need no special case — ``Decimal("1.0") == Decimal("1") == 1``
+        already holds.
+    """
+    if _is_blank(old) or _is_blank(new):
+        return _is_blank(old) and _is_blank(new)
+    old_dt, new_dt = _as_datetime(old), _as_datetime(new)
+    if old_dt is not None and new_dt is not None:
+        return old_dt == new_dt
+    return bool(old == new)
+
+
 async def _upsert_section(
     session: AsyncSession,
     model: type,
@@ -415,21 +481,40 @@ async def _upsert_section(
     order_by=None,
 ) -> bool:
     """Update the existing related row for *alumni_id* (or insert one) from
-    *values*. Returns True if a row was written (always, when called).
+    *values*. Returns True only when something ACTUALLY changed.
 
     The matching read query mirrors ``profile.get_profile`` so we update the
-    same row the profile/edit page shows. Only called when the section carries
-    at least one non-empty value (the caller checks ``has_values``).
+    same row the profile/edit page shows.
+
+    The return value gates ``manually_edited_at`` / ``profile_updated_by_user_id``
+    / ``updated_at`` in ``update_alumni``, so it must answer "did this write
+    change the record?", not "was this section submitted?" (#285). Opening Edit ->
+    Employment and saving without touching a field submits a full, populated
+    section; reporting that as written would stamp the profile "updated today by
+    <whoever opened it>" and make the very date this card exists to fix
+    untrustworthy. Fields that match what is stored are left alone entirely, so a
+    no-op save doesn't even dirty the session.
+
+    Callers gate on ``has_values`` (plus the derived-region merge for contact), so
+    *values* always carries something; a row that doesn't exist yet is still only
+    inserted when the incoming values are more than blanks/False, matching
+    ``has_values``' rule that an all-blank section is nothing to write.
     """
     stmt = select(model).where(model.alumni_id == alumni_id)
     if order_by is not None:
         stmt = stmt.order_by(order_by)
     existing = await session.scalar(stmt.limit(1))
     if existing is not None:
+        changed = False
         for field, value in values.items():
+            if _unchanged(getattr(existing, field, None), value):
+                continue
             setattr(existing, field, value)
-    else:
-        session.add(model(alumni_id=alumni_id, **values))
+            changed = True
+        return changed
+    if all(_is_blank(v) or v is False for v in values.values()):
+        return False
+    session.add(model(alumni_id=alumni_id, **values))
     return True
 
 
@@ -443,11 +528,23 @@ async def update_alumni(
     # record is "removed from the directory", so it must be restored (via
     # POST /alumni/{id}/restore) before it can be edited, not silently mutated.
     alumnus = await get_alumni(session, alumni_id, include_archived=False)
+    # Region auto-fill (#283) only fires when the work state actually CHANGED, so
+    # the cleaner needs the state currently on the record. Read it only when the
+    # payload carries a work state at all — otherwise nothing can derive and the
+    # query would be wasted. `stored_work_state` is the same read `/preview` uses,
+    # so the preview and this write always agree on whether the state moved.
+    stored_state = (
+        await hygiene.stored_work_state(session, alumni_id)
+        if hygiene.work_state_supplied(payload)
+        else None
+    )
     # Data-hygiene pass: clean the provided fields (write the CLEANED values) and
     # block exact duplicates against everyone *except* this record. Fuzzy
     # warnings never block. jsonable=False keeps dates as date objects for the
     # ORM. Cleaning is idempotent, so a re-save of already-clean data is a no-op.
-    cleaned, _changes = hygiene.clean_alumni_payload(payload, jsonable=False)
+    cleaned, _changes = hygiene.clean_alumni_payload(
+        payload, jsonable=False, stored_state=stored_state
+    )
     blockers, _warnings = await hygiene.detect_duplicates(
         session, cleaned, exclude_alumni_id=alumni_id
     )
@@ -482,12 +579,34 @@ async def update_alumni(
     education = getattr(payload, "education", None)
     engagement = getattr(payload, "engagement", None)
     section_written = False
-    if contact is not None and contact.has_values():
+    contact_values = (
+        hygiene.clean_section("contact", contact.model_dump(exclude_unset=True))
+        if contact is not None and contact.has_values()
+        else {}
+    )
+    # Region auto-fill (#283) has to be merged in HERE, not left to the sections
+    # above: `hygiene.clean_alumni_payload` derives the region (only when the work
+    # state actually CHANGED — see `derive_region`) into `cleaned["contact"]
+    # ["region"]`, but the section write is driven by the raw payload — so an
+    # EMPLOYMENT-ONLY edit (the exact case Tanya reported: change the work state,
+    # touch nothing else) sends no contact section at all and the derived region
+    # would be silently dropped while /preview claimed it was saved.
+    #
+    # Read the value off `cleaned` rather than calling `derive_region` again — it
+    # returns None on a second pass over its own output by design (the region now
+    # looks explicitly supplied), which is what keeps re-cleaning idempotent.
+    # An explicitly-supplied region is already in `contact_values` and wins: in
+    # that case `derive_region` derived nothing and this only re-reads what the
+    # caller sent, so the `not in` guard leaves it untouched either way.
+    derived_region = (cleaned.get("contact") or {}).get("region")
+    if derived_region is not None and "region" not in contact_values:
+        contact_values["region"] = derived_region
+    if contact_values:
         section_written |= await _upsert_section(
             session,
             AlumniContactInfo,
             alumni_id,
-            hygiene.clean_section("contact", contact.model_dump(exclude_unset=True)),
+            contact_values,
             order_by=AlumniContactInfo.contact_info_id,
         )
     if career is not None and career.has_values():
@@ -523,6 +642,14 @@ async def update_alumni(
         # Any manual edit (core or section) stamps provenance so later imports
         # won't clobber it.
         alumnus.manually_edited_at = _now()
+        # Last-updated provenance (#285): record WHO made this edit. Gated on the
+        # same `applied or section_written` condition as manually_edited_at, so a
+        # no-op save never re-attributes the profile. Touching the Alumni row here
+        # also guarantees TimestampMixin.onupdate bumps `updated_at` even for a
+        # section-only edit (career/contact/...), keeping the profile's
+        # "Last updated" honest for the employment edits that prompted this card.
+        if actor_user_id is not None:
+            alumnus.profile_updated_by_user_id = actor_user_id
         for field, (old, new) in applied.items():
             _audit(
                 session,

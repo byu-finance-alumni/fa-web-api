@@ -142,7 +142,7 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     # "Current city/state/ZIP/country" headers bind to contact.*, NOT career.
     "Current city": ("contact", "city", "str"),
     "Current state": ("contact", "state", "str"),
-    "Region (Northeast, Southeast, Midwest, Southwest, and West)": (
+    "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)": (
         "contact",
         "region",
         "str",
@@ -230,6 +230,34 @@ FRIEND_EXAMPLE_ROW: list[str] = [example for _, example in _FRIEND_COLUMNS]
 _FRIEND_MAPPING: dict[str, tuple[str, str, str]] = {
     header: _MAPPING[header] for header in FRIEND_EXPECTED_HEADERS
 }
+
+
+# --- Legacy header aliases ---------------------------------------------------
+#
+# Header validation is exact-match both ways, so RENAMING a template column would
+# hard-reject every sheet already filled in under the old name (the old header
+# reads as "Unexpected column", the new one as "Missing required column"). Staff
+# work off copies of the template that were downloaded months ago, so a rename
+# must not invalidate work already in progress.
+#
+# Each retired header therefore maps to its current name and is canonicalized on
+# read, BEFORE validation and mapping. This is deliberately a rename-only table:
+# both spellings mean the identical field, so there is no parallel mapping to
+# drift and _MAPPING stays keyed solely by the current template headers.
+#
+#   "Region (…, and West)" -> "Region (…, West, and Mountain West)"
+#       The Region header enumerates the valid regions, so adding the 6th region
+#       (Mountain West, 2026-07-16) forced the header text to change.
+_LEGACY_HEADER_ALIASES: dict[str, str] = {
+    "Region (Northeast, Southeast, Midwest, Southwest, and West)": (
+        "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)"
+    ),
+}
+
+
+def _canonicalize_header(header: str) -> str:
+    """Map a retired header spelling to its current one (others pass through)."""
+    return _LEGACY_HEADER_ALIASES.get(header, header)
 
 
 def _expected_headers(friend: bool) -> list[str]:
@@ -348,6 +376,86 @@ _PLACEHOLDER_BLANK_FIELDS = frozenset(
 )
 
 
+# --- "Best Contact" reconciliation (#284) ------------------------------------
+#
+# The intake sheet's "Best Contact" column is FREE TEXT holding a literal VALUE
+# (an email or a phone number), while ``preferred_contact_method`` names a
+# validated METHOD (personal_email / work_email / phone / linkedin). Left alone
+# the two drift apart and contradict each other.
+#
+# On import we resolve the free text against the row's other contact fields:
+#   * matches personal_email -> preferred_contact_method = "personal_email"
+#   * matches work_email     -> preferred_contact_method = "work_email"
+#   * matches phone          -> preferred_contact_method = "phone"
+#   * matches nothing        -> the free text is KEPT in best_contact (it's an
+#     address/number we don't otherwise have) and surfaced as a review warning.
+#
+# Where it resolves, best_contact is CLEARED — the method now carries the intent
+# and the value already lives in the field it points at, so the two cannot drift.
+# An explicit preferred_contact_method (in update mode: one already stored on the
+# record) always wins; reconciliation never overwrites it, and in that case the
+# free text is left in place rather than silently dropped.
+
+_PREFERRED_METHOD_ORDER = ("personal_email", "work_email", "phone")
+
+
+def _phone_key(value: str) -> str:
+    """Comparable form of a phone number: digits only.
+
+    Strips punctuation/spacing so ``555-123-4567``, ``(555) 123 4567`` and
+    ``5551234567`` all compare equal. A leading NANP country code is dropped so
+    ``+1 555-123-4567`` matches the same number stored without it. Anything with
+    no digits at all (i.e. not a phone) returns "" and never matches.
+    """
+    digits = re.sub(r"\D", "", value)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits
+
+
+def _match_best_contact(contact: dict) -> str | None:
+    """Which contact METHOD the free-text ``best_contact`` value names, if any.
+
+    Emails compare case-insensitively after trimming; phones compare on their
+    digits (see :func:`_phone_key`). Returns the ``preferred_contact_method``
+    token, or None when the value matches none of the row's contact fields.
+    """
+    raw = contact.get("best_contact")
+    value = str(raw).strip() if raw else ""
+    if not value:
+        return None
+
+    for field in ("personal_email", "work_email"):
+        stored = contact.get(field)
+        if stored and str(stored).strip().lower() == value.lower():
+            return field
+
+    key = _phone_key(value)
+    stored_phone = contact.get("phone")
+    if key and stored_phone and _phone_key(str(stored_phone)) == key:
+        return "phone"
+    return None
+
+
+def _reconcile_best_contact(contact: dict) -> str | None:
+    """Resolve ``best_contact`` into ``preferred_contact_method`` in place.
+
+    Mutates *contact*: on a clean match it sets ``preferred_contact_method`` and
+    REMOVES ``best_contact`` (so the two fields can't contradict each other).
+    Returns the method it resolved to, or None if it left the row untouched
+    (no ``best_contact``, no match, or an explicit method already set — the
+    explicit value always wins).
+    """
+    if contact.get("preferred_contact_method"):
+        return None  # explicit wins; leave the free text alone for review
+    method = _match_best_contact(contact)
+    if method is None:
+        return None
+    contact["preferred_contact_method"] = method
+    contact.pop("best_contact", None)
+    return method
+
+
 def _coerce_industry(header: str, raw: str) -> str:
     if raw.strip().lower() in _PLACEHOLDER_TOKENS:
         return "Other"
@@ -394,11 +502,14 @@ def parse_and_map(
         (as a single header-style error) and ``rows`` is empty.
       * ``rows`` — one dict per data row, each:
             ``{"row": int, "name": str, "payload": dict,
-               "spouse_byu_id": str|None, "error": str|None}``
+               "spouse_byu_id": str|None, "best_contact_raw": str|None,
+               "error": str|None}``
         ``row`` is the 1-based spreadsheet row number (header = row 1, so the
         first data row is row 2). ``payload`` is shaped for AlumniCreateFull
         (core fields at top level, sections nested) using only non-empty cells.
         ``spouse_byu_id`` is the raw spouse BYU ID to resolve later (or None).
+        ``best_contact_raw`` is the "Best Contact" cell BEFORE reconciliation
+        (#284), which update mode needs to re-resolve against stored values.
         ``error`` is set when a cell failed to coerce (bad date / number /
         industry), which marks the row rejected without building the model.
 
@@ -426,7 +537,10 @@ def parse_and_map(
     except StopIteration:
         return [], ["The file is empty."]
 
-    headers = [h.strip() for h in header_row]
+    # Retired header spellings are folded to their current names here, so every
+    # downstream step (validation, duplicate detection, _map_row) sees one
+    # canonical header set and a sheet on the old template still imports.
+    headers = [_canonicalize_header(h.strip()) for h in header_row]
     header_errors = _validate_headers(headers, expected)
     if header_errors:
         # Columns are wrong; don't attempt to map rows against a bad header.
@@ -552,6 +666,17 @@ def _map_row(
             if value is not None and value != "":
                 sections.setdefault("career", {}).setdefault(career_field, value)
 
+    # Resolve the free-text "Best Contact" cell against this row's own contact
+    # fields (#284). Kept raw below for update mode, which must re-reconcile
+    # against the STORED values (a blank email/phone cell there means
+    # "unchanged", not "absent").
+    contact_section = sections.get("contact")
+    best_contact_raw = (
+        contact_section.get("best_contact") if contact_section else None
+    )
+    if contact_section:
+        _reconcile_best_contact(contact_section)
+
     payload = dict(core)
     payload.update(sections)
     return {
@@ -559,6 +684,7 @@ def _map_row(
         "name": _display_name(core),
         "payload": payload,
         "spouse_byu_id": spouse_byu_id,
+        "best_contact_raw": best_contact_raw,
         "error": error,
     }
 
@@ -952,6 +1078,23 @@ def _evaluate_row(
                 }
             )
 
+    # A "Best Contact" value still sitting in the free-text field after
+    # reconciliation matched none of this row's contact fields (#284) — it's a
+    # new address/number, so surface it for review rather than dropping it.
+    unresolved = (cleaned.get("contact") or {}).get("best_contact")
+    if unresolved:
+        warnings.append(
+            {
+                "code": "best_contact_unresolved",
+                "message": (
+                    f"Best Contact {unresolved!r} doesn't match this row's "
+                    "personal email, work email, or phone. It was kept as free "
+                    "text — review whether it's a new contact detail."
+                ),
+                "alumni_id": None,
+            }
+        )
+
     # Recommended (soft) completeness warnings over the cleaned record.
     warnings.extend(hygiene.recommended_warnings(cleaned))
 
@@ -1262,6 +1405,49 @@ async def _current_section_row(session: AsyncSession, section: str, alumni_id: i
     return await session.scalar(stmt.limit(1))
 
 
+async def _reconcile_update_contact(
+    session: AsyncSession, alumni_id: int, row: dict, payload: dict
+) -> None:
+    """Re-run "Best Contact" reconciliation for UPDATE mode (#284), in place.
+
+    Update mode reconciles against the MERGED view, not just the cells present in
+    this row: a blank Personal Email / Work Email / Phone cell means "unchanged",
+    so the free text must still resolve against the value already STORED on the
+    record. A ``preferred_contact_method`` already on the record is an explicit
+    choice and always wins — reconciliation never overwrites it.
+
+    ``payload["contact"]`` is mutated to the reconciled result: on a match the
+    method is set and ``best_contact`` becomes None (CLEARING the stored free
+    text so the two fields can't drift); with no match the free text is restored.
+    """
+    contact = payload.get("contact")
+    if not contact:
+        return
+    current_row = await _current_section_row(session, "contact", alumni_id)
+
+    def _current(field: str):
+        return getattr(current_row, field, None) if current_row is not None else None
+
+    # The merged view: this row's cell if the user filled it in, else the stored
+    # value. Seeded with the STORED method so an explicit one wins below.
+    view = {
+        field: contact.get(field) or _current(field)
+        for field in _PREFERRED_METHOD_ORDER
+    }
+    view["best_contact"] = row.get("best_contact_raw")
+    view["preferred_contact_method"] = _current("preferred_contact_method")
+
+    _reconcile_best_contact(view)
+
+    # None here CLEARS the stored free text — that's the point of a clean resolve.
+    contact["best_contact"] = view.get("best_contact")
+    method = view.get("preferred_contact_method")
+    if method is None:
+        contact.pop("preferred_contact_method", None)
+    else:
+        contact["preferred_contact_method"] = method
+
+
 async def _diff_against_current(
     session: AsyncSession, alumnus: Alumni, cleaned: dict
 ) -> list[dict]:
@@ -1343,6 +1529,10 @@ async def _evaluate_update_row(
     # jsonable=False keeps dates as date objects so they compare equal to the ORM
     # values; _to_jsonable serializes them for the report.
     cleaned, _changes = hygiene.clean_alumni_payload(model, jsonable=False)
+    # Re-reconcile Best Contact against the STORED values (#284) so the preview
+    # diff shows exactly what commit_update will apply.
+    if row.get("best_contact_raw"):
+        await _reconcile_update_contact(session, alumni_id, row, cleaned)
     changes = await _diff_against_current(session, alumnus, cleaned)
     base["changes"] = changes
     base["status"] = "update" if changes else "no_changes"
@@ -1399,6 +1589,12 @@ async def _build_update_model(
     the current values back in is what keeps a blank cell from clearing an
     existing value."""
     partial = _update_payload_from_row(row)
+    # Best Contact resolves against the STORED contact values here (#284), not
+    # just this row's cells — same call the preview makes, so both agree. Copy
+    # the section first: the parsed row is re-read on retry/re-evaluation.
+    if row.get("best_contact_raw") and partial.get("contact"):
+        partial["contact"] = dict(partial["contact"])
+        await _reconcile_update_contact(session, alumni_id, row, partial)
     for section, schema in _UPDATE_SECTION_SCHEMAS.items():
         provided = partial.get(section)
         if not provided:

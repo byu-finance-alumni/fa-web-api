@@ -226,6 +226,89 @@ def test_duplicate_header_rejected():
     assert any("Duplicate column" in e for e in errors)
 
 
+# --- Legacy header aliases ---------------------------------------------------
+#
+# Renaming a template column must not invalidate sheets staff already filled in
+# under the old name. The Region header enumerates the regions, so adding
+# "Mountain West" (2026-07-16) renamed it — both spellings must import.
+
+_OLD_REGION_HEADER = "Region (Northeast, Southeast, Midwest, Southwest, and West)"
+_NEW_REGION_HEADER = (
+    "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)"
+)
+
+
+def _headers_with_old_region() -> list[str]:
+    return [
+        _OLD_REGION_HEADER if h == _NEW_REGION_HEADER else h
+        for h in import_csv.EXPECTED_HEADERS
+    ]
+
+
+def test_current_region_header_imports():
+    row = _row_values(first_name="Jane", last_name="Doe")
+    row[HEADERS.index(_NEW_REGION_HEADER)] = "Mountain West"
+    rows, errors = import_csv.parse_and_map(_csv_bytes(row))
+    assert errors == []
+    assert rows[0]["payload"]["contact"]["region"] == "Mountain West"
+
+
+def test_legacy_region_header_still_imports():
+    # A sheet downloaded before the rename: same column, old caption. It must
+    # import — not fail as "Missing required column" + "Unexpected column".
+    headers = _headers_with_old_region()
+    row = _row_values(first_name="Jane", last_name="Doe")
+    row[headers.index(_OLD_REGION_HEADER)] = "West"
+    rows, errors = import_csv.parse_and_map(_csv_bytes(row, headers=headers))
+    assert errors == []
+    assert rows[0]["payload"]["contact"]["region"] == "West"
+
+
+def test_legacy_region_header_maps_to_the_same_field_as_the_current_one():
+    row = _row_values(first_name="Jane", last_name="Doe")
+    old_headers = _headers_with_old_region()
+    old_row = list(row)
+    old_row[old_headers.index(_OLD_REGION_HEADER)] = "Southeast"
+    new_row = list(row)
+    new_row[HEADERS.index(_NEW_REGION_HEADER)] = "Southeast"
+
+    from_old, _ = import_csv.parse_and_map(_csv_bytes(old_row, headers=old_headers))
+    from_new, _ = import_csv.parse_and_map(_csv_bytes(new_row))
+    assert from_old[0]["payload"] == from_new[0]["payload"]
+
+
+def test_both_region_headers_in_one_sheet_is_a_duplicate_column():
+    # They are the same column under two captions, so accepting both would
+    # silently last-wins one of them.
+    headers = import_csv.EXPECTED_HEADERS + [_OLD_REGION_HEADER]
+    rows, errors = import_csv.parse_and_map(
+        _csv_bytes(["x"] * len(headers), headers=headers)
+    )
+    assert rows == []
+    assert any("Duplicate column" in e for e in errors)
+
+
+def test_aliases_are_renames_only_and_never_widen_the_template():
+    # The alias table maps retired spellings ONTO current headers; a typo'd
+    # target would make a real column unreachable, and the template itself must
+    # keep exactly one caption per column.
+    assert set(import_csv._LEGACY_HEADER_ALIASES.values()) <= set(
+        import_csv.EXPECTED_HEADERS
+    )
+    assert not set(import_csv._LEGACY_HEADER_ALIASES) & set(
+        import_csv.EXPECTED_HEADERS
+    )
+    # Retired captions are NOT mapping keys — the importer stays keyed solely by
+    # the current template headers (see test_expected_headers_are_the_finalized_set).
+    assert not set(import_csv._LEGACY_HEADER_ALIASES) & set(import_csv._MAPPING)
+
+
+def test_template_download_serves_only_the_current_region_header():
+    csv_text = import_csv.build_template_csv()
+    assert _NEW_REGION_HEADER in csv_text
+    assert _OLD_REGION_HEADER not in csv_text
+
+
 # --- Row-cap + decoding guards -----------------------------------------------
 
 
@@ -724,7 +807,7 @@ FINALIZED_ALUMNI_HEADERS = [
     "Address line 2",
     "Current city",
     "Current state",
-    "Region (Northeast, Southeast, Midwest, Southwest, and West)",
+    "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)",
     "Current country",
     "Current ZIP",
     "Home country",
@@ -758,7 +841,10 @@ def test_expected_headers_are_the_finalized_set_in_order():
     # The intake template's EXPECTED_HEADERS must equal the finalized column set
     # VERBATIM and in order (header validation is exact-match both ways). The set
     # grew from 64 to 66 when the graduate university + graduation-year columns
-    # were added (#269 follow-up) so the graduate program round-trips.
+    # were added (#269 follow-up) so the graduate program round-trips. Adding the
+    # "Mountain West" region RENAMED the Region column's caption without adding a
+    # column, so the count is unchanged — retired captions live in
+    # import_csv._LEGACY_HEADER_ALIASES, never here.
     assert import_csv.EXPECTED_HEADERS == FINALIZED_ALUMNI_HEADERS
     assert len(import_csv.EXPECTED_HEADERS) == 66
     # Every header is a mapping key (and vice-versa).

@@ -15,8 +15,94 @@ path exists. There is no such write path today, so nothing imports this yet.
 from __future__ import annotations
 
 # Industries — current_industry, current_industry_secondary, employment_industry.
-# "Other" is the catch-all and stays last.
+#
+# ORDER IS THE DROPDOWN ORDER and is mirrored by ``vocabulary_terms.sort_order``
+# (category 'industry'), where sort_order == the index below and "Other" is
+# pinned to 99. ``tests/test_industry_vocab.py`` parses the migrations and fails
+# if the two drift — do NOT reorder this tuple without a matching migration.
+#
+# Sorted case-insensitively ("Financial Services" before "FP&A"), with the
+# "Other" catch-all pinned last (#282).
 INDUSTRIES: tuple[str, ...] = (
+    "Asset Management",
+    "Commercial Banking",
+    "Consulting",
+    "Corporate Banking",
+    "Corporate Finance",
+    "Credit Risk",
+    "Equity Research",
+    "Financial Services",
+    "FP&A",
+    "Investment Banking",
+    "Law",
+    "Private Banking",
+    "Private Credit",
+    "Private Equity",
+    "Real Estate",
+    "Sales",
+    "Sales and Trading",
+    "Valuation & Advisory",
+    "Venture Capital",
+    "Wealth Management",
+    "Other",
+)
+
+# Mentor industries — the same list plus Law/Government (multi-select field).
+MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
+
+# --- primary vs secondary industry (#282) ------------------------------------
+# Tanya, 2026-07-16: these four aren't dashboard industries and shouldn't be
+# offered as an alumnus's PRIMARY industry — but they must stay available as a
+# SECONDARY industry, so they are hidden from the primary dropdown rather than
+# deleted from the vocabulary.
+#
+# This is a DROPDOWN-VISIBILITY split only. :func:`validate_industry` still
+# accepts all of :data:`INDUSTRIES` for either field, matching the established
+# soft-delete semantics in ``app/api/routes/vocabulary.py`` ("a value still on
+# existing records stays valid, it just disappears from new-entry dropdowns").
+# Records that keep one of these as their primary — the conflict rows the #282
+# data migration deliberately skips — must stay editable, not 422 on save.
+_PRIMARY_EXCLUDED_INDUSTRIES = frozenset(
+    {"Law", "Corporate Banking", "Sales and Trading", "Credit Risk"}
+)
+_PRIMARY_EXCLUDED_BY_LOWER = frozenset(
+    v.lower() for v in _PRIMARY_EXCLUDED_INDUSTRIES
+)
+
+# Options for the PRIMARY industry dropdown (current_industry).
+PRIMARY_INDUSTRIES: tuple[str, ...] = tuple(
+    i for i in INDUSTRIES if i not in _PRIMARY_EXCLUDED_INDUSTRIES
+)
+# Options for the SECONDARY industry dropdown (current_industry_secondary) —
+# the full vocabulary, including the four hidden from primary.
+SECONDARY_INDUSTRIES: tuple[str, ...] = INDUSTRIES
+
+
+def filter_primary_industries(values: list[str]) -> list[str]:
+    """Drop the primary-excluded industries from *values*, preserving order.
+
+    Applied to the DB-backed ``vocabulary_terms`` payload so the primary
+    dropdown hides them even though they remain live vocabulary terms. Matching
+    is case-insensitive because term casing can drift from admin edits.
+    """
+    return [v for v in values if v.strip().lower() not in _PRIMARY_EXCLUDED_BY_LOWER]
+
+
+# Dashboard wheel: the 15 finance industries Tanya wants shown as their own slice
+# (2026-07-11). Everything else in INDUSTRIES (Law, Corporate Banking, FP&A,
+# Sales and Trading, Credit Risk) plus any non-vocab value folds into "Other".
+# Both the dashboard breakdown AND the alumni-list ``industry_group=other`` filter
+# key off this set so the wheel slice and its drill-down stay in sync.
+_NON_WHEEL_INDUSTRIES = frozenset(
+    {"Law", "Corporate Banking", "FP&A", "Sales and Trading", "Credit Risk", "Other"}
+)
+# The bar ORDER on the dashboard industry breakdown is this tuple's order, so it
+# is PINNED here rather than derived from INDUSTRIES — #282 alphabetized the
+# dropdown and must not silently reshuffle the dashboard. MEMBERSHIP is still
+# asserted to equal ``INDUSTRIES - _NON_WHEEL_INDUSTRIES`` by
+# ``tests/test_industry_vocab.py``, so adding a wheel industry to INDUSTRIES
+# without listing it here fails CI.
+WHEEL_INDUSTRIES: tuple[str, ...] = (
     "Asset Management",
     "Commercial Banking",
     "Consulting",
@@ -32,27 +118,6 @@ INDUSTRIES: tuple[str, ...] = (
     "Venture Capital",
     "Wealth Management",
     "Financial Services",
-    "Law",
-    "Corporate Banking",
-    "FP&A",
-    "Sales and Trading",
-    "Credit Risk",
-    "Other",
-)
-
-# Mentor industries — the same list plus Law/Government (multi-select field).
-MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
-
-# Dashboard wheel: the 14 finance industries Tanya wants shown as their own slice
-# (2026-07-11). Everything else in INDUSTRIES (Law, Corporate Banking, FP&A,
-# Sales and Trading, Credit Risk) plus any non-vocab value folds into "Other".
-# Both the dashboard breakdown AND the alumni-list ``industry_group=other`` filter
-# key off this set so the wheel slice and its drill-down stay in sync.
-_NON_WHEEL_INDUSTRIES = frozenset(
-    {"Law", "Corporate Banking", "FP&A", "Sales and Trading", "Credit Risk", "Other"}
-)
-WHEEL_INDUSTRIES: tuple[str, ...] = tuple(
-    i for i in INDUSTRIES if i not in _NON_WHEEL_INDUSTRIES
 )
 
 _INDUSTRIES_SET = frozenset(INDUSTRIES)

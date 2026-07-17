@@ -18,26 +18,69 @@ consistent.
 ## Industries
 
 Used by:
-- `current_employment.current_industry` (Current Industry)
-- `current_employment.current_industry_secondary` (Current Industry 2)
+- `current_employment.current_industry` (Current Industry — **primary**)
+- `current_employment.current_industry_secondary` (Current Industry 2 — **secondary**)
 - `employment_history.employment_industry` (Former Company Industry)
+
+> **This list is machine-checked.** `tests/test_industry_vocab.py` parses the
+> bullets below and fails CI if they drift from `app/core/dropdowns.py`
+> `INDUSTRIES` or from the `vocabulary_terms` rows seeded by
+> `migrations/*.sql`. Change all three together — order included.
+
+Listed in **dropdown order**: alphabetical, compared case-insensitively (so
+"Financial Services" precedes "FP&A"), with the `Other` catch-all pinned last.
+This order is mirrored by `vocabulary_terms.sort_order` (the tuple index; `Other`
+is pinned at 99 so new options can be appended without a re-sort).
 
 Options:
 - Asset Management
 - Commercial Banking
 - Consulting
+- Corporate Banking *(secondary only)*
 - Corporate Finance
+- Credit Risk *(secondary only)*
 - Equity Research
+- Financial Services
+- FP&A
 - Investment Banking
+- Law *(secondary only)*
 - Private Banking
 - Private Credit
 - Private Equity
 - Real Estate
 - Sales
+- Sales and Trading *(secondary only)*
 - Valuation & Advisory
 - Venture Capital
 - Wealth Management
 - Other
+
+### Primary vs secondary (#282)
+
+Requested by Tanya, 2026-07-16. The four options marked *(secondary only)* are
+**not offered as an alumnus's primary industry** — they aren't dashboard
+industries — but they remain fully valid as a **secondary** industry.
+
+**Do not delete them, and do not "restore" them to the primary dropdown.**
+Primary and secondary render from the same vocabulary, so deleting them would
+remove them from secondary too, which is the opposite of what was asked. The
+split is visibility-only and is applied in three places:
+
+- `app/core/dropdowns.py` — `PRIMARY_INDUSTRIES` / `SECONDARY_INDUSTRIES`.
+- `GET /vocabulary/industry?scope=primary` — the payload the primary dropdown
+  renders from. The default (`scope=all`) still returns the full list.
+- Note `Sales and Trading` is stored with the word "and", **not** "Sales &
+  Trading".
+
+`validate_industry()` still **accepts all of the above for either field.** That
+is deliberate, and matches the soft-delete semantics elsewhere in the vocabulary
+("a value still on existing records stays valid, it just disappears from
+new-entry dropdowns"): the #282 data migration deliberately skips records that
+already had a secondary industry, so some records legitimately keep one of the
+four as their primary and must still save without a 422.
+
+`FP&A` is likewise not a dashboard industry, but Tanya did **not** ask to remove
+it from primary — leave it in primary unless she says otherwise.
 
 ---
 
@@ -45,23 +88,12 @@ Options:
 
 Used by: `alumni_mentor_industries.industry` (multi-select — one row per industry).
 
-Same list as **Industries** above, plus one extra option:
-- Asset Management
-- Commercial Banking
-- Consulting
-- Corporate Finance
-- Equity Research
-- Investment Banking
-- Private Banking
-- Private Credit
-- Private Equity
-- Real Estate
-- Sales
-- Valuation & Advisory
-- Venture Capital
-- Wealth Management
-- Other
+Exactly the **Industries** list above (all of it — the primary/secondary split
+does not apply here), plus one extra option:
 - Law/Government
+
+The list is intentionally not duplicated here; it mirrors `MENTOR_INDUSTRIES`
+in `app/core/dropdowns.py`, which is defined as `(*INDUSTRIES, "Law/Government")`.
 
 ---
 

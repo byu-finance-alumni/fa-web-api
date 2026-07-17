@@ -147,12 +147,17 @@ def test_db_vocab_order_matches_industries_tuple() -> None:
 
 
 def test_db_vocab_sort_order_is_tuple_index_with_other_pinned_last() -> None:
-    """The exact contract the migration encodes: sort_order == tuple index, and
-    the "Other" catch-all is pinned at 99 so new terms can be appended before
-    it without a re-sort."""
+    """The exact contract the migration encodes: sort_order == tuple index for
+    the alphabetical body, and the three pinned tail options are held out of the
+    body order — "Unknown" at 97, "Graduate Student" at 98 and the "Other"
+    catch-all at 99 — so new terms can be appended into the body without
+    disturbing them (#295/#294/#282).
+    """
     terms = _seeded_industry_terms()
     assert terms["Other"] == 99
-    for index, value in enumerate(INDUSTRIES[:-1]):
+    assert terms["Graduate Student"] == 98
+    assert terms["Unknown"] == 97
+    for index, value in enumerate(INDUSTRIES[:-3]):
         assert terms[value] == index, f"{value} sort_order {terms[value]} != {index}"
 
 
@@ -163,8 +168,25 @@ def test_other_is_pinned_last() -> None:
     assert INDUSTRIES[-1] == "Other"
 
 
+def test_graduate_student_is_pinned_second_to_last() -> None:
+    """"Graduate Student" (#294) is held just above "Other", out of the
+    otherwise alphabetical order, so it renders as its own bottom-of-list
+    indicator on the dashboard."""
+    assert INDUSTRIES[-2] == "Graduate Student"
+
+
+def test_unknown_is_pinned_third_to_last() -> None:
+    """"Unknown" (#295) is held just above "Graduate Student" (and thus above
+    "Other"), out of the otherwise alphabetical order. It is a distinct
+    selectable value meaning "we checked and it is genuinely unknown", not a
+    blank/unset ("not yet collected") industry."""
+    assert INDUSTRIES[-3] == "Unknown"
+
+
 def test_industries_are_alphabetical_ignoring_case_other_aside() -> None:
-    body = list(INDUSTRIES[:-1])
+    # Exclude the three pinned tail options ("Unknown", "Graduate Student",
+    # "Other"); the rest of the list is alphabetical case-insensitively.
+    body = list(INDUSTRIES[:-3])
     assert body == sorted(body, key=str.casefold)
 
 

@@ -17,12 +17,15 @@ from __future__ import annotations
 # Industries — current_industry, current_industry_secondary, employment_industry.
 #
 # ORDER IS THE DROPDOWN ORDER and is mirrored by ``vocabulary_terms.sort_order``
-# (category 'industry'), where sort_order == the index below and "Other" is
-# pinned to 99. ``tests/test_industry_vocab.py`` parses the migrations and fails
-# if the two drift — do NOT reorder this tuple without a matching migration.
+# (category 'industry'), where sort_order == the index below EXCEPT for the three
+# pinned tail options: "Unknown" (97), "Graduate Student" (98) and "Other" (99),
+# which are held at the bottom out of alphabetical order.
+# ``tests/test_industry_vocab.py`` parses the migrations and fails if the two
+# sources drift — do NOT reorder this tuple without a matching migration.
 #
 # Sorted case-insensitively ("Financial Services" before "FP&A"), with the
-# "Other" catch-all pinned last (#282).
+# "Unknown" value, the "Graduate Student" indicator and the "Other" catch-all
+# pinned last, in that order (#295 / #294 / #282).
 INDUSTRIES: tuple[str, ...] = (
     "Asset Management",
     "Commercial Banking",
@@ -44,6 +47,8 @@ INDUSTRIES: tuple[str, ...] = (
     "Valuation & Advisory",
     "Venture Capital",
     "Wealth Management",
+    "Unknown",
+    "Graduate Student",
     "Other",
 )
 
@@ -90,11 +95,30 @@ def filter_primary_industries(values: list[str]) -> list[str]:
 
 # Dashboard wheel: the 15 finance industries Tanya wants shown as their own slice
 # (2026-07-11). Everything else in INDUSTRIES (Law, Corporate Banking, FP&A,
-# Sales and Trading, Credit Risk) plus any non-vocab value folds into "Other".
-# Both the dashboard breakdown AND the alumni-list ``industry_group=other`` filter
-# key off this set so the wheel slice and its drill-down stay in sync.
+# Sales and Trading, Credit Risk, Unknown, Graduate Student) plus any non-vocab
+# value folds into "Other". Both the dashboard breakdown AND the alumni-list
+# ``industry_group=other`` filter key off this set so the wheel slice and its
+# drill-down stay in sync.
+#
+# "Graduate Student" (#294) is a non-wheel industry — it does NOT get its own
+# wheel slice — but the frontend dashboard surfaces it as its own clickable
+# indicator at the BOTTOM of the industry list, separate from the "Other" fold.
+#
+# "Unknown" (#295) is likewise a non-wheel industry and simply folds into "Other"
+# on the wheel — it gets NO separate dashboard indicator. It is distinct from a
+# blank/unset industry ("not yet collected"): "Unknown" means "we checked and it
+# is genuinely unknown".
 _NON_WHEEL_INDUSTRIES = frozenset(
-    {"Law", "Corporate Banking", "FP&A", "Sales and Trading", "Credit Risk", "Other"}
+    {
+        "Law",
+        "Corporate Banking",
+        "FP&A",
+        "Sales and Trading",
+        "Credit Risk",
+        "Unknown",
+        "Graduate Student",
+        "Other",
+    }
 )
 # The bar ORDER on the dashboard industry breakdown is this tuple's order, so it
 # is PINNED here rather than derived from INDUSTRIES — #282 alphabetized the

@@ -28,9 +28,11 @@ Used by:
 > `migrations/*.sql`. Change all three together — order included.
 
 Listed in **dropdown order**: alphabetical, compared case-insensitively (so
-"Financial Services" precedes "FP&A"), with the `Other` catch-all pinned last.
-This order is mirrored by `vocabulary_terms.sort_order` (the tuple index; `Other`
-is pinned at 99 so new options can be appended without a re-sort).
+"Financial Services" precedes "FP&A"), with `Unknown`, `Graduate Student` and the
+`Other` catch-all pinned last (in that order). This order is mirrored by
+`vocabulary_terms.sort_order` (the tuple index for the alphabetical body;
+`Unknown` is pinned at 97, `Graduate Student` at 98 and `Other` at 99 so new
+options can be appended without a re-sort).
 
 Options:
 - Asset Management
@@ -53,6 +55,8 @@ Options:
 - Valuation & Advisory
 - Venture Capital
 - Wealth Management
+- Unknown
+- Graduate Student
 - Other
 
 ### Primary vs secondary (#282)
@@ -81,6 +85,30 @@ four as their primary and must still save without a 422.
 
 `FP&A` is likewise not a dashboard industry, but Tanya did **not** ask to remove
 it from primary — leave it in primary unless she says otherwise.
+
+### Graduate Student (#294)
+
+`Graduate Student` was added so alumni currently in graduate school stop landing
+in `Other`. It is a **valid primary industry** (selectable as someone's current
+industry) but is **not** a dashboard wheel slice — it is in `_NON_WHEEL_INDUSTRIES`
+like the other non-wheel values. Unlike them, the dashboard surfaces it as its
+own clickable indicator at the **bottom** of the industry breakdown (separate
+from the `Other` fold), linking to the alumni list filtered to
+`current_industry = "Graduate Student"`. It is pinned in the dropdown just above
+`Other` (`sort_order` 98).
+
+### Unknown (#295)
+
+`Unknown` is **distinct from a blank / unset** current industry. A blank value
+means "not yet collected" — we simply haven't gathered it. `Unknown` means "we
+checked and it is genuinely unknown", so staff can record that explicitly instead
+of leaving the field empty.
+
+It is a **valid primary industry** (selectable and filterable, NOT in
+`_PRIMARY_EXCLUDED_INDUSTRIES`) but is **not** a dashboard wheel slice — it is in
+`_NON_WHEEL_INDUSTRIES` and simply **folds into `Other`** on the wheel. Unlike
+`Graduate Student` it gets **no** separate dashboard indicator. It is pinned in
+the dropdown just above `Graduate Student` (`sort_order` 97).
 
 ---
 

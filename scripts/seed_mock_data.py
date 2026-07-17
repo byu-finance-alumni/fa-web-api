@@ -237,7 +237,7 @@ MOCK_DETAIL: dict[str, dict] = {
         "tags": ["Donor", "Mentor"],
     },
     "lgarcia9": {
-        "contact": {"city": "Dallas", "state": "TX", "country": "USA", "region": "South"},
+        "contact": {"city": "Dallas", "state": "TX", "country": "USA", "region": "Southwest"},
         "career": {"current_employer": "JPMorgan", "current_title": "Vice President", "current_industry": "Investment Banking", "current_city": "Dallas", "current_state": "TX", "seniority_level": "Vice President"},
     },
     "hwhite10": {
@@ -251,7 +251,7 @@ MOCK_DETAIL: dict[str, dict] = {
         "career": {"current_employer": "Goldman Sachs", "current_title": "Analyst", "current_industry": "Investment Banking", "current_city": "Salt Lake City", "current_state": "UT", "seniority_level": "Analyst"},
     },
     "ethomas13": {
-        "contact": {"city": "Austin", "state": "TX", "country": "USA", "region": "South"},
+        "contact": {"city": "Austin", "state": "TX", "country": "USA", "region": "Southwest"},
         "career": {"current_employer": "Dell", "current_title": "Treasury Analyst", "current_industry": "Technology", "current_city": "Austin", "current_state": "TX", "seniority_level": "Analyst"},
     },
     "alewis15": {
@@ -336,6 +336,11 @@ _BIRTH_NAMES = [
 
 # (city, state, region) tuples. Utah-heavy (BYU hub) plus the major financial
 # centers, so the geography map has a realistic, well-shaded distribution.
+#
+# Every region here must be what app.services.state_regions.region_for_state()
+# derives for the state — otherwise the seeded data contradicts the map the write
+# path enforces, and any edit to a seeded alum's work state silently "corrects"
+# the region. tests/test_state_regions.py pins this.
 _LOCATIONS = [
     ("Provo", "UT", "Mountain West"),
     ("Salt Lake City", "UT", "Mountain West"),
@@ -347,20 +352,20 @@ _LOCATIONS = [
     ("Boston", "MA", "Northeast"),
     ("Stamford", "CT", "Northeast"),
     ("Chicago", "IL", "Midwest"),
-    ("Dallas", "TX", "South"),
-    ("Austin", "TX", "South"),
-    ("Houston", "TX", "South"),
-    ("Atlanta", "GA", "South"),
-    ("Charlotte", "NC", "South"),
+    ("Dallas", "TX", "Southwest"),
+    ("Austin", "TX", "Southwest"),
+    ("Houston", "TX", "Southwest"),
+    ("Atlanta", "GA", "Southeast"),
+    ("Charlotte", "NC", "Southeast"),
     ("San Francisco", "CA", "West"),
     ("San Jose", "CA", "West"),
     ("Los Angeles", "CA", "West"),
     ("Seattle", "WA", "West"),
     ("Denver", "CO", "Mountain West"),
-    ("Phoenix", "AZ", "West"),
-    ("Las Vegas", "NV", "West"),
-    ("Washington", "DC", "Northeast"),
-    ("Miami", "FL", "South"),
+    ("Phoenix", "AZ", "Southwest"),
+    ("Las Vegas", "NV", "Mountain West"),
+    ("Washington", "DC", "Southeast"),
+    ("Miami", "FL", "Southeast"),
 ]
 
 # (employer, industry-from-canonical-INDUSTRIES). Industries here are the

@@ -35,6 +35,8 @@ from app.core.us_states import to_full_name as _state_full_name
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
+from app.schemas.alumni import AlumniUpdate
+from app.services.state_regions import region_for_state
 
 # --- Field maps --------------------------------------------------------------
 #
@@ -225,6 +227,134 @@ def _clean_state(value: str | None) -> str | None:
     return _state_full_name(cleaned)
 
 
+# Country values that mean "the United States". Country is free text on the
+# intake sheet, so we accept the spellings we actually see rather than requiring
+# a canonical form. Anything else counts as non-US.
+_US_COUNTRIES = frozenset(
+    {
+        "us",
+        "u.s.",
+        "u.s.a.",
+        "usa",
+        "united states",
+        "united states of america",
+    }
+)
+
+
+def _is_us_country(value: object) -> bool:
+    """True when a free-text country value names the United States."""
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower().rstrip(".") in {
+        c.rstrip(".") for c in _US_COUNTRIES
+    }
+
+
+# "The caller has no stored work state to compare against." Distinct from None,
+# which means "the record HAS no work state" (a real value to compare with).
+UNKNOWN_STATE = object()
+
+
+def derive_region(cleaned: dict, stored_state: object = UNKNOWN_STATE) -> str | None:
+    """Region derived from the EMPLOYMENT state, or ``None`` to leave it alone.
+
+    Issue #283: when an alum's work state changes, their ``region`` should follow
+    automatically instead of being hand-entered twice. ``region`` physically
+    lives on the contact/residence row, but per Tanya it now means *where they
+    work* — so ``career.current_state`` is what drives it, not ``contact.state``.
+
+    *cleaned* is the dict from :func:`clean_alumni_payload`, i.e. already run
+    through :func:`_clean_state`, so ``career.current_state`` is a canonical full
+    state name. Because that dict is built with ``exclude_unset``, a key being
+    PRESENT means the caller explicitly sent it — which is how the rules below
+    tell "touched" from "omitted".
+
+    *stored_state* is the work state currently ON the record: a value, or ``None``
+    when the record has none (or doesn't exist yet, i.e. create). Pass
+    ``UNKNOWN_STATE`` only when there is genuinely nothing to compare against —
+    it makes "supplied" the trigger, which is right for a create and wrong for an
+    update (see :func:`clean_alumni_payload`).
+
+    Returns ``None`` (derive nothing, leave any stored region as-is) unless every
+    condition holds:
+
+    * ``career.current_state`` was supplied — an edit that didn't touch the work
+      state must never move the region.
+    * the supplied state CHANGED versus *stored_state* — re-submitting the state
+      a record already has is not a move, and must not touch the region. This is
+      what makes Tanya's override durable: she can deliberately set a Texas-based
+      remote worker to "West", and opening their Employment card and saving must
+      leave that alone rather than silently reverting her (#283 — she chose
+      auto-filled-but-overridable, and untouched records keep their region).
+      Both sides are normalized through :func:`_clean_state`, so "TX" against a
+      stored "Texas" is correctly seen as no change.
+    * ``contact.region`` was NOT supplied — an explicit region always wins, which
+      is the escape hatch for the cases the map gets wrong. An explicit ``null``
+      counts as supplied, so an intentional clear still applies.
+    * ``career.current_country``, IF supplied, is the US — the five regions are
+      US-only, so a move abroad leaves the region untouched rather than blanking
+      it. An omitted country is not treated as non-US: the state map itself is
+      the backstop, since only the 50 states + DC resolve.
+    * the state resolves to a region — a blank state, or a non-US/unrecognized
+      one ("Ontario"), derives nothing rather than clearing the stored value.
+
+    Note that ``clean_alumni_payload`` calls this itself and writes the result
+    into ``cleaned["contact"]["region"]``. Re-calling it on that same dict
+    therefore returns ``None`` (the region is now "explicitly supplied") — which
+    is what keeps re-cleaning idempotent, but means write-path callers should
+    read ``cleaned["contact"]["region"]`` rather than call this a second time.
+    """
+    career = cleaned.get("career")
+    if not isinstance(career, dict) or "current_state" not in career:
+        return None  # work state untouched -> region must not move
+    contact = cleaned.get("contact")
+    if isinstance(contact, dict) and "region" in contact:
+        return None  # caller supplied a region explicitly -> theirs wins
+    incoming_state = career.get("current_state")
+    if stored_state is not UNKNOWN_STATE and _clean_state(
+        stored_state if isinstance(stored_state, str) else None
+    ) == _clean_state(incoming_state):
+        return None  # work state didn't actually change -> region must not move
+    country = career.get("current_country")
+    if country is not None and not _is_us_country(country):
+        return None  # works abroad -> the US-only regions don't apply
+    # None for a blank / non-US / unrecognized state -> leave the stored region.
+    return region_for_state(incoming_state)
+
+
+def work_state_supplied(payload) -> bool:
+    """True when *payload* explicitly carries ``career.current_state``.
+
+    The one condition under which the region can derive at all, so both the
+    preview and the write use it to skip the :func:`stored_work_state` lookup
+    entirely when no work state was sent — the answer couldn't change anything.
+    An explicit ``null`` counts as supplied (it's a real edit); a merely-absent
+    field does not.
+    """
+    career = getattr(payload, "career", None)
+    return career is not None and "current_state" in career.__pydantic_fields_set__
+
+
+async def stored_work_state(session: AsyncSession, alumni_id: int) -> str | None:
+    """The work state currently stored for *alumni_id* (or ``None``).
+
+    The single source of "what state is this record on today" for the region
+    derivation, shared by ``/preview`` and the write path so the two can never
+    disagree about whether the state changed. Order-by mirrors
+    ``alumni_service._upsert_section`` so this reads the SAME row the write
+    upserts. Returns the whole row's field rather than selecting the column so a
+    caller's session sees one predictable query shape.
+    """
+    row = await session.scalar(
+        select(CurrentEmployment)
+        .where(CurrentEmployment.alumni_id == alumni_id)
+        .order_by(CurrentEmployment.current_employment_id.desc())
+        .limit(1)
+    )
+    return getattr(row, "current_state", None)
+
+
 def _clean_byu_id(value: str | None) -> str | None:
     """Strip every non-digit from a BYU ID."""
     cleaned = _collapse(value)
@@ -298,8 +428,21 @@ def clean_section(section: str, values: dict) -> dict:
 # --- Payload cleaning --------------------------------------------------------
 
 
-def clean_alumni_payload(payload, *, jsonable: bool = True) -> tuple[dict, list[dict]]:
+def clean_alumni_payload(
+    payload, *, jsonable: bool = True, stored_state: object = UNKNOWN_STATE
+) -> tuple[dict, list[dict]]:
     """Clean an ``AlumniCreateFull`` / ``AlumniUpdateFull`` payload.
+
+    *stored_state* is the work state currently on the record, threaded through to
+    :func:`derive_region` so the region only auto-fills when the state actually
+    CHANGED (#283). Every UPDATE caller should pass it — ``update_alumni`` and
+    ``build_preview`` both read it via :func:`stored_work_state`, which is what
+    keeps the preview and the write in lockstep. An update payload whose caller
+    left it ``UNKNOWN_STATE`` derives NOTHING rather than guessing: guessing
+    "supplied means changed" would make ``/preview`` promise a region change that
+    the write then declines to make, which is exactly the half-wired failure this
+    card already had once. (A create has nothing stored by definition, so
+    "supplied" is the correct trigger there and the default is right.)
 
     Returns ``(cleaned, changes)`` where:
       * ``cleaned`` is a plain dict shaped like the input — core fields at the
@@ -359,6 +502,30 @@ def clean_alumni_payload(payload, *, jsonable: bool = True) -> tuple[dict, list[
                     }
                 )
         cleaned[section] = cleaned_section
+
+    # Region auto-fill (#283). Runs last, over the CLEANED sections, so the map
+    # keys off the normalized full state name. Reported as a change so /preview
+    # shows the caller what the save will do; ``before`` is None because the
+    # caller sent no region (this function has no session and so can't know the
+    # stored one — the "after" is what's authoritative).
+    if isinstance(payload, AlumniUpdate) and stored_state is UNKNOWN_STATE:
+        # An update that can't tell whether the state changed must not guess —
+        # see the note on this function. Deriving here would show the caller a
+        # region change the write path (which DOES know) would skip.
+        derived_region = None
+    else:
+        derived_region = derive_region(cleaned, stored_state)
+    if derived_region is not None:
+        cleaned.setdefault("contact", {})["region"] = derived_region
+        changes.append(
+            {
+                "section": "contact",
+                "field": "region",
+                "label": _label("contact", "region"),
+                "before": None,
+                "after": derived_region,
+            }
+        )
 
     return cleaned, changes
 
@@ -679,9 +846,18 @@ async def build_preview(
 
     For an UPDATE (``existing`` given), duplicate + recommended checks run
     against the *effective* record (cleaned partial overlaid on the stored row),
-    so they reflect the resulting state rather than only the edited fields.
+    so they reflect the resulting state rather than only the edited fields, and
+    the region derivation is fed the record's stored work state so the preview
+    promises exactly what ``update_alumni`` will write — same rule, same query.
     """
-    cleaned, changes = clean_alumni_payload(payload)
+    if existing is not None and work_state_supplied(payload):
+        cleaned, changes = clean_alumni_payload(
+            payload, stored_state=await stored_work_state(session, existing.alumni_id)
+        )
+    else:
+        # Create (nothing stored yet, so "supplied" is the right trigger), or an
+        # update that sent no work state — nothing to derive from either way.
+        cleaned, changes = clean_alumni_payload(payload)
     blockers, dup_warnings = await detect_duplicates(
         session, cleaned, exclude_alumni_id=exclude_alumni_id
     )

@@ -152,18 +152,21 @@ def alumni_order_by(
     industry=None,
     city=None,
     state=None,
+    employer=None,
 ) -> tuple:
     """Return the ORDER BY tuple for a list ``sort`` token.
 
     Base tokens order by columns on the alumni row: ``name`` | ``grad_desc`` |
-    ``grad_asc``. The related-data tokens (#357) order by an expression the
-    caller supplies — ``industry`` (current industry), ``city``, ``state`` — each
-    a correlated scalar subquery built in ``list_page`` because those values live
-    on related tables, not the alumni row. Related tokens sort ASC with NULLs
-    last, always tie-broken by last name then the unique PK so tied rows have a
-    total order and OFFSET paging can't duplicate/skip across a page boundary
-    (#183). Unknown/legacy values — or a related token whose expression wasn't
-    supplied — fall back to name."""
+    ``grad_asc`` | ``gender`` (A→Z, NULLs last) | ``updated`` (most-recently
+    edited first, i.e. ``updated_at`` DESC). The related-data tokens (#357/#495)
+    order by an expression the caller supplies — ``industry`` (current industry),
+    ``city``, ``state``, ``employer`` (current employer) — each a correlated
+    scalar subquery built in ``list_page`` because those values live on related
+    tables, not the alumni row. Related tokens sort ASC with NULLs last, always
+    tie-broken by last name then the unique PK so tied rows have a total order and
+    OFFSET paging can't duplicate/skip across a page boundary (#183). Unknown/
+    legacy values — or a related token whose expression wasn't supplied — fall
+    back to name."""
     mapping: dict[str, tuple] = {
         "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
         "grad_desc": (
@@ -176,8 +179,25 @@ def alumni_order_by(
             Alumni.last_name.asc(),
             Alumni.alumni_id.asc(),
         ),
+        # Gender (#495) — coarse A→Z on the stored value, NULLs last.
+        "gender": (
+            Alumni.gender.asc().nulls_last(),
+            Alumni.last_name.asc(),
+            Alumni.alumni_id.asc(),
+        ),
+        # Last updated (#495) — most-recently edited first. `updated_at` is
+        # NOT NULL (ORM-stamped on every write), so nulls_last is a no-op guard.
+        "updated": (
+            Alumni.updated_at.desc().nulls_last(),
+            Alumni.alumni_id.asc(),
+        ),
     }
-    for token, expr in (("industry", industry), ("city", city), ("state", state)):
+    for token, expr in (
+        ("industry", industry),
+        ("city", city),
+        ("state", state),
+        ("employer", employer),
+    ):
         if expr is not None:
             mapping[token] = (
                 expr.asc().nulls_last(),
@@ -842,6 +862,7 @@ async def list_page(
                 industry=current_industry,
                 city=current_city,
                 state=current_state,
+                employer=current_employer,
             )
         )
         .limit(limit)

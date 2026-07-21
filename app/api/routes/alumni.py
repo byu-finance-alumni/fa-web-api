@@ -353,10 +353,21 @@ async def list_alumni(
         ),
     ] = None,
     sort: Annotated[
-        Literal["name", "grad_desc", "grad_asc", "industry", "city", "state"],
+        Literal[
+            "name",
+            "grad_desc",
+            "grad_asc",
+            "industry",
+            "city",
+            "state",
+            "employer",
+            "gender",
+            "updated",
+        ],
         Query(
             description=(
-                "Sort order: name | grad_desc | grad_asc | industry | city | state."
+                "Sort order: name | grad_desc | grad_asc | industry | city | "
+                "state | employer | gender | updated."
             )
         ),
     ] = "name",

@@ -759,10 +759,35 @@ def test_city_and_state_sorts_order_by_supplied_expression():
 def test_related_sort_without_expression_falls_back_to_name():
     # A related token with no expression supplied degrades to the name order,
     # never an unfiltered/ambiguous order.
-    for token in ("industry", "city", "state"):
+    for token in ("industry", "city", "state", "employer"):
         order_by = _order_sql(token).split("ORDER BY", 1)[1]
         assert order_by.startswith(" alumni.last_name ASC")
         assert "graduation_year" not in order_by
+
+
+# --- #495 company / gender / updated sorts -----------------------------------
+
+
+def test_employer_sort_orders_by_supplied_expression_nulls_last():
+    expr = CurrentEmployment.current_employer
+    order_by = _related_order_sql("employer", employer=expr).split("ORDER BY", 1)[1]
+    assert "current_employment.current_employer ASC NULLS LAST" in order_by
+    assert "last_name ASC" in order_by
+    assert order_by.rstrip().endswith("alumni.alumni_id ASC")
+
+
+def test_gender_sort_orders_by_gender_nulls_last():
+    order_by = _order_sql("gender").split("ORDER BY", 1)[1]
+    assert "alumni.gender ASC NULLS LAST" in order_by
+    assert "last_name ASC" in order_by
+    assert order_by.rstrip().endswith("alumni.alumni_id ASC")
+
+
+def test_updated_sort_orders_by_updated_at_desc():
+    # Most-recently edited first: updated_at DESC, tie-broken by the unique PK.
+    order_by = _order_sql("updated").split("ORDER BY", 1)[1]
+    assert "alumni.updated_at DESC NULLS LAST" in order_by
+    assert order_by.rstrip().endswith("alumni.alumni_id ASC")
 
 
 # --- #360 gender facet -------------------------------------------------------

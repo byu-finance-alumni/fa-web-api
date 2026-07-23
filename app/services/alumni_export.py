@@ -122,6 +122,21 @@ CATALOG: list[_Col] = [
         "int",
     ),
     _Col("graduate_degree", "Graduate degree", "Identity", _ALUMNI, "graduate_degree"),
+    _Col(
+        "graduate_school",
+        "Graduate university",
+        "Identity",
+        _ALUMNI,
+        "graduate_school",
+    ),
+    _Col(
+        "graduate_graduation_year",
+        "Graduate graduation year",
+        "Identity",
+        _ALUMNI,
+        "graduate_graduation_year",
+        "int",
+    ),
     # --- Survey / demographics (alumni row) ---
     _Col("citizenship", "Citizenship", "Survey", _ALUMNI, "citizenship"),
     _Col("marital_status", "Marital status", "Survey", _ALUMNI, "marital_status"),

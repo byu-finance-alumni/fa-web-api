@@ -313,8 +313,25 @@ async def _send_batch(emails: list[dict]) -> None:
     except httpx.HTTPError as exc:
         raise ServiceError("Could not reach the email service.") from exc
     if not response.is_success:
-        log.error("Resend batch send failed: status=%s", response.status_code)
-        raise ServiceError("The email service rejected the send.")
+        # Surface Resend's own reason (e.g. domain-not-verified, free-tier
+        # recipient restriction) so the operator can fix it — these messages
+        # are actionable and non-sensitive.
+        detail = ""
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                detail = str(body.get("message") or body.get("error") or "").strip()
+        except Exception:  # noqa: BLE001 - non-JSON error body
+            detail = ""
+        log.error(
+            "Resend batch send failed: status=%s detail=%s",
+            response.status_code,
+            detail,
+        )
+        raise ServiceError(
+            f"Resend rejected the send (HTTP {response.status_code})"
+            + (f": {detail}" if detail else ".")
+        )
 
 
 async def send_campaign(

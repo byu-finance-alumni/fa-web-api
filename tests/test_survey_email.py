@@ -151,6 +151,23 @@ def test_limit_caps_recipients(fake_settings, monkeypatch):
     assert result.remaining == 6
 
 
+# ------------------------------------------------------ sendable email -------
+
+
+def test_sendable_email_gate():
+    from app.services.survey_email import _is_sendable_email
+
+    assert _is_sendable_email("gunnjake@byu.edu")
+    assert _is_sendable_email("jake@jakegunnell.com")
+    # Reserved / placeholder / malformed -> not sendable.
+    assert not _is_sendable_email("REPLACE_WITH_TANYA_EMAIL@example.com")
+    assert not _is_sendable_email("someone@example.org")
+    assert not _is_sendable_email("no-at-sign")
+    assert not _is_sendable_email("@byu.edu")
+    assert not _is_sendable_email("x@localhost")
+    assert not _is_sendable_email(None)
+
+
 # --------------------------------------------------------- grad years --------
 
 

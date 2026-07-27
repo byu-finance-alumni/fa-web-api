@@ -229,6 +229,25 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
 # ------------------------------------------------------------- send service --
 
 
+# Reserved / placeholder domains that must never be emailed — Resend rejects the
+# whole batch if any `to` uses one, and they're never real inboxes anyway.
+_UNSENDABLE_DOMAINS = frozenset(
+    {"example.com", "example.org", "example.net", "test", "localhost", "invalid"}
+)
+
+
+def _is_sendable_email(email: str | None) -> bool:
+    """A minimal deliverability gate: a real-looking address, not a reserved /
+    placeholder domain (e.g. the REPLACE_WITH_…@example.com test stand-ins)."""
+    if not email or "@" not in email:
+        return False
+    local, _, domain = email.partition("@")
+    domain = domain.strip().lower()
+    if not local.strip() or "." not in domain:
+        return False
+    return domain not in _UNSENDABLE_DOMAINS
+
+
 def _chunks(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i : i + size]
@@ -277,7 +296,7 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
     for a in alumni:
         contact = contacts.get(a.alumni_id)
         email = contact.personal_email if contact else None
-        if not email:
+        if not _is_sendable_email(email):
             continue
         job = employ.get(a.alumni_id)
         recipients.append(

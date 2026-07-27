@@ -69,6 +69,19 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("JWT_SECRET", "SUPABASE_JWT_SECRET"),
     )
 
+    # Survey email (Resend). All optional so the app boots undeployed; the send
+    # service raises ServiceError when a required one is missing. The API key
+    # lives ONLY here (backend), never in the frontend.
+    resend_api_key: str | None = Field(default=None)  # RESEND_API_KEY
+    survey_from_email: str | None = Field(default=None)  # e.g. byufinancealumni@mailing.byu.edu
+    survey_from_name: str = Field(default="BYU Finance Alumni")
+    # Base URL of the frontend, used to build each recipient's /survey/<token> link.
+    survey_app_base_url: str | None = Field(default=None)  # e.g. https://finance.alumni.byu.edu
+    # HMAC secret that signs survey tokens (any long random string).
+    survey_token_secret: str | None = Field(default=None)
+    # Max recipients to actually send in one call (Resend Free = 100/day).
+    survey_daily_cap: int = Field(default=100)
+
     # CORS — comma-separated list of allowed frontend origins.
     cors_origins: str = Field(
         default=(

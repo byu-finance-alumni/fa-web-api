@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from html import escape
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -38,7 +38,11 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.repositories.alumni import build_alumni_query
-from app.schemas.survey import SurveySendResult, SurveySendSample
+from app.schemas.survey import (
+    GraduationYearCount,
+    SurveySendResult,
+    SurveySendSample,
+)
 
 log = logging.getLogger(__name__)
 
@@ -196,6 +200,30 @@ def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
   </div>
 </div>"""
     return _SUBJECT, html, text
+
+
+# --------------------------------------------------------- graduation years --
+
+
+async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCount]:
+    """Every graduation year present among eligible alumni (is_alumni, not
+    archived), with a count — newest first. Drives the console's year picker so
+    it reflects the real DB (including the 1900 test cohort)."""
+    stmt = (
+        select(Alumni.graduation_year, func.count().label("n"))
+        .where(
+            Alumni.is_alumni.is_(True),
+            Alumni.archived.is_(False),
+            Alumni.graduation_year.is_not(None),
+        )
+        .group_by(Alumni.graduation_year)
+        .order_by(Alumni.graduation_year.desc())
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        GraduationYearCount(graduation_year=year, total_alumni=count)
+        for year, count in rows
+    ]
 
 
 # ------------------------------------------------------------- send service --

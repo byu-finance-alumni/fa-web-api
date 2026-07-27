@@ -5,6 +5,14 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 
+class GraduationYearCount(BaseModel):
+    """One graduation year present in the DB + how many eligible alumni it has.
+    Drives the survey console's year picker."""
+
+    graduation_year: int
+    total_alumni: int
+
+
 class SurveySendSample(BaseModel):
     """One prepared recipient, surfaced in a dry-run so staff can eyeball it."""
 

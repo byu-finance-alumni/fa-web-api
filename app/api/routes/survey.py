@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess
 from app.core.database import get_session
-from app.schemas.survey import SurveySendResult
+from app.schemas.survey import GraduationYearCount, SurveySendResult
 from app.services import survey_email
 
 # The test cohort lives in grad year 1900 (below the normal 1950 floor), so allow
@@ -23,6 +23,15 @@ _GRAD_YEAR_MAX = 2100
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 router = APIRouter(prefix="/survey", tags=["survey"])
+
+
+@router.get("/graduation-years", response_model=list[GraduationYearCount])
+async def survey_graduation_years(
+    user: RequireFullAccess, session: SessionDep
+) -> list[GraduationYearCount]:
+    """Distinct graduation years present in the DB (eligible alumni) + counts,
+    newest first — powers the console's year picker."""
+    return await survey_email.list_graduation_years(session)
 
 
 @router.post("/campaigns/{grad_year}/send", response_model=SurveySendResult)

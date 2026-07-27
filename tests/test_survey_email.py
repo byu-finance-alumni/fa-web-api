@@ -151,6 +151,31 @@ def test_limit_caps_recipients(fake_settings, monkeypatch):
     assert result.remaining == 6
 
 
+# --------------------------------------------------------- grad years --------
+
+
+class _Result:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class ExecSession:
+    def __init__(self, rows):
+        self._rows = rows
+
+    async def execute(self, stmt):
+        return _Result(self._rows)
+
+
+def test_list_graduation_years_shape():
+    session = ExecSession([(2024, 5), (1900, 3)])
+    result = asyncio.run(survey_email.list_graduation_years(session))
+    assert [(g.graduation_year, g.total_alumni) for g in result] == [(2024, 5), (1900, 3)]
+
+
 # ------------------------------------------------------------- route ---------
 
 

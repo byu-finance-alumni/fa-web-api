@@ -5,6 +5,16 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 
+class SurveyRespondInfo(BaseModel):
+    """The alum's current on-file info for the public confirm page, resolved from
+    a survey token. `fields` is keyed by the frontend's SURVEY_FIELDS keys
+    (`table.column`), mirroring the sample-alum shape so the page can drop it in."""
+
+    first_name: str
+    full_name: str
+    fields: dict[str, str]
+
+
 class GraduationYearCount(BaseModel):
     """One graduation year present in the DB + how many eligible alumni it has.
     Drives the survey console's year picker."""

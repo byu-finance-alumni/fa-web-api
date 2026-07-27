@@ -193,6 +193,42 @@ def test_list_graduation_years_shape():
     assert [(g.graduation_year, g.total_alumni) for g in result] == [(2024, 5), (1900, 3)]
 
 
+# --------------------------------------------------------- respondent --------
+
+
+def test_get_respondent_invalid_token_is_none(fake_settings):
+    # Garbage token -> verify fails before any DB access -> None.
+    result = asyncio.run(survey_email.get_respondent(object(), "not-a-real-token"))
+    assert result is None
+
+
+def test_respond_route_404_on_invalid(client, monkeypatch):
+    async def none_resp(session, token):
+        return None
+
+    monkeypatch.setattr(survey_email, "get_respondent", none_resp)
+    resp = client.get("/survey/respond/badtoken")
+    assert resp.status_code == 404
+
+
+def test_respond_route_returns_info(client, monkeypatch):
+    from app.schemas.survey import SurveyRespondInfo
+
+    async def ok(session, token):
+        return SurveyRespondInfo(
+            first_name="Jane",
+            full_name="Jane Doe",
+            fields={"contact.personal_email": "jane@example-real.com"},
+        )
+
+    monkeypatch.setattr(survey_email, "get_respondent", ok)
+    resp = client.get("/survey/respond/whatever")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["first_name"] == "Jane"
+    assert body["fields"]["contact.personal_email"] == "jane@example-real.com"
+
+
 # ------------------------------------------------------------- route ---------
 
 

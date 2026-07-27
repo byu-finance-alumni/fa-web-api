@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess
 from app.core.database import get_session
-from app.schemas.survey import GraduationYearCount, SurveySendResult
+from app.core.errors import NotFoundError
+from app.schemas.survey import (
+    GraduationYearCount,
+    SurveyRespondInfo,
+    SurveySendResult,
+)
 from app.services import survey_email
 
 # The test cohort lives in grad year 1900 (below the normal 1950 floor), so allow
@@ -23,6 +28,17 @@ _GRAD_YEAR_MAX = 2100
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 router = APIRouter(prefix="/survey", tags=["survey"])
+
+
+@router.get("/respond/{token}", response_model=SurveyRespondInfo)
+async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondInfo:
+    """PUBLIC (token-gated, no login): the alum's current on-file info for the
+    confirm page. The signed token is the credential — an invalid/expired one
+    404s."""
+    info = await survey_email.get_respondent(session, token)
+    if info is None:
+        raise NotFoundError("This survey link is invalid or has expired.")
+    return info
 
 
 @router.get("/graduation-years", response_model=list[GraduationYearCount])

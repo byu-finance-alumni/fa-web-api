@@ -40,6 +40,7 @@ from app.models.employment import CurrentEmployment
 from app.repositories.alumni import build_alumni_query
 from app.schemas.survey import (
     GraduationYearCount,
+    SurveyRespondInfo,
     SurveySendResult,
     SurveySendSample,
 )
@@ -200,6 +201,74 @@ def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
   </div>
 </div>"""
     return _SUBJECT, html, text
+
+
+# ----------------------------------------------------- respondent (public) ---
+
+
+async def get_respondent(
+    session: AsyncSession, token: str
+) -> SurveyRespondInfo | None:
+    """Resolve a survey token to the alum's current on-file info for the public
+    confirm page. Returns None if the token is invalid/tampered or the alum is
+    gone/archived. The token is the credential (no login), so only the fields the
+    survey confirms are returned — keyed by the frontend's SURVEY_FIELDS keys."""
+    alumni_id = verify_survey_token(token)
+    if alumni_id is None:
+        return None
+    alum = (
+        await session.execute(select(Alumni).where(Alumni.alumni_id == alumni_id))
+    ).scalar_one_or_none()
+    if alum is None or alum.archived:
+        return None
+
+    contact = (
+        await session.execute(
+            select(AlumniContactInfo).where(AlumniContactInfo.alumni_id == alumni_id)
+        )
+    ).scalar_one_or_none()
+    job = (
+        await session.execute(
+            select(CurrentEmployment).where(CurrentEmployment.alumni_id == alumni_id)
+        )
+    ).scalar_one_or_none()
+
+    fields: dict[str, str] = {}
+
+    def put(key: str, value: object) -> None:
+        if value is not None and str(value).strip() != "":
+            fields[key] = str(value)
+
+    # Employment (current_employment)
+    put("employment.current_employer", getattr(job, "current_employer", None))
+    put("employment.current_title", getattr(job, "current_title", None))
+    put("employment.current_industry", getattr(job, "current_industry", None))
+    put(
+        "employment.current_industry_secondary",
+        getattr(job, "current_industry_secondary", None),
+    )
+    put("employment.current_city", getattr(job, "current_city", None))
+    put("employment.current_state", getattr(job, "current_state", None))
+    put("employment.current_country", getattr(job, "current_country", None))
+    put("employment.seniority_level", getattr(job, "seniority_level", None))
+    # Contact (alumni_contact_info)
+    put("contact.personal_email", getattr(contact, "personal_email", None))
+    put("contact.work_email", getattr(contact, "work_email", None))
+    put("contact.phone", getattr(contact, "phone", None))
+    put("contact.city", getattr(contact, "city", None))
+    put("contact.state", getattr(contact, "state", None))
+    put("contact.country", getattr(contact, "country", None))
+    # Profile (alumni)
+    put("profile.linkedin_url", alum.linkedin_url)
+    put("profile.graduate_degree", alum.graduate_degree)
+    put("profile.graduate_school", alum.graduate_school)
+    put("profile.graduate_graduation_year", alum.graduate_graduation_year)
+    put("profile.spouse_first_name", alum.spouse_first_name)
+    put("profile.spouse_last_name", alum.spouse_last_name)
+
+    first = (alum.preferred_first_name or alum.first_name or "there").strip()
+    full = " ".join(p for p in (alum.first_name, alum.last_name) if p).strip() or first
+    return SurveyRespondInfo(first_name=first, full_name=full, fields=fields)
 
 
 # --------------------------------------------------------- graduation years --

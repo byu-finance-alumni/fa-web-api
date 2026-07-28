@@ -82,6 +82,7 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("Notes", "Investment banking track."),
     ("Citizenship", "USA"),
     ("Marital Status", "Married"),
+    ("Languages", "English; Spanish"),
     ("Spouse First Name", "Ava"),
     ("Spouse Last Name", "Lee"),
     ("Phone #", "+1 (212) 555-0142"),
@@ -92,6 +93,8 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("Work Email", "jdoe@goldmansachs.com"),
     ("Address line 1", "200 West St"),
     ("Address line 2", ""),
+    ("Residence city", "Brooklyn"),
+    ("Residence state", "NY"),
     ("Current city", "New York"),
     ("Current state", "NY"),
     (

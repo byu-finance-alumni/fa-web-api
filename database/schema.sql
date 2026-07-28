@@ -213,6 +213,9 @@ CREATE TABLE alumni (
     home_country         varchar(100),
     employment_status    varchar(50),
     other_designations   text,
+    -- Free-text list of languages the alum speaks (e.g. "English; Spanish").
+    -- Stored + import/export only; not shown on the profile.
+    languages            varchar(255),
     survey_completed_date date,
     -- Manual-edit provenance for the profile ("Profile updated by Amy"): the
     -- date of the last manual profile update and the user who made it. FK ->

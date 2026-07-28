@@ -126,6 +126,7 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "Notes": ("core", "notes", "str"),
     "Citizenship": ("core", "citizenship", "str"),
     "Marital Status": ("core", "marital_status", "str"),
+    "Languages": ("core", "languages", "str"),
     "Spouse First Name": ("core", "spouse_first_name", "str"),
     "Spouse Last Name": ("core", "spouse_last_name", "str"),
     "Phone #": ("contact", "phone", "str"),
@@ -150,6 +151,10 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     # that call is made — the rest of the block moved to career.* below.
     "Address line 1": ("contact", "address_line_1", "str"),
     "Address line 2": ("contact", "address_line_2", "str"),
+    # Residence city/state -> the actual contact address columns (distinct from
+    # the employer "Current city/state" below, which are career.current_*).
+    "Residence city": ("contact", "city", "str"),
+    "Residence state": ("contact", "state", "str"),
     # The location block is the EMPLOYER's (#287) -> career.current_*, not contact.
     "Current city": ("career", "current_city", "str"),
     "Current state": ("career", "current_state", "str"),

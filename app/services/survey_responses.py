@@ -1,0 +1,384 @@
+"""Survey response review queue.
+
+Alumni submit "confirm your info" updates from the public survey link; we STAGE
+them (`submit_response`) as pending rows instead of touching the record. Staff
+review each in the console (`list_pending`, with a before/after diff) and apply
+(`apply_response` — writes the whitelisted fields to the real record) or reject
+(`reject_response`).
+
+Every field an alum can submit is in `_FIELDS` (key -> table/column/kind), which
+is the ONLY thing that gets written — nothing else in the payload is applied.
+"""
+
+from __future__ import annotations
+
+import datetime
+from dataclasses import dataclass
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.errors import InvalidRequestError, NotFoundError
+from app.models.alumni import Alumni
+from app.models.audit import AuditLog
+from app.models.contact import AlumniContactInfo
+from app.models.employment import CurrentEmployment
+from app.models.engagement import AlumniProgramEngagement
+from app.models.survey_response import SurveyResponse
+from app.schemas.survey import (
+    SurveyChange,
+    SurveyResponseItem,
+    SurveySubmitResult,
+)
+from app.services.survey_email import verify_survey_token
+
+
+@dataclass(frozen=True)
+class _Field:
+    key: str
+    label: str
+    group: str  # alumni | contact | employment | engagement
+    column: str
+    kind: str  # text | int | bool
+
+
+# The whitelist of fields an alum may submit + where each writes. Order matches
+# the confirm page. Anything not here is ignored on submit AND on apply.
+_FIELDS: tuple[_Field, ...] = (
+    _Field("employment.current_industry", "Industry", "employment", "current_industry", "text"),
+    _Field("profile.employment_status", "Employment status", "alumni", "employment_status", "text"),
+    _Field("employment.current_employer", "Company", "employment", "current_employer", "text"),
+    _Field("employment.current_title", "Title", "employment", "current_title", "text"),
+    _Field(
+        "employment.current_industry_secondary",
+        "Secondary industry",
+        "employment",
+        "current_industry_secondary",
+        "text",
+    ),
+    _Field("employment.current_city", "Employment city", "employment", "current_city", "text"),
+    _Field("employment.current_state", "Employment state", "employment", "current_state", "text"),
+    _Field(
+        "employment.current_country", "Employment country", "employment", "current_country", "text"
+    ),
+    _Field("contact.city", "Residence city", "contact", "city", "text"),
+    _Field("contact.state", "Residence state", "contact", "state", "text"),
+    _Field("contact.country", "Residence country", "contact", "country", "text"),
+    _Field("profile.spouse_first_name", "Spouse first name", "alumni", "spouse_first_name", "text"),
+    _Field("profile.spouse_last_name", "Spouse last name", "alumni", "spouse_last_name", "text"),
+    _Field("contact.personal_email", "Permanent email", "contact", "personal_email", "text"),
+    _Field("contact.work_email", "Work email", "contact", "work_email", "text"),
+    _Field("profile.linkedin_url", "LinkedIn", "alumni", "linkedin_url", "text"),
+    _Field("profile.graduate_degree", "Graduate program", "alumni", "graduate_degree", "text"),
+    _Field("profile.graduate_school", "Graduate school", "alumni", "graduate_school", "text"),
+    _Field(
+        "profile.graduate_graduation_year",
+        "Projected graduation year",
+        "alumni",
+        "graduate_graduation_year",
+        "int",
+    ),
+    _Field(
+        "profile.other_designations", "Finance designations", "alumni", "other_designations", "text"
+    ),
+    _Field(
+        "program.mentor_willing",
+        "Willing to mentor students",
+        "engagement",
+        "mentor_willing",
+        "bool",
+    ),
+    _Field(
+        "program.women_in_finance_mentor_willing",
+        "Willing to mentor for Women in Finance",
+        "engagement",
+        "women_in_finance_mentor_willing",
+        "bool",
+    ),
+    _Field(
+        "program.guest_speaker_willing",
+        "Willing to be a guest speaker",
+        "engagement",
+        "guest_speaker_willing",
+        "bool",
+    ),
+    _Field(
+        "program.help_at_event_willing",
+        "Willing to help at an event",
+        "engagement",
+        "help_at_event_willing",
+        "bool",
+    ),
+    _Field(
+        "program.nettrek_host_willing",
+        "Willing to host a NetTrek visit",
+        "engagement",
+        "nettrek_host_willing",
+        "bool",
+    ),
+    _Field(
+        "program.finance_conference_willing",
+        "Willing to take part in the finance conference",
+        "engagement",
+        "finance_conference_willing",
+        "bool",
+    ),
+    _Field(
+        "program.company_event_sponsor_willing",
+        "Willing to sponsor a company event",
+        "engagement",
+        "company_event_sponsor_willing",
+        "bool",
+    ),
+    _Field(
+        "program.case_competition_host_willing",
+        "Willing to host a case competition",
+        "engagement",
+        "case_competition_host_willing",
+        "bool",
+    ),
+    _Field("program.piff_donor", "Pay It Forward donor", "engagement", "piff_donor", "bool"),
+)
+_FIELD_BY_KEY = {f.key: f for f in _FIELDS}
+
+_TRUE = frozenset({"yes", "true", "1"})
+
+
+def _text(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _current(field: _Field, obj: object | None) -> str:
+    """The on-file value as a display string ('Yes'/'No' for booleans)."""
+    if obj is None:
+        return ""
+    raw = getattr(obj, field.column, None)
+    if field.kind == "bool":
+        return "Yes" if raw else "No"
+    return _text(raw)
+
+
+def _after(field: _Field, raw: object) -> str:
+    """The submitted value as a display string, normalized to match `_current`."""
+    value = _text(raw)
+    if field.kind == "bool":
+        return "Yes" if value.lower() in _TRUE else "No"
+    return value
+
+
+def _coerce(field: _Field, raw: object):
+    """The submitted value coerced to the column's Python type for writing."""
+    value = _text(raw)
+    if field.kind == "bool":
+        return value.lower() in _TRUE
+    if field.kind == "int":
+        try:
+            return int(value) if value else None
+        except ValueError:
+            return None
+    return value or None
+
+
+# --------------------------------------------------------------- submit ------
+
+
+async def submit_response(
+    session: AsyncSession, token: str, fields: dict[str, str]
+) -> SurveySubmitResult:
+    """Stage an alum's submission (token-gated, public). Keeps only recognized
+    fields; nothing is applied to the record here."""
+    alumni_id = verify_survey_token(token)
+    if alumni_id is None:
+        raise NotFoundError("This survey link is invalid or has expired.")
+    alum = (
+        await session.execute(select(Alumni).where(Alumni.alumni_id == alumni_id))
+    ).scalar_one_or_none()
+    if alum is None or alum.archived:
+        raise NotFoundError("This survey link is invalid or has expired.")
+
+    payload = {k: _text(v) for k, v in (fields or {}).items() if k in _FIELD_BY_KEY}
+    if not payload:
+        return SurveySubmitResult(staged=False, change_count=0)
+
+    session.add(
+        SurveyResponse(
+            alumni_id=alumni_id,
+            graduation_year=alum.graduation_year,
+            payload=payload,
+            status="pending",
+        )
+    )
+    await session.commit()
+    return SurveySubmitResult(staged=True, change_count=len(payload))
+
+
+# ------------------------------------------------------------- review --------
+
+
+async def _load_side_rows(session: AsyncSession, ids: list[int]):
+    async def by_alum(model):
+        rows = (
+            (await session.execute(select(model).where(model.alumni_id.in_(ids)))).scalars().all()
+        )
+        return {r.alumni_id: r for r in rows}
+
+    return (
+        await by_alum(AlumniContactInfo),
+        await by_alum(CurrentEmployment),
+        await by_alum(AlumniProgramEngagement),
+    )
+
+
+async def list_pending(session: AsyncSession, graduation_year: int) -> list[SurveyResponseItem]:
+    """Pending responses for a grad year, each with its before/after diff
+    (unchanged fields are dropped)."""
+    responses = (
+        (
+            await session.execute(
+                select(SurveyResponse)
+                .where(
+                    SurveyResponse.status == "pending",
+                    SurveyResponse.graduation_year == graduation_year,
+                )
+                .order_by(SurveyResponse.submitted_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not responses:
+        return []
+
+    ids = [r.alumni_id for r in responses]
+    alumni = {
+        a.alumni_id: a
+        for a in (await session.execute(select(Alumni).where(Alumni.alumni_id.in_(ids))))
+        .scalars()
+        .all()
+    }
+    contacts, jobs, engs = await _load_side_rows(session, ids)
+
+    items: list[SurveyResponseItem] = []
+    for r in responses:
+        alum = alumni.get(r.alumni_id)
+        if alum is None:
+            continue
+        by_group = {
+            "alumni": alum,
+            "contact": contacts.get(r.alumni_id),
+            "employment": jobs.get(r.alumni_id),
+            "engagement": engs.get(r.alumni_id),
+        }
+        changes: list[SurveyChange] = []
+        for key, raw in (r.payload or {}).items():
+            field = _FIELD_BY_KEY.get(key)
+            if field is None:
+                continue
+            before = _current(field, by_group.get(field.group))
+            after = _after(field, raw)
+            if before == after:
+                continue
+            changes.append(
+                SurveyChange(field_key=key, label=field.label, before=before, after=after)
+            )
+        name = (
+            " ".join(p for p in (alum.first_name, alum.last_name) if p).strip()
+            or alum.preferred_first_name
+            or "Alum"
+        )
+        items.append(
+            SurveyResponseItem(
+                survey_response_id=r.survey_response_id,
+                alumni_id=r.alumni_id,
+                name=name,
+                submitted_at=r.submitted_at.isoformat(),
+                changes=changes,
+            )
+        )
+    return items
+
+
+async def _get_pending(session: AsyncSession, response_id: int) -> SurveyResponse:
+    resp = (
+        await session.execute(
+            select(SurveyResponse).where(SurveyResponse.survey_response_id == response_id)
+        )
+    ).scalar_one_or_none()
+    if resp is None:
+        raise NotFoundError("Survey response not found.")
+    if resp.status != "pending":
+        raise InvalidRequestError("This response has already been reviewed.")
+    return resp
+
+
+async def apply_response(
+    session: AsyncSession, response_id: int, actor_user_id: int | None
+) -> None:
+    """Write the staged changes to the alum's record and mark applied."""
+    resp = await _get_pending(session, response_id)
+    alum = (
+        await session.execute(select(Alumni).where(Alumni.alumni_id == resp.alumni_id))
+    ).scalar_one_or_none()
+    if alum is None:
+        raise NotFoundError("Alum not found.")
+    contacts, jobs, engs = await _load_side_rows(session, [resp.alumni_id])
+    contact = contacts.get(resp.alumni_id)
+    job = jobs.get(resp.alumni_id)
+    eng = engs.get(resp.alumni_id)
+
+    for key, raw in (resp.payload or {}).items():
+        field = _FIELD_BY_KEY.get(key)
+        if field is None:
+            continue
+        value = _coerce(field, raw)
+        if field.group == "alumni":
+            setattr(alum, field.column, value)
+        elif field.group == "contact":
+            if contact is None:
+                contact = AlumniContactInfo(alumni_id=alum.alumni_id)
+                session.add(contact)
+            setattr(contact, field.column, value)
+        elif field.group == "employment":
+            if job is None:
+                job = CurrentEmployment(alumni_id=alum.alumni_id)
+                session.add(job)
+            setattr(job, field.column, value)
+        elif field.group == "engagement":
+            if eng is None:
+                eng = AlumniProgramEngagement(alumni_id=alum.alumni_id)
+                session.add(eng)
+            setattr(eng, field.column, value)
+
+    resp.status = "applied"
+    resp.reviewed_by_user_id = actor_user_id
+    resp.reviewed_at = datetime.datetime.now(datetime.UTC)
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="apply_survey_response",
+            entity_type="alumni",
+            entity_id=alum.alumni_id,
+            new_value=f"survey_response={response_id} fields={len(resp.payload or {})}",
+        )
+    )
+    await session.commit()
+
+
+async def reject_response(
+    session: AsyncSession, response_id: int, actor_user_id: int | None
+) -> None:
+    """Mark a staged response rejected — nothing is written to the record."""
+    resp = await _get_pending(session, response_id)
+    resp.status = "rejected"
+    resp.reviewed_by_user_id = actor_user_id
+    resp.reviewed_at = datetime.datetime.now(datetime.UTC)
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="reject_survey_response",
+            entity_type="alumni",
+            entity_id=resp.alumni_id,
+            new_value=f"survey_response={response_id}",
+        )
+    )
+    await session.commit()

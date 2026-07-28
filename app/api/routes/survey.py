@@ -16,9 +16,12 @@ from app.core.errors import NotFoundError
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyRespondInfo,
+    SurveyResponseItem,
     SurveySendResult,
+    SurveySubmitRequest,
+    SurveySubmitResult,
 )
-from app.services import survey_email
+from app.services import survey_email, survey_responses
 
 # The test cohort lives in grad year 1900 (below the normal 1950 floor), so allow
 # it explicitly here.
@@ -39,6 +42,44 @@ async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondI
     if info is None:
         raise NotFoundError("This survey link is invalid or has expired.")
     return info
+
+
+@router.post("/respond/{token}", response_model=SurveySubmitResult)
+async def survey_submit(
+    token: str, body: SurveySubmitRequest, session: SessionDep
+) -> SurveySubmitResult:
+    """PUBLIC (token-gated): stage the alum's submitted changes for admin review.
+    Nothing is applied to the record here."""
+    return await survey_responses.submit_response(session, token, body.fields)
+
+
+@router.get(
+    "/campaigns/{grad_year}/responses",
+    response_model=list[SurveyResponseItem],
+)
+async def survey_pending_responses(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> list[SurveyResponseItem]:
+    """Admin review queue: pending responses for a grad year, each with a diff."""
+    return await survey_responses.list_pending(session, grad_year)
+
+
+@router.post("/responses/{response_id}/apply", status_code=204)
+async def survey_apply_response(
+    response_id: int, user: RequireFullAccess, session: SessionDep
+) -> None:
+    """Apply a staged response to the alum's record."""
+    await survey_responses.apply_response(session, response_id, user.user_id)
+
+
+@router.post("/responses/{response_id}/reject", status_code=204)
+async def survey_reject_response(
+    response_id: int, user: RequireFullAccess, session: SessionDep
+) -> None:
+    """Reject a staged response — nothing is written to the record."""
+    await survey_responses.reject_response(session, response_id, user.user_id)
 
 
 @router.get("/graduation-years", response_model=list[GraduationYearCount])

@@ -592,6 +592,26 @@ CREATE TABLE surveys (
     CONSTRAINT fk_surveys_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE
 );
 
+-- Alum "confirm your info" submissions from the public survey link, STAGED for
+-- admin review (per the email's "reviewed before applied" promise). `payload` is
+-- the submitted values keyed by survey field keys (table.column). See
+-- migrations/2026-07-27_survey_responses.sql.
+CREATE TABLE survey_responses (
+    survey_response_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id           bigint NOT NULL,
+    graduation_year     int,
+    payload             jsonb NOT NULL,
+    status              varchar(20) NOT NULL DEFAULT 'pending',
+    submitted_at        timestamptz NOT NULL DEFAULT now(),
+    reviewed_by_user_id bigint,
+    reviewed_at         timestamptz,
+    CONSTRAINT fk_survey_responses_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_survey_responses_reviewer FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected'))
+);
+CREATE INDEX IF NOT EXISTS idx_survey_responses_status_year ON survey_responses (status, graduation_year);
+CREATE INDEX IF NOT EXISTS idx_survey_responses_alumni_id ON survey_responses (alumni_id);
+
 CREATE TABLE attachments (
     attachment_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id          bigint NOT NULL,

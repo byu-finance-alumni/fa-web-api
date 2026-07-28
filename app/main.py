@@ -30,6 +30,7 @@ from app.api.routes import (
     health,
     notes,
     support,
+    survey,
     tasks,
     vocabulary,
 )
@@ -184,6 +185,7 @@ app.include_router(vocabulary.router)
 app.include_router(vocabulary.admin_router)
 app.include_router(support.router)
 app.include_router(support.admin_router)
+app.include_router(survey.router)
 
 
 @app.exception_handler(SessionSupersededError)

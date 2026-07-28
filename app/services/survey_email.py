@@ -276,6 +276,7 @@ async def get_respondent(
     put("employment.current_city", getattr(job, "current_city", None))
     put("employment.current_state", getattr(job, "current_state", None))
     put("employment.current_country", getattr(job, "current_country", None))
+    put("employment.current_zip", getattr(job, "current_zip", None))
     put("employment.seniority_level", getattr(job, "seniority_level", None))
     # Contact (alumni_contact_info)
     put("contact.personal_email", getattr(contact, "personal_email", None))
@@ -293,6 +294,12 @@ async def get_respondent(
     put("profile.spouse_first_name", alum.spouse_first_name)
     put("profile.spouse_last_name", alum.spouse_last_name)
     put("profile.other_designations", alum.other_designations)
+    put("profile.gender", alum.gender)
+    put("profile.marital_status", alum.marital_status)
+    # A date column — emit as an ISO "YYYY-MM-DD" string for the survey date input.
+    put("profile.birth_date", alum.birth_date)
+    put("profile.citizenship", alum.citizenship)
+    put("profile.home_country", alum.home_country)
 
     first = (alum.preferred_first_name or alum.first_name or "there").strip()
     full = " ".join(p for p in (alum.first_name, alum.last_name) if p).strip() or first

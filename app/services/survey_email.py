@@ -130,22 +130,48 @@ class Recipient:
     alumni_id: int
     first_name: str
     email: str
-    employer: str | None
-    title: str | None
-    industry: str | None
-    city: str | None
-    state: str | None
+    # The full "here's what we have on file" list (label, value) shown in the
+    # email — the Career Directors' field list, empties as "—".
+    on_file: tuple[tuple[str, str], ...]
 
 
 def _on_file_rows(r: Recipient) -> list[tuple[str, str]]:
-    location = ", ".join(p for p in (r.city, r.state) if p)
-    pairs = [
-        ("Employer", r.employer),
-        ("Current title", r.title),
-        ("Industry", r.industry),
-        ("Location", location or None),
-    ]
-    return [(label, value) for label, value in pairs if value]
+    return list(r.on_file)
+
+
+def _dash(value: object) -> str:
+    """Display value, or an em dash when we have nothing on file."""
+    text = "" if value is None else str(value).strip()
+    return text or "—"
+
+
+def _build_on_file(alum, contact, job) -> tuple[tuple[str, str], ...]:
+    """The Career Directors' full field list, in order, for the email preview."""
+    spouse = " ".join(
+        p for p in (alum.spouse_first_name, alum.spouse_last_name) if p
+    ).strip()
+    g = lambda o, n: getattr(o, n, None)  # noqa: E731
+    return (
+        ("Current employment status", _dash(alum.employment_status)),
+        ("Company", _dash(g(job, "current_employer"))),
+        ("Title", _dash(g(job, "current_title"))),
+        ("Industry", _dash(g(job, "current_industry"))),
+        ("Secondary industry", _dash(g(job, "current_industry_secondary"))),
+        ("Employment city", _dash(g(job, "current_city"))),
+        ("Employment state", _dash(g(job, "current_state"))),
+        ("Employment country", _dash(g(job, "current_country"))),
+        ("Residence city", _dash(g(contact, "city"))),
+        ("Residence state", _dash(g(contact, "state"))),
+        ("Residence country", _dash(g(contact, "country"))),
+        ("Spouse name", _dash(spouse)),
+        ("Permanent email", _dash(g(contact, "personal_email"))),
+        ("Work email", _dash(g(contact, "work_email"))),
+        ("LinkedIn profile", _dash(alum.linkedin_url)),
+        ("Graduate school program", _dash(alum.graduate_degree)),
+        ("Graduate school name", _dash(alum.graduate_school)),
+        ("Projected graduation year", _dash(alum.graduate_graduation_year)),
+        ("Finance designations", _dash(alum.other_designations)),
+    )
 
 
 def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
@@ -375,11 +401,7 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
                 alumni_id=a.alumni_id,
                 first_name=(a.preferred_first_name or a.first_name or "there"),
                 email=email,
-                employer=getattr(job, "current_employer", None),
-                title=getattr(job, "current_title", None),
-                industry=getattr(job, "current_industry", None),
-                city=getattr(contact, "city", None),
-                state=getattr(contact, "state", None),
+                on_file=_build_on_file(a, contact, job),
             )
         )
     return recipients

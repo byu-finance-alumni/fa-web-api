@@ -32,7 +32,12 @@ def fake_settings(monkeypatch):
 
 def _recipients(n: int) -> list[Recipient]:
     return [
-        Recipient(i, f"Alum{i}", f"alum{i}@example.com", "Emp", "Title", "Ind", "City", "ST")
+        Recipient(
+            i,
+            f"Alum{i}",
+            f"alum{i}@example.com",
+            (("Company", "Emp"), ("Title", "T")),
+        )
         for i in range(1, n + 1)
     ]
 
@@ -60,7 +65,12 @@ def test_token_garbage_rejected(fake_settings):
 
 
 def test_render_email_has_greeting_info_and_link(fake_settings):
-    r = Recipient(1, "Jordan", "jordan@example.com", "Goldman Sachs", "Analyst", "IB", "NYC", "NY")
+    r = Recipient(
+        1,
+        "Jordan",
+        "jordan@example.com",
+        (("Company", "Goldman Sachs"), ("Title", "Analyst")),
+    )
     subject, html, text = render_survey_email(r, "https://x.test/survey/abc123")
     assert subject
     assert "Hello Jordan," in text

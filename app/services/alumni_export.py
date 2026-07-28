@@ -140,6 +140,7 @@ CATALOG: list[_Col] = [
     # --- Survey / demographics (alumni row) ---
     _Col("citizenship", "Citizenship", "Survey", _ALUMNI, "citizenship"),
     _Col("marital_status", "Marital status", "Survey", _ALUMNI, "marital_status"),
+    _Col("languages", "Languages", "Survey", _ALUMNI, "languages"),
     _Col("home_country", "Home country", "Survey", _ALUMNI, "home_country"),
     _Col(
         "employment_status",

@@ -922,6 +922,7 @@ FINALIZED_ALUMNI_HEADERS = [
     "Notes",
     "Citizenship",
     "Marital Status",
+    "Languages",
     "Spouse First Name",
     "Spouse Last Name",
     "Phone #",
@@ -932,6 +933,8 @@ FINALIZED_ALUMNI_HEADERS = [
     "Work Email",
     "Address line 1",
     "Address line 2",
+    "Residence city",
+    "Residence state",
     "Current city",
     "Current state",
     "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)",
@@ -971,9 +974,11 @@ def test_expected_headers_are_the_finalized_set_in_order():
     # were added (#269 follow-up) so the graduate program round-trips. Adding the
     # "Mountain West" region RENAMED the Region column's caption without adding a
     # column, so the count is unchanged — retired captions live in
-    # import_csv._LEGACY_HEADER_ALIASES, never here.
+    # import_csv._LEGACY_HEADER_ALIASES, never here. It grew to 69 with the
+    # Languages column and the Residence city/state columns (which bind to the
+    # actual contact address, distinct from the employer "Current city/state").
     assert import_csv.EXPECTED_HEADERS == FINALIZED_ALUMNI_HEADERS
-    assert len(import_csv.EXPECTED_HEADERS) == 66
+    assert len(import_csv.EXPECTED_HEADERS) == 69
     # Every header is a mapping key (and vice-versa).
     assert set(import_csv._MAPPING) == set(FINALIZED_ALUMNI_HEADERS)
 

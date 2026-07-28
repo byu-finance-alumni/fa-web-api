@@ -82,6 +82,9 @@ class Alumni(TimestampMixin, Base):
     home_country: Mapped[str | None] = mapped_column(String(100))
     employment_status: Mapped[str | None] = mapped_column(String(50))
     other_designations: Mapped[str | None] = mapped_column(Text)
+    # Free-text languages the alum speaks (e.g. "English; Spanish"). Stored +
+    # import/export only — never rendered on the profile.
+    languages: Mapped[str | None] = mapped_column(String(255))
     survey_completed_date: Mapped[datetime.date | None] = mapped_column(Date)
 
     # Manual-edit provenance for the profile ("Profile updated by Amy"): the date

@@ -56,6 +56,7 @@ ALTER TABLE public.follow_up_tasks       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events                ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.event_attendance      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.surveys               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.survey_responses      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notes                 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.donations             ENABLE ROW LEVEL SECURITY;
 

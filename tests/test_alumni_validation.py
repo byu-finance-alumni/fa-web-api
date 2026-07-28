@@ -149,7 +149,7 @@ def test_good_linkedin_host_accepted(url):
     assert model.linkedin_url == url
 
 
-@pytest.mark.parametrize("year", [1949, datetime.date.today().year + 11, 0])
+@pytest.mark.parametrize("year", [1899, datetime.date.today().year + 11, 0])
 def test_out_of_range_year_rejected(year):
     with pytest.raises(ValidationError):
         AlumniCreate(last_name="Doe", graduation_year=year)

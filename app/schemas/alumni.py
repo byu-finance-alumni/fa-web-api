@@ -55,7 +55,11 @@ _PROFILE_UPDATED_BY_MAX = 200
 _BYU_ID_RE = re.compile(r"^\d{9}$")
 _NET_ID_RE = re.compile(r"^[a-z0-9]{2,12}$")
 
-_YEAR_MIN = 1950
+# Year floor for graduation/program/degree/role years. Kept at 1900 to match
+# _BIRTH_DATE_MIN below: a graduation can't predate the earliest plausible birth,
+# and the #501 test cohort (Jake/Tanya/Amy) is seeded at graduation_year 1900, so
+# a tighter floor made those rows un-editable (#527).
+_YEAR_MIN = 1900
 _YEAR_MAX = datetime.date.today().year + 10
 
 # Which contact method an alum flags as "preferred". A single nullable string on

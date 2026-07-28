@@ -162,6 +162,22 @@ def test_graduate_graduation_year_out_of_range_is_422():
         AlumniCreate(first_name="Jane", graduate_graduation_year=99999)
 
 
+def test_edit_year_1900_is_accepted():
+    # #527: the #501 test cohort (Jake/Tanya/Amy) is seeded at graduation_year
+    # 1900. The year floor used to be 1950, so opening/saving their Edit tab 422'd
+    # ("Request validation failed"). 1900 must now validate on every year field
+    # and across the create/update/full-update schemas.
+    for year_field in (
+        "graduation_year",
+        "finance_program_year",
+        "graduation_class",
+        "graduate_graduation_year",
+    ):
+        AlumniCreate(first_name="Jake", **{year_field: 1900})
+        AlumniUpdate(**{year_field: 1900})
+        AlumniUpdateFull(first_name="Jake", **{year_field: 1900})
+
+
 # --- company_address is retired: off the write AND read surface (#287) -------
 
 

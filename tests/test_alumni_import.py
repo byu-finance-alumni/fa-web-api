@@ -57,6 +57,8 @@ def _row_values(**overrides) -> list[str]:
         "mentor_willing": "Willing to mentor (Yes/No)",
         "cfp_designation": "CFP designation (Yes/No)",
         "cfa_designation": "CFA designation (Yes/No)",
+        "spouse_name": "Spouse Name",
+        "marital_status": "Marital Status",
     }
     for field, value in overrides.items():
         values[by_field[field]] = value
@@ -356,6 +358,55 @@ def test_existing_index_normalizes_formatted_byu_id():
 
 
 # --- Clean row imports -------------------------------------------------------
+
+
+def test_spouse_name_splits_into_first_and_last():
+    # "First Last" -> first word is the first name, the rest is the last name.
+    rows, errors = import_csv.parse_and_map(
+        _csv_bytes(_row_values(first_name="Jane", last_name="Doe", spouse_name="Ava Lee"))
+    )
+    assert errors == []
+    payload = rows[0]["payload"]
+    assert payload["spouse_first_name"] == "Ava"
+    assert payload["spouse_last_name"] == "Lee"
+
+
+def test_spouse_name_single_word_is_first_name_only():
+    rows, _ = import_csv.parse_and_map(
+        _csv_bytes(_row_values(first_name="Jane", last_name="Doe", spouse_name="Ava"))
+    )
+    payload = rows[0]["payload"]
+    assert payload["spouse_first_name"] == "Ava"
+    assert "spouse_last_name" not in payload
+
+
+def test_spouse_name_multiword_last_name():
+    rows, _ = import_csv.parse_and_map(
+        _csv_bytes(
+            _row_values(first_name="Jane", last_name="Doe", spouse_name="Ava de la Cruz")
+        )
+    )
+    payload = rows[0]["payload"]
+    assert payload["spouse_first_name"] == "Ava"
+    assert payload["spouse_last_name"] == "de la Cruz"
+
+
+def test_marital_status_undeclared_imports_blank():
+    for token in ("Undeclared", "N/A", "None", "unknown"):
+        rows, _ = import_csv.parse_and_map(
+            _csv_bytes(
+                _row_values(first_name="Jane", last_name="Doe", marital_status=token)
+            )
+        )
+        payload = rows[0]["payload"]
+        assert "marital_status" not in payload, f"{token!r} should import blank"
+
+
+def test_marital_status_real_value_is_kept():
+    rows, _ = import_csv.parse_and_map(
+        _csv_bytes(_row_values(first_name="Jane", last_name="Doe", marital_status="Married"))
+    )
+    assert rows[0]["payload"]["marital_status"] == "Married"
 
 
 def test_clean_rows_are_importable():
@@ -923,8 +974,7 @@ FINALIZED_ALUMNI_HEADERS = [
     "Citizenship",
     "Marital Status",
     "Languages",
-    "Spouse First Name",
-    "Spouse Last Name",
+    "Spouse Name",
     "Phone #",
     "Current employer",
     "Current title",
@@ -978,7 +1028,9 @@ def test_expected_headers_are_the_finalized_set_in_order():
     # Languages column and the Residence city/state columns (which bind to the
     # actual contact address, distinct from the employer "Current city/state").
     assert import_csv.EXPECTED_HEADERS == FINALIZED_ALUMNI_HEADERS
-    assert len(import_csv.EXPECTED_HEADERS) == 69
+    # 69 -> 68: the two Spouse First/Last columns collapsed into one "Spouse Name"
+    # column that _map_row splits into first/last on import.
+    assert len(import_csv.EXPECTED_HEADERS) == 68
     # Every header is a mapping key (and vice-versa).
     assert set(import_csv._MAPPING) == set(FINALIZED_ALUMNI_HEADERS)
 
@@ -1146,7 +1198,7 @@ def test_friend_template_excludes_academic_and_identity_fields():
         "Finance program admitted year",
         "Graduate degree",
         "Degree year",
-        "Spouse First Name",
+        "Spouse Name",
     ):
         assert banned not in headers
 

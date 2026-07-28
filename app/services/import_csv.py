@@ -127,8 +127,11 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "Citizenship": ("core", "citizenship", "str"),
     "Marital Status": ("core", "marital_status", "str"),
     "Languages": ("core", "languages", "str"),
-    "Spouse First Name": ("core", "spouse_first_name", "str"),
-    "Spouse Last Name": ("core", "spouse_last_name", "str"),
+    # One combined column on the sheet (99% of intake data has the full name in
+    # one field). Split into spouse_first_name/spouse_last_name in _map_row; the
+    # data stays separate everywhere else (Option A). kind "spouse_name" drives
+    # both the split on import and the join on the cohort round-trip export.
+    "Spouse Name": ("core", "spouse_first_name", "spouse_name"),
     "Phone #": ("contact", "phone", "str"),
     "Current employer": ("career", "current_employer", "str"),
     "Current title": ("career", "current_title", "str"),
@@ -377,6 +380,13 @@ def _coerce_date(header: str, raw: str) -> str:
 # INDUSTRY cell we map them to the catch-all "Other"; in the free-text fields
 # below we blank them out (see the map loop) rather than storing the literal.
 _PLACEHOLDER_TOKENS = frozenset({"unknown", "n/a", "na"})
+
+# Marital status is free-text (not a validated vocab), and intake sheets often
+# carry "Undeclared"/"N/A"/"None" for students who didn't answer. Those all mean
+# "not provided", so they import as blank rather than a literal value. Kept
+# separate from _PLACEHOLDER_TOKENS so "Undeclared"/"None" only blank marital
+# status — they must NOT reclassify an industry cell (see _coerce_industry).
+_MARITAL_BLANK_TOKENS = frozenset({"undeclared", "n/a", "na", "none", "unknown"})
 
 # Free-text fields where a placeholder token means "leave blank": the address/
 # location columns, the open-response secondary industry, and the LinkedIn URL.
@@ -641,6 +651,20 @@ def _map_row(
         if kind == "spouse":
             # Captured for later DB resolution; not placed in the payload yet.
             spouse_byu_id = raw.strip()
+            continue
+
+        if kind == "spouse_name":
+            # One combined "Spouse Name" cell -> first token is the first name,
+            # the remainder is the last name (blank last if a single word).
+            parts = raw.strip().split(None, 1)
+            if parts:
+                core["spouse_first_name"] = parts[0]
+                if len(parts) > 1:
+                    core["spouse_last_name"] = parts[1]
+            continue
+
+        # "Undeclared"/"N/A"/"None" marital status means "not provided" -> blank.
+        if field == "marital_status" and raw.strip().lower() in _MARITAL_BLANK_TOKENS:
             continue
 
         # A free-text location / secondary-industry cell filled with a
@@ -1880,6 +1904,13 @@ async def build_cohort_update_csv(
                 row_out.append("")  # no clean single-field source -> blank
                 continue
             section, field, kind = target
+            if kind == "spouse_name":
+                # Inverse of the import split: join first + last back into the
+                # single "Spouse Name" cell so the round-trip re-parses cleanly.
+                first = getattr(alumnus, "spouse_first_name", None) or ""
+                last = getattr(alumnus, "spouse_last_name", None) or ""
+                row_out.append(_cohort_cell(f"{first} {last}".strip(), "str"))
+                continue
             if section == "core":
                 source_row = alumnus
             else:

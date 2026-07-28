@@ -68,6 +68,7 @@ _FIELDS: tuple[_Field, ...] = (
     _Field("profile.spouse_last_name", "Spouse last name", "alumni", "spouse_last_name", "text"),
     _Field("contact.personal_email", "Permanent email", "contact", "personal_email", "text"),
     _Field("contact.work_email", "Work email", "contact", "work_email", "text"),
+    _Field("contact.phone", "Phone", "contact", "phone", "text"),
     _Field("profile.linkedin_url", "LinkedIn", "alumni", "linkedin_url", "text"),
     _Field("profile.graduate_degree", "Graduate program", "alumni", "graduate_degree", "text"),
     _Field("profile.graduate_school", "Graduate school", "alumni", "graduate_school", "text"),

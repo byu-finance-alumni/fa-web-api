@@ -61,6 +61,7 @@ _FIELDS: tuple[_Field, ...] = (
     _Field(
         "employment.current_country", "Employment country", "employment", "current_country", "text"
     ),
+    _Field("employment.current_zip", "Company ZIP", "employment", "current_zip", "text"),
     _Field("contact.city", "Residence city", "contact", "city", "text"),
     _Field("contact.state", "Residence state", "contact", "state", "text"),
     _Field("contact.country", "Residence country", "contact", "country", "text"),
@@ -82,6 +83,12 @@ _FIELDS: tuple[_Field, ...] = (
     _Field(
         "profile.other_designations", "Finance designations", "alumni", "other_designations", "text"
     ),
+    # Personal & family (alumni table). Columns already exist — no migration.
+    _Field("profile.gender", "Gender", "alumni", "gender", "text"),
+    _Field("profile.marital_status", "Marital status", "alumni", "marital_status", "text"),
+    _Field("profile.birth_date", "Birthday", "alumni", "birth_date", "date"),
+    _Field("profile.citizenship", "Citizenship", "alumni", "citizenship", "text"),
+    _Field("profile.home_country", "Home country", "alumni", "home_country", "text"),
     _Field(
         "program.mentor_willing",
         "Willing to mentor students",
@@ -175,6 +182,12 @@ def _coerce(field: _Field, raw: object):
     if field.kind == "int":
         try:
             return int(value) if value else None
+        except ValueError:
+            return None
+    if field.kind == "date":
+        # Expect an ISO "YYYY-MM-DD" string (the survey's <input type="date">).
+        try:
+            return datetime.date.fromisoformat(value) if value else None
         except ValueError:
             return None
     return value or None

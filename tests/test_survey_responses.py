@@ -23,6 +23,25 @@ def test_coerce_bool_int_text():
     tf = _Field("k", "L", "alumni", "c", "text")
     assert _coerce(tf, "  hi ") == "hi"
     assert _coerce(tf, "") is None
+    import datetime
+
+    df = _Field("profile.birth_date", "Birthday", "alumni", "birth_date", "date")
+    assert _coerce(df, "2000-01-15") == datetime.date(2000, 1, 15)
+    assert _coerce(df, "") is None
+    assert _coerce(df, "not-a-date") is None
+
+
+def test_new_profile_fields_are_whitelisted():
+    # #523 — the Personal & family + Company ZIP fields the survey now covers.
+    for key in (
+        "profile.gender",
+        "profile.marital_status",
+        "profile.birth_date",
+        "profile.citizenship",
+        "profile.home_country",
+        "employment.current_zip",
+    ):
+        assert key in sr._FIELD_BY_KEY, key
 
 
 def test_current_and_after_formatting():

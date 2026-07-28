@@ -259,12 +259,14 @@ async def get_respondent(
     put("contact.state", getattr(contact, "state", None))
     put("contact.country", getattr(contact, "country", None))
     # Profile (alumni)
+    put("profile.employment_status", alum.employment_status)
     put("profile.linkedin_url", alum.linkedin_url)
     put("profile.graduate_degree", alum.graduate_degree)
     put("profile.graduate_school", alum.graduate_school)
     put("profile.graduate_graduation_year", alum.graduate_graduation_year)
     put("profile.spouse_first_name", alum.spouse_first_name)
     put("profile.spouse_last_name", alum.spouse_last_name)
+    put("profile.other_designations", alum.other_designations)
 
     first = (alum.preferred_first_name or alum.first_name or "there").strip()
     full = " ".join(p for p in (alum.first_name, alum.last_name) if p).strip() or first

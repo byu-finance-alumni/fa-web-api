@@ -279,7 +279,31 @@ _LEGACY_HEADER_ALIASES: dict[str, str] = {
 
 def _canonicalize_header(header: str) -> str:
     """Map a retired header spelling to its current one (others pass through)."""
-    return _LEGACY_HEADER_ALIASES.get(header, header)
+    if header in _LEGACY_HEADER_ALIASES:
+        return _LEGACY_HEADER_ALIASES[header]
+    # The Women-in-Finance header contains an em-dash, which Excel/encoding
+    # routinely mangles into a hyphen, en-dash, or mojibake ("â€"") — the #1
+    # cause of a spurious "columns don't match" on this template. Normalize ANY
+    # dash variant back to the canonical spelling.
+    if header.startswith("Willing to mentor") and "Women in Finance" in header:
+        return "Willing to mentor — Women in Finance (Yes/No)"
+    return header
+
+
+def _decode_upload(data: bytes) -> str | None:
+    """Decode uploaded CSV bytes to text, tolerant of how Excel actually saves.
+
+    Tries UTF-8 (with/without BOM) first — the recommended format — then falls
+    back to Windows-1252 (Excel's plain "CSV" / ANSI default on Windows) and
+    finally Latin-1 (which decodes any byte). So an ANSI export containing an
+    em-dash or an accented name imports without the user re-saving as UTF-8.
+    """
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None  # unreachable — latin-1 never raises — kept for safety
 
 
 def _expected_headers(friend: bool) -> list[str]:
@@ -557,12 +581,11 @@ def parse_and_map(
     """
     expected = _expected_headers(friend)
     mapping = _mapping_for(friend)
-    try:
-        text = file_bytes.decode("utf-8-sig")
-    except UnicodeDecodeError:
+    text = _decode_upload(file_bytes)
+    if text is None:
         return [], [
-            "The file could not be read as UTF-8. Re-save it as UTF-8 (or "
-            "UTF-8 with BOM) from Excel and re-upload."
+            "The file could not be read. Re-save it as CSV UTF-8 from Excel "
+            "(Save As → 'CSV UTF-8 (Comma delimited)') and re-upload."
         ]
     reader = csv.reader(io.StringIO(text))
     try:

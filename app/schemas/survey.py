@@ -87,3 +87,13 @@ class SurveySendResult(BaseModel):
     remaining: int
     dry_run: bool
     sample: list[SurveySendSample]
+
+
+class SurveyUsage(BaseModel):
+    """Real Resend send usage for the console's daily/monthly tallies — emails
+    actually sent today and this calendar month (summed from the `send_survey`
+    audit rows). UTC day/month boundaries, matching the rest of the app's date
+    filtering."""
+
+    sent_today: int
+    sent_this_month: int

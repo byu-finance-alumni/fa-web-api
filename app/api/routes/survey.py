@@ -5,9 +5,20 @@
 send via Resend, `?limit=N` to override the per-call cap.
 """
 
+import hmac
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Path, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,18 +30,22 @@ from app.api.routes.alumni import (
     _read_capped,
     _too_large_response,
 )
+from app.core.config import get_settings
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyRespondInfo,
     SurveyResponseItem,
+    SurveyScheduleCreateRequest,
+    SurveyScheduleItem,
+    SurveyScheduleRunSummary,
     SurveySendResult,
     SurveySubmitRequest,
     SurveySubmitResult,
     SurveyUsage,
 )
-from app.services import survey_email, survey_responses
+from app.services import survey_email, survey_responses, survey_schedule
 
 # The test cohort lives in grad year 1900 (below the normal 1950 floor), so allow
 # it explicitly here.
@@ -158,3 +173,78 @@ async def send_survey_campaign(
         dry_run=dry_run,
         limit=limit,
     )
+
+
+# --------------------------------------------------------------- scheduler ----
+
+
+@router.get("/schedules", response_model=list[SurveyScheduleItem])
+async def list_survey_schedules(
+    user: RequireFullAccess, session: SessionDep
+) -> list[SurveyScheduleItem]:
+    """All auto-send schedules (newest cohort first) + per-stage sent counts."""
+    return await survey_schedule.list_schedules(session)
+
+
+@router.post("/schedules", response_model=SurveyScheduleItem)
+async def create_survey_schedule(
+    body: SurveyScheduleCreateRequest,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> SurveyScheduleItem:
+    """Create — or replace — the auto-send schedule for a graduation year."""
+    if not _GRAD_YEAR_MIN <= body.graduation_year <= _GRAD_YEAR_MAX:
+        raise InvalidRequestError("Graduation year is out of range.")
+    return await survey_schedule.create_schedule(
+        session,
+        graduation_year=body.graduation_year,
+        start_date=body.start_date,
+        actor_user_id=user.user_id,
+    )
+
+
+@router.post("/schedules/{grad_year}/cancel", response_model=SurveyScheduleItem)
+async def cancel_survey_schedule(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> SurveyScheduleItem:
+    """Cancel a graduation year's schedule — no further sends."""
+    item = await survey_schedule.cancel_schedule(session, grad_year)
+    if item is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return item
+
+
+async def _run_cron(request: Request, session: AsyncSession) -> SurveyScheduleRunSummary:
+    """Send scheduler cron core — NOT login-gated (Vercel Cron can't log in).
+
+    Authorized only by a shared secret: the request must carry
+    ``Authorization: Bearer <CRON_SECRET>``. Vercel Cron sends exactly this header
+    automatically when ``CRON_SECRET`` is set as a project env var. Any other (or
+    absent) credential → 401. When ``CRON_SECRET`` is unset the endpoint rejects
+    everything, so it is never open by default.
+    """
+    expected = get_settings().cron_secret
+    provided = request.headers.get("Authorization", "")
+    if not expected or not hmac.compare_digest(provided, f"Bearer {expected}"):
+        raise HTTPException(status_code=401, detail="Invalid cron credentials.")
+    return await survey_schedule.run_due_schedules(session)
+
+
+@router.post("/cron/run", response_model=SurveyScheduleRunSummary)
+async def survey_cron_run(
+    request: Request, session: SessionDep
+) -> SurveyScheduleRunSummary:
+    """Run the survey send scheduler (POST). See :func:`_run_cron`."""
+    return await _run_cron(request, session)
+
+
+@router.get(
+    "/cron/run", response_model=SurveyScheduleRunSummary, include_in_schema=False
+)
+async def survey_cron_run_get(
+    request: Request, session: SessionDep
+) -> SurveyScheduleRunSummary:
+    """GET variant — Vercel Cron invokes the path with a GET."""
+    return await _run_cron(request, session)

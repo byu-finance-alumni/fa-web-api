@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime
+
 from pydantic import BaseModel
 
 
@@ -109,3 +111,48 @@ class SurveyUsage(BaseModel):
 
     sent_today: int
     sent_this_month: int
+
+
+# --------------------------------------------------------------- scheduler ----
+
+
+class SurveyScheduleCreateRequest(BaseModel):
+    """Create/replace the auto-send schedule for a graduation year (#542)."""
+
+    graduation_year: int
+    # Initial send date. The 1-week and 2-week reminders follow from here.
+    start_date: datetime.date
+
+
+class SurveyScheduleItem(BaseModel):
+    """One survey schedule + how many emails each stage has sent so far."""
+
+    survey_schedule_id: int
+    graduation_year: int
+    start_date: datetime.date
+    status: str
+    last_run_at: datetime.datetime | None = None
+    created_at: datetime.datetime | None = None
+    # Delivered counts per stage from survey_send_log (0=initial, 1/2=reminders).
+    sent_initial: int = 0
+    sent_reminder_1: int = 0
+    sent_reminder_2: int = 0
+
+
+class SurveyScheduleRunItem(BaseModel):
+    """What one due schedule did on this cron run."""
+
+    graduation_year: int
+    # The stage sent (0/1/2), or None if the campaign was already complete.
+    stage: int | None
+    sent: int
+    remaining: int
+    # Set when Resend rate-limited us mid-run (429): seconds to wait before the
+    # remaining recipients go out. Picked up on the next cron run.
+    retry_after_seconds: int | None = None
+
+
+class SurveyScheduleRunSummary(BaseModel):
+    """Summary of a cron run over every due schedule."""
+
+    ran: list[SurveyScheduleRunItem]

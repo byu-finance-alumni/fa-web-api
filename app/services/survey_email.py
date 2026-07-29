@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html import escape
 
@@ -604,6 +605,77 @@ async def _send_batch(emails: list[dict]) -> tuple[int | None, int | None]:
     )
 
 
+def _survey_link(base_url: str, alumni_id: int, graduation_year: int) -> str:
+    """The recipient's unique, signed confirm link."""
+    token = make_survey_token(alumni_id, graduation_year)
+    return f"{base_url.rstrip('/')}/survey/{token}"
+
+
+def _build_survey_email(
+    r: Recipient, *, graduation_year: int, base_url: str, from_field: str
+) -> dict:
+    """One Resend batch entry for a recipient (unique link + rendered content)."""
+    link = _survey_link(base_url, r.alumni_id, graduation_year)
+    subject, html, text = render_survey_email(r, link)
+    return {
+        "from": from_field,
+        "to": [r.email],
+        "subject": subject,
+        "html": html,
+        "text": text,
+    }
+
+
+async def send_recipients(
+    recipients: list[Recipient],
+    *,
+    graduation_year: int,
+    base_url: str,
+    from_field: str,
+    on_batch_sent: Callable[[list[Recipient]], Awaitable[None]] | None = None,
+) -> tuple[int, int | None]:
+    """Send the survey to a list of recipients, Resend-governed.
+
+    Sends in ``_BATCH_MAX`` chunks via :func:`_send_batch`, pacing from Resend's
+    ratelimit-* headers. Returns ``(sent, retry_after)`` — the count actually
+    delivered and, if Resend rate-limited us (429), the seconds to wait before the
+    rest can go (``None`` when not throttled). On a 429 it STOPS: the un-sent
+    remainder is left for a later run. ``on_batch_sent`` is awaited with each
+    successfully-sent chunk BEFORE pacing, so callers can durably record delivery
+    (the scheduler logs each recipient) so a crash/throttle never re-emails them.
+
+    The limit is Resend's, discovered from its response — never a configured cap.
+    Shared by :func:`send_campaign` (manual send) and the send scheduler.
+    """
+    sent = 0
+    retry_after: int | None = None
+    try:
+        for chunk in _chunks(recipients, _BATCH_MAX):
+            emails = [
+                _build_survey_email(
+                    r,
+                    graduation_year=graduation_year,
+                    base_url=base_url,
+                    from_field=from_field,
+                )
+                for r in chunk
+            ]
+            remaining, reset = await _send_batch(emails)
+            sent += len(chunk)
+            if on_batch_sent is not None:
+                await on_batch_sent(chunk)
+            # Pace from Resend's own headers: if the window is exhausted wait for
+            # its reset, otherwise a small gap to stay under the req/s cap.
+            if remaining is not None and remaining <= 0 and reset:
+                await asyncio.sleep(min(reset, _MAX_PACE_SLEEP_SECONDS))
+            else:
+                await asyncio.sleep(_INTER_BATCH_DELAY_SECONDS)
+    except ResendRateLimited as exc:
+        # Hit Resend's limit — stop; the rest is left for a later run.
+        retry_after = exc.retry_after
+    return sent, retry_after
+
+
 async def send_campaign(
     session: AsyncSession,
     *,
@@ -635,34 +707,18 @@ async def send_campaign(
     # (the scheduler resumes it once `retry_after` has elapsed).
     to_send = recipients[: max(limit, 0)] if limit is not None else recipients
     from_field = f"{settings.survey_from_name} <{from_email}>"
-
-    emails: list[dict] = []
-    links: list[str] = []
-    for r in to_send:
-        token = make_survey_token(r.alumni_id, graduation_year)
-        link = f"{base_url.rstrip('/')}/survey/{token}"
-        links.append(link)
-        subject, html, text = render_survey_email(r, link)
-        emails.append(
-            {"from": from_field, "to": [r.email], "subject": subject, "html": html, "text": text}
-        )
+    # Every eligible recipient builds exactly one email, so prepared == len(to_send).
+    prepared = len(to_send)
 
     sent = 0
     retry_after: int | None = None
-    if not dry_run and emails:
-        try:
-            for chunk in _chunks(emails, _BATCH_MAX):
-                remaining, reset = await _send_batch(chunk)
-                sent += len(chunk)
-                # Pace from Resend's own headers: if the window is exhausted wait
-                # for its reset, otherwise a small gap to stay under the req/s cap.
-                if remaining is not None and remaining <= 0 and reset:
-                    await asyncio.sleep(min(reset, _MAX_PACE_SLEEP_SECONDS))
-                else:
-                    await asyncio.sleep(_INTER_BATCH_DELAY_SECONDS)
-        except ResendRateLimited as exc:
-            # Hit Resend's limit — stop; the rest is left for a later run.
-            retry_after = exc.retry_after
+    if not dry_run and to_send:
+        sent, retry_after = await send_recipients(
+            to_send,
+            graduation_year=graduation_year,
+            base_url=base_url,
+            from_field=from_field,
+        )
 
     remaining = len(recipients) - len(to_send) if dry_run else len(recipients) - sent
     session.add(
@@ -673,7 +729,7 @@ async def send_campaign(
             entity_id=graduation_year,
             new_value=(
                 f"grad_year={graduation_year} recipients={len(recipients)} "
-                f"prepared={len(emails)} sent={sent} dry_run={dry_run}"
+                f"prepared={prepared} sent={sent} dry_run={dry_run}"
                 + (f" throttled_retry_after={retry_after}" if retry_after else "")
             ),
         )
@@ -683,13 +739,16 @@ async def send_campaign(
     return SurveySendResult(
         graduation_year=graduation_year,
         total_recipients=len(recipients),
-        prepared=len(emails),
+        prepared=prepared,
         sent=sent,
         remaining=remaining,
         dry_run=dry_run,
         retry_after_seconds=retry_after,
         sample=[
-            SurveySendSample(email=r.email, link=link)
-            for r, link in list(zip(to_send, links, strict=False))[:3]
+            SurveySendSample(
+                email=r.email,
+                link=_survey_link(base_url, r.alumni_id, graduation_year),
+            )
+            for r in to_send[:3]
         ],
     )

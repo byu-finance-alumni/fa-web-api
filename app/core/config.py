@@ -8,6 +8,7 @@ Supabase<->Vercel integration (e.g. `POSTGRES_URL`, `SUPABASE_JWT_SECRET`), so
 the app works whether values are set manually or by the integration.
 """
 
+import datetime
 from functools import lru_cache
 
 from pydantic import AliasChoices, Field
@@ -81,6 +82,14 @@ class Settings(BaseSettings):
     survey_token_secret: str | None = Field(default=None)
     # Max recipients to actually send in one call (Resend Free = 100/day).
     survey_daily_cap: int = Field(default=100)
+    # Manual send-usage baseline (#544). If `survey_usage_baseline_at` is set, the
+    # console's daily/monthly tallies START from these counts as of that instant
+    # and add ONLY sends recorded AFTER it — a correction for when the audit
+    # history is incomplete/polluted (e.g. dev testing). Leave `_at` unset (the
+    # default) to report the pure audit-summed usage.
+    survey_usage_baseline_at: datetime.datetime | None = Field(default=None)
+    survey_usage_baseline_today: int = Field(default=0)
+    survey_usage_baseline_month: int = Field(default=0)
 
     # CORS — comma-separated list of allowed frontend origins.
     cors_origins: str = Field(

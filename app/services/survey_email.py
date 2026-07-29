@@ -90,19 +90,30 @@ async def get_send_usage(session: AsyncSession) -> SurveyUsage:
     ``sent=N``). Day/month boundaries are UTC, matching the app's other date
     filtering. Dry runs (``send_survey_dry_run``) are excluded by the action
     filter."""
+    settings = get_settings()
+    anchor = settings.survey_usage_baseline_at
     now = datetime.datetime.now(datetime.UTC)
     start_today = datetime.datetime.combine(
         now.date(), datetime.time.min, tzinfo=datetime.UTC
     )
     start_month = start_today.replace(day=1)
-    rows = (
-        await session.execute(
-            select(AuditLog.new_value, AuditLog.created_at)
-            .where(AuditLog.action_type == "send_survey")
-            .where(AuditLog.created_at >= start_month)
-        )
-    ).all()
+    stmt = (
+        select(AuditLog.new_value, AuditLog.created_at)
+        .where(AuditLog.action_type == "send_survey")
+        .where(AuditLog.created_at >= start_month)
+    )
+    if anchor is not None:
+        # Baseline set: the baseline covers everything up to the anchor, so only
+        # count sends recorded strictly AFTER it (avoids double-counting).
+        stmt = stmt.where(AuditLog.created_at > anchor)
+    rows = (await session.execute(stmt)).all()
     sent_today, sent_this_month = _tally_sent(rows, start_today)
+    if anchor is not None:
+        # Add the baseline only while we're still in the anchor's day / month.
+        if now.date() == anchor.date():
+            sent_today += settings.survey_usage_baseline_today
+        if (now.year, now.month) == (anchor.year, anchor.month):
+            sent_this_month += settings.survey_usage_baseline_month
     return SurveyUsage(sent_today=sent_today, sent_this_month=sent_this_month)
 _TIMEOUT_SECONDS = 20.0
 # Resend caps a batch call at 100 messages.

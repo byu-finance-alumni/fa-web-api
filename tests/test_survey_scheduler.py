@@ -361,6 +361,94 @@ def test_cancel_missing_schedule_returns_none():
     assert asyncio.run(survey_schedule.cancel_schedule(session, 1999)) is None
 
 
+def test_create_schedules_bulk_inserts_and_updates_many():
+    from app.schemas.survey import SurveyScheduleCreateRequest
+
+    existing = _sched(2001, datetime.date(2026, 1, 1), status="completed")
+    session = QueueSession(
+        [
+            _Res(one=None),  # year 2000 existence -> new
+            _Res(one=existing),  # year 2001 existence -> found (update)
+            _Res(one=None),  # year 2002 existence -> new
+            # list_schedules re-query: all rows + per-stage counts
+            _Res(scalars_all=[_sched(2000, datetime.date(2026, 8, 1))]),
+            _Res(rows=[]),
+        ]
+    )
+    items = [
+        SurveyScheduleCreateRequest(
+            graduation_year=2000, start_date=datetime.date(2026, 8, 1)
+        ),
+        SurveyScheduleCreateRequest(
+            graduation_year=2001, start_date=datetime.date(2026, 9, 1)
+        ),
+        SurveyScheduleCreateRequest(
+            graduation_year=2002, start_date=datetime.date(2026, 10, 1)
+        ),
+    ]
+    result = asyncio.run(
+        survey_schedule.create_schedules_bulk(
+            session, items=items, actor_user_id=5
+        )
+    )
+    assert isinstance(result, list)
+    # One commit for the whole batch (not one per year).
+    assert session.commits == 1
+    # The two brand-new years were inserted; the existing one was updated in place.
+    added = [a for a in session.added if type(a).__name__ == "SurveySchedule"]
+    assert sorted(a.graduation_year for a in added) == [2000, 2002]
+    assert existing.status == "scheduled"
+    assert existing.start_date == datetime.date(2026, 9, 1)
+
+
+def test_create_schedules_bulk_empty_is_noop():
+    session = QueueSession(
+        [
+            _Res(scalars_all=[]),  # list_schedules: no rows
+            _Res(rows=[]),  # per-stage counts
+        ]
+    )
+    result = asyncio.run(
+        survey_schedule.create_schedules_bulk(
+            session, items=[], actor_user_id=5
+        )
+    )
+    assert result == []
+    # No schedule rows were touched.
+    assert not [a for a in session.added if type(a).__name__ == "SurveySchedule"]
+
+
+def test_create_schedules_bulk_dedupes_duplicate_year():
+    from app.schemas.survey import SurveyScheduleCreateRequest
+
+    session = QueueSession(
+        [
+            _Res(one=None),  # single existence check for the one deduped year
+            _Res(scalars_all=[_sched(2000, datetime.date(2026, 9, 1))]),
+            _Res(rows=[]),
+        ]
+    )
+    items = [
+        SurveyScheduleCreateRequest(
+            graduation_year=2000, start_date=datetime.date(2026, 8, 1)
+        ),
+        SurveyScheduleCreateRequest(
+            graduation_year=2000, start_date=datetime.date(2026, 9, 1)
+        ),
+    ]
+    asyncio.run(
+        survey_schedule.create_schedules_bulk(
+            session, items=items, actor_user_id=5
+        )
+    )
+    # The duplicate year collapses to ONE inserted row, and last-one-wins picks
+    # the later start date.
+    added = [a for a in session.added if type(a).__name__ == "SurveySchedule"]
+    assert len(added) == 1
+    assert added[0].graduation_year == 2000
+    assert added[0].start_date == datetime.date(2026, 9, 1)
+
+
 def test_list_schedules_includes_stage_counts():
     s1 = _sched(2001, datetime.date(2026, 5, 1), status="active")
     session = QueueSession(

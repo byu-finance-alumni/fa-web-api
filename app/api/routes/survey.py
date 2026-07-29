@@ -37,6 +37,7 @@ from app.schemas.survey import (
     GraduationYearCount,
     SurveyRespondInfo,
     SurveyResponseItem,
+    SurveyScheduleBulkRequest,
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
     SurveyScheduleRunSummary,
@@ -199,6 +200,25 @@ async def create_survey_schedule(
         session,
         graduation_year=body.graduation_year,
         start_date=body.start_date,
+        actor_user_id=user.user_id,
+    )
+
+
+@router.post("/schedules/bulk", response_model=list[SurveyScheduleItem])
+async def create_survey_schedules_bulk(
+    body: SurveyScheduleBulkRequest,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> list[SurveyScheduleItem]:
+    """Create — or replace — the auto-send schedule for many graduation years in
+    one call. A duplicate year in the payload resolves to a single row (last one
+    wins). Returns the full, refreshed schedule list."""
+    for item in body.schedules:
+        if not _GRAD_YEAR_MIN <= item.graduation_year <= _GRAD_YEAR_MAX:
+            raise InvalidRequestError("Graduation year is out of range.")
+    return await survey_schedule.create_schedules_bulk(
+        session,
+        items=body.schedules,
         actor_user_id=user.user_id,
     )
 

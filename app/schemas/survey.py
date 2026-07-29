@@ -124,6 +124,15 @@ class SurveyScheduleCreateRequest(BaseModel):
     start_date: datetime.date
 
 
+class SurveyScheduleBulkRequest(BaseModel):
+    """Create/replace the auto-send schedule for many graduation years at once
+    (#542). Lets an admin schedule every class from one dialog instead of one at
+    a time. A duplicate ``graduation_year`` in the list resolves to a single
+    row — last one wins."""
+
+    schedules: list[SurveyScheduleCreateRequest]
+
+
 class SurveyScheduleItem(BaseModel):
     """One survey schedule + how many emails each stage has sent so far."""
 

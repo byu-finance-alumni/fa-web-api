@@ -94,6 +94,10 @@ class SurveySendResult(BaseModel):
     sent: int
     remaining: int
     dry_run: bool
+    # Set when Resend rate-limited us mid-send (429): seconds to wait before the
+    # remaining recipients can be sent. None = not throttled. The limit is
+    # Resend's, discovered from its response — never a value we configure.
+    retry_after_seconds: int | None = None
     sample: list[SurveySendSample]
 
 

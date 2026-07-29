@@ -102,6 +102,7 @@ def test_dry_run_sends_nothing(fake_settings, monkeypatch):
 
     async def fake_batch(emails):
         calls.append(emails)
+        return (None, None)
 
     monkeypatch.setattr(survey_email, "_load_recipients", fake_load)
     monkeypatch.setattr(survey_email, "_send_batch", fake_batch)
@@ -127,6 +128,7 @@ def test_live_send_calls_resend(fake_settings, monkeypatch):
 
     async def fake_batch(emails):
         calls.append(emails)
+        return (None, None)
 
     monkeypatch.setattr(survey_email, "_load_recipients", fake_load)
     monkeypatch.setattr(survey_email, "_send_batch", fake_batch)
@@ -146,7 +148,7 @@ def test_limit_caps_recipients(fake_settings, monkeypatch):
         return _recipients(10)
 
     async def fake_batch(emails):
-        pass
+        return (None, None)
 
     monkeypatch.setattr(survey_email, "_load_recipients", fake_load)
     monkeypatch.setattr(survey_email, "_send_batch", fake_batch)
@@ -159,6 +161,35 @@ def test_limit_caps_recipients(fake_settings, monkeypatch):
     )
     assert result.prepared == 4
     assert result.remaining == 6
+
+
+def test_send_stops_and_reports_retry_after_on_429(fake_settings, monkeypatch):
+    # Resend rate-limits mid-send -> we stop, report what got sent, how many
+    # remain, and Resend's retry-after. The limit comes from Resend, not config.
+    async def fake_load(session, year):
+        return _recipients(250)  # 3 batches: 100, 100, 50
+
+    state = {"n": 0}
+
+    async def fake_batch(emails):
+        state["n"] += 1
+        if state["n"] == 1:
+            return (None, None)  # first batch delivers
+        raise survey_email.ResendRateLimited(retry_after=42)  # then throttled
+
+    monkeypatch.setattr(survey_email, "_load_recipients", fake_load)
+    monkeypatch.setattr(survey_email, "_send_batch", fake_batch)
+
+    session = FakeSession()
+    result = asyncio.run(
+        survey_email.send_campaign(
+            session, graduation_year=1900, actor_user_id=1, dry_run=False
+        )
+    )
+    assert result.sent == 100  # only the first batch went out
+    assert result.retry_after_seconds == 42
+    assert result.remaining == 150  # 250 - 100
+    assert session.committed == 1  # audit row still written
 
 
 # ------------------------------------------------------ sendable email -------

@@ -20,6 +20,7 @@ Design notes:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime
 import hashlib
@@ -519,7 +520,40 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
     return recipients
 
 
-async def _send_batch(emails: list[dict]) -> None:
+class ResendRateLimited(Exception):
+    """Resend returned 429 — we've hit its request/volume limit. ``retry_after``
+    is the seconds Resend told us to wait (from its ``retry-after`` /
+    ``ratelimit-reset`` header) before sending more. The LIMIT COMES FROM RESEND:
+    we never hardcode a daily/monthly cap — we send until Resend says stop."""
+
+    def __init__(self, retry_after: int) -> None:
+        self.retry_after = retry_after
+        super().__init__(f"Resend rate limit hit; retry after {retry_after}s")
+
+
+def _int_header(response: httpx.Response, name: str) -> int | None:
+    raw = response.headers.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+# Small pause between batches to stay under Resend's request rate limit
+# (default ~10 req/s per team); the authoritative pace still comes from the
+# ratelimit-* headers below.
+_INTER_BATCH_DELAY_SECONDS = 0.15
+_MAX_PACE_SLEEP_SECONDS = 5.0
+
+
+async def _send_batch(emails: list[dict]) -> tuple[int | None, int | None]:
+    """Send one ≤100-email batch. Returns ``(ratelimit_remaining, ratelimit_reset)``
+    from Resend's response headers so the caller can pace itself. Raises
+    :class:`ResendRateLimited` on 429 (honoring ``retry-after``) and
+    :class:`ServiceError` on other failures. All pacing/stopping is driven by
+    Resend's own headers — nothing here is a configured limit."""
     settings = get_settings()
     key = settings.resend_api_key
     if not key:
@@ -536,6 +570,14 @@ async def _send_batch(emails: list[dict]) -> None:
             )
     except httpx.HTTPError as exc:
         raise ServiceError("Could not reach the email service.") from exc
+    if response.status_code == 429:
+        retry_after = (
+            _int_header(response, "retry-after")
+            or _int_header(response, "ratelimit-reset")
+            or 1
+        )
+        log.warning("Resend rate limit (429); retry after %ss", retry_after)
+        raise ResendRateLimited(retry_after)
     if not response.is_success:
         # Surface Resend's own reason (e.g. domain-not-verified, free-tier
         # recipient restriction) so the operator can fix it — these messages
@@ -556,6 +598,10 @@ async def _send_batch(emails: list[dict]) -> None:
             f"Resend rejected the send (HTTP {response.status_code})"
             + (f": {detail}" if detail else ".")
         )
+    return (
+        _int_header(response, "ratelimit-remaining"),
+        _int_header(response, "ratelimit-reset"),
+    )
 
 
 async def send_campaign(
@@ -568,8 +614,11 @@ async def send_campaign(
 ) -> SurveySendResult:
     """Build and (unless dry_run) send the survey to a graduation year.
 
-    Sends at most `limit` (or `SURVEY_DAILY_CAP`) recipients this call; the rest
-    are reported as `remaining` for a later day. Writes an audit row and commits.
+    Attempts EVERY eligible recipient (or the first `limit` if given) and lets
+    RESEND'S rate limit decide how many actually go: on a 429 it stops, reports
+    `retry_after_seconds`, and leaves the rest as `remaining` for a later run.
+    No daily/monthly cap is configured here — the limit comes from Resend.
+    Writes an audit row and commits.
     """
     settings = get_settings()
     base_url = settings.survey_app_base_url
@@ -580,8 +629,11 @@ async def send_campaign(
         raise ServiceError("SURVEY_FROM_EMAIL is not configured.")
 
     recipients = await _load_recipients(session, graduation_year)
-    cap = limit if limit is not None else settings.survey_daily_cap
-    to_send = recipients[: max(cap, 0)]
+    # The cap comes from RESEND, not our config: attempt everyone unless the
+    # caller passes an explicit `limit`. Resend's 429 stops us at the plan's real
+    # daily/monthly limit, and the un-sent remainder is reported for a later run
+    # (the scheduler resumes it once `retry_after` has elapsed).
+    to_send = recipients[: max(limit, 0)] if limit is not None else recipients
     from_field = f"{settings.survey_from_name} <{from_email}>"
 
     emails: list[dict] = []
@@ -596,11 +648,23 @@ async def send_campaign(
         )
 
     sent = 0
+    retry_after: int | None = None
     if not dry_run and emails:
-        for chunk in _chunks(emails, _BATCH_MAX):
-            await _send_batch(chunk)
-        sent = len(emails)
+        try:
+            for chunk in _chunks(emails, _BATCH_MAX):
+                remaining, reset = await _send_batch(chunk)
+                sent += len(chunk)
+                # Pace from Resend's own headers: if the window is exhausted wait
+                # for its reset, otherwise a small gap to stay under the req/s cap.
+                if remaining is not None and remaining <= 0 and reset:
+                    await asyncio.sleep(min(reset, _MAX_PACE_SLEEP_SECONDS))
+                else:
+                    await asyncio.sleep(_INTER_BATCH_DELAY_SECONDS)
+        except ResendRateLimited as exc:
+            # Hit Resend's limit — stop; the rest is left for a later run.
+            retry_after = exc.retry_after
 
+    remaining = len(recipients) - len(to_send) if dry_run else len(recipients) - sent
     session.add(
         AuditLog(
             user_id=actor_user_id,
@@ -610,6 +674,7 @@ async def send_campaign(
             new_value=(
                 f"grad_year={graduation_year} recipients={len(recipients)} "
                 f"prepared={len(emails)} sent={sent} dry_run={dry_run}"
+                + (f" throttled_retry_after={retry_after}" if retry_after else "")
             ),
         )
     )
@@ -620,8 +685,9 @@ async def send_campaign(
         total_recipients=len(recipients),
         prepared=len(emails),
         sent=sent,
-        remaining=len(recipients) - len(to_send),
+        remaining=remaining,
         dry_run=dry_run,
+        retry_after_seconds=retry_after,
         sample=[
             SurveySendSample(email=r.email, link=link)
             for r, link in list(zip(to_send, links, strict=False))[:3]

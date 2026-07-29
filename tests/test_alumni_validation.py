@@ -334,3 +334,19 @@ def test_route_rejects_bad_linkedin_host(client):
     assert response.status_code == 422
     fields = response.json()["error"]["fields"]
     assert any(f["field"] == "linkedin_url" for f in fields)
+
+
+def test_alumni_create_accepts_languages():
+    # The intake "Languages" column maps to alumni.languages; AlumniBase is
+    # extra='forbid', so the field must be accepted (a row with a language was
+    # being rejected with "Extra inputs are not permitted").
+    model = AlumniCreate(
+        first_name="Jane", last_name="Doe", languages="English; Spanish"
+    )
+    assert model.languages == "English; Spanish"
+
+
+def test_alumni_create_still_rejects_unknown_field():
+    # extra='forbid' still guards genuinely unknown columns.
+    with pytest.raises(ValidationError):
+        AlumniCreate(first_name="Jane", not_a_real_column="x")

@@ -46,6 +46,7 @@ _MARITAL_STATUS_MAX = 50
 _HOME_COUNTRY_MAX = 100
 _EMPLOYMENT_STATUS_MAX = 50
 _OTHER_DESIGNATIONS_MAX = 10000
+_LANGUAGES_MAX = 255
 _GRADUATION_SEMESTER_MAX = 20
 _PROFILE_UPDATED_BY_MAX = 200
 
@@ -134,6 +135,11 @@ class AlumniBase(BaseModel):
     other_designations: str | None = Field(
         default=None, max_length=_OTHER_DESIGNATIONS_MAX
     )
+    # Free-text list of languages the alum speaks. Store-only (imported/exported,
+    # not shown on the profile), but MUST be a field here: the intake sheet's
+    # "Languages" column maps to this core key, and AlumniBase is extra='forbid',
+    # so omitting it makes every row with a language a validation error (#...).
+    languages: str | None = Field(default=None, max_length=_LANGUAGES_MAX)
     survey_completed_date: datetime.date | None = None
     # Schema-LEGAL but client-READ-ONLY, and that split is deliberate (#285).
     #

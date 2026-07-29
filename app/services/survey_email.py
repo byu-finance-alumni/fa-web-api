@@ -39,6 +39,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
+from app.models.survey_response import SurveyResponse
 from app.repositories.alumni import build_alumni_query
 from app.schemas.survey import (
     GraduationYearCount,
@@ -368,8 +369,27 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
         .order_by(Alumni.graduation_year.desc())
     )
     rows = (await session.execute(stmt)).all()
+
+    # How many DISTINCT alumni have submitted a response for each grad year (any
+    # status — a reply is a reply). One grouped query, merged with the year counts.
+    responded_stmt = (
+        select(
+            SurveyResponse.graduation_year,
+            func.count(func.distinct(SurveyResponse.alumni_id)).label("responded"),
+        )
+        .where(SurveyResponse.graduation_year.is_not(None))
+        .group_by(SurveyResponse.graduation_year)
+    )
+    responded_by_year = {
+        year: responded for year, responded in (await session.execute(responded_stmt)).all()
+    }
+
     return [
-        GraduationYearCount(graduation_year=year, total_alumni=count)
+        GraduationYearCount(
+            graduation_year=year,
+            total_alumni=count,
+            responded=responded_by_year.get(year, 0),
+        )
         for year, count in rows
     ]
 

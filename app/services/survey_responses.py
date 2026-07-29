@@ -229,10 +229,14 @@ def _coerce(field: _Field, raw: object):
 
 
 async def submit_response(
-    session: AsyncSession, token: str, fields: dict[str, str]
+    session: AsyncSession, token: str, fields: dict[str, str], has_photo: bool = False
 ) -> SurveySubmitResult:
     """Stage an alum's submission (token-gated, public). Keeps only recognized
-    fields; nothing is applied to the record here."""
+    fields; nothing is applied to the record here.
+
+    A photo-only submission (empty `fields` but `has_photo=True`) still creates a
+    pending response so the page has an id to attach the photo to. Only a true
+    no-op (no recognized fields AND no photo) returns early with a null id."""
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
         raise NotFoundError("This survey link is invalid or has expired.")
@@ -243,7 +247,7 @@ async def submit_response(
         raise NotFoundError("This survey link is invalid or has expired.")
 
     payload = {k: _text(v) for k, v in (fields or {}).items() if k in _FIELD_BY_KEY}
-    if not payload:
+    if not payload and not has_photo:
         return SurveySubmitResult(staged=False, change_count=0)
 
     response = SurveyResponse(

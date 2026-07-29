@@ -59,7 +59,9 @@ async def survey_submit(
 ) -> SurveySubmitResult:
     """PUBLIC (token-gated): stage the alum's submitted changes for admin review.
     Nothing is applied to the record here."""
-    return await survey_responses.submit_response(session, token, body.fields)
+    return await survey_responses.submit_response(
+        session, token, body.fields, body.has_photo
+    )
 
 
 @router.post("/respond/{token}/photo", status_code=204)

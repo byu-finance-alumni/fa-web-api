@@ -13,10 +13,15 @@ class SurveySubmitRequest(BaseModel):
 
 
 class SurveySubmitResult(BaseModel):
-    """Outcome of a submit — how many changes were staged for review."""
+    """Outcome of a submit — how many changes were staged for review.
+
+    `survey_response_id` is the id of the staged row (None when nothing was
+    staged); the public survey page uses it to attach an optional profile photo
+    via `POST /survey/respond/{token}/photo`."""
 
     staged: bool
     change_count: int
+    survey_response_id: int | None = None
 
 
 class SurveyChange(BaseModel):
@@ -36,6 +41,9 @@ class SurveyResponseItem(BaseModel):
     name: str
     submitted_at: str
     changes: list[SurveyChange]
+    # Short-lived signed URL of a NEW profile photo the alum submitted with this
+    # response, for the reviewer to preview. None when no photo was staged.
+    photo_preview_url: str | None = None
 
 
 class SurveyRespondInfo(BaseModel):

@@ -59,6 +59,24 @@ async def upload_object(
         raise ServiceError("The file storage service rejected the upload.")
 
 
+async def download_object(bucket: str, path: str) -> bytes:
+    """Download an object's raw bytes from a private bucket (service key auth).
+
+    Used server-side to promote a staged survey photo into the alum's real
+    headshot. Raises ``ServiceError`` (-> 502) if the object can't be reached or
+    the storage service rejects the read; never surfaces the upstream body."""
+    base, key = _base_and_key()
+    url = f"{base}/object/{bucket}/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            response = await client.get(url, headers=_headers(key))
+    except httpx.HTTPError as exc:
+        raise ServiceError("Could not reach the file storage service to download.") from exc
+    if not response.is_success:
+        raise ServiceError("The file storage service rejected the download.")
+    return response.content
+
+
 async def create_signed_url(
     bucket: str, path: str, *, expires_in: int = 3600
 ) -> str | None:

@@ -56,6 +56,17 @@ _RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
 # actually sent). We sum those N to report true daily/monthly usage.
 _SENT_COUNT_RE = re.compile(r"\bsent=(\d+)")
 
+# The survey is ANNUAL: once an alum replies, they're not re-surveyed for a year.
+# A response submitted on/after this cutoff counts as "already surveyed this
+# cycle" — used both to exclude them from a send and to count real replies.
+_RESURVEY_INTERVAL_DAYS = 365
+
+
+def _resurvey_cutoff() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+        days=_RESURVEY_INTERVAL_DAYS
+    )
+
 
 def _tally_sent(rows, start_today: datetime.datetime) -> tuple[int, int]:
     """Sum ``sent=N`` across ``(new_value, created_at)`` audit rows. ``rows`` are
@@ -370,14 +381,18 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
     )
     rows = (await session.execute(stmt)).all()
 
-    # How many DISTINCT alumni have submitted a response for each grad year (any
-    # status — a reply is a reply). One grouped query, merged with the year counts.
+    # How many DISTINCT alumni have replied WITHIN THE LAST YEAR for each grad
+    # year (any status — a reply is a reply). Matches the re-survey exclusion in
+    # _load_recipients, so "responded" == "already surveyed this cycle".
     responded_stmt = (
         select(
             SurveyResponse.graduation_year,
             func.count(func.distinct(SurveyResponse.alumni_id)).label("responded"),
         )
-        .where(SurveyResponse.graduation_year.is_not(None))
+        .where(
+            SurveyResponse.graduation_year.is_not(None),
+            SurveyResponse.submitted_at >= _resurvey_cutoff(),
+        )
         .group_by(SurveyResponse.graduation_year)
     )
     responded_by_year = {
@@ -423,8 +438,10 @@ def _chunks(items: list, size: int):
 
 async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[Recipient]:
     """Eligible alumni for a grad year (is_alumni, not archived) who have a
-    personal email — with the on-file fields the email previews. Side tables are
-    bulk-loaded once (no N+1), mirroring the CSV export."""
+    personal email AND have NOT replied within the last year — with the on-file
+    fields the email previews. Side tables are bulk-loaded once (no N+1),
+    mirroring the CSV export. Excluding recent responders is what stops an alum
+    who already confirmed their info from being surveyed again this cycle."""
     has_personal_email = (
         select(AlumniContactInfo.contact_info_id)
         .where(
@@ -433,7 +450,20 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
         )
         .exists()
     )
-    stmt = build_alumni_query(graduation_year=graduation_year).where(has_personal_email)
+    # Already replied within the last year -> skip (the survey is annual).
+    replied_recently = (
+        select(SurveyResponse.survey_response_id)
+        .where(
+            SurveyResponse.alumni_id == Alumni.alumni_id,
+            SurveyResponse.submitted_at >= _resurvey_cutoff(),
+        )
+        .exists()
+    )
+    stmt = (
+        build_alumni_query(graduation_year=graduation_year)
+        .where(has_personal_email)
+        .where(~replied_recently)
+    )
     alumni = (await session.execute(stmt)).scalars().all()
     ids = [a.alumni_id for a in alumni]
     if not ids:

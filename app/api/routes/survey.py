@@ -7,12 +7,20 @@ send via Resend, `?limit=N` to override the per-call cap.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query
+from fastapi import APIRouter, Depends, File, Form, Path, Query, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireFullAccess
+from app.api.routes.alumni import (
+    _HEADSHOT_MAX_BYTES,
+    _HEADSHOT_MIME_TYPES,
+    _image_content_error,
+    _read_capped,
+    _too_large_response,
+)
 from app.core.database import get_session
-from app.core.errors import NotFoundError
+from app.core.errors import InvalidRequestError, NotFoundError
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyRespondInfo,
@@ -20,6 +28,7 @@ from app.schemas.survey import (
     SurveySendResult,
     SurveySubmitRequest,
     SurveySubmitResult,
+    SurveyUsage,
 )
 from app.services import survey_email, survey_responses
 
@@ -50,7 +59,41 @@ async def survey_submit(
 ) -> SurveySubmitResult:
     """PUBLIC (token-gated): stage the alum's submitted changes for admin review.
     Nothing is applied to the record here."""
-    return await survey_responses.submit_response(session, token, body.fields)
+    return await survey_responses.submit_response(
+        session, token, body.fields, body.has_photo
+    )
+
+
+@router.post("/respond/{token}/photo", status_code=204)
+async def survey_submit_photo(
+    token: str,
+    session: SessionDep,
+    survey_response_id: Annotated[int, Form()],
+    photo: Annotated[UploadFile, File()],
+) -> Response:
+    """PUBLIC (token-gated): attach a NEW profile photo to a just-staged response.
+
+    A separate step from the JSON field-submit so the field submit is unaffected.
+    The signed token gates it (no login); the same JPEG/PNG/WebP + size validation
+    as the headshot upload runs here before the image is staged for admin review.
+    The photo only becomes the alum's headshot if an admin applies the response."""
+    content_type = (photo.content_type or "").split(";")[0].strip().lower()
+    if content_type not in _HEADSHOT_MIME_TYPES:
+        raise InvalidRequestError("Photo must be a JPEG, PNG, or WebP image.")
+    data = await _read_capped(photo, _HEADSHOT_MAX_BYTES)
+    if data is None:
+        return _too_large_response(_HEADSHOT_MAX_BYTES)
+    if not data:
+        raise InvalidRequestError("The uploaded image is empty.")
+    # The Content-Type is just a client label; verify the real bytes match before
+    # anything reaches storage.
+    content_error = _image_content_error(data, content_type)
+    if content_error is not None:
+        raise InvalidRequestError(content_error)
+    await survey_responses.stage_photo(
+        session, token, survey_response_id, data, content_type
+    )
+    return Response(status_code=204)
 
 
 @router.get(
@@ -89,6 +132,15 @@ async def survey_graduation_years(
     """Distinct graduation years present in the DB (eligible alumni) + counts,
     newest first — powers the console's year picker."""
     return await survey_email.list_graduation_years(session)
+
+
+@router.get("/usage", response_model=SurveyUsage)
+async def survey_send_usage(
+    user: RequireFullAccess, session: SessionDep
+) -> SurveyUsage:
+    """Real Resend send usage (emails actually sent today / this calendar month),
+    for the console's daily/monthly tallies against the send caps."""
+    return await survey_email.get_send_usage(session)
 
 
 @router.post("/campaigns/{grad_year}/send", response_model=SurveySendResult)

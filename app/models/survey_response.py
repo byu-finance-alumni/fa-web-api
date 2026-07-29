@@ -23,6 +23,9 @@ class SurveyResponse(Base):
     graduation_year: Mapped[int | None] = mapped_column(Integer)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    # Staging key of a NEW profile photo uploaded with this response (headshots
+    # bucket, `survey-pending/<id>`), pending admin review. None when no photo.
+    staged_photo_path: Mapped[str | None] = mapped_column(String(255))
     submitted_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

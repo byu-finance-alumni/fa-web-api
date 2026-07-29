@@ -10,13 +10,22 @@ class SurveySubmitRequest(BaseModel):
     Only recognized survey fields are kept; anything else is ignored."""
 
     fields: dict[str, str]
+    # True when the alum also picked a new profile photo to upload. A photo-only
+    # submission (empty `fields`) must still create a response row so the page has
+    # an id to attach the photo to — see `submit_response`.
+    has_photo: bool = False
 
 
 class SurveySubmitResult(BaseModel):
-    """Outcome of a submit — how many changes were staged for review."""
+    """Outcome of a submit — how many changes were staged for review.
+
+    `survey_response_id` is the id of the staged row (None when nothing was
+    staged); the public survey page uses it to attach an optional profile photo
+    via `POST /survey/respond/{token}/photo`."""
 
     staged: bool
     change_count: int
+    survey_response_id: int | None = None
 
 
 class SurveyChange(BaseModel):
@@ -36,6 +45,9 @@ class SurveyResponseItem(BaseModel):
     name: str
     submitted_at: str
     changes: list[SurveyChange]
+    # Short-lived signed URL of a NEW profile photo the alum submitted with this
+    # response, for the reviewer to preview. None when no photo was staged.
+    photo_preview_url: str | None = None
 
 
 class SurveyRespondInfo(BaseModel):
@@ -54,6 +66,10 @@ class GraduationYearCount(BaseModel):
 
     graduation_year: int
     total_alumni: int
+    # Distinct alumni in this grad year who have submitted a survey response (any
+    # status — pending/applied/rejected; a reply is a reply). Drives the console's
+    # "N replied" count.
+    responded: int = 0
 
 
 class SurveySendSample(BaseModel):
@@ -79,3 +95,13 @@ class SurveySendResult(BaseModel):
     remaining: int
     dry_run: bool
     sample: list[SurveySendSample]
+
+
+class SurveyUsage(BaseModel):
+    """Real Resend send usage for the console's daily/monthly tallies — emails
+    actually sent today and this calendar month (summed from the `send_survey`
+    audit rows). UTC day/month boundaries, matching the rest of the app's date
+    filtering."""
+
+    sent_today: int
+    sent_this_month: int

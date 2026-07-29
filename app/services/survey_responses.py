@@ -30,7 +30,39 @@ from app.schemas.survey import (
     SurveyResponseItem,
     SurveySubmitResult,
 )
+from app.services import supabase_storage
 from app.services.survey_email import verify_survey_token
+
+# A staged survey photo lives in the SAME private bucket as real headshots, but
+# under a `survey-pending/` prefix so it can NEVER overwrite an alum's actual
+# headshot before an admin approves it. On apply it's copied to the headshot key
+# (the alum's net_id, or their alumni_id as a fallback) and the staged copy is
+# removed; on reject the staged copy is just removed.
+_HEADSHOT_BUCKET = "headshots"
+_STAGED_PHOTO_PREFIX = "survey-pending"
+
+
+def _staged_photo_path(survey_response_id: int) -> str:
+    return f"{_STAGED_PHOTO_PREFIX}/{survey_response_id}"
+
+
+def _headshot_key(alum: Alumni) -> str:
+    """The object key an alum's headshot is stored under: their net_id, or their
+    alumni_id as a string when they have no net_id (so a missing net_id NEVER
+    hard-fails an otherwise-valid approval)."""
+    net_id = (alum.net_id or "").strip()
+    return net_id or str(alum.alumni_id)
+
+
+def _sniff_image_content_type(data: bytes) -> str:
+    """Best-effort image MIME from magic bytes for re-uploading a staged photo as
+    a headshot. Mirrors the headshot route's sniff; defaults to JPEG (the staged
+    bytes were already validated as JPEG/PNG/WebP at upload time)."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
 
 
 @dataclass(frozen=True)
@@ -197,10 +229,14 @@ def _coerce(field: _Field, raw: object):
 
 
 async def submit_response(
-    session: AsyncSession, token: str, fields: dict[str, str]
+    session: AsyncSession, token: str, fields: dict[str, str], has_photo: bool = False
 ) -> SurveySubmitResult:
     """Stage an alum's submission (token-gated, public). Keeps only recognized
-    fields; nothing is applied to the record here."""
+    fields; nothing is applied to the record here.
+
+    A photo-only submission (empty `fields` but `has_photo=True`) still creates a
+    pending response so the page has an id to attach the photo to. Only a true
+    no-op (no recognized fields AND no photo) returns early with a null id."""
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
         raise NotFoundError("This survey link is invalid or has expired.")
@@ -211,19 +247,56 @@ async def submit_response(
         raise NotFoundError("This survey link is invalid or has expired.")
 
     payload = {k: _text(v) for k, v in (fields or {}).items() if k in _FIELD_BY_KEY}
-    if not payload:
+    if not payload and not has_photo:
         return SurveySubmitResult(staged=False, change_count=0)
 
-    session.add(
-        SurveyResponse(
-            alumni_id=alumni_id,
-            graduation_year=alum.graduation_year,
-            payload=payload,
-            status="pending",
-        )
+    response = SurveyResponse(
+        alumni_id=alumni_id,
+        graduation_year=alum.graduation_year,
+        payload=payload,
+        status="pending",
     )
+    session.add(response)
+    # Flush so the identity is assigned; capture it BEFORE commit expires the row,
+    # so the public page can attach an optional photo to this exact response.
+    await session.flush()
+    new_id = response.survey_response_id
     await session.commit()
-    return SurveySubmitResult(staged=True, change_count=len(payload))
+    return SurveySubmitResult(
+        staged=True, change_count=len(payload), survey_response_id=new_id
+    )
+
+
+async def stage_photo(
+    session: AsyncSession,
+    token: str,
+    survey_response_id: int,
+    data: bytes,
+    content_type: str,
+) -> None:
+    """Attach an already-validated NEW profile photo to a pending response
+    (token-gated, public). The token proves which alum is calling; the response
+    must belong to that alum AND still be pending, else it's a 404. The image is
+    uploaded to the private headshots bucket under a `survey-pending/<id>` key
+    (never an alum's live headshot) and recorded on the row for admin review."""
+    alumni_id = verify_survey_token(token)
+    if alumni_id is None:
+        raise NotFoundError("This survey link is invalid or has expired.")
+    resp = (
+        await session.execute(
+            select(SurveyResponse).where(
+                SurveyResponse.survey_response_id == survey_response_id
+            )
+        )
+    ).scalar_one_or_none()
+    # A foreign response (belongs to another alum) or one already reviewed is
+    # indistinguishable from "not found" to the caller — never leak which.
+    if resp is None or resp.alumni_id != alumni_id or resp.status != "pending":
+        raise NotFoundError("Survey response not found.")
+    path = _staged_photo_path(survey_response_id)
+    await supabase_storage.upload_object(_HEADSHOT_BUCKET, path, data, content_type)
+    resp.staged_photo_path = path
+    await session.commit()
 
 
 # ------------------------------------------------------------- review --------
@@ -300,6 +373,13 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
             or alum.preferred_first_name
             or "Alum"
         )
+        # Mint a short-lived signed URL so the reviewer can preview a submitted
+        # photo (the bucket is private). None when no photo was staged.
+        photo_preview_url = None
+        if r.staged_photo_path:
+            photo_preview_url = await supabase_storage.create_signed_url(
+                _HEADSHOT_BUCKET, r.staged_photo_path
+            )
         items.append(
             SurveyResponseItem(
                 survey_response_id=r.survey_response_id,
@@ -307,6 +387,7 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
                 name=name,
                 submitted_at=r.submitted_at.isoformat(),
                 changes=changes,
+                photo_preview_url=photo_preview_url,
             )
         )
     return items
@@ -339,6 +420,19 @@ async def apply_response(
     contact = contacts.get(resp.alumni_id)
     job = jobs.get(resp.alumni_id)
     eng = engs.get(resp.alumni_id)
+
+    # Promote a staged photo (if any) into the alum's real headshot: download the
+    # staged copy, re-upload it under the headshot key (net_id, or alumni_id when
+    # no net_id), then remove the staged copy so the pending prefix stays clean.
+    if resp.staged_photo_path:
+        data = await supabase_storage.download_object(
+            _HEADSHOT_BUCKET, resp.staged_photo_path
+        )
+        content_type = _sniff_image_content_type(data)
+        await supabase_storage.upload_object(
+            _HEADSHOT_BUCKET, _headshot_key(alum), data, content_type
+        )
+        await supabase_storage.delete_object(_HEADSHOT_BUCKET, resp.staged_photo_path)
 
     for key, raw in (resp.payload or {}).items():
         field = _FIELD_BY_KEY.get(key)
@@ -383,6 +477,9 @@ async def reject_response(
 ) -> None:
     """Mark a staged response rejected — nothing is written to the record."""
     resp = await _get_pending(session, response_id)
+    # Discard any staged photo so rejected uploads don't linger in storage.
+    if resp.staged_photo_path:
+        await supabase_storage.delete_object(_HEADSHOT_BUCKET, resp.staged_photo_path)
     resp.status = "rejected"
     resp.reviewed_by_user_id = actor_user_id
     resp.reviewed_at = datetime.datetime.now(datetime.UTC)

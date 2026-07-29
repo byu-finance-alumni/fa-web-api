@@ -605,6 +605,10 @@ CREATE TABLE survey_responses (
     graduation_year     int,
     payload             jsonb NOT NULL,
     status              varchar(20) NOT NULL DEFAULT 'pending',
+    -- Staging key of a NEW profile photo the alum uploaded with this response
+    -- (headshots bucket, `survey-pending/<id>`), pending admin review. See
+    -- migrations/2026-07-28_survey_response_photo.sql.
+    staged_photo_path   varchar(255),
     submitted_at        timestamptz NOT NULL DEFAULT now(),
     reviewed_by_user_id bigint,
     reviewed_at         timestamptz,

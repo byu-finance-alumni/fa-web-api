@@ -197,10 +197,37 @@ class ExecSession:
         return _Result(self._rows)
 
 
+class QueueSession:
+    """Returns a queued result per ``execute`` call, so a service that runs more
+    than one query gets a distinct result set for each."""
+
+    def __init__(self, result_sets):
+        self._queue = list(result_sets)
+
+    async def execute(self, stmt):
+        return _Result(self._queue.pop(0))
+
+
 def test_list_graduation_years_shape():
-    session = ExecSession([(2024, 5), (1900, 3)])
+    # Two executes now: year counts, then distinct-responder counts. Same rows for
+    # both here is fine — the shape assertion only checks the year/total columns.
+    session = QueueSession([[(2024, 5), (1900, 3)], []])
     result = asyncio.run(survey_email.list_graduation_years(session))
     assert [(g.graduation_year, g.total_alumni) for g in result] == [(2024, 5), (1900, 3)]
+
+
+def test_list_graduation_years_includes_responded():
+    # #537 — the second query returns distinct responders per grad year; each is
+    # merged onto its year (0 when a year has no responses).
+    session = QueueSession([
+        [(2024, 5), (1900, 3)],  # year counts
+        [(2024, 2)],             # only 2024 has responders
+    ])
+    result = asyncio.run(survey_email.list_graduation_years(session))
+    assert [(g.graduation_year, g.total_alumni, g.responded) for g in result] == [
+        (2024, 5, 2),
+        (1900, 3, 0),
+    ]
 
 
 # --------------------------------------------------------- respondent --------
@@ -303,3 +330,51 @@ def test_route_defaults_to_dry_run(client, monkeypatch):
     assert response.status_code == 200
     assert captured["graduation_year"] == 1900
     assert captured["dry_run"] is True  # must NOT send unless explicitly asked
+
+
+# --- Real send-usage tally (#534) -------------------------------------------
+
+
+def test_tally_sent_splits_today_vs_month():
+    import datetime
+
+    from app.services.survey_email import _tally_sent
+
+    start_today = datetime.datetime(2026, 7, 28, tzinfo=datetime.UTC)
+    rows = [
+        # Two sends today -> count toward both today and the month.
+        ("grad_year=1900 recipients=60 prepared=50 sent=50 dry_run=False",
+         datetime.datetime(2026, 7, 28, 14, 0, tzinfo=datetime.UTC)),
+        ("grad_year=2000 recipients=30 prepared=30 sent=30 dry_run=False",
+         datetime.datetime(2026, 7, 28, 8, 0, tzinfo=datetime.UTC)),
+        # Earlier this month -> month only.
+        ("grad_year=1990 recipients=20 prepared=20 sent=20 dry_run=False",
+         datetime.datetime(2026, 7, 10, 9, 0, tzinfo=datetime.UTC)),
+        # A row with no parseable count contributes 0, not a crash.
+        ("malformed audit row with no count",
+         datetime.datetime(2026, 7, 28, 10, 0, tzinfo=datetime.UTC)),
+    ]
+    sent_today, sent_this_month = _tally_sent(rows, start_today)
+    assert sent_today == 80  # 50 + 30
+    assert sent_this_month == 100  # + 20
+
+
+def test_get_send_usage_sums_audit_rows():
+    import datetime
+
+    from app.schemas.survey import SurveyUsage
+
+    class _Rows:
+        def all(self):
+            # created "now" -> counts as today (and this month).
+            return [("grad_year=1900 sent=7 dry_run=False",
+                     datetime.datetime.now(datetime.UTC))]
+
+    class _Session:
+        async def execute(self, _stmt):
+            return _Rows()
+
+    usage = asyncio.run(survey_email.get_send_usage(_Session()))
+    assert isinstance(usage, SurveyUsage)
+    assert usage.sent_today == 7
+    assert usage.sent_this_month == 7

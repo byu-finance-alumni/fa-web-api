@@ -21,9 +21,11 @@ Design notes:
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import hmac
 import logging
+import re
 from dataclasses import dataclass
 from html import escape
 
@@ -37,17 +39,60 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
+from app.models.survey_response import SurveyResponse
 from app.repositories.alumni import build_alumni_query
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyRespondInfo,
     SurveySendResult,
     SurveySendSample,
+    SurveyUsage,
 )
 
 log = logging.getLogger(__name__)
 
 _RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
+# Each real send writes an audit row whose text carries `sent=N` (the recipients
+# actually sent). We sum those N to report true daily/monthly usage.
+_SENT_COUNT_RE = re.compile(r"\bsent=(\d+)")
+
+
+def _tally_sent(rows, start_today: datetime.datetime) -> tuple[int, int]:
+    """Sum ``sent=N`` across ``(new_value, created_at)`` audit rows. ``rows`` are
+    already scoped to this calendar month, so their sum is the month total; rows
+    at/after ``start_today`` also count toward the day total. A row with no
+    ``sent=N`` contributes 0."""
+    sent_today = 0
+    sent_this_month = 0
+    for new_value, created_at in rows:
+        match = _SENT_COUNT_RE.search(new_value or "")
+        n = int(match.group(1)) if match else 0
+        sent_this_month += n
+        if created_at >= start_today:
+            sent_today += n
+    return sent_today, sent_this_month
+
+
+async def get_send_usage(session: AsyncSession) -> SurveyUsage:
+    """Real send usage for the console tallies: emails actually sent today and
+    this calendar month, summed from the ``send_survey`` audit rows (each records
+    ``sent=N``). Day/month boundaries are UTC, matching the app's other date
+    filtering. Dry runs (``send_survey_dry_run``) are excluded by the action
+    filter."""
+    now = datetime.datetime.now(datetime.UTC)
+    start_today = datetime.datetime.combine(
+        now.date(), datetime.time.min, tzinfo=datetime.UTC
+    )
+    start_month = start_today.replace(day=1)
+    rows = (
+        await session.execute(
+            select(AuditLog.new_value, AuditLog.created_at)
+            .where(AuditLog.action_type == "send_survey")
+            .where(AuditLog.created_at >= start_month)
+        )
+    ).all()
+    sent_today, sent_this_month = _tally_sent(rows, start_today)
+    return SurveyUsage(sent_today=sent_today, sent_this_month=sent_this_month)
 _TIMEOUT_SECONDS = 20.0
 # Resend caps a batch call at 100 messages.
 _BATCH_MAX = 100
@@ -324,8 +369,27 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
         .order_by(Alumni.graduation_year.desc())
     )
     rows = (await session.execute(stmt)).all()
+
+    # How many DISTINCT alumni have submitted a response for each grad year (any
+    # status — a reply is a reply). One grouped query, merged with the year counts.
+    responded_stmt = (
+        select(
+            SurveyResponse.graduation_year,
+            func.count(func.distinct(SurveyResponse.alumni_id)).label("responded"),
+        )
+        .where(SurveyResponse.graduation_year.is_not(None))
+        .group_by(SurveyResponse.graduation_year)
+    )
+    responded_by_year = {
+        year: responded for year, responded in (await session.execute(responded_stmt)).all()
+    }
+
     return [
-        GraduationYearCount(graduation_year=year, total_alumni=count)
+        GraduationYearCount(
+            graduation_year=year,
+            total_alumni=count,
+            responded=responded_by_year.get(year, 0),
+        )
         for year, count in rows
     ]
 

@@ -33,6 +33,7 @@ from app.core.errors import ServiceError
 from app.models.audit import AuditLog
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.schemas.survey import (
+    SurveyScheduleCreateRequest,
     SurveyScheduleItem,
     SurveyScheduleRunItem,
     SurveyScheduleRunSummary,
@@ -167,17 +168,19 @@ async def get_schedule(
     return _to_item(sched, counts)
 
 
-async def create_schedule(
+async def _upsert_schedule(
     session: AsyncSession,
     *,
     graduation_year: int,
     start_date: datetime.date,
     actor_user_id: int | None,
-) -> SurveyScheduleItem:
-    """Create — or replace — the schedule for a graduation year (unique per year).
+) -> None:
+    """Create or replace one year's schedule row — WITHOUT committing.
 
     Replacing resets the campaign to ``scheduled`` with the new start date; the
-    delivery log is left intact so an already-sent stage is never re-sent."""
+    delivery log is left intact so an already-sent stage is never re-sent. The
+    caller owns the commit, so the single- and bulk-create paths share this
+    upsert while controlling their own transaction boundary."""
     existing = (
         await session.execute(
             select(SurveySchedule).where(
@@ -198,10 +201,61 @@ async def create_schedule(
                 created_by_user_id=actor_user_id,
             )
         )
+
+
+async def create_schedule(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    start_date: datetime.date,
+    actor_user_id: int | None,
+) -> SurveyScheduleItem:
+    """Create — or replace — the schedule for a graduation year (unique per year).
+
+    Replacing resets the campaign to ``scheduled`` with the new start date; the
+    delivery log is left intact so an already-sent stage is never re-sent."""
+    await _upsert_schedule(
+        session,
+        graduation_year=graduation_year,
+        start_date=start_date,
+        actor_user_id=actor_user_id,
+    )
     await session.commit()
     item = await get_schedule(session, graduation_year)
     assert item is not None  # just upserted
     return item
+
+
+async def create_schedules_bulk(
+    session: AsyncSession,
+    *,
+    items: list[SurveyScheduleCreateRequest],
+    actor_user_id: int | None,
+) -> list[SurveyScheduleItem]:
+    """Create/replace schedules for many graduation years in one transaction.
+
+    Each item is upserted with the same logic as :func:`create_schedule`. A
+    duplicate ``graduation_year`` in the payload collapses to a single row —
+    last one wins — so the result never has two schedules for the same year.
+    Everything is committed once and the full, refreshed schedule list is
+    returned (mirroring what :func:`list_schedules` would serve). An empty list
+    is a no-op that just returns the current schedules.
+
+    Start-date validation intentionally mirrors :func:`create_schedule`, which
+    does not reject past dates — so none is added here."""
+    # Dedupe by graduation_year, last occurrence wins (dict preserves order).
+    deduped: dict[int, datetime.date] = {
+        item.graduation_year: item.start_date for item in items
+    }
+    for graduation_year, start_date in deduped.items():
+        await _upsert_schedule(
+            session,
+            graduation_year=graduation_year,
+            start_date=start_date,
+            actor_user_id=actor_user_id,
+        )
+    await session.commit()
+    return await list_schedules(session)
 
 
 async def cancel_schedule(

@@ -29,6 +29,8 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.note import Note
 from app.models.role_capability import RoleCapability
+from app.models.survey_response import SurveyResponse
+from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import Role, User, UserRole
 from app.models.vocabulary import VocabularyTerm
@@ -62,6 +64,9 @@ __all__ = [
     "RoleCapability",
     "StatusLabel",
     "Survey",
+    "SurveyResponse",
+    "SurveySchedule",
+    "SurveySendLog",
     "Tag",
     "User",
     "UserRole",

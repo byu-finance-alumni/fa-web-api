@@ -619,6 +619,35 @@ CREATE TABLE survey_responses (
 CREATE INDEX IF NOT EXISTS idx_survey_responses_status_year ON survey_responses (status, graduation_year);
 CREATE INDEX IF NOT EXISTS idx_survey_responses_alumni_id ON survey_responses (alumni_id);
 
+-- Survey send scheduler (#542). `survey_schedule` holds one row per graduation
+-- year (initial send date + campaign state); a daily Vercel cron sends the due
+-- stage. `survey_send_log` is the append-only record of every delivered email —
+-- its UNIQUE (graduation_year, alumni_id, stage) prevents double-emailing across
+-- cron runs. See migrations/2026-07-29_survey_scheduler.sql.
+CREATE TABLE survey_schedule (
+    survey_schedule_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    graduation_year     int NOT NULL UNIQUE,
+    start_date          date NOT NULL,
+    status              varchar(20) NOT NULL DEFAULT 'scheduled',
+    created_by_user_id  bigint,
+    last_run_at         timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_survey_schedule_created_by FOREIGN KEY (created_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT ck_survey_schedule_status CHECK (status IN ('scheduled', 'active', 'completed', 'cancelled'))
+);
+
+CREATE TABLE survey_send_log (
+    survey_send_log_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    graduation_year     int NOT NULL,
+    alumni_id           bigint NOT NULL,
+    stage               smallint NOT NULL,
+    sent_at             timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_survey_send_log_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT uq_survey_send_log_year_alumni_stage UNIQUE (graduation_year, alumni_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_survey_send_log_year_stage ON survey_send_log (graduation_year, stage);
+
 CREATE TABLE attachments (
     attachment_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id          bigint NOT NULL,

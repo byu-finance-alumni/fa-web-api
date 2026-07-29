@@ -28,6 +28,7 @@ from app.schemas.survey import (
     SurveySendResult,
     SurveySubmitRequest,
     SurveySubmitResult,
+    SurveyUsage,
 )
 from app.services import survey_email, survey_responses
 
@@ -129,6 +130,15 @@ async def survey_graduation_years(
     """Distinct graduation years present in the DB (eligible alumni) + counts,
     newest first — powers the console's year picker."""
     return await survey_email.list_graduation_years(session)
+
+
+@router.get("/usage", response_model=SurveyUsage)
+async def survey_send_usage(
+    user: RequireFullAccess, session: SessionDep
+) -> SurveyUsage:
+    """Real Resend send usage (emails actually sent today / this calendar month),
+    for the console's daily/monthly tallies against the send caps."""
+    return await survey_email.get_send_usage(session)
 
 
 @router.post("/campaigns/{grad_year}/send", response_model=SurveySendResult)

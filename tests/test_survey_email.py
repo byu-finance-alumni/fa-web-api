@@ -303,3 +303,51 @@ def test_route_defaults_to_dry_run(client, monkeypatch):
     assert response.status_code == 200
     assert captured["graduation_year"] == 1900
     assert captured["dry_run"] is True  # must NOT send unless explicitly asked
+
+
+# --- Real send-usage tally (#534) -------------------------------------------
+
+
+def test_tally_sent_splits_today_vs_month():
+    import datetime
+
+    from app.services.survey_email import _tally_sent
+
+    start_today = datetime.datetime(2026, 7, 28, tzinfo=datetime.UTC)
+    rows = [
+        # Two sends today -> count toward both today and the month.
+        ("grad_year=1900 recipients=60 prepared=50 sent=50 dry_run=False",
+         datetime.datetime(2026, 7, 28, 14, 0, tzinfo=datetime.UTC)),
+        ("grad_year=2000 recipients=30 prepared=30 sent=30 dry_run=False",
+         datetime.datetime(2026, 7, 28, 8, 0, tzinfo=datetime.UTC)),
+        # Earlier this month -> month only.
+        ("grad_year=1990 recipients=20 prepared=20 sent=20 dry_run=False",
+         datetime.datetime(2026, 7, 10, 9, 0, tzinfo=datetime.UTC)),
+        # A row with no parseable count contributes 0, not a crash.
+        ("malformed audit row with no count",
+         datetime.datetime(2026, 7, 28, 10, 0, tzinfo=datetime.UTC)),
+    ]
+    sent_today, sent_this_month = _tally_sent(rows, start_today)
+    assert sent_today == 80  # 50 + 30
+    assert sent_this_month == 100  # + 20
+
+
+def test_get_send_usage_sums_audit_rows():
+    import datetime
+
+    from app.schemas.survey import SurveyUsage
+
+    class _Rows:
+        def all(self):
+            # created "now" -> counts as today (and this month).
+            return [("grad_year=1900 sent=7 dry_run=False",
+                     datetime.datetime.now(datetime.UTC))]
+
+    class _Session:
+        async def execute(self, _stmt):
+            return _Rows()
+
+    usage = asyncio.run(survey_email.get_send_usage(_Session()))
+    assert isinstance(usage, SurveyUsage)
+    assert usage.sent_today == 7
+    assert usage.sent_this_month == 7

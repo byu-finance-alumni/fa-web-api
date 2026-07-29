@@ -216,6 +216,19 @@ def test_list_graduation_years_shape():
     assert [(g.graduation_year, g.total_alumni) for g in result] == [(2024, 5), (1900, 3)]
 
 
+def test_resurvey_cutoff_is_about_a_year_ago():
+    # Alumni who replied on/after this cutoff are skipped by _load_recipients and
+    # counted as "responded" — the annual re-survey window.
+    import datetime
+
+    from app.services.survey_email import _RESURVEY_INTERVAL_DAYS, _resurvey_cutoff
+
+    assert _RESURVEY_INTERVAL_DAYS == 365
+    delta = datetime.datetime.now(datetime.UTC) - _resurvey_cutoff()
+    assert abs(delta.days - 365) <= 1
+    assert _resurvey_cutoff().tzinfo is not None
+
+
 def test_list_graduation_years_includes_responded():
     # #537 — the second query returns distinct responders per grad year; each is
     # merged onto its year (0 when a year has no responses).

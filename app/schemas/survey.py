@@ -10,6 +10,10 @@ class SurveySubmitRequest(BaseModel):
     Only recognized survey fields are kept; anything else is ignored."""
 
     fields: dict[str, str]
+    # True when the alum also picked a new profile photo to upload. A photo-only
+    # submission (empty `fields`) must still create a response row so the page has
+    # an id to attach the photo to — see `submit_response`.
+    has_photo: bool = False
 
 
 class SurveySubmitResult(BaseModel):
@@ -62,6 +66,10 @@ class GraduationYearCount(BaseModel):
 
     graduation_year: int
     total_alumni: int
+    # Distinct alumni in this grad year who have submitted a survey response (any
+    # status — pending/applied/rejected; a reply is a reply). Drives the console's
+    # "N replied" count.
+    responded: int = 0
 
 
 class SurveySendSample(BaseModel):

@@ -197,10 +197,37 @@ class ExecSession:
         return _Result(self._rows)
 
 
+class QueueSession:
+    """Returns a queued result per ``execute`` call, so a service that runs more
+    than one query gets a distinct result set for each."""
+
+    def __init__(self, result_sets):
+        self._queue = list(result_sets)
+
+    async def execute(self, stmt):
+        return _Result(self._queue.pop(0))
+
+
 def test_list_graduation_years_shape():
-    session = ExecSession([(2024, 5), (1900, 3)])
+    # Two executes now: year counts, then distinct-responder counts. Same rows for
+    # both here is fine — the shape assertion only checks the year/total columns.
+    session = QueueSession([[(2024, 5), (1900, 3)], []])
     result = asyncio.run(survey_email.list_graduation_years(session))
     assert [(g.graduation_year, g.total_alumni) for g in result] == [(2024, 5), (1900, 3)]
+
+
+def test_list_graduation_years_includes_responded():
+    # #537 — the second query returns distinct responders per grad year; each is
+    # merged onto its year (0 when a year has no responses).
+    session = QueueSession([
+        [(2024, 5), (1900, 3)],  # year counts
+        [(2024, 2)],             # only 2024 has responders
+    ])
+    result = asyncio.run(survey_email.list_graduation_years(session))
+    assert [(g.graduation_year, g.total_alumni, g.responded) for g in result] == [
+        (2024, 5, 2),
+        (1900, 3, 0),
+    ]
 
 
 # --------------------------------------------------------- respondent --------

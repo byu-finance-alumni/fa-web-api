@@ -108,7 +108,7 @@ def test_apply_forbidden_for_view_only(client):
 def test_submit_route_is_public(client, monkeypatch):
     from app.schemas.survey import SurveySubmitResult
 
-    async def fake_submit(session, token, fields):
+    async def fake_submit(session, token, fields, has_photo=False):
         return SurveySubmitResult(staged=True, change_count=len(fields))
 
     monkeypatch.setattr(sr, "submit_response", fake_submit)
@@ -197,6 +197,37 @@ def test_submit_fields_only_stages_with_id(monkeypatch):
     assert len(staged) == 1
     assert staged[0].staged_photo_path is None
     assert session.committed == 1
+
+
+def test_submit_photo_only_creates_row_and_returns_id(monkeypatch):
+    # #537 — an alum who ONLY changed their photo sends an empty `fields` with
+    # has_photo=True. That must still stage a pending row (change_count=0) and
+    # return its id, so the page can attach the photo.
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    result = asyncio.run(sr.submit_response(session, "tok", {}, has_photo=True))
+    assert result.staged is True
+    assert result.change_count == 0
+    assert result.survey_response_id == 777
+    staged = [o for o in session.added if isinstance(o, SurveyResponse)]
+    assert len(staged) == 1
+    assert staged[0].payload == {}
+    assert session.committed == 1
+
+
+def test_submit_empty_no_photo_is_noop(monkeypatch):
+    # #537 — a true no-op (no recognized fields AND no photo) stages nothing and
+    # returns a null id, exactly as before.
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    result = asyncio.run(sr.submit_response(session, "tok", {"bogus": "x"}, has_photo=False))
+    assert result.staged is False
+    assert result.change_count == 0
+    assert result.survey_response_id is None
+    assert [o for o in session.added if isinstance(o, SurveyResponse)] == []
+    assert session.committed == 0
 
 
 def test_stage_photo_foreign_response_404(monkeypatch):

@@ -340,13 +340,42 @@ def test_row_cap_default_constant():
     assert import_csv.MAX_UPLOAD_BYTES == 4 * 1024 * 1024
 
 
-def test_non_utf8_file_reports_friendly_error():
-    # 0x80 is invalid as a leading UTF-8 byte -> decode fails gracefully.
-    bad = b"First name,Last name\n\x80\x80,Doe\n"
-    rows, errors = import_csv.parse_and_map(bad)
-    assert rows == []
-    assert errors
-    assert "UTF-8" in errors[0]
+def test_ansi_excel_file_is_accepted():
+    # Excel's plain "CSV"/ANSI export isn't UTF-8. The importer now falls back to
+    # Windows-1252 instead of rejecting it, so a file whose em-dash
+    # Women-in-Finance header is byte 0x97 (cp1252) still matches the template.
+    import csv as _csv
+    import io as _io
+
+    headers = list(import_csv.EXPECTED_HEADERS)
+    assert "Willing to mentor — Women in Finance (Yes/No)" in headers  # sanity
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(headers)  # quotes the Region header (it contains commas)
+    writer.writerow([""] * (len(headers) - 1) + ["Jane"])
+    raw = buf.getvalue().encode("cp1252")  # ANSI, not UTF-8
+    rows, errors = import_csv.parse_and_map(raw)
+    assert errors == []  # decoded as cp1252 -> em-dash matches -> no header error
+
+
+def test_women_in_finance_dash_variants_normalize():
+    # Em-dash / en-dash / hyphen all canonicalize to the template header, so an
+    # encoding-mangled dash no longer trips "columns don't match".
+    canonical = "Willing to mentor — Women in Finance (Yes/No)"
+    for variant in (
+        "Willing to mentor — Women in Finance (Yes/No)",  # em-dash (canonical)
+        "Willing to mentor – Women in Finance (Yes/No)",  # en-dash
+        "Willing to mentor - Women in Finance (Yes/No)",  # hyphen
+    ):
+        assert import_csv._canonicalize_header(variant) == canonical
+
+
+def test_decode_upload_falls_back_to_cp1252():
+    # A byte 0x97 (em-dash in Windows-1252) that's invalid UTF-8 decodes cleanly.
+    assert (
+        import_csv._decode_upload(b"Willing to mentor \x97 Women")
+        == "Willing to mentor — Women"
+    )
 
 
 def test_existing_index_normalizes_formatted_byu_id():

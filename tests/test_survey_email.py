@@ -391,3 +391,31 @@ def test_get_send_usage_sums_audit_rows():
     assert isinstance(usage, SurveyUsage)
     assert usage.sent_today == 7
     assert usage.sent_this_month == 7
+
+
+def test_get_send_usage_applies_baseline(monkeypatch):
+    # #544 — a configured baseline is added, and only sends AFTER the anchor are
+    # counted on top (the baseline covers everything up to it).
+    import datetime
+
+    now = datetime.datetime.now(datetime.UTC)
+    anchor = now - datetime.timedelta(minutes=5)  # earlier the same day/month
+
+    class _S:
+        survey_usage_baseline_at = anchor
+        survey_usage_baseline_today = 14
+        survey_usage_baseline_month = 26
+
+    monkeypatch.setattr(survey_email, "get_settings", lambda: _S())
+
+    class _Rows:
+        def all(self):
+            return [("grad_year=1900 sent=3 dry_run=False", now)]  # after anchor
+
+    class _Session:
+        async def execute(self, _stmt):
+            return _Rows()
+
+    usage = asyncio.run(survey_email.get_send_usage(_Session()))
+    assert usage.sent_today == 17  # 14 baseline + 3 new
+    assert usage.sent_this_month == 29  # 26 baseline + 3 new

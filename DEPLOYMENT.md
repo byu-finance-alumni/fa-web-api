@@ -43,10 +43,27 @@ public deploy, rotate them in Supabase and use the new values below:
 | `JWT_SECRET` | project JWT secret (HS256 project) — Settings → API → JWT Secret |
 | `ENVIRONMENT` | `production` |
 | `DEBUG` | `false` |
+| `CRON_SECRET` | long random string — protects the survey send-scheduler cron (see below). Optional; unset ⇒ the cron endpoint rejects everything. |
 
 > Use the **transaction pooler (6543)**, not the session pooler (5432), on
 > serverless. The DB layer detects `:6543` and disables prepared-statement
 > caching + connection pooling automatically.
+
+### Survey send scheduler (Vercel Cron, #542)
+
+`vercel.json` defines a **daily cron** that hits `POST /survey/cron/run` at
+`0 13 * * *` (13:00 UTC ≈ 7am Mountain). That endpoint sends whatever survey
+stage is due (initial / 1-week / 2-week reminder) for each active
+`survey_schedule`, respecting Resend's rate limit and the `survey_send_log`
+double-send guard.
+
+The endpoint is **not** login-gated (Vercel Cron can't authenticate as a user).
+Instead it requires `Authorization: Bearer $CRON_SECRET`. **Vercel Cron sends
+this header automatically** whenever `CRON_SECRET` is set as a project env var —
+no wiring needed. Any request without the matching secret gets a `401`, and when
+`CRON_SECRET` is unset the endpoint rejects every request, so it is never open by
+default. Set `CRON_SECRET` on the **`dev-fa-web-api`** project to enable the dev
+cron (this feature is dev-only for now).
 
 ## 2A. Deploy via GitHub integration (recommended)
 

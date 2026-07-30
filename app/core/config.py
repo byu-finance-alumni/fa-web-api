@@ -90,6 +90,12 @@ class Settings(BaseSettings):
     survey_usage_baseline_at: datetime.datetime | None = Field(default=None)
     survey_usage_baseline_today: int = Field(default=0)
     survey_usage_baseline_month: int = Field(default=0)
+    # Shared secret protecting the survey send-scheduler cron endpoint
+    # (POST /survey/cron/run). Vercel Cron sends `Authorization: Bearer
+    # $CRON_SECRET` automatically when CRON_SECRET is set as a project env var;
+    # the route accepts the call only when the header matches. Unset (None) ->
+    # the endpoint rejects every request (401), so it's never open by default.
+    cron_secret: str | None = Field(default=None)  # CRON_SECRET
 
     # CORS — comma-separated list of allowed frontend origins.
     cors_origins: str = Field(

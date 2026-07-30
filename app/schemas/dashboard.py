@@ -9,6 +9,8 @@ handler's shape changes, update the matching schema here in lockstep.
 
 from __future__ import annotations
 
+import datetime
+
 from pydantic import BaseModel
 
 
@@ -58,6 +60,16 @@ class DashboardIndustryBreakdown(BaseModel):
     graduate_student: int
 
 
+class DashboardNextSurvey(BaseModel):
+    """The next scheduled survey send for the dashboard's "Next survey" KPI:
+    which class, on what date, and which stage (initial vs a reminder). ``None``
+    on the summary when no runnable schedule has an upcoming send."""
+
+    graduation_year: int
+    send_date: datetime.date
+    stage: str  # "initial" | "1-week reminder" | "2-week reminder"
+
+
 class DashboardSummary(BaseModel):
     """KPIs + distributions for ``GET /dashboard/summary`` (aggregate counts
     only; no per-alumnus identity)."""
@@ -83,6 +95,7 @@ class DashboardSummary(BaseModel):
     top_employers: list[DashboardEmployerCount]
     by_state: list[DashboardStateCount]
     industry_breakdown: DashboardIndustryBreakdown
+    next_survey: DashboardNextSurvey | None = None
 
 
 class BirthdayRow(BaseModel):

@@ -24,6 +24,7 @@ from app.models.crm import FollowUpTask, Interaction
 from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
+from app.models.survey_schedule import SurveySchedule
 from app.models.user import User
 from app.schemas.auth import UserContext
 from app.schemas.dashboard import (
@@ -472,6 +473,39 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         )
     ).all()
 
+    # "Next survey" KPI: the soonest upcoming send across runnable schedules
+    # (scheduled/active). For a not-yet-started campaign that's its initial send
+    # date; for one already under way it's the next reminder still in the future
+    # (+7 / +14 days from the start). Ties break to the earliest class year.
+    schedule_rows = (
+        await session.execute(
+            select(SurveySchedule.graduation_year, SurveySchedule.start_date).where(
+                SurveySchedule.status.in_(("scheduled", "active"))
+            )
+        )
+    ).all()
+    best: tuple[datetime.date, int, str] | None = None
+    for grad_year, start_date in schedule_rows:
+        if start_date >= today:
+            candidate: tuple[datetime.date, str] | None = (start_date, "initial")
+        else:
+            candidate = None
+            for offset, label in ((7, "1-week reminder"), (14, "2-week reminder")):
+                send_on = start_date + datetime.timedelta(days=offset)
+                if send_on >= today:
+                    candidate = (send_on, label)
+                    break
+        if candidate is None:
+            continue  # campaign past its last reminder window
+        send_on, label = candidate
+        if best is None or (send_on, grad_year) < (best[0], best[1]):
+            best = (send_on, grad_year, label)
+    next_survey = (
+        {"graduation_year": best[1], "send_date": best[0], "stage": best[2]}
+        if best is not None
+        else None
+    )
+
     return {
         "total_alumni": int(total or 0),
         "archived": int(archived or 0),
@@ -504,6 +538,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             "unknown": unknown_count,
             "graduate_student": graduate_student_count,
         },
+        "next_survey": next_survey,
     }
 
 

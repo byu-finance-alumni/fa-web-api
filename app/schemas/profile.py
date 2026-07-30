@@ -560,6 +560,9 @@ class ProfileRead(BaseModel):
     tags: list[str] = []
     status_labels: list[str] = []
     surveys: list[SurveyRead] = []
+    # Next scheduled survey send for this alum's graduation year, from the survey
+    # send-scheduler (#364/#542). None when the class has no runnable schedule.
+    next_survey_date: datetime.date | None = None
     interactions: list[InteractionRead] = []
     interaction_count: int = 0
     tasks: list[TaskRead] = []

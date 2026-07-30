@@ -31,6 +31,7 @@ from app.models.note import Note
 from app.models.role_capability import RoleCapability
 from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
+from app.models.survey_send_config import SurveySendConfig
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import Role, User, UserRole
 from app.models.vocabulary import VocabularyTerm
@@ -66,6 +67,7 @@ __all__ = [
     "Survey",
     "SurveyResponse",
     "SurveySchedule",
+    "SurveySendConfig",
     "SurveySendLog",
     "Tag",
     "User",

@@ -648,6 +648,24 @@ CREATE TABLE survey_send_log (
 );
 CREATE INDEX IF NOT EXISTS idx_survey_send_log_year_stage ON survey_send_log (graduation_year, stage);
 
+-- Survey send cap (#542 follow-up). Single-row config (id pinned to 1) the
+-- scheduler paces against: when `enabled`, sends at most `daily_limit`/day and
+-- `monthly_limit`/month across every graduation year. See
+-- migrations/2026-07-29_survey_send_config.sql.
+CREATE TABLE survey_send_config (
+    id                  int PRIMARY KEY DEFAULT 1,
+    enabled             boolean NOT NULL DEFAULT true,
+    daily_limit         int NOT NULL DEFAULT 100,
+    monthly_limit       int NOT NULL DEFAULT 3000,
+    updated_by_user_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_survey_send_config_singleton CHECK (id = 1),
+    CONSTRAINT ck_survey_send_config_daily   CHECK (daily_limit   >= 0),
+    CONSTRAINT ck_survey_send_config_monthly CHECK (monthly_limit >= 0),
+    CONSTRAINT fk_survey_send_config_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 CREATE TABLE attachments (
     attachment_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id          bigint NOT NULL,

@@ -33,6 +33,7 @@ from app.models.engagement import (
     FinanceSocietyLeadership,
 )
 from app.models.event import Event, EventAttendance
+from app.models.survey_schedule import SurveySchedule
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import User
 from app.schemas.alumni import AlumniRead, minimize_alumni_read
@@ -351,6 +352,29 @@ async def get_profile(
         session, alumni_id, show_amounts=show_pay_it_forward_amounts
     )
 
+    # Next scheduled survey send for this alum's graduation year (#364): the
+    # initial send if it hasn't started yet, else the next reminder (+7 / +14
+    # days) still in the future. Only a runnable schedule (scheduled/active)
+    # counts; None once it's completed/cancelled or past its last reminder.
+    next_survey_date: datetime.date | None = None
+    if alumnus.graduation_year is not None:
+        start_date = await session.scalar(
+            select(SurveySchedule.start_date).where(
+                SurveySchedule.graduation_year == alumnus.graduation_year,
+                SurveySchedule.status.in_(("scheduled", "active")),
+            )
+        )
+        if isinstance(start_date, datetime.date):
+            today = datetime.datetime.now(datetime.UTC).date()
+            if start_date >= today:
+                next_survey_date = start_date
+            else:
+                for offset in (7, 14):
+                    reminder = start_date + datetime.timedelta(days=offset)
+                    if reminder >= today:
+                        next_survey_date = reminder
+                        break
+
     profile = ProfileRead(
         alumni=AlumniRead.model_validate(alumnus).model_copy(
             update={"profile_updated_by_name": profile_updated_by_name}
@@ -370,6 +394,7 @@ async def get_profile(
         tags=list(tags),
         status_labels=list(status_labels),
         surveys=[SurveyRead.model_validate(s) for s in surveys],
+        next_survey_date=next_survey_date,
         interactions=[
             InteractionRead.model_validate(i).model_copy(
                 # full_access/student see the logger's full name; view_only sees

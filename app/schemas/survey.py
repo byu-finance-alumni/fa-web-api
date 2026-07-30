@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SurveySubmitRequest(BaseModel):
@@ -165,3 +165,27 @@ class SurveyScheduleRunSummary(BaseModel):
     """Summary of a cron run over every due schedule."""
 
     ran: list[SurveyScheduleRunItem]
+
+
+# ------------------------------------------------------------- send cap --------
+
+
+class SurveySendConfigItem(BaseModel):
+    """The account-wide send cap the scheduler paces against. When ``enabled``,
+    the daily cron sends at most ``daily_limit`` emails per UTC day and
+    ``monthly_limit`` per calendar month across every graduation year, spreading
+    a big cohort over several days. When disabled there is no internal cap —
+    sends are limited only by Resend."""
+
+    enabled: bool
+    daily_limit: int
+    monthly_limit: int
+
+
+class SurveySendConfigUpdateRequest(BaseModel):
+    """Update the send cap (in-console admin control). ``enabled`` false turns
+    the cap off (e.g. after upgrading the Resend plan)."""
+
+    enabled: bool
+    daily_limit: int = Field(ge=0)
+    monthly_limit: int = Field(ge=0)

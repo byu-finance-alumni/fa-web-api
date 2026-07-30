@@ -41,6 +41,8 @@ from app.schemas.survey import (
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
     SurveyScheduleRunSummary,
+    SurveySendConfigItem,
+    SurveySendConfigUpdateRequest,
     SurveySendResult,
     SurveySubmitRequest,
     SurveySubmitResult,
@@ -157,6 +159,32 @@ async def survey_send_usage(
     """Real Resend send usage (emails actually sent today / this calendar month),
     for the console's daily/monthly tallies against the send caps."""
     return await survey_email.get_send_usage(session)
+
+
+@router.get("/send-config", response_model=SurveySendConfigItem)
+async def get_survey_send_config(
+    user: RequireFullAccess, session: SessionDep
+) -> SurveySendConfigItem:
+    """The account-wide send cap the scheduler paces against — the daily/monthly
+    email budget and whether it's enforced."""
+    return await survey_schedule.get_send_config(session)
+
+
+@router.post("/send-config", response_model=SurveySendConfigItem)
+async def update_survey_send_config(
+    body: SurveySendConfigUpdateRequest,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> SurveySendConfigItem:
+    """Update the send cap. ``enabled=false`` removes the internal cap (e.g. after
+    upgrading the Resend plan) — sends are then limited only by Resend itself."""
+    return await survey_schedule.update_send_config(
+        session,
+        enabled=body.enabled,
+        daily_limit=body.daily_limit,
+        monthly_limit=body.monthly_limit,
+        actor_user_id=user.user_id,
+    )
 
 
 @router.post("/campaigns/{grad_year}/send", response_model=SurveySendResult)

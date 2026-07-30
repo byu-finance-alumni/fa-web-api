@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.schemas.survey import SurveyScheduleRunSummary
+from app.schemas.survey import SurveyScheduleRunSummary, SurveySendConfigItem
 from app.services import survey_email, survey_schedule
 
 _TODAY = datetime.date(2026, 7, 29)
@@ -91,7 +91,7 @@ def test_stage_for_windows():
 # ---------------------------------------------------------- run: stage 0 ------
 
 
-def _patch_run(monkeypatch, *, schedules, recipients, logged, batch):
+def _patch_run(monkeypatch, *, schedules, recipients, logged, batch, allowance=None):
     async def fake_due(session, today):
         return schedules
 
@@ -101,9 +101,14 @@ def _patch_run(monkeypatch, *, schedules, recipients, logged, batch):
     async def fake_logged(session, year, stage):
         return set(logged.get((year, stage), set()))
 
+    async def fake_allowance(session):
+        # None = cap disabled (unlimited); an int = the shared run budget.
+        return allowance
+
     monkeypatch.setattr(survey_schedule, "_load_schedules_due", fake_due)
     monkeypatch.setattr(survey_email, "_load_recipients", fake_recipients)
     monkeypatch.setattr(survey_schedule, "_logged_alumni_ids", fake_logged)
+    monkeypatch.setattr(survey_schedule, "_run_allowance", fake_allowance)
     monkeypatch.setattr(survey_email, "_send_batch", batch)
 
 
@@ -262,6 +267,170 @@ def test_rate_limit_midrun_stops_and_leaves_rest(fake_settings, monkeypatch):
     assert item.retry_after_seconds == 30
     # Only the delivered batch produced log rows — the un-sent 150 have none.
     assert len(_logs(session)) == 100
+
+
+# ------------------------------------------------------------- send cap -------
+
+
+def test_cap_limits_how_many_go_out_this_run(fake_settings, monkeypatch):
+    # Budget of 2 with a 5-person cohort: only 2 go out this run, the other 3
+    # are left for the next cron.
+    sent_to = []
+
+    async def batch(emails):
+        sent_to.extend(e["to"][0] for e in emails)
+        return (None, None)
+
+    _patch_run(
+        monkeypatch,
+        schedules=[_sched(2000, _TODAY)],
+        recipients=_rcpts([1, 2, 3, 4, 5]),
+        logged={},
+        batch=batch,
+        allowance=2,
+    )
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    item = summary.ran[0]
+    assert item.stage == 0
+    assert item.sent == 2
+    assert item.remaining == 3
+    assert len(sent_to) == 2
+    assert len(_logs(session)) == 2
+
+
+def test_cap_budget_is_shared_across_years(fake_settings, monkeypatch):
+    # Two due schedules, shared budget of 3. The first (earliest-scheduled) year
+    # drains the budget; the second gets nothing this run.
+    async def batch(emails):
+        return (None, None)
+
+    older = _sched(2001, _TODAY - datetime.timedelta(days=1))
+    newer = _sched(2000, _TODAY)
+    _patch_run(
+        monkeypatch,
+        schedules=[older, newer],  # _load_schedules_due returns them pre-ordered
+        recipients=_rcpts([1, 2, 3, 4, 5]),
+        logged={},
+        batch=batch,
+        allowance=3,
+    )
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    # Only the first year ran — the budget was spent before the second.
+    assert [i.graduation_year for i in summary.ran] == [2001]
+    assert summary.ran[0].sent == 3
+    assert summary.ran[0].remaining == 2
+
+
+def test_cap_disabled_sends_everything(fake_settings, monkeypatch):
+    # allowance=None (cap off) → the whole cohort goes out in one run.
+    async def batch(emails):
+        return (None, None)
+
+    _patch_run(
+        monkeypatch,
+        schedules=[_sched(2000, _TODAY)],
+        recipients=_rcpts(list(range(1, 151))),  # 150 > any Free-tier day cap
+        logged={},
+        batch=batch,
+        allowance=None,
+    )
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    assert summary.ran[0].sent == 150
+    assert summary.ran[0].remaining == 0
+
+
+def test_initial_sent_before_reminder_when_cap_delayed(fake_settings, monkeypatch):
+    # Day 8 (the 1-week reminder window) but two recipients never got the initial
+    # — the run must FINISH the initial, not jump to the reminder.
+    sent_to = []
+
+    async def batch(emails):
+        sent_to.extend(e["to"][0] for e in emails)
+        return (None, None)
+
+    _patch_run(
+        monkeypatch,
+        schedules=[_sched(2000, _TODAY - datetime.timedelta(days=8))],
+        recipients=_rcpts([1, 2, 3]),
+        logged={(2000, 0): {1}},  # only alum 1 has had the initial so far
+        batch=batch,
+        allowance=None,
+    )
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    item = summary.ran[0]
+    assert item.stage == 0  # INITIAL, not the day-8 reminder
+    assert sorted(sent_to) == ["a2@example.com", "a3@example.com"]
+    assert {r.stage for r in _logs(session)} == {0}
+
+
+def test_run_allowance_subtracts_usage_and_takes_tighter_budget(
+    fake_settings, monkeypatch
+):
+    async def fake_usage(session):
+        return SimpleNamespace(sent_today=30, sent_this_month=1000)
+
+    async def fake_cfg(session):
+        return SurveySendConfigItem(
+            enabled=True, daily_limit=100, monthly_limit=3000
+        )
+
+    monkeypatch.setattr(survey_email, "get_send_usage", fake_usage)
+    monkeypatch.setattr(survey_schedule, "get_send_config", fake_cfg)
+
+    # min(100 - 30, 3000 - 1000) = 70
+    assert asyncio.run(survey_schedule._run_allowance(FakeSession())) == 70
+
+
+def test_run_allowance_none_when_cap_disabled(monkeypatch):
+    async def fake_cfg(session):
+        return SurveySendConfigItem(
+            enabled=False, daily_limit=100, monthly_limit=3000
+        )
+
+    monkeypatch.setattr(survey_schedule, "get_send_config", fake_cfg)
+    assert asyncio.run(survey_schedule._run_allowance(FakeSession())) is None
+
+
+def test_get_send_config_defaults_when_row_missing():
+    session = QueueSession([_Res(one=None)])
+    cfg = asyncio.run(survey_schedule.get_send_config(session))
+    assert cfg.enabled is True
+    assert cfg.daily_limit == 100
+    assert cfg.monthly_limit == 3000
+
+
+def test_update_send_config_updates_existing_row():
+    row = SimpleNamespace(
+        enabled=True, daily_limit=100, monthly_limit=3000, updated_by_user_id=None
+    )
+    session = QueueSession([_Res(one=row), _Res(one=row)])
+    cfg = asyncio.run(
+        survey_schedule.update_send_config(
+            session,
+            enabled=False,
+            daily_limit=500,
+            monthly_limit=12000,
+            actor_user_id=7,
+        )
+    )
+    assert row.enabled is False
+    assert row.daily_limit == 500
+    assert row.monthly_limit == 12000
+    assert row.updated_by_user_id == 7
+    assert cfg.daily_limit == 500
+    assert session.commits == 1
 
 
 # ------------------------------------------------- create / cancel / list -----

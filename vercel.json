@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/survey/cron/run",
-      "schedule": "0 13 * * *"
+      "schedule": "0 18 * * *"
     }
   ]
 }

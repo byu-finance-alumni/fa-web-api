@@ -32,11 +32,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import ServiceError
 from app.models.audit import AuditLog
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
+from app.models.survey_send_config import SurveySendConfig
 from app.schemas.survey import (
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
     SurveyScheduleRunItem,
     SurveyScheduleRunSummary,
+    SurveySendConfigItem,
 )
 from app.services import survey_email
 
@@ -81,12 +83,16 @@ def _stage_for(elapsed_days: int) -> int | None:
 async def _load_schedules_due(
     session: AsyncSession, today: datetime.date
 ) -> list[SurveySchedule]:
-    """Schedules that are runnable (scheduled/active) and have started."""
+    """Schedules that are runnable (scheduled/active) and have started.
+
+    Ordered earliest-scheduled first (then oldest cohort) so that, under the
+    shared daily send budget, the campaign that started first drains before a
+    later one gets any of the day's allowance."""
     stmt = (
         select(SurveySchedule)
         .where(SurveySchedule.status.in_(_RUNNABLE_STATUSES))
         .where(SurveySchedule.start_date <= today)
-        .order_by(SurveySchedule.graduation_year)
+        .order_by(SurveySchedule.start_date, SurveySchedule.graduation_year)
     )
     return list((await session.execute(stmt)).scalars().all())
 
@@ -276,6 +282,75 @@ async def cancel_schedule(
     return await get_schedule(session, graduation_year)
 
 
+# --------------------------------------------------------------- send cap ------
+
+# Fallback if the seeded config row is ever missing (Resend Free tier).
+_DEFAULT_DAILY_LIMIT = 100
+_DEFAULT_MONTHLY_LIMIT = 3000
+
+
+async def get_send_config(session: AsyncSession) -> SurveySendConfigItem:
+    """The single-row send cap (id=1). Falls back to enabled Free-tier defaults
+    if the row is somehow missing (the migration seeds it)."""
+    row = (
+        await session.execute(
+            select(SurveySendConfig).where(SurveySendConfig.id == 1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return SurveySendConfigItem(
+            enabled=True,
+            daily_limit=_DEFAULT_DAILY_LIMIT,
+            monthly_limit=_DEFAULT_MONTHLY_LIMIT,
+        )
+    return SurveySendConfigItem(
+        enabled=row.enabled,
+        daily_limit=row.daily_limit,
+        monthly_limit=row.monthly_limit,
+    )
+
+
+async def update_send_config(
+    session: AsyncSession,
+    *,
+    enabled: bool,
+    daily_limit: int,
+    monthly_limit: int,
+    actor_user_id: int | None,
+) -> SurveySendConfigItem:
+    """Set the send cap (in-console admin control). Upserts the single row."""
+    row = (
+        await session.execute(
+            select(SurveySendConfig).where(SurveySendConfig.id == 1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = SurveySendConfig(id=1)
+        session.add(row)
+    row.enabled = enabled
+    row.daily_limit = daily_limit
+    row.monthly_limit = monthly_limit
+    row.updated_by_user_id = actor_user_id
+    await session.commit()
+    return await get_send_config(session)
+
+
+async def _run_allowance(session: AsyncSession) -> int | None:
+    """How many emails this cron run may send under the configured cap, or
+    ``None`` for unlimited (cap disabled).
+
+    The cap is account-wide: the daily and monthly budgets minus what Resend has
+    already sent today / this month (the same usage tally the console shows). The
+    run may send up to whichever budget is tighter."""
+    config = await get_send_config(session)
+    if not config.enabled:
+        return None
+    usage = await survey_email.get_send_usage(session)
+    daily_remaining = max(0, config.daily_limit - usage.sent_today)
+    monthly_remaining = max(0, config.monthly_limit - usage.sent_this_month)
+    return min(daily_remaining, monthly_remaining)
+
+
 # --------------------------------------------------------------- cron core -----
 
 
@@ -284,13 +359,22 @@ async def run_due_schedules(
 ) -> SurveyScheduleRunSummary:
     """Send whatever is due across all runnable schedules (the cron core).
 
-    For each due schedule, derive the current stage from the elapsed days, compute
-    the stage's recipients (initial: not-yet-sent; reminder: initial-recipients
-    who haven't replied and haven't had this reminder), and send them
-    Resend-governed. Each delivered recipient is logged right after its batch, so
-    a re-run — or a resume after a 429 — never re-emails anyone. On a rate-limit we
-    stop the whole run (Resend's limit is account-wide) and let the next cron run
-    resume. Returns a per-year summary.
+    Schedules are processed earliest-scheduled first. For each, the stage sent
+    THIS run is chosen so the initial always finishes before reminders: if any
+    recipient still hasn't had the initial, that's the stage — even past its
+    1-week window, because a cap-throttled initial must complete first; otherwise
+    the 1-week / 2-week reminder for the current window, to initial-recipients who
+    haven't replied and haven't had it yet. Past the 2-week window the campaign is
+    marked complete.
+
+    Sends are paced by a shared, account-wide budget (:func:`_run_allowance`): at
+    most ``daily_limit``/day and ``monthly_limit``/month across ALL years, so a
+    cohort trickles out over several days. When the cap is disabled the budget is
+    unlimited and everything eligible is attempted (Resend's own 429 is then the
+    only brake). Each delivered recipient is logged right after its batch, so a
+    re-run — or a resume after a 429 or a spent budget — never re-emails anyone.
+    On a 429, or once the budget is spent, we stop the whole run and the next
+    daily cron resumes. Returns a per-year summary.
     """
     settings = survey_email.get_settings()
     base_url = settings.survey_app_base_url
@@ -308,10 +392,14 @@ async def run_due_schedules(
     # would fail. Attribute *writes* (status/last_run_at) below are still fine.
     due = [(s, s.graduation_year, s.start_date) for s in schedules]
 
+    # Shared daily/monthly send budget for this whole run (None = cap disabled).
+    allowance = await _run_allowance(session)
+
     ran: list[SurveyScheduleRunItem] = []
     for sched, year, start_date in due:
-        stage = _stage_for((today - start_date).days)
-        if stage is None:
+        elapsed = (today - start_date).days
+        primary = _stage_for(elapsed)
+        if primary is None:
             # Past the last reminder window — the campaign is finished.
             sched.status = STATUS_COMPLETED
             sched.last_run_at = _now()
@@ -324,23 +412,39 @@ async def run_due_schedules(
 
         recipients = await survey_email._load_recipients(session, year)
         logged_initial = await _logged_alumni_ids(session, year, STAGE_INITIAL)
-        if stage == STAGE_INITIAL:
-            targets = [r for r in recipients if r.alumni_id not in logged_initial]
+        initial_targets = [
+            r for r in recipients if r.alumni_id not in logged_initial
+        ]
+        if initial_targets:
+            # Finish the initial send first — even if its 1-week window has
+            # passed because the daily cap spread the cohort over many days.
+            stage, targets = STAGE_INITIAL, initial_targets
+        elif primary == STAGE_INITIAL:
+            stage, targets = STAGE_INITIAL, []
         else:
-            # Reminders: only those who GOT the initial and haven't yet had this
-            # reminder. Repliers are already gone via _load_recipients.
-            logged_current = await _logged_alumni_ids(session, year, stage)
+            # Reminder: only initial-recipients who haven't replied (repliers are
+            # already gone from recipients) and haven't had this reminder yet.
+            logged_stage = await _logged_alumni_ids(session, year, primary)
+            stage = primary
             targets = [
                 r
                 for r in recipients
                 if r.alumni_id in logged_initial
-                and r.alumni_id not in logged_current
+                and r.alumni_id not in logged_stage
             ]
 
+        # Apply the shared budget: send at most `allowance` of this year's
+        # targets this run, then stop — the rest resumes on the next cron.
+        if allowance is not None and allowance <= 0:
+            break
+        chunk = targets if allowance is None else targets[:allowance]
+
         async def _log_batch(
-            chunk: list[survey_email.Recipient], _year: int = year, _stage: int = stage
+            chunk_batch: list[survey_email.Recipient],
+            _year: int = year,
+            _stage: int = stage,
         ) -> None:
-            for r in chunk:
+            for r in chunk_batch:
                 session.add(
                     SurveySendLog(
                         graduation_year=_year, alumni_id=r.alumni_id, stage=_stage
@@ -351,12 +455,14 @@ async def run_due_schedules(
             await session.commit()
 
         sent, retry_after = await survey_email.send_recipients(
-            targets,
+            chunk,
             graduation_year=year,
             base_url=base_url,
             from_field=from_field,
             on_batch_sent=_log_batch,
         )
+        if allowance is not None:
+            allowance -= sent
 
         sched.status = STATUS_ACTIVE
         sched.last_run_at = _now()
@@ -389,6 +495,9 @@ async def run_due_schedules(
         )
         if retry_after is not None:
             # Resend's limit is account-wide — stop; the next cron run resumes.
+            break
+        if allowance is not None and allowance <= 0:
+            # Budget spent for this run — the rest resumes on the next cron.
             break
 
     await session.commit()

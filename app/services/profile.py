@@ -33,7 +33,8 @@ from app.models.engagement import (
     FinanceSocietyLeadership,
 )
 from app.models.event import Event, EventAttendance
-from app.models.survey_schedule import SurveySchedule
+from app.models.survey_response import SurveyResponse
+from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import User
 from app.schemas.alumni import AlumniRead, minimize_alumni_read
@@ -144,6 +145,136 @@ def _require_interaction_ownership(
         raise AuthorizationError(
             "You can only edit or delete interactions you logged."
         )
+
+
+# Synthetic `survey_id`s for derived history rows (#40). The rows aren't stored,
+# but `SurveyRead.survey_id` is the list key, so each needs a stable, unique
+# value. Real `surveys.survey_id`s are IDENTITY-generated and therefore >= 1, so
+# 0 and negatives can never collide with a legacy row.
+_OPEN_CYCLE_SURVEY_ID = 0
+# Days from a campaign's start_date to the end of its 2-week reminder window,
+# after which `survey_schedule.send_due` marks the campaign complete. Mirrors
+# STAGE_REMINDER_2 * _STAGE_WINDOW_DAYS + _STAGE_WINDOW_DAYS in
+# app/services/survey_schedule.py — the alum's effective deadline to reply.
+_CAMPAIGN_WINDOW_DAYS = 21
+
+_RESPONSE_STATUS_LABELS = {
+    "applied": "Completed",
+    "pending": "Completed - awaiting review",
+    "rejected": "Completed - not applied",
+}
+
+_SEND_STAGE_LABELS = {
+    0: "Survey sent",
+    1: "1-week reminder sent",
+    2: "2-week reminder sent",
+}
+
+
+async def _derive_survey_history(
+    session: AsyncSession,
+    alumni_id: int,
+    graduation_year: int | None,
+) -> list[SurveyRead]:
+    """The alum's real survey history, derived from what actually happened.
+
+    The `surveys` table this tab was built against has NO writer anywhere in the
+    codebase — nothing has ever inserted a row — so the Surveys tab rendered
+    empty for every alumnus. The truth now lives in the scheduler's tables, so
+    read it from there rather than adding a second write path that could drift:
+
+      * ``survey_responses`` — one row per cycle they actually answered.
+      * ``survey_send_log``  — what we emailed them, and when (stage 0/1/2).
+      * ``survey_schedule``  — their cohort's campaign, for the due date.
+
+    Returns rows in the SAME ``SurveyRead`` shape the legacy table produced, so
+    the profile tab renders them with no change.
+    """
+    responses = list(
+        (
+            await session.scalars(
+                select(SurveyResponse)
+                .where(SurveyResponse.alumni_id == alumni_id)
+                .order_by(SurveyResponse.submitted_at.desc())
+            )
+        ).all()
+    )
+    sends = list(
+        (
+            await session.scalars(
+                select(SurveySendLog)
+                .where(SurveySendLog.alumni_id == alumni_id)
+                .order_by(SurveySendLog.sent_at)
+            )
+        ).all()
+    )
+    if not responses and not sends:
+        return []
+
+    # The cohort campaign's deadline, when there is one to tie rows to.
+    campaign_start: datetime.date | None = None
+    if graduation_year is not None:
+        campaign_start = await session.scalar(
+            select(SurveySchedule.start_date).where(
+                SurveySchedule.graduation_year == graduation_year
+            )
+        )
+    campaign_due = (
+        campaign_start + datetime.timedelta(days=_CAMPAIGN_WINDOW_DAYS) if campaign_start else None
+    )
+
+    rows: list[SurveyRead] = []
+    for r in responses:
+        submitted = r.submitted_at
+        # Only claim the campaign's due date for a response that actually
+        # answered it — an older response predating the campaign gets none
+        # rather than borrowing a deadline it was never measured against.
+        answered_campaign = campaign_start is not None and submitted.date() >= campaign_start
+        field_count = len(r.payload or {})
+        notes = f"{field_count} field{'' if field_count == 1 else 's'} submitted"
+        if r.staged_photo_path:
+            notes += " + photo"
+        rows.append(
+            SurveyRead(
+                survey_id=-r.survey_response_id,
+                survey_year=submitted.year,
+                survey_due_date=campaign_due if answered_campaign else None,
+                completed=True,
+                completed_at=submitted,
+                # `completed` stays True for every response, including rejected:
+                # the alum DID answer, and the badge shouldn't imply otherwise.
+                # Whether staff applied it is carried in the label instead.
+                survey_status=_RESPONSE_STATUS_LABELS.get(r.status, "Completed"),
+                survey_notes=notes,
+            )
+        )
+
+    # An open cycle: we emailed them and nothing has come back since. One row at
+    # most — `survey_send_log` is unique on (year, alumni, stage), so an alum has
+    # a single campaign's worth of sends.
+    if sends:
+        first_sent = sends[0].sent_at
+        last = sends[-1]
+        answered = any(r.submitted_at >= first_sent for r in responses)
+        if not answered:
+            rows.append(
+                SurveyRead(
+                    survey_id=_OPEN_CYCLE_SURVEY_ID,
+                    survey_year=(campaign_start or first_sent.date()).year,
+                    survey_due_date=campaign_due,
+                    completed=False,
+                    completed_at=None,
+                    # Left None on purpose: the UI derives "Overdue" vs
+                    # "Pending" from the due date, so the badge stays right as
+                    # the deadline passes without anything re-deriving here.
+                    survey_status=None,
+                    survey_notes=(
+                        f"{_SEND_STAGE_LABELS.get(last.stage, 'Survey sent')}"
+                        f" {last.sent_at.date().isoformat()} - no reply yet"
+                    ),
+                )
+            )
+    return rows
 
 
 async def get_profile(
@@ -262,13 +393,28 @@ async def get_profile(
             .order_by(StatusLabel.status_label_name)
         )
     ).all()
-    surveys = (
+    # Survey history (#40) = the LEGACY `surveys` rows plus rows derived from
+    # what actually happened to this alum. See `_derive_survey_history`: the
+    # legacy table has no writer anywhere in the codebase, so on its own the
+    # Surveys tab was empty for everyone.
+    legacy_surveys = (
         await session.scalars(
             select(Survey)
             .where(Survey.alumni_id == alumni_id)
             .order_by(Survey.survey_year.desc().nullslast())
         )
     ).all()
+    surveys = [SurveyRead.model_validate(s) for s in legacy_surveys]
+    surveys.extend(
+        await _derive_survey_history(session, alumni_id, alumnus.graduation_year)
+    )
+    surveys.sort(
+        key=lambda s: (
+            s.survey_year or 0,
+            s.completed_at.date() if s.completed_at else datetime.date.min,
+        ),
+        reverse=True,
+    )
     # Cap the returned list to the 50 most recent; expose the true total
     # separately so the UI can show an accurate count without a huge payload.
     interaction_count = await session.scalar(
@@ -393,7 +539,7 @@ async def get_profile(
         ],
         tags=list(tags),
         status_labels=list(status_labels),
-        surveys=[SurveyRead.model_validate(s) for s in surveys],
+        surveys=surveys,
         next_survey_date=next_survey_date,
         interactions=[
             InteractionRead.model_validate(i).model_copy(

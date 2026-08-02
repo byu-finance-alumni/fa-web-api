@@ -105,3 +105,6 @@ desktop.ini
 /.board-seed*
 *.scratch
 *DO_NOT_MERGE*
+
+# Local git worktrees (see .claude / dev workflow) — never committed.
+.worktrees/

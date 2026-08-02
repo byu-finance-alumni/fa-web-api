@@ -10,6 +10,12 @@ Two tables drive the auto-send of the annual "confirm your info" survey:
   if a previous run crashed or was throttled part-way through.
 
 See migration ``database/migrations/2026-07-29_survey_scheduler.sql``.
+
+These two tables, with ``survey_responses``, are the SOURCE OF TRUTH for an
+alum's survey history — ``profile._derive_survey_history`` builds the profile's
+Surveys tab from them (send log for what went out, schedule's ``start_date`` for
+the due date). The legacy ``surveys`` table is read-only and must not be written
+to; see ``models.crm.Survey``.
 """
 
 import datetime

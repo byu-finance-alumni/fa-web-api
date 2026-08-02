@@ -3,6 +3,10 @@
 `POST /survey/campaigns/{grad_year}/send` is full-access gated and defaults to a
 **dry run** (builds + counts, sends nothing). Pass `?dry_run=false` to actually
 send via Resend, `?limit=N` to override the per-call cap.
+
+Sends and responses here are what the profile's Surveys tab reports on, via
+`profile._derive_survey_history`. Nothing in this module should write to the
+legacy `surveys` table — see `models.crm.Survey`.
 """
 
 import hmac

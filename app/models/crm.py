@@ -70,6 +70,25 @@ class FollowUpTask(TimestampMixin, Base):
 
 
 class Survey(TimestampMixin, Base):
+    """LEGACY, READ-ONLY. Do NOT write rows to this table.
+
+    Nothing in this codebase has ever inserted a ``surveys`` row — no service,
+    no route, not the CSV import. The profile Surveys tab was built against it
+    and was therefore empty for every alumnus until #40.
+
+    Survey history now comes from ``profile._derive_survey_history``, which
+    builds it out of the tables the survey lifecycle actually fills in:
+
+      * ``survey_responses``  — what the alum submitted
+      * ``survey_send_log``   — what we emailed them, and when
+      * ``survey_schedule``   — their cohort's campaign, for the due date
+
+    Adding a writer here would make the same fact recorded twice, and the moment
+    the two disagree there is no way to tell which is right. **If the Surveys tab
+    is wrong, fix the derivation — don't start populating this table.** Existing
+    rows are still read and merged, which is the only reason the mapping stays.
+    """
+
     __tablename__ = "surveys"
 
     survey_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

@@ -10,7 +10,11 @@ current STAGE is derived purely from the days elapsed since ``start_date`` (0 / 
 
 Double-emailing is prevented by ``survey_send_log``: after each successful Resend
 batch the scheduler records a row per recipient, and later runs exclude anyone
-already logged for the (year, stage). The eligible set itself comes from
+already logged for the (year, stage). Those same rows are what the profile's
+Surveys tab reports as "sent, no reply yet"
+(``profile._derive_survey_history``) — so the send log is a read source, not
+just a guard, and nothing here should ALSO write the legacy ``surveys`` table
+(see ``models.crm.Survey``). The eligible set itself comes from
 :func:`survey_email._load_recipients`, which already drops non-sendable addresses
 and anyone who replied within the last 365 days — so reminders only ever reach
 genuine non-responders.

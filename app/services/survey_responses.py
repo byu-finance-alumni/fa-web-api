@@ -8,6 +8,10 @@ review each in the console (`list_pending`, with a before/after diff) and apply
 
 Every field an alum can submit is in `_FIELDS` (key -> table/column/kind), which
 is the ONLY thing that gets written — nothing else in the payload is applied.
+
+These rows ARE the survey history the profile's Surveys tab shows: it derives
+from them in `profile._derive_survey_history`. Do NOT also insert into the
+legacy `surveys` table (see `models.crm.Survey`) — one fact, one home.
 """
 
 from __future__ import annotations

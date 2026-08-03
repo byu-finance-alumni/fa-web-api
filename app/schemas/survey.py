@@ -148,10 +148,28 @@ class SurveyScheduleItem(BaseModel):
     # (FERPA — minimize internal identifiers). None when the schedule predates
     # the column, or the creator's account has since been deleted (FK SET NULL).
     created_by: str | None = None
+    # When the campaign was paused — set only while ``status == 'paused'``, and
+    # cleared on resume. The console shows it so "paused" is never an undated
+    # state ("paused 3 days ago" is what tells staff a stopped campaign has been
+    # forgotten about).
+    paused_at: datetime.datetime | None = None
     # Delivered counts per stage from survey_send_log (0=initial, 1/2=reminders).
     sent_initial: int = 0
     sent_reminder_1: int = 0
     sent_reminder_2: int = 0
+
+
+class SurveySchedulePauseAllResult(BaseModel):
+    """Outcome of the engineer blanket pause (``POST /survey/schedules/pause-all``).
+
+    Same shape and contract as :class:`SurveyScheduleCancelAllResult` — the two
+    controls sit together in the console — but reports what was PAUSED, which is
+    reversible: every year named here can be resumed and will pick its cadence up
+    where it left off. Both fields are empty / 0 when nothing was running; the
+    call is idempotent."""
+
+    paused: int
+    graduation_years: list[int]
 
 
 class SurveyScheduleCancelAllResult(BaseModel):

@@ -19,6 +19,12 @@ just a guard, and nothing here should ALSO write the legacy ``surveys`` table
 and anyone who replied within the last 365 days — so reminders only ever reach
 genuine non-responders.
 
+A campaign can be stopped two ways. ``cancel`` is terminal — it never resumes.
+``pause`` is reversible: it drops the row out of the runnable set so the cron
+skips it, and :func:`resume_schedule` shifts ``start_date`` forward by the paused
+duration so the stage arithmetic picks up exactly where it stopped instead of
+silently ageing past the reminder windows. See the "pause / resume" section.
+
 The send is Resend-governed via :func:`survey_email.send_recipients`: on a 429 it
 stops and the remainder is picked up on the next cron run. Every scheduled send
 writes the same ``send_survey`` audit row the manual send writes (carrying
@@ -34,7 +40,7 @@ from collections.abc import Sequence
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import ServiceError
+from app.core.errors import ConflictError, ServiceError
 from app.models.audit import AuditLog
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
@@ -43,6 +49,7 @@ from app.schemas.survey import (
     SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
+    SurveySchedulePauseAllResult,
     SurveyScheduleRunItem,
     SurveyScheduleRunSummary,
     SurveySendConfigItem,
@@ -54,8 +61,12 @@ log = logging.getLogger(__name__)
 # Campaign states (mirror the DB CHECK constraint).
 STATUS_SCHEDULED = "scheduled"
 STATUS_ACTIVE = "active"
+STATUS_PAUSED = "paused"
 STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
+# The ONLY statuses the cron acts on (`_load_schedules_due`). `paused` is
+# deliberately absent — that single omission is what actually stops the sending,
+# and it is why pause needs no change to the cron itself.
 _RUNNABLE_STATUSES = (STATUS_SCHEDULED, STATUS_ACTIVE)
 
 # Send stages and the day-since-start windows that select them.
@@ -176,6 +187,7 @@ def _to_item(
         last_run_at=sched.last_run_at,
         created_at=getattr(sched, "created_at", None),
         created_by=creators.get(created_by_id) if created_by_id else None,
+        paused_at=getattr(sched, "paused_at", None),
         sent_initial=counts.get((year, STAGE_INITIAL), 0),
         sent_reminder_1=counts.get((year, STAGE_REMINDER_1), 0),
         sent_reminder_2=counts.get((year, STAGE_REMINDER_2), 0),
@@ -307,6 +319,225 @@ async def create_schedules_bulk(
         )
     await session.commit()
     return await list_schedules(session)
+
+
+# ------------------------------------------------------------ pause / resume ---
+#
+# PAUSE is the REVERSIBLE stop; `cancel` is the terminal one. Pausing only flips
+# the status out of `_RUNNABLE_STATUSES`, which is by itself enough to stop the
+# daily cron — `_load_schedules_due` never selects a `paused` row.
+#
+# Resume is the hard part. The stage a campaign sends is derived purely from
+# `today - start_date` (`_stage_for`), so a naive pause silently EATS the rest of
+# the campaign: pause on day 3, resume three weeks later, and `elapsed` is 24 —
+# past the 2-week window — so the very next cron run marks the campaign
+# `completed` and the two reminders never go out. Nothing would look broken; the
+# cohort would just never be reminded.
+#
+# So resume restores the campaign to where it was in its CADENCE, not where the
+# calendar has drifted to, by pushing `start_date` forward by the paused
+# duration. `paused_at` is therefore load-bearing state, not an audit stamp.
+#
+# What resume does NOT need to reconstruct: partially-sent stages. Who has been
+# emailed lives in `survey_send_log` (see `_logged_alumni_ids`), never in dates,
+# and pause/resume never touch it. A half-finished initial therefore resumes on
+# its own — `run_due_schedules` sends STAGE_INITIAL to anyone missing a stage-0
+# log row before it will look at any reminder, whatever `elapsed` says.
+
+
+def _resumed_start_date(
+    *,
+    start_date: datetime.date,
+    paused_on: datetime.date | None,
+    resumed_on: datetime.date,
+) -> datetime.date:
+    """The ``start_date`` a resuming campaign should carry.
+
+    Two cases, because "shift by the paused duration" is only right for a
+    campaign that was actually IN FLIGHT:
+
+    * **In flight** (``paused_on > start_date``): shift forward by exactly the
+      paused duration, so ``today - start_date`` — and therefore the stage — is
+      the same number it was the day it was paused. The cadence continues rather
+      than restarting: a campaign paused on day 3 resumes on day 3.
+
+    * **Never started** (``paused_on <= start_date``): nothing had elapsed, so
+      there is no cadence to preserve and shifting would be wrong — it would push
+      a future start further into the future for no reason. It keeps its original
+      start date... unless that date PASSED during the pause, in which case it
+      starts today. That last clamp matters: honouring a start date 10 days gone
+      would land the campaign at `elapsed=10`, and because the initial-first rule
+      sends stage 0 anyway, it would fire the initial today and the 1-week
+      reminder TOMORROW. Starting from today gives it the full, correct cadence,
+      which is what "it never started" should mean.
+
+    The two branches agree on the boundary (``paused_on == start_date`` yields
+    ``resumed_on`` either way), so which side of the comparison it falls on is
+    not load-bearing.
+
+    ``paused_on`` is None only for a `paused` row that predates / bypassed the
+    pause service (a hand-edited DB row): there is no duration to shift by, so
+    the start date is left exactly as found rather than invented.
+    """
+    if paused_on is None:
+        return start_date
+    if paused_on <= start_date:
+        return max(start_date, resumed_on)
+    return start_date + (resumed_on - paused_on)
+
+
+async def _load_schedule_row(
+    session: AsyncSession, graduation_year: int
+) -> SurveySchedule | None:
+    stmt = select(SurveySchedule).where(
+        SurveySchedule.graduation_year == graduation_year
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def pause_schedule(
+    session: AsyncSession, graduation_year: int, *, actor_user_id: int | None
+) -> SurveyScheduleItem | None:
+    """Pause one year's campaign — a stop it can come back from.
+
+    Returns None if there is no schedule for the year (the route 404s). Pausing
+    an already-paused campaign is a no-op success: the caller asked for a state
+    it is already in, and two admins hitting the button together must not fight
+    over `paused_at`. Anything else (`completed`/`cancelled`) is a 409 rather
+    than a silent no-op — it means the caller believes a campaign is running that
+    isn't, and quietly succeeding would confirm that misconception."""
+    sched = await _load_schedule_row(session, graduation_year)
+    if sched is None:
+        return None
+    if sched.status == STATUS_PAUSED:
+        return await get_schedule(session, graduation_year)
+    if sched.status not in _RUNNABLE_STATUSES:
+        raise ConflictError(
+            f"Only a scheduled or active campaign can be paused — the "
+            f"{graduation_year} campaign is {sched.status}."
+        )
+    # Remember what to come back to. Deriving it on resume is not reliable:
+    # `last_run_at` (and the send log) survive a re-schedule — `_upsert_schedule`
+    # resets status to `scheduled` but leaves both — so a re-scheduled year would
+    # resume as `active` having never started.
+    sched.paused_from_status = sched.status
+    sched.paused_at = _now()
+    sched.status = STATUS_PAUSED
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="pause_survey_schedule",
+            entity_type="survey_campaign",
+            entity_id=graduation_year,
+            old_value=sched.paused_from_status,
+            new_value=f"paused grad_year={graduation_year}",
+        )
+    )
+    await session.commit()
+    return await get_schedule(session, graduation_year)
+
+
+async def resume_schedule(
+    session: AsyncSession, graduation_year: int, *, actor_user_id: int | None
+) -> SurveyScheduleItem | None:
+    """Resume a paused campaign where its cadence left off (see the notes above).
+
+    Returns None if there is no schedule for the year. Resuming a campaign that
+    is already running is a no-op success (it is already in the requested state);
+    resuming a `completed` or `cancelled` one is a 409 — cancel is terminal by
+    design and resume must not become a back door around that."""
+    sched = await _load_schedule_row(session, graduation_year)
+    if sched is None:
+        return None
+    if sched.status in _RUNNABLE_STATUSES:
+        return await get_schedule(session, graduation_year)
+    if sched.status != STATUS_PAUSED:
+        raise ConflictError(
+            f"Only a paused campaign can be resumed — the {graduation_year} "
+            f"campaign is {sched.status}. Re-schedule it instead."
+        )
+    resumed_on = _today()
+    paused_at = sched.paused_at
+    # `paused_at` is stored as timestamptz (UTC); `_today()` is the UTC date the
+    # scheduler itself compares `start_date` against, so both sides of the shift
+    # are measured on the same clock.
+    paused_on = (
+        paused_at.astimezone(datetime.UTC).date() if paused_at is not None else None
+    )
+    previous_start = sched.start_date
+    sched.start_date = _resumed_start_date(
+        start_date=previous_start, paused_on=paused_on, resumed_on=resumed_on
+    )
+    # Restore the status it held when paused; fall back to `scheduled` only for a
+    # row that was never paused through this service (nothing recorded).
+    sched.status = sched.paused_from_status or STATUS_SCHEDULED
+    sched.paused_at = None
+    sched.paused_from_status = None
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="resume_survey_schedule",
+            entity_type="survey_campaign",
+            entity_id=graduation_year,
+            old_value=f"paused start_date={previous_start.isoformat()}",
+            new_value=(
+                f"resumed grad_year={graduation_year} status={sched.status} "
+                f"start_date={sched.start_date.isoformat()}"
+            ),
+        )
+    )
+    await session.commit()
+    return await get_schedule(session, graduation_year)
+
+
+async def pause_all_schedules(
+    session: AsyncSession, *, actor_user_id: int | None
+) -> SurveySchedulePauseAllResult:
+    """Pause EVERY runnable (scheduled/active) campaign at once — the reversible
+    twin of :func:`cancel_all_schedules`.
+
+    Same shape for the same reasons: one ``UPDATE ... RETURNING`` rather than a
+    read-then-write loop, so the stop is atomic and the daily cron cannot pick up
+    a year this call has already decided to stop; only ``_RUNNABLE_STATUSES``
+    rows are touched, so paused/completed/cancelled campaigns keep their state;
+    and it always writes ONE audit row, even for a no-op, because reaching for a
+    blanket stop is itself an intervention worth tracing.
+
+    Idempotent: a second press finds nothing runnable and reports 0, leaving the
+    first press's ``paused_at`` stamps untouched — so "resume" still shifts by
+    the real paused duration.
+
+    ``paused_from_status`` is set from the row's CURRENT ``status`` in the same
+    statement. Postgres evaluates every SET expression against the pre-UPDATE
+    row, so it captures `scheduled`/`active` and not the `paused` being written.
+    """
+    result = await session.execute(
+        update(SurveySchedule)
+        .where(SurveySchedule.status.in_(_RUNNABLE_STATUSES))
+        .values(
+            paused_from_status=SurveySchedule.status,
+            status=STATUS_PAUSED,
+            paused_at=_now(),
+        )
+        .returning(SurveySchedule.graduation_year)
+        .execution_options(synchronize_session=False)
+    )
+    years = sorted(result.scalars().all())
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="pause_all_survey_schedules",
+            entity_type="survey_campaign",
+            # No single entity — the years paused are named in new_value.
+            entity_id=None,
+            new_value=(
+                f"paused={len(years)} "
+                f"grad_years={','.join(str(y) for y in years) or 'none'}"
+            ),
+        )
+    )
+    await session.commit()
+    return SurveySchedulePauseAllResult(paused=len(years), graduation_years=years)
 
 
 async def cancel_schedule(

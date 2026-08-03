@@ -624,6 +624,12 @@ CREATE INDEX IF NOT EXISTS idx_survey_responses_alumni_id ON survey_responses (a
 -- stage. `survey_send_log` is the append-only record of every delivered email —
 -- its UNIQUE (graduation_year, alumni_id, stage) prevents double-emailing across
 -- cron runs. See migrations/2026-07-29_survey_scheduler.sql.
+-- `paused` is the REVERSIBLE stop (`cancelled` is terminal). `paused_at` is load-
+-- bearing, not just an audit stamp: the send stage is derived from
+-- `today - start_date`, so resume shifts `start_date` forward by the paused
+-- duration to keep the cadence. `paused_from_status` is what resume restores.
+-- Both are NULL unless the campaign is paused. See
+-- migrations/2026-08-03_survey_schedule_pause.sql.
 CREATE TABLE survey_schedule (
     survey_schedule_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     graduation_year     int NOT NULL UNIQUE,
@@ -631,10 +637,13 @@ CREATE TABLE survey_schedule (
     status              varchar(20) NOT NULL DEFAULT 'scheduled',
     created_by_user_id  bigint,
     last_run_at         timestamptz,
+    paused_at           timestamptz,
+    paused_from_status  varchar(20),
     created_at          timestamptz NOT NULL DEFAULT now(),
     updated_at          timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_survey_schedule_created_by FOREIGN KEY (created_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
-    CONSTRAINT ck_survey_schedule_status CHECK (status IN ('scheduled', 'active', 'completed', 'cancelled'))
+    CONSTRAINT ck_survey_schedule_status CHECK (status IN ('scheduled', 'active', 'paused', 'completed', 'cancelled')),
+    CONSTRAINT ck_survey_schedule_paused_from_status CHECK (paused_from_status IS NULL OR paused_from_status IN ('scheduled', 'active'))
 );
 
 CREATE TABLE survey_send_log (

@@ -1,9 +1,14 @@
 """Tests for the survey send scheduler (#542) — service + cron route.
 
 All run against fakes (no real DB / network), mirroring the monkeypatch style in
-tests/test_survey_email.py: `_load_recipients` / `_send_batch` are stubbed, and
-the scheduler's own DB helpers (`_load_schedules_due`, `_logged_alumni_ids`) are
-monkeypatched so `run_due_schedules` can be exercised without a session backend.
+tests/test_survey_email.py: `_load_recipients` / `_send_batch` are stubbed and
+`_load_schedules_due` is monkeypatched so `run_due_schedules` can be exercised
+without a session backend.
+
+Delivery, though, is NOT faked away: the run sessions are
+`survey_fakes.SendLogSession`, which keeps a real `survey_send_log` set and
+honours its unique constraint, so "was this send recorded?" is asserted against
+the actual claim rows rather than against ORM objects handed to `add()`.
 """
 
 import asyncio
@@ -14,6 +19,7 @@ import pytest
 
 from app.schemas.survey import SurveyScheduleRunSummary, SurveySendConfigItem
 from app.services import survey_email, survey_schedule
+from tests.survey_fakes import SendLogSession
 
 _TODAY = datetime.date(2026, 7, 29)
 
@@ -67,23 +73,21 @@ def _utc(d, hour=12):
     return datetime.datetime(d.year, d.month, d.day, hour, tzinfo=datetime.UTC)
 
 
-class FakeSession:
-    """Records added rows + commits (run_due_schedules never queries it directly —
-    its DB helpers are monkeypatched)."""
-
-    def __init__(self):
-        self.added = []
-        self.commits = 0
-
-    def add(self, obj):
-        self.added.append(obj)
-
-    async def commit(self):
-        self.commits += 1
+class FakeSession(SendLogSession):
+    """A run session: records added rows + commits, and keeps a real send log."""
 
 
 def _logs(session):
-    return [a for a in session.added if type(a).__name__ == "SurveySendLog"]
+    """The (year, alumni_id, stage) rows actually claimed in `survey_send_log`."""
+    return sorted(session.send_log)
+
+
+def _sent_ids(session, stage=None):
+    return sorted(
+        alumni_id
+        for _year, alumni_id, s in session.send_log
+        if stage is None or s == stage
+    )
 
 
 def _audits(session):
@@ -114,7 +118,11 @@ def _patch_run(monkeypatch, *, schedules, recipients, logged, batch, allowance=N
         return recipients
 
     async def fake_logged(session, year, stage):
-        return set(logged.get((year, stage), set()))
+        # Whatever the test seeded as already-sent, PLUS anything this run has
+        # since claimed on the session — so the stage selection sees the run's
+        # own writes, exactly as it would against the real table.
+        seeded = set(logged.get((year, stage), set()))
+        return seeded | getattr(session, "logged", lambda *_: set())(year, stage)
 
     async def fake_allowance(session):
         # None = cap disabled (unlimited); an int = the shared run budget.
@@ -122,7 +130,7 @@ def _patch_run(monkeypatch, *, schedules, recipients, logged, batch, allowance=N
 
     monkeypatch.setattr(survey_schedule, "_load_schedules_due", fake_due)
     monkeypatch.setattr(survey_email, "_load_recipients", fake_recipients)
-    monkeypatch.setattr(survey_schedule, "_logged_alumni_ids", fake_logged)
+    monkeypatch.setattr(survey_email, "logged_alumni_ids", fake_logged)
     monkeypatch.setattr(survey_schedule, "_run_allowance", fake_allowance)
     monkeypatch.setattr(survey_email, "_send_batch", batch)
 
@@ -153,9 +161,7 @@ def test_run_sends_stage0_and_logs_recipients(fake_settings, monkeypatch):
     assert item.remaining == 0
     assert sorted(sent_to) == ["a1@example.com", "a2@example.com", "a3@example.com"]
     # A send_log row per recipient, all stage 0.
-    logs = _logs(session)
-    assert sorted(r.alumni_id for r in logs) == [1, 2, 3]
-    assert {r.stage for r in logs} == {0}
+    assert _logs(session) == [(2000, 1, 0), (2000, 2, 0), (2000, 3, 0)]
     # Audit row carries sent=N so the usage tally counts scheduled sends.
     audit = _audits(session)[0]
     assert audit.action_type == "send_survey"
@@ -202,7 +208,7 @@ def test_stage_advances_by_date(fake_settings, monkeypatch):
 
     assert summary.ran[0].stage == 1
     assert summary.ran[0].sent == 3
-    assert {r.stage for r in _logs(session)} == {1}
+    assert {stage for _y, _a, stage in _logs(session)} == {1}
 
 
 def test_reminder_targets_only_initial_nonresponders(fake_settings, monkeypatch):
@@ -228,12 +234,17 @@ def test_reminder_targets_only_initial_nonresponders(fake_settings, monkeypatch)
 
     assert summary.ran[0].sent == 1
     assert sent_to == ["a2@example.com"]
-    logs = _logs(session)
-    assert [r.alumni_id for r in logs] == [2]
-    assert logs[0].stage == 1
+    assert _logs(session) == [(2000, 2, 1)]
 
 
-def test_completed_when_past_last_window(fake_settings, monkeypatch):
+def test_completed_when_past_last_window_and_everyone_has_had_every_stage(
+    fake_settings, monkeypatch
+):
+    """Past the last window AND nothing left to send -> completed.
+
+    This is the ONLY shape that may complete a campaign: every stage delivered to
+    every eligible recipient."""
+
     async def batch(emails):  # pragma: no cover - never called
         raise AssertionError("no send when the campaign is complete")
 
@@ -242,7 +253,7 @@ def test_completed_when_past_last_window(fake_settings, monkeypatch):
         monkeypatch,
         schedules=[schedule],
         recipients=_rcpts([1]),
-        logged={},
+        logged={(2000, 0): {1}, (2000, 1): {1}, (2000, 2): {1}},
         batch=batch,
     )
 
@@ -251,6 +262,112 @@ def test_completed_when_past_last_window(fake_settings, monkeypatch):
 
     assert summary.ran[0].stage is None
     assert schedule.status == survey_schedule.STATUS_COMPLETED
+    assert _logs(session) == []
+
+
+def test_past_last_window_still_sends_to_anyone_never_emailed(
+    fake_settings, monkeypatch
+):
+    """The bug that produced this rewrite.
+
+    The old code checked `_stage_for(elapsed) is None` FIRST — before it loaded a
+    single recipient — and marked the campaign `completed`, which is terminal.
+    Schedule many years at once (the bulk dialog applies one date to every year)
+    against the default 100/day budget and the cohorts past roughly the
+    sixteenth were flipped to `completed` on day 21 having sent ZERO emails, with
+    no log rows and a summary that read like a clean finish. On prod that is
+    thousands of alumni silently never surveyed.
+
+    Elapsed days are now a CEILING on which stage may go out, never a definition
+    of done: nobody has had the initial, so the initial is what goes out."""
+
+    sent_to = []
+
+    async def batch(emails):
+        sent_to.extend(e["to"][0] for e in emails)
+        return (None, None)
+
+    schedule = _sched(2000, _TODAY - datetime.timedelta(days=30), status="active")
+    assert survey_schedule._stage_for(30) is None  # the old "campaign over" test
+    _patch_run(
+        monkeypatch,
+        schedules=[schedule],
+        recipients=_rcpts([1, 2, 3]),
+        logged={},  # nobody has ever been emailed
+        batch=batch,
+    )
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    assert summary.ran[0].stage == survey_schedule.STAGE_INITIAL
+    assert summary.ran[0].sent == 3
+    assert sorted(sent_to) == ["a1@example.com", "a2@example.com", "a3@example.com"]
+    assert _sent_ids(session, stage=0) == [1, 2, 3]
+    # NOT completed — it still owes both reminders.
+    assert schedule.status == survey_schedule.STATUS_ACTIVE
+
+
+def test_past_last_window_finishes_an_abandoned_reminder(fake_settings, monkeypatch):
+    """A reminder window that could not drain is picked up later, not abandoned.
+
+    Only stage 0 used to have a "finish it regardless of the window" rule;
+    reminders were selected purely by the CURRENT window, so a cap-throttled (or
+    missed) reminder window stranded its stragglers permanently. The run now
+    picks the LOWEST stage at or below the ceiling that still owes anyone."""
+
+    sent_to = []
+
+    async def batch(emails):
+        sent_to.extend(e["to"][0] for e in emails)
+        return (None, None)
+
+    schedule = _sched(2000, _TODAY - datetime.timedelta(days=25), status="active")
+    _patch_run(
+        monkeypatch,
+        schedules=[schedule],
+        recipients=_rcpts([1, 2]),
+        # Everyone had the initial; only alum 1 got the 1-week reminder before
+        # the budget ran out, and its window has long since closed.
+        logged={(2000, 0): {1, 2}, (2000, 1): {1}},
+        batch=batch,
+    )
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    assert summary.ran[0].stage == survey_schedule.STAGE_REMINDER_1
+    assert sent_to == ["a2@example.com"]
+    assert _logs(session) == [(2000, 2, 1)]
+    assert schedule.status == survey_schedule.STATUS_ACTIVE
+
+
+def test_not_completed_while_the_budget_still_owes_a_cohort(
+    fake_settings, monkeypatch
+):
+    """A year starved of send budget is never completed.
+
+    The budget check now runs AFTER the completion decision, and completion is
+    evidence-based, so a cohort that got nothing this run stays runnable."""
+
+    async def batch(emails):  # pragma: no cover - budget is spent before any send
+        raise AssertionError("nothing may be sent with a zero budget")
+
+    starved = _sched(2000, _TODAY - datetime.timedelta(days=40), status="active")
+    _patch_run(
+        monkeypatch,
+        schedules=[starved],
+        recipients=_rcpts([1, 2, 3]),
+        logged={},
+        batch=batch,
+        allowance=0,  # budget already spent by earlier years / manual sends
+    )
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    assert summary.ran == []  # the run stopped before touching this year
+    assert starved.status == "active"  # NOT completed
     assert _logs(session) == []
 
 
@@ -387,7 +504,7 @@ def test_initial_sent_before_reminder_when_cap_delayed(fake_settings, monkeypatc
     item = summary.ran[0]
     assert item.stage == 0  # INITIAL, not the day-8 reminder
     assert sorted(sent_to) == ["a2@example.com", "a3@example.com"]
-    assert {r.stage for r in _logs(session)} == {0}
+    assert {stage for _y, _a, stage in _logs(session)} == {0}
 
 
 def test_run_allowance_subtracts_usage_and_takes_tighter_budget(

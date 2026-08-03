@@ -2,6 +2,7 @@
 
 import asyncio
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,8 @@ from app.services.survey_email import (
     render_survey_email,
     verify_survey_token,
 )
+from tests.survey_fakes import SendLogSession
+from tests.survey_fakes import audits as _audits
 
 
 class _FakeSettings:
@@ -19,8 +22,10 @@ class _FakeSettings:
     survey_from_email = "test@jakegunnell.com"
     survey_from_name = "BYU Finance Alumni"
     survey_app_base_url = "https://finance.alumni.byu.edu"
-    survey_daily_cap = 100
     resend_api_key = "re_test_key"
+    survey_usage_baseline_at = None
+    survey_usage_baseline_today = 0
+    survey_usage_baseline_month = 0
 
 
 @pytest.fixture
@@ -82,16 +87,13 @@ def test_render_email_has_greeting_info_and_link(fake_settings):
 # ------------------------------------------------------------- send flow -----
 
 
-class FakeSession:
-    def __init__(self):
-        self.added = []
-        self.committed = 0
+class FakeSession(SendLogSession):
+    """The manual send now reads (the year's schedule, the send log) and WRITES
+    claim rows, so its session has to be a real-ish one."""
 
-    def add(self, obj):
-        self.added.append(obj)
-
-    async def commit(self):
-        self.committed += 1
+    @property
+    def committed(self):
+        return self.commits
 
 
 def test_dry_run_sends_nothing(fake_settings, monkeypatch):
@@ -189,7 +191,14 @@ def test_send_stops_and_reports_retry_after_on_429(fake_settings, monkeypatch):
     assert result.sent == 100  # only the first batch went out
     assert result.retry_after_seconds == 42
     assert result.remaining == 150  # 250 - 100
-    assert session.committed == 1  # audit row still written
+    # Exactly the delivered 100 are recorded: the throttled batch's claim was
+    # RELEASED (a 429 means Resend queued nothing), so those 100 are still owed.
+    assert len(session.send_log) == 100
+    assert {stage for _y, _a, stage in session.send_log} == {0}
+    # The audit row is still written — and, unlike before, so is every claim,
+    # each committed before its own send rather than all at the end.
+    assert session.committed >= 1
+    assert len(_audits(session)) == 1
 
 
 # ------------------------------------------------------ sendable email -------
@@ -478,49 +487,42 @@ def test_route_defaults_to_dry_run(client, monkeypatch):
 # --- Real send-usage tally (#534) -------------------------------------------
 
 
-def test_tally_sent_splits_today_vs_month():
-    import datetime
+class _CountSession:
+    """Serves get_send_usage's single (month, today) aggregate."""
 
-    from app.services.survey_email import _tally_sent
+    def __init__(self, month, today):
+        self._row = (month, today)
+        self.stmt = None
 
-    start_today = datetime.datetime(2026, 7, 28, tzinfo=datetime.UTC)
-    rows = [
-        # Two sends today -> count toward both today and the month.
-        ("grad_year=1900 recipients=60 prepared=50 sent=50 dry_run=False",
-         datetime.datetime(2026, 7, 28, 14, 0, tzinfo=datetime.UTC)),
-        ("grad_year=2000 recipients=30 prepared=30 sent=30 dry_run=False",
-         datetime.datetime(2026, 7, 28, 8, 0, tzinfo=datetime.UTC)),
-        # Earlier this month -> month only.
-        ("grad_year=1990 recipients=20 prepared=20 sent=20 dry_run=False",
-         datetime.datetime(2026, 7, 10, 9, 0, tzinfo=datetime.UTC)),
-        # A row with no parseable count contributes 0, not a crash.
-        ("malformed audit row with no count",
-         datetime.datetime(2026, 7, 28, 10, 0, tzinfo=datetime.UTC)),
-    ]
-    sent_today, sent_this_month = _tally_sent(rows, start_today)
-    assert sent_today == 80  # 50 + 30
-    assert sent_this_month == 100  # + 20
+    async def execute(self, stmt):
+        self.stmt = stmt
+        return SimpleNamespace(first=lambda: self._row)
 
 
-def test_get_send_usage_sums_audit_rows():
-    import datetime
-
+def test_get_send_usage_counts_send_log_rows(fake_settings):
     from app.schemas.survey import SurveyUsage
 
-    class _Rows:
-        def all(self):
-            # created "now" -> counts as today (and this month).
-            return [("grad_year=1900 sent=7 dry_run=False",
-                     datetime.datetime.now(datetime.UTC))]
-
-    class _Session:
-        async def execute(self, _stmt):
-            return _Rows()
-
-    usage = asyncio.run(survey_email.get_send_usage(_Session()))
+    session = _CountSession(month=31, today=7)
+    usage = asyncio.run(survey_email.get_send_usage(session))
     assert isinstance(usage, SurveyUsage)
     assert usage.sent_today == 7
-    assert usage.sent_this_month == 7
+    assert usage.sent_this_month == 31
+
+
+def test_get_send_usage_reads_the_send_log_not_the_audit_trail(fake_settings):
+    """The ledger MUST be `survey_send_log`, not `audit_logs`.
+
+    Usage used to be regex-scraped out of `sent=N` in the audit text, which had
+    two holes: an ENGINEER actor's AuditLog is rerouted into
+    `engineer_action_log` by the audit hook (#199) and was never counted at all —
+    so an engineer's manual send left the meter on zero and the scheduler handed
+    out a budget that was already spent — and any aborted run lost the whole
+    run's count even for batches that had been delivered."""
+    session = _CountSession(month=0, today=0)
+    asyncio.run(survey_email.get_send_usage(session))
+    sql = str(session.stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "survey_send_log" in sql
+    assert "audit_logs" not in sql
 
 
 def test_get_send_usage_applies_baseline(monkeypatch):
@@ -538,14 +540,7 @@ def test_get_send_usage_applies_baseline(monkeypatch):
 
     monkeypatch.setattr(survey_email, "get_settings", lambda: _S())
 
-    class _Rows:
-        def all(self):
-            return [("grad_year=1900 sent=3 dry_run=False", now)]  # after anchor
-
-    class _Session:
-        async def execute(self, _stmt):
-            return _Rows()
-
-    usage = asyncio.run(survey_email.get_send_usage(_Session()))
+    session = _CountSession(month=3, today=3)  # rows after the anchor
+    usage = asyncio.run(survey_email.get_send_usage(session))
     assert usage.sent_today == 17  # 14 baseline + 3 new
     assert usage.sent_this_month == 29  # 26 baseline + 3 new

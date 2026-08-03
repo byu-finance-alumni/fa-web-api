@@ -283,6 +283,29 @@ STATUS_LABELS: tuple[str, ...] = (
     "Do Not Contact",
 )
 
+# Status labels that SUPPRESS outbound bulk contact (the survey send, and any
+# future mailing built on the same predicate). A label here means "we must not
+# email this record", NOT "we have lost touch with them":
+#
+#   * ``Deceased``       — the address may still be live and read by a surviving
+#                          spouse; a "confirm your information" email carrying
+#                          the deceased person's full record is the worst thing
+#                          this system can send.
+#   * ``Do Not Contact`` — an explicit, recorded request. It is the whole point
+#                          of the label.
+#
+# ``Lost Contact``, ``Retired`` and ``Inactive`` are deliberately NOT here.
+# "Lost Contact" means we WANT to reconnect and the survey is the tool for it;
+# retired/inactive alumni are still ours to survey. Suppression is a narrow,
+# two-value list on purpose — widening it silently un-surveys whole cohorts.
+#
+# Named here, next to :data:`STATUS_LABELS`, so the survey service and any
+# "who would receive this?" preview share one definition and cannot drift.
+SUPPRESSED_CONTACT_STATUS_LABELS: tuple[str, ...] = (
+    "Deceased",
+    "Do Not Contact",
+)
+
 _TAGS_SET = frozenset(TAGS)
 _STATUS_LABELS_SET = frozenset(STATUS_LABELS)
 

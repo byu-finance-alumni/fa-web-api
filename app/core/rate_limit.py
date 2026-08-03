@@ -167,15 +167,18 @@ HEADSHOT_WRITE_LIMITER = rate_limiter(
     window_seconds=_MUTATION_WINDOW,
     actor_guard=require_full_access,
 )
-# Bulk headshot import is far heavier than a single upload: one call can pull up
-# to _HEADSHOT_BULK_MAX_FILES images / 200 MB of decompressed data through the
-# server and issue that many storage writes + audit rows. So it gets its OWN,
-# tighter budget (a handful of batches per 10 min) rather than sharing the
-# per-upload bucket — enough for legitimate re-runs, a hard brake on a loop /
-# compromised session trying to churn the whole directory.
+# Bulk headshot import (#595) is chunked: image bytes go browser -> Supabase
+# directly, and the client makes two small metadata calls (mint upload URLs, then
+# confirm) per chunk of up to _HEADSHOT_BULK_MAX_PER_REQUEST (100) photos. The
+# budget is expressed in REQUESTS, so it is sized to the same ceiling on IMAGES
+# the old single-shot route had (10 requests x 1000 files = 10k images / 10 min):
+# 100 requests x 100 files is the same 10k, i.e. ~5 full 1000-photo imports per
+# window. Still its own bucket, separate from the per-upload one — enough for
+# legitimate re-runs, a hard brake on a loop / compromised session trying to
+# churn the whole directory.
 BULK_HEADSHOT_LIMITER = rate_limiter(
     "alumni:headshot_bulk",
-    limit=10,
+    limit=100,
     window_seconds=600,
     actor_guard=require_full_access,
 )

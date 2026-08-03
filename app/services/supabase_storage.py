@@ -145,26 +145,35 @@ async def create_signed_upload_url(bucket: str, path: str) -> str:
     return f"{base}{signed}" if signed.startswith("/") else f"{base}/{signed}"
 
 
-async def probe_object(bucket: str, path: str) -> tuple[str | None, int | None]:
-    """Best-effort read of an object's ``(content_type, size)`` WITHOUT
-    downloading it, via a 1-byte ranged GET. Used as defense-in-depth on the
-    direct-upload path (the bucket's own allow-list/size-limit is the primary
-    guard). Returns ``(None, None)`` if the object is missing or unreadable so
+async def probe_object_head(
+    bucket: str, path: str, *, head_bytes: int = 16
+) -> tuple[str | None, int | None, bytes | None]:
+    """Best-effort read of an object's ``(content_type, size, first bytes)``
+    WITHOUT downloading it, via a small ranged GET.
+
+    Used as defense-in-depth on the direct-upload paths (the bucket's own
+    allow-list / size limit is the primary guard). The leading bytes let the
+    caller SNIFF the real image type — a browser-supplied ``Content-Type`` on a
+    direct PUT is just a label, exactly like a multipart header, so the magic
+    bytes are the only trustworthy signal. 16 bytes covers every signature we
+    recognise (JPEG 3, PNG 8, WebP 12).
+
+    Returns ``(None, None, None)`` if the object is missing or unreadable so
     callers FAIL OPEN — a probe hiccup must never reject a legitimate upload."""
     base, key = _base_and_key()
     url = f"{base}/object/{bucket}/{path}"
     headers = _headers(key)
-    headers["Range"] = "bytes=0-0"
+    headers["Range"] = f"bytes=0-{max(head_bytes, 1) - 1}"
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
             response = await client.get(url, headers=headers)
     except httpx.HTTPError:
-        return (None, None)
+        return (None, None, None)
     if response.status_code not in (200, 206):
-        return (None, None)
+        return (None, None, None)
     content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
     size: int | None = None
-    # A 206 carries the true total after the slash: "bytes 0-0/<total>".
+    # A 206 carries the true total after the slash: "bytes 0-15/<total>".
     content_range = response.headers.get("content-range")
     if content_range and "/" in content_range:
         try:
@@ -176,7 +185,18 @@ async def probe_object(bucket: str, path: str) -> tuple[str | None, int | None]:
             size = int(response.headers["content-length"])
         except (KeyError, ValueError):
             size = None
-    return (content_type or None, size)
+    # A server that ignored the Range header returns 200 with the WHOLE object;
+    # trim so callers only ever see the head they asked for.
+    head = response.content[:head_bytes] if response.content else None
+    return (content_type or None, size, head)
+
+
+async def probe_object(bucket: str, path: str) -> tuple[str | None, int | None]:
+    """``(content_type, size)`` for an object, or ``(None, None)`` when it can't
+    be read. Thin wrapper over {@link probe_object_head} for callers that don't
+    need the leading bytes."""
+    content_type, size, _ = await probe_object_head(bucket, path)
+    return (content_type, size)
 
 
 async def delete_object(bucket: str, path: str) -> None:

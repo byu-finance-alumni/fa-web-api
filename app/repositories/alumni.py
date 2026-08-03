@@ -269,6 +269,13 @@ def build_alumni_query(
     state: "str | list[str] | None" = None,
     tag: "str | list[str] | None" = None,
     status_label: "str | list[str] | None" = None,
+    # Suppression (opt-in, #survey): EXCLUDE alumni carrying any of these status
+    # labels — the inverse of ``status_label`` above. Used by outbound sends
+    # (see ``dropdowns.SUPPRESSED_CONTACT_STATUS_LABELS``) so "must not be
+    # emailed" is one SQL predicate shared by the sender and any preview of it,
+    # rather than a filter re-implemented per caller. Off unless passed, so no
+    # existing list/export query changes.
+    suppress_labels: "str | list[str] | None" = None,
     leadership_role: "str | list[str] | None" = None,
     survey_status: "str | list[str] | None" = None,
     # "Needs surveying" (#160): alumni who are DUE for the biennial survey —
@@ -579,6 +586,22 @@ def build_alumni_query(
             .where(
                 AlumniStatusLabel.alumni_id == Alumni.alumni_id,
                 _ilike_any(StatusLabel.status_label_name, status_labels),
+            )
+            .exists()
+        )
+    suppressed = _as_values(suppress_labels)
+    if suppressed:
+        # NOT EXISTS, so it stays a SQL-level predicate over the whole cohort —
+        # never a post-query filter in Python (8,000+ alumni).
+        conditions.append(
+            ~select(AlumniStatusLabel.alumni_status_label_id)
+            .join(
+                StatusLabel,
+                StatusLabel.status_label_id == AlumniStatusLabel.status_label_id,
+            )
+            .where(
+                AlumniStatusLabel.alumni_id == Alumni.alumni_id,
+                _ilike_any(StatusLabel.status_label_name, suppressed),
             )
             .exists()
         )

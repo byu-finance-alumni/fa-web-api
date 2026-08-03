@@ -26,17 +26,16 @@ import datetime
 import hashlib
 import hmac
 import logging
-import re
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html import escape
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.dropdowns import holds_designation
+from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS, holds_designation
 from app.core.errors import ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -44,6 +43,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.survey_response import SurveyResponse
+from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.repositories.alumni import build_alumni_query
 from app.schemas.survey import (
     GraduationYearCount,
@@ -56,14 +56,70 @@ from app.schemas.survey import (
 log = logging.getLogger(__name__)
 
 _RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
-# Each real send writes an audit row whose text carries `sent=N` (the recipients
-# actually sent). We sum those N to report true daily/monthly usage.
-_SENT_COUNT_RE = re.compile(r"\bsent=(\d+)")
 
 # The survey is ANNUAL: once an alum replies, they're not re-surveyed for a year.
 # A response submitted on/after this cutoff counts as "already surveyed this
 # cycle" — used both to exclude them from a send and to count real replies.
 _RESURVEY_INTERVAL_DAYS = 365
+
+# Which `survey_responses.status` values count as "they replied this cycle".
+#
+# `rejected` is DELIBERATELY absent. A rejected response is one staff THREW AWAY
+# (spam, junk, someone else's data) — nothing was written to the record, so the
+# alum has effectively not replied and must stay surveyable. Counting it both
+# silenced them for 365 days and reported them to the console as "replied", i.e.
+# complete. This tuple is the single definition, shared by the send exclusion
+# (:func:`_load_recipients`) and the console's responded tally
+# (:func:`list_graduation_years`) — they must never drift.
+RESPONDED_STATUSES: tuple[str, ...] = ("pending", "applied")
+
+# --------------------------------------------------------------- send stages --
+#
+# A campaign sends in three stages: the initial email, then a 1-week and a 2-week
+# reminder to whoever has not replied. `survey_send_log` is UNIQUE on
+# (graduation_year, alumni_id, stage), so the stage is what makes "have we
+# already emailed this person?" answerable — and it is why a manual send must
+# pick a REAL stage rather than a synthetic "manual" one: a `stage = -1` would
+# satisfy the unique constraint alongside a stage-0 cron row and let the same
+# alum be emailed twice, which is exactly the incident this all exists to stop.
+#
+# These live here, not in `survey_schedule`, because they describe the send log —
+# which both the scheduled and the manual sender now write. `survey_schedule`
+# re-exports them so its own callers/tests are unaffected.
+STAGE_INITIAL = 0
+STAGE_REMINDER_1 = 1
+STAGE_REMINDER_2 = 2
+_STAGE_WINDOW_DAYS = 7  # each stage covers a 7-day window from start_date
+
+
+def stage_for(elapsed_days: int) -> int | None:
+    """Which stage's WINDOW ``elapsed_days`` after the start falls in.
+
+    0 for the first week, 1 for the second, 2 for the third; ``None`` once the
+    2-week-reminder window has passed.
+
+    ``None`` means "the calendar has run out of windows" — it does NOT mean the
+    campaign is finished. Completion is decided from what has actually been
+    delivered (see :func:`select_stage_targets` and
+    ``survey_schedule.run_due_schedules``); this function only ever CAPS which
+    stage may go out. Treating its ``None`` as "done" is what silently completed
+    cohorts that had never been emailed at all."""
+    if elapsed_days < 0:
+        return None  # not started yet
+    stage = elapsed_days // _STAGE_WINDOW_DAYS
+    return stage if stage <= STAGE_REMINDER_2 else None
+
+
+def ceiling_stage_for(elapsed_days: int) -> int:
+    """The HIGHEST stage that may be sent ``elapsed_days`` after the start.
+
+    Same windows as :func:`stage_for`, but total: before the start only the
+    initial is permitted, and once every window has gone by all three stages are
+    permitted so stragglers from any stage can still be finished."""
+    if elapsed_days < 0:
+        return STAGE_INITIAL
+    window = stage_for(elapsed_days)
+    return STAGE_REMINDER_2 if window is None else window
 
 
 def _resurvey_cutoff() -> datetime.datetime:
@@ -72,28 +128,31 @@ def _resurvey_cutoff() -> datetime.datetime:
     )
 
 
-def _tally_sent(rows, start_today: datetime.datetime) -> tuple[int, int]:
-    """Sum ``sent=N`` across ``(new_value, created_at)`` audit rows. ``rows`` are
-    already scoped to this calendar month, so their sum is the month total; rows
-    at/after ``start_today`` also count toward the day total. A row with no
-    ``sent=N`` contributes 0."""
-    sent_today = 0
-    sent_this_month = 0
-    for new_value, created_at in rows:
-        match = _SENT_COUNT_RE.search(new_value or "")
-        n = int(match.group(1)) if match else 0
-        sent_this_month += n
-        if created_at >= start_today:
-            sent_today += n
-    return sent_today, sent_this_month
+async def logged_alumni_ids(
+    session: AsyncSession, graduation_year: int, stage: int
+) -> set[int]:
+    """alumni_ids already emailed for (year, stage) — the double-send guard."""
+    stmt = select(SurveySendLog.alumni_id).where(
+        SurveySendLog.graduation_year == graduation_year,
+        SurveySendLog.stage == stage,
+    )
+    return set((await session.execute(stmt)).scalars().all())
 
 
 async def get_send_usage(session: AsyncSession) -> SurveyUsage:
     """Real send usage for the console tallies: emails actually sent today and
-    this calendar month, summed from the ``send_survey`` audit rows (each records
-    ``sent=N``). Day/month boundaries are UTC, matching the app's other date
-    filtering. Dry runs (``send_survey_dry_run``) are excluded by the action
-    filter."""
+    this calendar month, counted from ``survey_send_log``.
+
+    The ledger is the send log, NOT the audit trail. Audit rows are still written
+    for every send, but they cannot be counted on: an ENGINEER actor's
+    ``AuditLog`` is rerouted into ``engineer_action_log`` by the audit hook
+    (#199), so an engineer's manual send left the meter reading zero and the
+    scheduler handed out a budget that was already spent. The send log has no
+    such hole — one row per email, inserted and committed in the same
+    transaction as the delivery claim, by both senders.
+
+    Day/month boundaries are UTC, matching the app's other date filtering. Dry
+    runs never claim, so they never appear here."""
     settings = get_settings()
     anchor = settings.survey_usage_baseline_at
     now = datetime.datetime.now(datetime.UTC)
@@ -101,17 +160,18 @@ async def get_send_usage(session: AsyncSession) -> SurveyUsage:
         now.date(), datetime.time.min, tzinfo=datetime.UTC
     )
     start_month = start_today.replace(day=1)
-    stmt = (
-        select(AuditLog.new_value, AuditLog.created_at)
-        .where(AuditLog.action_type == "send_survey")
-        .where(AuditLog.created_at >= start_month)
-    )
+    stmt = select(
+        func.count().label("month"),
+        func.count()
+        .filter(SurveySendLog.sent_at >= start_today)
+        .label("today"),
+    ).where(SurveySendLog.sent_at >= start_month)
     if anchor is not None:
         # Baseline set: the baseline covers everything up to the anchor, so only
         # count sends recorded strictly AFTER it (avoids double-counting).
-        stmt = stmt.where(AuditLog.created_at > anchor)
-    rows = (await session.execute(stmt)).all()
-    sent_today, sent_this_month = _tally_sent(rows, start_today)
+        stmt = stmt.where(SurveySendLog.sent_at > anchor)
+    row = (await session.execute(stmt)).first()
+    sent_this_month, sent_today = (row[0] or 0, row[1] or 0) if row else (0, 0)
     if anchor is not None:
         # Add the baseline only while we're still in the anchor's day / month.
         if now.date() == anchor.date():
@@ -119,6 +179,8 @@ async def get_send_usage(session: AsyncSession) -> SurveyUsage:
         if (now.year, now.month) == (anchor.year, anchor.month):
             sent_this_month += settings.survey_usage_baseline_month
     return SurveyUsage(sent_today=sent_today, sent_this_month=sent_this_month)
+
+
 _TIMEOUT_SECONDS = 20.0
 # Resend caps a batch call at 100 messages.
 _BATCH_MAX = 100
@@ -426,8 +488,11 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
     rows = (await session.execute(stmt)).all()
 
     # How many DISTINCT alumni have replied WITHIN THE LAST YEAR for each grad
-    # year (any status — a reply is a reply). Matches the re-survey exclusion in
-    # _load_recipients, so "responded" == "already surveyed this cycle".
+    # year. Uses the SAME status filter as the re-survey exclusion in
+    # _load_recipients (:data:`RESPONDED_STATUSES`), so "responded" really does
+    # mean "already surveyed this cycle". A REJECTED response is neither — staff
+    # threw it away, so the alum is still surveyable and must not be reported to
+    # the console as complete.
     responded_stmt = (
         select(
             SurveyResponse.graduation_year,
@@ -436,6 +501,7 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
         .where(
             SurveyResponse.graduation_year.is_not(None),
             SurveyResponse.submitted_at >= _resurvey_cutoff(),
+            SurveyResponse.status.in_(RESPONDED_STATUSES),
         )
         .group_by(SurveyResponse.graduation_year)
     )
@@ -480,12 +546,38 @@ def _chunks(items: list, size: int):
         yield items[i : i + size]
 
 
-async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[Recipient]:
-    """Eligible alumni for a grad year (is_alumni, not archived) who have a
-    personal email AND have NOT replied within the last year — with the on-file
-    fields the email previews. Side tables are bulk-loaded once (no N+1),
-    mirroring the CSV export. Excluding recent responders is what stops an alum
-    who already confirmed their info from being surveyed again this cycle."""
+def eligible_alumni_query(graduation_year: int):
+    """The SINGLE definition of "who may be emailed the survey for this year".
+
+    Everything is a SQL-level predicate (correlated EXISTS / NOT EXISTS) so it
+    runs in Postgres over the whole 8,000+ row table — nothing is filtered in
+    Python. Exposed (not private) so a future "who would receive this?" preview
+    can render the identical population rather than re-deriving it.
+
+    On top of ``build_alumni_query``'s defaults (is_alumni, not archived):
+
+    * **Not deceased** — ``alumni.deceased`` is the flag; the column is NOT NULL
+      so ``deceased=False`` is total.
+    * **Not suppressed** — no ``Deceased`` / ``Do Not Contact`` status label
+      (:data:`SUPPRESSED_CONTACT_STATUS_LABELS`). The deceased flag and the
+      Deceased LABEL are separate columns that are set independently, so both
+      must be checked: on dev, alumni carry both and only the ``@example.com``
+      placeholder filter was accidentally stopping them. On prod, with real
+      addresses, a "confirm your information" email listing a dead person's full
+      record goes to a live inbox — in practice, their spouse's.
+      ``Lost Contact`` / ``Retired`` / ``Inactive`` stay ELIGIBLE by design
+      (Jake, 2026-08-03): "lost contact" means we want to reconnect, and this
+      survey is the tool for it.
+    * **Has a personal email** — there is nothing to send to otherwise.
+    * **Has not replied this cycle** — a `pending` or `applied` response within
+      365 days. A `rejected` one does NOT count (see
+      :data:`RESPONDED_STATUSES`).
+
+    Ordered by ``alumni_id`` so that ANY truncation (a ``limit``, or the daily
+    send budget) takes a stable, reproducible prefix. ``build_alumni_query`` has
+    no ORDER BY of its own, so without this an interrupted send resumed on an
+    arbitrary subset and "run Send again to continue" was not a true statement.
+    """
     has_personal_email = (
         select(AlumniContactInfo.contact_info_id)
         .where(
@@ -500,15 +592,58 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
         .where(
             SurveyResponse.alumni_id == Alumni.alumni_id,
             SurveyResponse.submitted_at >= _resurvey_cutoff(),
+            SurveyResponse.status.in_(RESPONDED_STATUSES),
         )
         .exists()
     )
-    stmt = (
-        build_alumni_query(graduation_year=graduation_year)
+    return (
+        build_alumni_query(
+            graduation_year=graduation_year,
+            deceased=False,
+            suppress_labels=SUPPRESSED_CONTACT_STATUS_LABELS,
+        )
         .where(has_personal_email)
         .where(~replied_recently)
+        .order_by(Alumni.alumni_id)
     )
-    alumni = (await session.execute(stmt)).scalars().all()
+
+
+def dedupe_by_email(
+    recipients: list[Recipient],
+) -> tuple[list[Recipient], list[Recipient]]:
+    """Split ``recipients`` into (one per address, the collisions dropped).
+
+    Two alumni rows can carry the same personal email — spouses sharing a
+    household address, an address reassigned to a new owner, a data-entry slip,
+    or a genuine duplicate record. Without this, EACH of them is emailed
+    separately, and every message contains ~19 fields of that alum's record
+    (both emails, spouse names, residence, employer, title, LinkedIn) plus a
+    live signed token that lets the holder EDIT that record. One inbox would
+    receive several people's profiles with write access to all of them.
+
+    The keeper is chosen deterministically — the input is ordered by
+    ``alumni_id``, so it is the lowest id — which makes a re-run pick the same
+    person rather than rotating whose record leaks. The dropped ones are
+    returned, not silently discarded, so the caller can surface the collision.
+    """
+    seen: dict[str, Recipient] = {}
+    kept: list[Recipient] = []
+    dropped: list[Recipient] = []
+    for r in recipients:
+        key = (r.email or "").strip().lower()
+        if key in seen:
+            dropped.append(r)
+            continue
+        seen[key] = r
+        kept.append(r)
+    return kept, dropped
+
+
+async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[Recipient]:
+    """Eligible alumni for a grad year (see :func:`eligible_alumni_query`), with
+    the on-file fields the email previews. Side tables are bulk-loaded once (no
+    N+1), mirroring the CSV export."""
+    alumni = (await session.execute(eligible_alumni_query(graduation_year))).scalars().all()
     ids = [a.alumni_id for a in alumni]
     if not ids:
         return []
@@ -556,11 +691,26 @@ class ResendRateLimited(Exception):
     """Resend returned 429 — we've hit its request/volume limit. ``retry_after``
     is the seconds Resend told us to wait (from its ``retry-after`` /
     ``ratelimit-reset`` header) before sending more. The LIMIT COMES FROM RESEND:
-    we never hardcode a daily/monthly cap — we send until Resend says stop."""
+    we never hardcode a daily/monthly cap — we send until Resend says stop.
+
+    A 429 is a DEFINITIVE rejection: Resend refused the call, so not one email in
+    that batch was queued. The claim for it is therefore released (see
+    :func:`_release_claim`) and those recipients go out on the next run."""
 
     def __init__(self, retry_after: int) -> None:
         self.retry_after = retry_after
         super().__init__(f"Resend rate limit hit; retry after {retry_after}s")
+
+
+class ResendDeliveryUnknown(ServiceError):
+    """The batch left us but we never learned its fate — a transport error or a
+    timeout, which can fire AFTER Resend accepted and queued the emails.
+
+    This is the one failure we cannot undo, and it is why the sender claims
+    before it sends: the claim stays, so those recipients are treated as
+    possibly-delivered and are never emailed a second time. A non-2xx RESPONSE is
+    different — Resend answered, and answered no — so that raises a plain
+    :class:`ServiceError` and the claim is released."""
 
 
 def _int_header(response: httpx.Response, name: str) -> int | None:
@@ -601,7 +751,10 @@ async def _send_batch(emails: list[dict]) -> tuple[int | None, int | None]:
                 json=emails,
             )
     except httpx.HTTPError as exc:
-        raise ServiceError("Could not reach the email service.") from exc
+        # AMBIGUOUS: the request may have reached Resend and been queued before
+        # the connection died. Distinct exception type so the caller keeps the
+        # claim rather than releasing it (see :class:`ResendDeliveryUnknown`).
+        raise ResendDeliveryUnknown("Could not reach the email service.") from exc
     if response.status_code == 429:
         retry_after = (
             _int_header(response, "retry-after")
@@ -657,54 +810,370 @@ def _build_survey_email(
     }
 
 
-async def send_recipients(
+# ------------------------------------------------ stage + target selection ---
+
+
+async def select_stage_targets(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    recipients: list[Recipient],
+    max_stage: int,
+) -> tuple[int | None, list[Recipient]]:
+    """Pick the stage this send should cover, and who still needs it.
+
+    Returns the LOWEST stage ``s <= max_stage`` that still has recipients with no
+    ``survey_send_log`` row, together with those recipients — or ``(None, [])``
+    when every permitted stage has been fully delivered.
+
+    ``max_stage`` is a CEILING derived from the calendar
+    (:func:`ceiling_stage_for`), never a target: a stage is sent because someone
+    is owed it, not because today is its window.
+
+    Two bugs this shape fixes:
+
+    * The initial used to be the only stage with a "finish it regardless of the
+      window" rule. A reminder window that could not drain — cap-throttled, or a
+      cron run missed inside its 7 days — abandoned its stragglers permanently,
+      because the next run only ever looked at the CURRENT window. Scanning
+      upward from 0 means an unfinished stage is always picked up.
+    * ``(None, [])`` is the only honest basis for completing a campaign. Deciding
+      it from ``elapsed >= 21`` alone completed cohorts that had received zero
+      emails.
+
+    Reminders reach only initial-recipients without needing a separate check: we
+    only reach the loop when stage 0 has no targets left, which means every
+    remaining recipient is already logged for stage 0.
+    """
+    logged_initial = await logged_alumni_ids(session, graduation_year, STAGE_INITIAL)
+    initial_targets = [r for r in recipients if r.alumni_id not in logged_initial]
+    if initial_targets:
+        return STAGE_INITIAL, initial_targets
+    for stage in range(STAGE_REMINDER_1, max_stage + 1):
+        already = await logged_alumni_ids(session, graduation_year, stage)
+        targets = [r for r in recipients if r.alumni_id not in already]
+        if targets:
+            return stage, targets
+    return None, []
+
+
+async def campaign_max_stage(session: AsyncSession, graduation_year: int) -> int:
+    """The ceiling stage a MANUAL send for this year may record.
+
+    A manual send has no stage of its own — there is one email template — but
+    ``survey_send_log`` is UNIQUE on (year, alumni, stage), so it must record a
+    REAL one. It is resolved exactly the way the cron resolves it: from the
+    year's ``survey_schedule`` row if there is one, else stage 0 only. Inventing
+    a synthetic ``stage = -1`` would let the unique constraint hold while the
+    same alum received both a manual email and a stage-0 cron email — the very
+    incident this is fixing.
+    """
+    start_date = (
+        await session.execute(
+            select(SurveySchedule.start_date).where(
+                SurveySchedule.graduation_year == graduation_year
+            )
+        )
+    ).scalar_one_or_none()
+    if start_date is None:
+        return STAGE_INITIAL
+    elapsed = (datetime.datetime.now(datetime.UTC).date() - start_date).days
+    return ceiling_stage_for(elapsed)
+
+
+# ----------------------------------------------------- claim-then-send core ---
+
+
+async def _claim_batch(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    stage: int,
+    batch: list[Recipient],
+) -> list[Recipient]:
+    """Reserve ``batch`` in ``survey_send_log`` and COMMIT, before sending.
+
+    ``ON CONFLICT DO NOTHING ... RETURNING alumni_id`` makes the reservation
+    atomic: only rows this statement actually inserted come back, so anyone
+    already logged (an earlier run, a concurrent one) is simply not ours to send
+    to and drops out of the batch.
+
+    Claiming BEFORE the Resend call is deliberate. Emailing is irreversible and
+    the log row is not, so the two orderings fail in opposite directions:
+    send-then-log loses the record on any failure in between and RE-EMAILS those
+    people on the next run (this is what produced the unscheduled Sunday send);
+    claim-then-send can at worst skip someone. For an irreversible side effect,
+    "possibly missed" is the correct way to fail — a missed alum can be found and
+    re-sent deliberately, a duplicate cannot be recalled.
+    """
+    stmt = (
+        pg_insert(SurveySendLog)
+        .values(
+            [
+                {
+                    "graduation_year": graduation_year,
+                    "alumni_id": r.alumni_id,
+                    "stage": stage,
+                }
+                for r in batch
+            ]
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_survey_send_log_year_alumni_stage"
+        )
+        .returning(SurveySendLog.alumni_id)
+    )
+    claimed = set((await session.execute(stmt)).scalars().all())
+    await session.commit()
+    return [r for r in batch if r.alumni_id in claimed]
+
+
+async def _release_claim(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    stage: int,
+    batch: list[Recipient],
+) -> None:
+    """Undo a claim Resend DEFINITIVELY refused (a 429, or a non-2xx answer).
+
+    Only rows :func:`_claim_batch` itself inserted are ever passed here — an
+    ``ON CONFLICT DO NOTHING`` never returns a pre-existing row — so this can
+    never delete the record of a genuinely delivered email.
+    """
+    if not batch:
+        return
+    await session.execute(
+        delete(SurveySendLog).where(
+            SurveySendLog.graduation_year == graduation_year,
+            SurveySendLog.stage == stage,
+            SurveySendLog.alumni_id.in_([r.alumni_id for r in batch]),
+        )
+    )
+    await session.commit()
+
+
+async def _send_and_log(
+    session: AsyncSession,
     recipients: list[Recipient],
     *,
     graduation_year: int,
+    stage: int,
     base_url: str,
     from_field: str,
-    on_batch_sent: Callable[[list[Recipient]], Awaitable[None]] | None = None,
-) -> tuple[int, int | None]:
-    """Send the survey to a list of recipients, Resend-governed.
+) -> tuple[int, int | None, ServiceError | None]:
+    """Claim, send and durably record ``recipients`` in ``_BATCH_MAX`` chunks.
 
-    Sends in ``_BATCH_MAX`` chunks via :func:`_send_batch`, pacing from Resend's
-    ratelimit-* headers. Returns ``(sent, retry_after)`` — the count actually
-    delivered and, if Resend rate-limited us (429), the seconds to wait before the
-    rest can go (``None`` when not throttled). On a 429 it STOPS: the un-sent
-    remainder is left for a later run. ``on_batch_sent`` is awaited with each
-    successfully-sent chunk BEFORE pacing, so callers can durably record delivery
-    (the scheduler logs each recipient) so a crash/throttle never re-emails them.
+    Returns ``(sent, retry_after, error)``. Every chunk is claimed and committed
+    before its Resend call, so what has been delivered is already durable when
+    anything goes wrong — a crash, a throttle or a transport failure can no
+    longer lose the send log and cause a re-send.
 
-    The limit is Resend's, discovered from its response — never a configured cap.
-    Shared by :func:`send_campaign` (manual send) and the send scheduler.
+    Stops at the first failure, and unwinds according to what the failure tells
+    us: a 429 or a non-2xx answer means Resend queued nothing, so the claim is
+    released and those recipients go out next run; a transport failure means we
+    do not know, so the claim STAYS and they are treated as delivered.
+
+    This is the only place either sender reaches Resend — ``_send_batch`` is
+    private and nothing outside this module can send without logging again.
     """
     sent = 0
     retry_after: int | None = None
-    try:
-        for chunk in _chunks(recipients, _BATCH_MAX):
-            emails = [
-                _build_survey_email(
-                    r,
-                    graduation_year=graduation_year,
-                    base_url=base_url,
-                    from_field=from_field,
-                )
-                for r in chunk
-            ]
+    error: ServiceError | None = None
+    for chunk in _chunks(recipients, _BATCH_MAX):
+        claimed = await _claim_batch(
+            session, graduation_year=graduation_year, stage=stage, batch=chunk
+        )
+        if not claimed:
+            continue  # someone else already owns this (year, alumni, stage)
+        emails = [
+            _build_survey_email(
+                r,
+                graduation_year=graduation_year,
+                base_url=base_url,
+                from_field=from_field,
+            )
+            for r in claimed
+        ]
+        try:
             remaining, reset = await _send_batch(emails)
-            sent += len(chunk)
-            if on_batch_sent is not None:
-                await on_batch_sent(chunk)
-            # Pace from Resend's own headers: if the window is exhausted wait for
-            # its reset, otherwise a small gap to stay under the req/s cap.
-            if remaining is not None and remaining <= 0 and reset:
-                await asyncio.sleep(min(reset, _MAX_PACE_SLEEP_SECONDS))
-            else:
-                await asyncio.sleep(_INTER_BATCH_DELAY_SECONDS)
-    except ResendRateLimited as exc:
-        # Hit Resend's limit — stop; the rest is left for a later run.
-        retry_after = exc.retry_after
-    return sent, retry_after
+        except ResendRateLimited as exc:
+            await _release_claim(
+                session,
+                graduation_year=graduation_year,
+                stage=stage,
+                batch=claimed,
+            )
+            retry_after = exc.retry_after
+            break
+        except ResendDeliveryUnknown as exc:
+            # Ambiguous — keep the claim. See :class:`ResendDeliveryUnknown`.
+            log.error(
+                "Survey send outcome unknown for %s recipients "
+                "(grad_year=%s stage=%s); claim kept, they will NOT be retried",
+                len(claimed),
+                graduation_year,
+                stage,
+            )
+            error = exc
+            break
+        except ServiceError as exc:
+            # Resend answered, and answered no — nothing was queued.
+            await _release_claim(
+                session,
+                graduation_year=graduation_year,
+                stage=stage,
+                batch=claimed,
+            )
+            error = exc
+            break
+        sent += len(claimed)
+        # Pace from Resend's own headers: if the window is exhausted wait for
+        # its reset, otherwise a small gap to stay under the req/s cap.
+        if remaining is not None and remaining <= 0 and reset:
+            await asyncio.sleep(min(reset, _MAX_PACE_SLEEP_SECONDS))
+        else:
+            await asyncio.sleep(_INTER_BATCH_DELAY_SECONDS)
+    return sent, retry_after, error
+
+
+# ------------------------------------------------- the one send entry point ---
+
+
+@dataclass(frozen=True)
+class SendOutcome:
+    """What one call to :func:`send_survey_stage` did."""
+
+    graduation_year: int
+    # The stage sent, or None when nothing was owed at any permitted stage.
+    stage: int | None
+    eligible: list[Recipient]  # everyone eligible this year, deduped
+    targets: list[Recipient]  # of those, not yet logged for `stage`
+    prepared: list[Recipient]  # targets after the limit / send budget
+    sent: int
+    retry_after: int | None = None
+    duplicate_emails: int = 0
+
+
+async def send_survey_stage(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    max_stage: int,
+    actor_user_id: int | None,
+    dry_run: bool = False,
+    limit: int | None = None,
+    recipients: list[Recipient] | None = None,
+    scheduled: bool = False,
+) -> SendOutcome:
+    """Send one stage of a year's survey — the ONLY way either caller sends.
+
+    Owns the whole irreversible step end to end: choose the stage, work out who
+    is owed it, claim them, send, record the audit trail and commit. Both the
+    manual console send (:func:`send_campaign`) and the daily cron
+    (``survey_schedule.run_due_schedules``) go through here.
+
+    That is the point. The unscheduled second send of 2026-08-02 happened
+    because the manual path called the raw sender WITHOUT the callback that
+    writes ``survey_send_log`` — it emailed a whole cohort and recorded nothing,
+    so the cron saw a cohort that had never had its initial and sent it again.
+    The fix is not to pass the callback at that one call site (which leaves the
+    same trap for the next caller) but to make it impossible to send without
+    recording: the raw sender is private, and logging is not optional here.
+
+    ``recipients`` may be pre-loaded by the caller purely to avoid re-running the
+    cohort query the cron already ran; when omitted they are loaded here. Either
+    way they come from :func:`_load_recipients`, so "who is eligible" has exactly
+    one implementation.
+
+    ``limit`` is the caller's own ceiling (the console's explicit limit, or the
+    scheduler's shared daily budget). Resend's 429 is still the real brake.
+    """
+    settings = get_settings()
+    base_url = settings.survey_app_base_url
+    from_email = settings.survey_from_email
+    if not base_url:
+        raise ServiceError("SURVEY_APP_BASE_URL is not configured.")
+    if not from_email:
+        raise ServiceError("SURVEY_FROM_EMAIL is not configured.")
+    from_field = f"{settings.survey_from_name} <{from_email}>"
+
+    if recipients is None:
+        recipients = await _load_recipients(session, graduation_year)
+    eligible, duplicates = dedupe_by_email(recipients)
+    if duplicates:
+        # Visible to staff, not silent: each of these alumni shares an inbox with
+        # someone we ARE emailing, and the email carries an edit token.
+        log.warning(
+            "Survey %s: %s alumni share an email address with another recipient "
+            "and were skipped (alumni_ids=%s)",
+            graduation_year,
+            len(duplicates),
+            ",".join(str(r.alumni_id) for r in duplicates[:20]),
+        )
+
+    stage, targets = await select_stage_targets(
+        session,
+        graduation_year=graduation_year,
+        recipients=eligible,
+        max_stage=max_stage,
+    )
+    prepared = [] if stage is None else targets
+    if limit is not None:
+        prepared = prepared[: max(limit, 0)]
+
+    sent = 0
+    retry_after: int | None = None
+    error: ServiceError | None = None
+    if not dry_run and prepared and stage is not None:
+        sent, retry_after, error = await _send_and_log(
+            session,
+            prepared,
+            graduation_year=graduation_year,
+            stage=stage,
+            base_url=base_url,
+            from_field=from_field,
+        )
+
+    # The audit row is the TRAIL, not the ledger — usage is counted from
+    # `survey_send_log` (see `get_send_usage`), which an engineer actor's
+    # rerouted audit row cannot silently zero out.
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="send_survey_dry_run" if dry_run else "send_survey",
+            entity_type="survey_campaign",
+            entity_id=graduation_year,
+            new_value=(
+                f"grad_year={graduation_year} stage={stage} "
+                f"scheduled={scheduled} recipients={len(eligible)} "
+                f"targets={len(targets)} prepared={len(prepared)} "
+                f"sent={sent} dry_run={dry_run}"
+                + (f" duplicate_emails={len(duplicates)}" if duplicates else "")
+                + (f" throttled_retry_after={retry_after}" if retry_after else "")
+                + (" failed=True" if error is not None else "")
+            ),
+        )
+    )
+    await session.commit()
+
+    if error is not None and sent == 0:
+        # Nothing went out and something is genuinely wrong (bad key, unverified
+        # domain, network). The trail is committed; surface it rather than
+        # reporting a clean "sent 0". When SOME batches did land we stay quiet
+        # and report the partial send — that accounting is now durable.
+        raise error
+
+    return SendOutcome(
+        graduation_year=graduation_year,
+        stage=stage,
+        eligible=eligible,
+        targets=targets,
+        prepared=prepared,
+        sent=sent,
+        retry_after=retry_after,
+        duplicate_emails=len(duplicates),
+    )
 
 
 async def send_campaign(
@@ -715,71 +1184,43 @@ async def send_campaign(
     dry_run: bool = True,
     limit: int | None = None,
 ) -> SurveySendResult:
-    """Build and (unless dry_run) send the survey to a graduation year.
+    """The console's manual send for a graduation year.
 
-    Attempts EVERY eligible recipient (or the first `limit` if given) and lets
-    RESEND'S rate limit decide how many actually go: on a 429 it stops, reports
-    `retry_after_seconds`, and leaves the rest as `remaining` for a later run.
-    No daily/monthly cap is configured here — the limit comes from Resend.
-    Writes an audit row and commits.
+    A thin shell over :func:`send_survey_stage`: it resolves the stage ceiling
+    from the year's schedule (:func:`campaign_max_stage`) and translates the
+    outcome into the console's result shape. Everything that matters — who is
+    eligible, who has already had this stage, the send log, the audit row, the
+    commit boundary — is the shared helper's, identical to the cron's.
     """
     settings = get_settings()
     base_url = settings.survey_app_base_url
-    from_email = settings.survey_from_email
-    if not base_url:
-        raise ServiceError("SURVEY_APP_BASE_URL is not configured.")
-    if not from_email:
-        raise ServiceError("SURVEY_FROM_EMAIL is not configured.")
-
-    recipients = await _load_recipients(session, graduation_year)
-    # The cap comes from RESEND, not our config: attempt everyone unless the
-    # caller passes an explicit `limit`. Resend's 429 stops us at the plan's real
-    # daily/monthly limit, and the un-sent remainder is reported for a later run
-    # (the scheduler resumes it once `retry_after` has elapsed).
-    to_send = recipients[: max(limit, 0)] if limit is not None else recipients
-    from_field = f"{settings.survey_from_name} <{from_email}>"
-    # Every eligible recipient builds exactly one email, so prepared == len(to_send).
-    prepared = len(to_send)
-
-    sent = 0
-    retry_after: int | None = None
-    if not dry_run and to_send:
-        sent, retry_after = await send_recipients(
-            to_send,
-            graduation_year=graduation_year,
-            base_url=base_url,
-            from_field=from_field,
-        )
-
-    remaining = len(recipients) - len(to_send) if dry_run else len(recipients) - sent
-    session.add(
-        AuditLog(
-            user_id=actor_user_id,
-            action_type="send_survey" if not dry_run else "send_survey_dry_run",
-            entity_type="survey_campaign",
-            entity_id=graduation_year,
-            new_value=(
-                f"grad_year={graduation_year} recipients={len(recipients)} "
-                f"prepared={prepared} sent={sent} dry_run={dry_run}"
-                + (f" throttled_retry_after={retry_after}" if retry_after else "")
-            ),
-        )
+    max_stage = await campaign_max_stage(session, graduation_year)
+    outcome = await send_survey_stage(
+        session,
+        graduation_year=graduation_year,
+        max_stage=max_stage,
+        actor_user_id=actor_user_id,
+        dry_run=dry_run,
+        limit=limit,
     )
-    await session.commit()
-
+    # What is left of THIS stage: the targets we did not send to. (Before, this
+    # was measured against every eligible alum, which counted people who had
+    # already received this exact email as still owed it.)
+    done = len(outcome.prepared) if dry_run else outcome.sent
+    remaining = len(outcome.targets) - done
     return SurveySendResult(
         graduation_year=graduation_year,
-        total_recipients=len(recipients),
-        prepared=prepared,
-        sent=sent,
+        total_recipients=len(outcome.eligible),
+        prepared=len(outcome.prepared),
+        sent=outcome.sent,
         remaining=remaining,
         dry_run=dry_run,
-        retry_after_seconds=retry_after,
+        retry_after_seconds=outcome.retry_after,
         sample=[
             SurveySendSample(
                 email=r.email,
                 link=_survey_link(base_url, r.alumni_id, graduation_year),
             )
-            for r in to_send[:3]
+            for r in outcome.prepared[:3]
         ],
     )

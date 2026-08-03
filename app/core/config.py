@@ -80,8 +80,10 @@ class Settings(BaseSettings):
     survey_app_base_url: str | None = Field(default=None)  # e.g. https://finance.alumni.byu.edu
     # HMAC secret that signs survey tokens (any long random string).
     survey_token_secret: str | None = Field(default=None)
-    # Max recipients to actually send in one call (Resend Free = 100/day).
-    survey_daily_cap: int = Field(default=100)
+    # NOTE: there is deliberately no `survey_daily_cap` here. The send budget is
+    # the admin-editable `survey_send_config` row (see
+    # `survey_schedule.get_send_config`) plus Resend's own 429; a config-file cap
+    # was read by nothing and only misled anyone auditing this file.
     # Manual send-usage baseline (#544). If `survey_usage_baseline_at` is set, the
     # console's daily/monthly tallies START from these counts as of that instant
     # and add ONLY sends recorded AFTER it — a correction for when the audit

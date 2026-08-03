@@ -40,7 +40,7 @@ from collections.abc import Sequence
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import ConflictError, ServiceError
+from app.core.errors import ConflictError
 from app.models.audit import AuditLog
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
@@ -69,11 +69,14 @@ STATUS_CANCELLED = "cancelled"
 # and it is why pause needs no change to the cron itself.
 _RUNNABLE_STATUSES = (STATUS_SCHEDULED, STATUS_ACTIVE)
 
-# Send stages and the day-since-start windows that select them.
-STAGE_INITIAL = 0
-STAGE_REMINDER_1 = 1
-STAGE_REMINDER_2 = 2
-_STAGE_WINDOW_DAYS = 7  # each stage covers a 7-day window from start_date
+# Send stages and the day-since-start windows that select them. Defined in
+# `survey_email` (they describe `survey_send_log`, which BOTH senders write) and
+# re-exported here so this module's callers are unchanged.
+STAGE_INITIAL = survey_email.STAGE_INITIAL
+STAGE_REMINDER_1 = survey_email.STAGE_REMINDER_1
+STAGE_REMINDER_2 = survey_email.STAGE_REMINDER_2
+_STAGE_WINDOW_DAYS = survey_email._STAGE_WINDOW_DAYS
+_stage_for = survey_email.stage_for
 
 
 def _now() -> datetime.datetime:
@@ -82,17 +85,6 @@ def _now() -> datetime.datetime:
 
 def _today() -> datetime.date:
     return _now().date()
-
-
-def _stage_for(elapsed_days: int) -> int | None:
-    """Which stage a campaign is in ``elapsed_days`` after its start.
-
-    0 for the first week, 1 for the second, 2 for the third; ``None`` once the
-    2-week-reminder window has passed (campaign complete)."""
-    if elapsed_days < 0:
-        return None  # not started yet (shouldn't happen — due filter excludes it)
-    stage = elapsed_days // _STAGE_WINDOW_DAYS
-    return stage if stage <= STAGE_REMINDER_2 else None
 
 
 # --------------------------------------------------------------- queries ------
@@ -113,17 +105,6 @@ async def _load_schedules_due(
         .order_by(SurveySchedule.start_date, SurveySchedule.graduation_year)
     )
     return list((await session.execute(stmt)).scalars().all())
-
-
-async def _logged_alumni_ids(
-    session: AsyncSession, graduation_year: int, stage: int
-) -> set[int]:
-    """alumni_ids already emailed for (year, stage) — the double-send guard."""
-    stmt = select(SurveySendLog.alumni_id).where(
-        SurveySendLog.graduation_year == graduation_year,
-        SurveySendLog.stage == stage,
-    )
-    return set((await session.execute(stmt)).scalars().all())
 
 
 async def _sent_counts_by_stage(
@@ -680,32 +661,31 @@ async def run_due_schedules(
 ) -> SurveyScheduleRunSummary:
     """Send whatever is due across all runnable schedules (the cron core).
 
-    Schedules are processed earliest-scheduled first. For each, the stage sent
-    THIS run is chosen so the initial always finishes before reminders: if any
-    recipient still hasn't had the initial, that's the stage — even past its
-    1-week window, because a cap-throttled initial must complete first; otherwise
-    the 1-week / 2-week reminder for the current window, to initial-recipients who
-    haven't replied and haven't had it yet. Past the 2-week window the campaign is
-    marked complete.
+    Schedules are processed earliest-scheduled first. For each, the elapsed days
+    give a CEILING on which stage may go out (:func:`survey_email.ceiling_stage_for`)
+    and the send log decides the rest: the run sends the LOWEST stage at or below
+    that ceiling which still has recipients with no log row. So the initial always
+    finishes before any reminder, and — new — a reminder that could not drain
+    inside its own week is finished later instead of being abandoned.
+
+    A campaign is COMPLETED only when every stage has been offered (the ceiling
+    has reached the 2-week reminder) AND none of them has a single unsent
+    recipient left. Completion used to be decided from the calendar alone, before
+    the recipients were even loaded: schedule twenty years at once against the
+    default 100/day budget and the later cohorts flipped to `completed` on day 21
+    having sent ZERO emails — terminally, with a summary that read like a clean
+    finish. Elapsed days now cap what may be sent; they never declare it done.
 
     Sends are paced by a shared, account-wide budget (:func:`_run_allowance`): at
     most ``daily_limit``/day and ``monthly_limit``/month across ALL years, so a
     cohort trickles out over several days. When the cap is disabled the budget is
     unlimited and everything eligible is attempted (Resend's own 429 is then the
-    only brake). Each delivered recipient is logged right after its batch, so a
-    re-run — or a resume after a 429 or a spent budget — never re-emails anyone.
-    On a 429, or once the budget is spent, we stop the whole run and the next
-    daily cron resumes. Returns a per-year summary.
+    only brake). Delivery is claimed and committed per batch inside
+    :func:`survey_email.send_survey_stage`, so a re-run — or a resume after a 429
+    or a spent budget — never re-emails anyone. On a 429, or once the budget is
+    spent, we stop the whole run and the next daily cron resumes. Returns a
+    per-year summary.
     """
-    settings = survey_email.get_settings()
-    base_url = settings.survey_app_base_url
-    from_email = settings.survey_from_email
-    if not base_url:
-        raise ServiceError("SURVEY_APP_BASE_URL is not configured.")
-    if not from_email:
-        raise ServiceError("SURVEY_FROM_EMAIL is not configured.")
-    from_field = f"{settings.survey_from_name} <{from_email}>"
-
     today = _today()
     schedules = await _load_schedules_due(session, today)
     # Snapshot the values we need up front: committing a batch mid-loop expires
@@ -719,98 +699,68 @@ async def run_due_schedules(
     ran: list[SurveyScheduleRunItem] = []
     for sched, year, start_date in due:
         elapsed = (today - start_date).days
-        primary = _stage_for(elapsed)
-        if primary is None:
-            # Past the last reminder window — the campaign is finished.
-            sched.status = STATUS_COMPLETED
-            sched.last_run_at = _now()
-            ran.append(
-                SurveyScheduleRunItem(
-                    graduation_year=year, stage=None, sent=0, remaining=0
-                )
-            )
-            continue
+        max_stage = survey_email.ceiling_stage_for(elapsed)
 
         recipients = await survey_email._load_recipients(session, year)
-        logged_initial = await _logged_alumni_ids(session, year, STAGE_INITIAL)
-        initial_targets = [
-            r for r in recipients if r.alumni_id not in logged_initial
-        ]
-        if initial_targets:
-            # Finish the initial send first — even if its 1-week window has
-            # passed because the daily cap spread the cohort over many days.
-            stage, targets = STAGE_INITIAL, initial_targets
-        elif primary == STAGE_INITIAL:
-            stage, targets = STAGE_INITIAL, []
-        else:
-            # Reminder: only initial-recipients who haven't replied (repliers are
-            # already gone from recipients) and haven't had this reminder yet.
-            logged_stage = await _logged_alumni_ids(session, year, primary)
-            stage = primary
-            targets = [
-                r
-                for r in recipients
-                if r.alumni_id in logged_initial
-                and r.alumni_id not in logged_stage
-            ]
+        eligible, _dupes = survey_email.dedupe_by_email(recipients)
+        stage, targets = await survey_email.select_stage_targets(
+            session,
+            graduation_year=year,
+            recipients=eligible,
+            max_stage=max_stage,
+        )
 
-        # Apply the shared budget: send at most `allowance` of this year's
-        # targets this run, then stop — the rest resumes on the next cron.
-        if allowance is not None and allowance <= 0:
-            break
-        chunk = targets if allowance is None else targets[:allowance]
-
-        async def _log_batch(
-            chunk_batch: list[survey_email.Recipient],
-            _year: int = year,
-            _stage: int = stage,
-        ) -> None:
-            for r in chunk_batch:
-                session.add(
-                    SurveySendLog(
-                        graduation_year=_year, alumni_id=r.alumni_id, stage=_stage
+        if not targets:
+            # Nothing is owed at any stage the calendar permits.
+            sched.last_run_at = _now()
+            if max_stage >= STAGE_REMINDER_2:
+                # Every stage has been offered AND drained — genuinely finished.
+                sched.status = STATUS_COMPLETED
+                ran.append(
+                    SurveyScheduleRunItem(
+                        graduation_year=year, stage=None, sent=0, remaining=0
                     )
                 )
-            # Commit per batch so a crash/throttle mid-run never re-emails the
-            # recipients this batch already delivered to.
-            await session.commit()
+            else:
+                # Still inside the cadence — the later stages are simply not due
+                # yet. Emphatically NOT complete.
+                sched.status = STATUS_ACTIVE
+                ran.append(
+                    SurveyScheduleRunItem(
+                        graduation_year=year, stage=stage, sent=0, remaining=0
+                    )
+                )
+            continue
 
-        sent, retry_after = await survey_email.send_recipients(
-            chunk,
+        # Apply the shared budget: send at most `allowance` of this year's
+        # targets this run, then stop — the rest resumes on the next cron. This
+        # comes AFTER the completion decision on purpose: a year starved of
+        # budget still owes emails and must never be completed.
+        if allowance is not None and allowance <= 0:
+            break
+
+        outcome = await survey_email.send_survey_stage(
+            session,
             graduation_year=year,
-            base_url=base_url,
-            from_field=from_field,
-            on_batch_sent=_log_batch,
+            max_stage=max_stage,
+            actor_user_id=actor_user_id,
+            limit=allowance,
+            recipients=eligible,
+            scheduled=True,
         )
+        sent = outcome.sent
+        retry_after = outcome.retry_after
         if allowance is not None:
             allowance -= sent
 
         sched.status = STATUS_ACTIVE
         sched.last_run_at = _now()
-        # Same audit row the manual send writes, so usage tallies count these.
-        session.add(
-            AuditLog(
-                user_id=actor_user_id,
-                action_type="send_survey",
-                entity_type="survey_campaign",
-                entity_id=year,
-                new_value=(
-                    f"grad_year={year} stage={stage} scheduled=True "
-                    f"recipients={len(targets)} sent={sent}"
-                    + (
-                        f" throttled_retry_after={retry_after}"
-                        if retry_after
-                        else ""
-                    )
-                ),
-            )
-        )
         ran.append(
             SurveyScheduleRunItem(
                 graduation_year=year,
-                stage=stage,
+                stage=outcome.stage,
                 sent=sent,
-                remaining=len(targets) - sent,
+                remaining=len(outcome.targets) - sent,
                 retry_after_seconds=retry_after,
             )
         )

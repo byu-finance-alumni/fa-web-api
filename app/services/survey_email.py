@@ -6,6 +6,19 @@ HMAC-signed link to `<SURVEY_APP_BASE_URL>/survey/<token>`; the token carries th
 alum's id so the landing page can (later) load their record and save edits.
 
 Design notes:
+- There is ONE way to send: `send_survey_stage`. It owns choosing the stage,
+  working out who is owed it, claiming them in `survey_send_log`, calling Resend,
+  writing the audit row and committing — for BOTH the console's manual send and
+  the daily cron. `_send_batch` is private; nothing outside this module can email
+  an alum without recording it. The manual send previously called the raw sender
+  without the send-log callback, which is what let a whole cohort be emailed with
+  no record and then emailed again by the cron two days later (2026-08-02).
+- Delivery is CLAIMED BEFORE IT IS SENT (insert + commit, then Resend). Emailing
+  is irreversible and a log row is not, so this fails toward "possibly missed"
+  rather than "sent twice".
+- `survey_send_log` is the usage ledger (`get_send_usage`), not the audit trail —
+  an engineer actor's audit row is rerouted to `engineer_action_log` and would
+  read as zero usage.
 - The Resend API key lives ONLY in backend config (`RESEND_API_KEY`); it is never
   exposed to the frontend.
 - `dry_run=True` (the endpoint default) builds and counts everything but sends

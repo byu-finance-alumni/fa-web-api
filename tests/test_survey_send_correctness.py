@@ -106,9 +106,23 @@ def test_eligible_query_excludes_deceased_and_suppressed_labels():
 
 def test_suppression_is_a_sql_predicate_not_a_python_filter():
     """8,000+ alumni and a performance budget: the exclusion has to run in
-    Postgres as a correlated NOT EXISTS, never as a post-query loop."""
-    sql = _sql(survey_email.eligible_alumni_query(_YEAR))
-    assert "NOT (EXISTS (SELECT" in sql
+    Postgres as a correlated NOT EXISTS over the status-label join, never as a
+    post-query loop."""
+    sql = " ".join(_sql(survey_email.eligible_alumni_query(_YEAR)).split())
+    # The NOT EXISTS that carries the suppressed labels also has to be the one
+    # correlated to the alumnus and joined to status_label.
+    suppression = next(
+        (
+            fragment
+            for fragment in sql.split("NOT (EXISTS (SELECT")[1:]
+            if "Do Not Contact" in fragment
+        ),
+        None,
+    )
+    assert suppression is not None, sql
+    assert "FROM alumni_status_labels JOIN status_labels" in suppression
+    assert "status_labels.status_label_name" in suppression
+    assert "alumni_status_labels.alumni_id = alumni.alumni_id" in suppression
 
 
 def test_suppress_labels_is_opt_in_and_off_by_default():

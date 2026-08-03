@@ -5,19 +5,25 @@ Vercel cron (``POST /survey/cron/run`` → :func:`run_due_schedules`).
 
 Each ``survey_schedule`` row is one graduation year's campaign: an initial send on
 ``start_date``, then a 1-week and a 2-week reminder to the non-responders. The
-current STAGE is derived purely from the days elapsed since ``start_date`` (0 / 1
-/ 2), so the cron is idempotent — it can run every day and only sends what's due.
+days elapsed since ``start_date`` set a CEILING on which stage may go out (0 / 1
+/ 2); WHICH stage actually goes out, and whether the campaign is finished at all,
+comes from the delivery log. So the cron is idempotent — it can run every day and
+only sends what is genuinely still owed.
 
-Double-emailing is prevented by ``survey_send_log``: after each successful Resend
-batch the scheduler records a row per recipient, and later runs exclude anyone
-already logged for the (year, stage). Those same rows are what the profile's
-Surveys tab reports as "sent, no reply yet"
-(``profile._derive_survey_history``) — so the send log is a read source, not
-just a guard, and nothing here should ALSO write the legacy ``surveys`` table
-(see ``models.crm.Survey``). The eligible set itself comes from
-:func:`survey_email._load_recipients`, which already drops non-sendable addresses
-and anyone who replied within the last 365 days — so reminders only ever reach
-genuine non-responders.
+Double-emailing is prevented by ``survey_send_log``: the sender CLAIMS each batch
+there (and commits) before it calls Resend, and later runs exclude anyone already
+logged for the (year, stage). Those same rows are what the profile's Surveys tab
+reports as "sent, no reply yet" (``profile._derive_survey_history``) — so the
+send log is a read source, not just a guard, and nothing here should ALSO write
+the legacy ``surveys`` table (see ``models.crm.Survey``). It is also the usage
+ledger the daily/monthly budget is measured against
+(``survey_email.get_send_usage``).
+
+Sending itself belongs entirely to :func:`survey_email.send_survey_stage`, shared
+with the console's manual send — this module decides WHICH years and stages are
+due, never how to send or how to record it. That split is deliberate: the manual
+send used to call the raw sender directly without recording anything, which is
+what produced the unscheduled second send of 2026-08-02.
 
 A campaign can be stopped two ways. ``cancel`` is terminal — it never resumes.
 ``pause`` is reversible: it drops the row out of the runnable set so the cron
@@ -25,10 +31,10 @@ skips it, and :func:`resume_schedule` shifts ``start_date`` forward by the pause
 duration so the stage arithmetic picks up exactly where it stopped instead of
 silently ageing past the reminder windows. See the "pause / resume" section.
 
-The send is Resend-governed via :func:`survey_email.send_recipients`: on a 429 it
-stops and the remainder is picked up on the next cron run. Every scheduled send
-writes the same ``send_survey`` audit row the manual send writes (carrying
-``sent=N``), so the console's usage tally still counts these.
+The send is Resend-governed: on a 429 it stops, the claim for the throttled batch
+is released, and the remainder is picked up on the next cron run. Every scheduled
+send writes the same ``send_survey`` audit row the manual send writes — as the
+TRAIL, not the ledger; usage is counted from ``survey_send_log``.
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ from collections.abc import Sequence
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import ConflictError
+from app.core.errors import ConflictError, ServiceError
 from app.models.audit import AuditLog
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
@@ -686,6 +692,14 @@ async def run_due_schedules(
     spent, we stop the whole run and the next daily cron resumes. Returns a
     per-year summary.
     """
+    # Fail fast on misconfiguration rather than reporting an empty, clean run.
+    # `send_survey_stage` checks these too; this only moves the error earlier.
+    settings = survey_email.get_settings()
+    if not settings.survey_app_base_url:
+        raise ServiceError("SURVEY_APP_BASE_URL is not configured.")
+    if not settings.survey_from_email:
+        raise ServiceError("SURVEY_FROM_EMAIL is not configured.")
+
     today = _today()
     schedules = await _load_schedules_due(session, today)
     # Snapshot the values we need up front: committing a batch mid-loop expires
@@ -703,7 +717,13 @@ async def run_due_schedules(
 
         recipients = await survey_email._load_recipients(session, year)
         eligible, _dupes = survey_email.dedupe_by_email(recipients)
-        stage, targets = await survey_email.select_stage_targets(
+        # Asked here purely to decide COMPLETION — which has to happen before the
+        # budget check, so a year the budget starves is never mistaken for a
+        # finished one. `send_survey_stage` asks again and owns the answer it
+        # sends on; nothing changes in between, and it is a pair of indexed
+        # lookups on `survey_send_log`. `eligible` is passed through so the
+        # cohort query itself is not repeated.
+        _stage, targets = await survey_email.select_stage_targets(
             session,
             graduation_year=year,
             recipients=eligible,
@@ -727,7 +747,7 @@ async def run_due_schedules(
                 sched.status = STATUS_ACTIVE
                 ran.append(
                     SurveyScheduleRunItem(
-                        graduation_year=year, stage=stage, sent=0, remaining=0
+                        graduation_year=year, stage=None, sent=0, remaining=0
                     )
                 )
             continue

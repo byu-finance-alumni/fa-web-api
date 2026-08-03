@@ -114,6 +114,18 @@ def test_designation_diff_reads_as_yes_no(monkeypatch):
     assert _after(cfa, "No") == "No"
 
 
+def test_designation_diff_treats_a_stored_negative_as_not_held():
+    # A column imported as the literal "No" is a truthy stored value, but it
+    # means NOT held — the reviewer's "before" must say "No" or the diff would
+    # claim the alum already had the designation. Same predicate as the filter.
+    cfa = sr._FIELD_BY_KEY["program.cfa_designation"]
+    assert _current(cfa, types.SimpleNamespace(cfa_designation="No")) == "No"
+    assert _current(cfa, types.SimpleNamespace(cfa_designation="  n/a ")) == "No"
+    # In-progress text still reads as held (open product question — see
+    # tests/test_designations.py).
+    assert _current(cfa, types.SimpleNamespace(cfa_designation="CFA Level II")) == "Yes"
+
+
 def test_current_and_after_formatting():
     obj = types.SimpleNamespace(piff_donor=True, employer="Acme")
     bf = _Field("program.piff_donor", "PIFF", "engagement", "piff_donor", "bool")

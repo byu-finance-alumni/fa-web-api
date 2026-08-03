@@ -171,6 +171,92 @@ def validate_industry(value: str | None) -> str | None:
     return canonical
 
 
+# --- finance designations (CFA / CFP / CPA) ----------------------------------
+#
+# ``alumni_program_engagement.cfa_designation`` / ``cfp_designation`` /
+# ``cpa_designation`` are ``varchar(100)``, NOT booleans. The convention is that
+# they hold a marker string ("CFA") when the alumnus HOLDS the designation and
+# ``NULL`` when they don't — nothing at the database level enforces it.
+#
+# That matters because the intake sheet's columns are literally headed "CFA
+# designation (Yes/No)", so a human filling it in can and will type "No". Stored
+# verbatim, "No" is a non-NULL value, and every presence test ("IS NOT NULL")
+# counts that alumnus as HOLDING the designation — an alum explicitly recorded as
+# NOT a CFA would show up in the CFA filter and in every designation count. This
+# module is the ONE place the codebase decides which written values mean "does
+# not hold it", so the import path, the SQL filter and the survey pre-fill can
+# never disagree about it.
+#
+# Matching is on the WHOLE trimmed value, case-insensitively — never a substring.
+# "No CFA yet" is not in this set and counts as held: guessing at prose is how
+# you silently drop real holders.
+#
+# IN-PROGRESS VALUES ARE DELIBERATELY NOT INTERPRETED. Production holds
+# "CFP Level 1" today, and "CFA Level II Candidate" is the shape to expect next.
+# Whether a candidate counts as holding the designation is an open product
+# question Jake has not decided (2026-08), so those fall through as non-negative
+# == held, exactly as they behave today. This was CONSIDERED, not missed — do not
+# "fix" it without that decision.
+#
+# The groups below, in order: plain negatives (mirroring the importer's
+# ``_FALSE_TOKENS``), boolean-ish spellings, and the "no data" placeholders the
+# real intake sheets use (mirroring ``import_csv._PLACEHOLDER_TOKENS`` /
+# ``_MARITAL_BLANK_TOKENS``) — an unrecorded designation is not a held one.
+DESIGNATION_NEGATIVES: frozenset[str] = frozenset(
+    {
+        "no",
+        "n",
+        "no.",
+        "nope",
+        "false",
+        "f",
+        "0",
+        "none",
+        "n/a",
+        "na",
+        "not applicable",
+        "unknown",
+        "undeclared",
+        "-",
+        "--",
+        "–",  # en dash
+        "—",  # em dash
+    }
+)
+
+
+def holds_designation(value: str | None) -> bool:
+    """True when *value* records that the alumnus HOLDS the designation.
+
+    False for ``None``, blank/whitespace-only, and any of
+    :data:`DESIGNATION_NEGATIVES`; True for anything else (the marker strings
+    "CFA"/"CFP"/"CPA", a "Yes", and in-progress text like "CFP Level 1" — see the
+    note above). Case-insensitive and whitespace-trimmed, because the intake
+    sheet is human-typed free text.
+
+    This is the single answer to "does this alumnus hold the CFA?". The SQL-side
+    equivalent lives in ``app.repositories.alumni._holds_designation`` and is
+    built from the SAME :data:`DESIGNATION_NEGATIVES` set.
+    """
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    return text.lower() not in DESIGNATION_NEGATIVES
+
+
+def normalize_designation(value: str | None) -> str | None:
+    """The value as it should be STORED: the trimmed text when held, else ``None``.
+
+    Jake, 2026-08-01: "i think we have it auto make the nos into blank if entered
+    in" — a negative becomes blank rather than being stored as the literal "No".
+    """
+    if not holds_designation(value):
+        return None
+    return str(value).strip()
+
+
 # Tags — the fixed, canonical engagement tags an alumnus can be labelled with
 # (alumni_tags join). Free-text is intentionally disallowed so the set stays a
 # clean, filterable vocabulary. Mirror in fa-web-app/src/constants/dropdowns.ts.

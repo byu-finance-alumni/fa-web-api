@@ -149,6 +149,18 @@ _FIELDS: tuple[_Field, ...] = (
         "designation",
         "CFP",
     ),
+    # CPA joined the list after CFA/CFP (Jake, 2026-08-03). It has always had a
+    # column and a filter but NO intake-sheet mapping, so nothing ever populated
+    # it — a CPA typed into an "Other" blank landed in free text and stayed
+    # invisible to the CPA filter.
+    _Field(
+        "program.cpa_designation",
+        "CPA designation",
+        "engagement",
+        "cpa_designation",
+        "designation",
+        "CPA",
+    ),
     # Everything else the alum holds stays free text (the survey collects it in
     # three "Other" blanks and joins them with ", ").
     _Field(

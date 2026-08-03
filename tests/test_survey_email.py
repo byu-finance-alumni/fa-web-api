@@ -326,17 +326,21 @@ def _respondent_alum():
 
 
 def test_get_respondent_prefills_held_designations(fake_settings, monkeypatch):
-    # #529 — the confirm page pre-ticks CFA/CFP from the DEDICATED columns (which
-    # hold a marker string), sent as the tickbox's "Yes". Not-held is omitted
-    # entirely rather than sent as "No", so the box renders untouched.
+    # #529 — the confirm page pre-ticks CFA/CFP/CPA from the DEDICATED columns
+    # (which hold a marker string), sent as the tickbox's "Yes". Not-held is
+    # omitted entirely rather than sent as "No", so the box renders untouched.
     import types
 
     monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)
-    eng = types.SimpleNamespace(cfa_designation="CFA", cfp_designation=None)
+    eng = types.SimpleNamespace(
+        cfa_designation="CFA", cfp_designation=None, cpa_designation="CPA"
+    )
     session = _RespondentSession([_respondent_alum(), None, None, eng])
     info = asyncio.run(survey_email.get_respondent(session, "tok"))
     assert info.fields["program.cfa_designation"] == "Yes"
     assert "program.cfp_designation" not in info.fields
+    # CPA joined the tickboxes on 2026-08-03; it pre-ticks like the other two.
+    assert info.fields["program.cpa_designation"] == "Yes"
     # The free text is untouched — "CFA Level II Candidate"-style entries stay put.
     assert info.fields["profile.other_designations"] == "Series 7, Series 63"
 

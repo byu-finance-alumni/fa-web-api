@@ -65,17 +65,26 @@ def test_coerce_designation_writes_the_server_side_marker():
 
 
 def test_designation_fields_are_whitelisted_to_their_own_columns():
-    # #529 — CFA/CFP write to the dedicated alumni_program_engagement columns the
-    # filter/exports key off, NOT into the free-text `other_designations`.
-    cfa = sr._FIELD_BY_KEY["program.cfa_designation"]
-    cfp = sr._FIELD_BY_KEY["program.cfp_designation"]
-    assert (cfa.group, cfa.column, cfa.marker) == ("engagement", "cfa_designation", "CFA")
-    assert (cfp.group, cfp.column, cfp.marker) == ("engagement", "cfp_designation", "CFP")
+    # #529 — CFA/CFP/CPA write to the dedicated alumni_program_engagement columns
+    # the filter/exports key off, NOT into the free-text `other_designations`.
+    # Each writes its own marker, so a ticked box is findable by the filter.
+    for key, column, marker in (
+        ("program.cfa_designation", "cfa_designation", "CFA"),
+        ("program.cfp_designation", "cfp_designation", "CFP"),
+        # CPA was added after CFA/CFP (Jake, 2026-08-03). It previously had a
+        # column and a filter but no way for an alum to ever populate it.
+        ("program.cpa_designation", "cpa_designation", "CPA"),
+    ):
+        field = sr._FIELD_BY_KEY[key]
+        assert (field.group, field.column, field.kind, field.marker) == (
+            "engagement",
+            column,
+            "designation",
+            marker,
+        )
     # The three "Other" blanks still merge into the alumni free-text column.
     other = sr._FIELD_BY_KEY["profile.other_designations"]
     assert (other.group, other.column, other.kind) == ("alumni", "other_designations", "text")
-    # Jake scoped this to CFA + CFP only; CPA stays off the survey whitelist.
-    assert "program.cpa_designation" not in sr._FIELD_BY_KEY
 
 
 def test_apply_writes_designation_markers(monkeypatch):

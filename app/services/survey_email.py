@@ -393,6 +393,7 @@ async def get_respondent(
     # is a stored value but must NOT pre-tick the box.
     put("program.cfa_designation", _held(getattr(eng, "cfa_designation", None)))
     put("program.cfp_designation", _held(getattr(eng, "cfp_designation", None)))
+    put("program.cpa_designation", _held(getattr(eng, "cpa_designation", None)))
     put("profile.gender", alum.gender)
     put("profile.marital_status", alum.marital_status)
     # A date column — emit as an ISO "YYYY-MM-DD" string for the survey date input.

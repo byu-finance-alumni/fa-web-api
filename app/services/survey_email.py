@@ -36,11 +36,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.dropdowns import holds_designation
 from app.core.errors import ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
+from app.models.engagement import AlumniProgramEngagement
 from app.models.survey_response import SurveyResponse
 from app.repositories.alumni import build_alumni_query
 from app.schemas.survey import (
@@ -301,6 +303,16 @@ def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
 # ----------------------------------------------------- respondent (public) ---
 
 
+def _held(value: str | None) -> str | None:
+    """'Yes' when a designation column says the alum HOLDS it, else None (so `put`
+    drops the key and the survey renders an unticked box).
+
+    Uses the shared :func:`holds_designation` predicate, so an alum whose column
+    was imported as "No" (or any other negative) is NOT pre-ticked — presence
+    alone is not the question."""
+    return "Yes" if holds_designation(value) else None
+
+
 async def get_respondent(
     session: AsyncSession, token: str
 ) -> SurveyRespondInfo | None:
@@ -325,6 +337,16 @@ async def get_respondent(
     job = (
         await session.execute(
             select(CurrentEmployment).where(CurrentEmployment.alumni_id == alumni_id)
+        )
+    ).scalar_one_or_none()
+    # Only for the CFA/CFP tickboxes (#529) — without it the confirm page would
+    # show an alum who already holds the CFA an empty box, and they'd have to
+    # re-tick something we already know.
+    eng = (
+        await session.execute(
+            select(AlumniProgramEngagement).where(
+                AlumniProgramEngagement.alumni_id == alumni_id
+            )
         )
     ).scalar_one_or_none()
 
@@ -363,6 +385,15 @@ async def get_respondent(
     put("profile.spouse_first_name", alum.spouse_first_name)
     put("profile.spouse_last_name", alum.spouse_last_name)
     put("profile.other_designations", alum.other_designations)
+    # Designations (alumni_program_engagement). The columns hold a marker string
+    # ('CFA'/'CFP') when held and NULL when not, but the survey asks a
+    # held/not-held question — so send the tickbox's own vocabulary and omit the
+    # key entirely when it isn't held, which renders as an unticked box. "Not
+    # held" is decided by `holds_designation`, not by presence: an imported "No"
+    # is a stored value but must NOT pre-tick the box.
+    put("program.cfa_designation", _held(getattr(eng, "cfa_designation", None)))
+    put("program.cfp_designation", _held(getattr(eng, "cfp_designation", None)))
+    put("program.cpa_designation", _held(getattr(eng, "cpa_designation", None)))
     put("profile.gender", alum.gender)
     put("profile.marital_status", alum.marital_status)
     # A date column — emit as an ISO "YYYY-MM-DD" string for the survey date input.

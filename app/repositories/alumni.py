@@ -17,7 +17,7 @@ import re
 from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import WHEEL_INDUSTRIES
+from app.core.dropdowns import DESIGNATION_NEGATIVES, WHEEL_INDUSTRIES
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Interaction, Survey
@@ -117,13 +117,31 @@ def _ilike_any(column, values: list[str]):
     return or_(*[column.ilike(escape_like(v), escape="\\") for v in values])
 
 
+# The negatives, lower-cased and pre-sorted for a stable SQL literal, with ""
+# folded in so a blank/whitespace-only cell is excluded by the same NOT IN.
+_DESIGNATION_NEGATIVES_SQL: tuple[str, ...] = tuple(
+    sorted(DESIGNATION_NEGATIVES | {""})
+)
+
+
 def _holds_designation(column):
-    """Predicate: a designation flag column holds a non-null, NON-EMPTY value.
+    """Predicate: a designation flag column says the alumnus HOLDS it.
 
     The ``cfp/cfa/cpa_designation`` columns on ``alumni_program_engagement`` are
-    free-text flags — any non-null, non-blank value means the alumnus holds that
-    certification (#404). Trims so a whitespace-only cell doesn't count."""
-    return and_(column.isnot(None), func.trim(column) != "")
+    free-text flags, not booleans (#404), and nothing enforces the "marker string
+    or NULL" convention — the intake sheet's columns are headed "(Yes/No)", so a
+    human can type "No" straight into one. A presence test alone would then count
+    that alumnus as holding the certification, so this excludes the negatives too.
+
+    SQL-side twin of :func:`app.core.dropdowns.holds_designation`, built from the
+    SAME ``DESIGNATION_NEGATIVES`` set so the filter, the importer and the survey
+    pre-fill can never disagree. Stays a SQL predicate (never a Python filter over
+    fetched rows) — this runs over 8,000+ alumni.
+    """
+    return and_(
+        column.isnot(None),
+        func.lower(func.trim(column)).notin_(_DESIGNATION_NEGATIVES_SQL),
+    )
 
 
 # Professional certifications stored as flag columns on the program-engagement
@@ -692,7 +710,7 @@ def build_alumni_query(
             select(AlumniProgramEngagement.engagement_profile_id)
             .where(
                 AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
-                AlumniProgramEngagement.cfa_designation.isnot(None),
+                _holds_designation(AlumniProgramEngagement.cfa_designation),
             )
             .exists()
         )
@@ -702,7 +720,7 @@ def build_alumni_query(
             select(AlumniProgramEngagement.engagement_profile_id)
             .where(
                 AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
-                AlumniProgramEngagement.cpa_designation.isnot(None),
+                _holds_designation(AlumniProgramEngagement.cpa_designation),
             )
             .exists()
         )

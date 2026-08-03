@@ -47,6 +47,94 @@ def test_new_profile_fields_are_whitelisted():
         assert key in sr._FIELD_BY_KEY, key
 
 
+def test_coerce_designation_writes_the_server_side_marker():
+    # #529 — the submitted TEXT is ignored: ticked writes the marker from the
+    # field definition, unticked writes NULL. The submit route is public
+    # (token-gated), so a client must not be able to choose what lands in a
+    # column the designation filter reads as "holds the CFA".
+    cfa = sr._FIELD_BY_KEY["program.cfa_designation"]
+    assert _coerce(cfa, "Yes") == "CFA"
+    assert _coerce(cfa, "true") == "CFA"
+    assert _coerce(cfa, "1") == "CFA"
+    assert _coerce(cfa, "No") is None
+    assert _coerce(cfa, "") is None
+    # Arbitrary text is NOT stored — truthiness only, then the canonical marker.
+    assert _coerce(cfa, "CFA Level II Candidate") is None
+    assert _coerce(cfa, "x" * 200) is None
+    assert _coerce(sr._FIELD_BY_KEY["program.cfp_designation"], "yes") == "CFP"
+
+
+def test_designation_fields_are_whitelisted_to_their_own_columns():
+    # #529 — CFA/CFP/CPA write to the dedicated alumni_program_engagement columns
+    # the filter/exports key off, NOT into the free-text `other_designations`.
+    # Each writes its own marker, so a ticked box is findable by the filter.
+    for key, column, marker in (
+        ("program.cfa_designation", "cfa_designation", "CFA"),
+        ("program.cfp_designation", "cfp_designation", "CFP"),
+        # CPA was added after CFA/CFP (Jake, 2026-08-03). It previously had a
+        # column and a filter but no way for an alum to ever populate it.
+        ("program.cpa_designation", "cpa_designation", "CPA"),
+    ):
+        field = sr._FIELD_BY_KEY[key]
+        assert (field.group, field.column, field.kind, field.marker) == (
+            "engagement",
+            column,
+            "designation",
+            marker,
+        )
+    # The three "Other" blanks still merge into the alumni free-text column.
+    other = sr._FIELD_BY_KEY["profile.other_designations"]
+    assert (other.group, other.column, other.kind) == ("alumni", "other_designations", "text")
+
+
+def test_apply_writes_designation_markers(monkeypatch):
+    # End to end through apply: a ticked CFA lands as the marker on the engagement
+    # row, an unticked CFP clears it, and free text goes to the alumni column.
+    resp = _fake_resp(
+        payload={
+            "program.cfa_designation": "Yes",
+            "program.cfp_designation": "No",
+            "profile.other_designations": "Series 7, Series 63",
+        }
+    )
+    alum = types.SimpleNamespace(alumni_id=5, net_id="jdoe5", other_designations=None)
+    eng = types.SimpleNamespace(alumni_id=5, cfa_designation=None, cfp_designation="CFP")
+
+    async def fake_get_pending(_s, _rid):
+        return resp
+
+    async def fake_side(_s, _ids):
+        return ({}, {}, {5: eng})
+
+    monkeypatch.setattr(sr, "_get_pending", fake_get_pending)
+    monkeypatch.setattr(sr, "_load_side_rows", fake_side)
+    asyncio.run(sr.apply_response(_Session(alum), 1, actor_user_id=9))
+    assert eng.cfa_designation == "CFA"
+    assert eng.cfp_designation is None
+    assert alum.other_designations == "Series 7, Series 63"
+
+
+def test_designation_diff_reads_as_yes_no(monkeypatch):
+    # The reviewer sees "No -> Yes", not "None -> CFA".
+    cfa = sr._FIELD_BY_KEY["program.cfa_designation"]
+    assert _current(cfa, types.SimpleNamespace(cfa_designation="CFA")) == "Yes"
+    assert _current(cfa, types.SimpleNamespace(cfa_designation=None)) == "No"
+    assert _after(cfa, "Yes") == "Yes"
+    assert _after(cfa, "No") == "No"
+
+
+def test_designation_diff_treats_a_stored_negative_as_not_held():
+    # A column imported as the literal "No" is a truthy stored value, but it
+    # means NOT held — the reviewer's "before" must say "No" or the diff would
+    # claim the alum already had the designation. Same predicate as the filter.
+    cfa = sr._FIELD_BY_KEY["program.cfa_designation"]
+    assert _current(cfa, types.SimpleNamespace(cfa_designation="No")) == "No"
+    assert _current(cfa, types.SimpleNamespace(cfa_designation="  n/a ")) == "No"
+    # In-progress text still reads as held (open product question — see
+    # tests/test_designations.py).
+    assert _current(cfa, types.SimpleNamespace(cfa_designation="CFA Level II")) == "Yes"
+
+
 def test_current_and_after_formatting():
     obj = types.SimpleNamespace(piff_donor=True, employer="Acme")
     bf = _Field("program.piff_donor", "PIFF", "engagement", "piff_donor", "bool")

@@ -2,6 +2,11 @@
 
 An alum's staged "confirm your info" submission, awaiting admin review. `payload`
 holds the submitted values keyed by survey field keys (`table.column`).
+
+Together with `survey_send_log` and `survey_schedule`, these rows are the SOURCE
+OF TRUTH for an alum's survey history — `profile._derive_survey_history` builds
+the profile's Surveys tab from them. The legacy `surveys` table is read-only and
+must not be written to; see `models.crm.Survey`.
 """
 
 import datetime

@@ -10,6 +10,12 @@ Two tables drive the auto-send of the annual "confirm your info" survey:
   if a previous run crashed or was throttled part-way through.
 
 See migration ``database/migrations/2026-07-29_survey_scheduler.sql``.
+
+These two tables, with ``survey_responses``, are the SOURCE OF TRUTH for an
+alum's survey history — ``profile._derive_survey_history`` builds the profile's
+Surveys tab from them (send log for what went out, schedule's ``start_date`` for
+the due date). The legacy ``surveys`` table is read-only and must not be written
+to; see ``models.crm.Survey``.
 """
 
 import datetime
@@ -41,8 +47,9 @@ class SurveySchedule(TimestampMixin, Base):
     )
     # The initial send date. Stage advances weekly from here (0 / 1 / 2).
     start_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
-    # 'scheduled' -> 'active' (first send done) -> 'completed' (all stages sent)
-    # or 'cancelled'. CHECK constraint mirrors these in the DB.
+    # 'scheduled' -> 'active' (first send done) -> 'completed' (all stages sent),
+    # or 'paused' (reversible stop) / 'cancelled' (terminal). CHECK constraint
+    # mirrors these in the DB.
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="scheduled"
     )
@@ -53,6 +60,16 @@ class SurveySchedule(TimestampMixin, Base):
     last_run_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    # When the campaign was paused — NULL unless status == 'paused'. Load-bearing,
+    # not just an audit stamp: the send stage is derived from
+    # ``today - start_date``, so resume shifts ``start_date`` forward by the
+    # paused duration to keep the cadence. See ``survey_schedule.resume_schedule``.
+    paused_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    # The status the campaign held when it was paused ('scheduled' or 'active'),
+    # so resume restores it exactly rather than guessing. Cleared on resume.
+    paused_from_status: Mapped[str | None] = mapped_column(String(20))
     # created_at / updated_at come from TimestampMixin.
 
 

@@ -38,7 +38,11 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import validate_industry
+from app.core.dropdowns import (
+    holds_designation,
+    normalize_designation,
+    validate_industry,
+)
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -79,6 +83,8 @@ MAX_IMPORT_ROWS = 2000
 #   "date"     -> parsed YYYY-MM-DD date (kept as ISO string for the schema)
 #   "bool"     -> Yes/No/true/1 -> bool
 #   "industry" -> validated against the controlled vocab (invalid -> row error)
+#   "designation" -> CFA/CFP marker string; a NEGATIVE cell ("No", "N/A", ...)
+#                    imports as blank instead of being stored verbatim
 #
 # Section targets: core -> alumni; contact -> alumni_contact_info; career ->
 # current_employment (employer/title/industry AND the work location — see below);
@@ -226,8 +232,12 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
         "bool",
     ),
     "Willing to be a PIFF donor (Yes/No)": ("engagement", "piff_donor", "bool"),
-    "CFP designation (Yes/No)": ("engagement", "cfp_designation", "str"),
-    "CFA designation (Yes/No)": ("engagement", "cfa_designation", "str"),
+    # These two columns are literally headed "(Yes/No)" but the underlying
+    # columns are marker-string-or-NULL, not booleans — hence the dedicated
+    # "designation" kind rather than "str" (see _map_row / _coerce). The sheet has
+    # NO column for cpa_designation today; that is a separate open decision.
+    "CFP designation (Yes/No)": ("engagement", "cfp_designation", "designation"),
+    "CFA designation (Yes/No)": ("engagement", "cfa_designation", "designation"),
     "Other Designations:": ("core", "other_designations", "str"),
     "Engagement notes": ("engagement", "engagement_notes", "str"),
     "Best Contact": ("contact", "best_contact", "str"),
@@ -699,6 +709,18 @@ def _map_row(
         ):
             continue
 
+        # Finance designations (#529). The sheet's headers say "(Yes/No)" but the
+        # column is a marker string ("CFA") or NULL — a stored "No" is non-NULL
+        # and would make every presence test count this alumnus as HOLDING the
+        # designation. Jake, 2026-08-01: "auto make the nos into blank if entered
+        # in". So a negative cell is treated exactly like an EMPTY cell: dropped
+        # from the payload. In create mode that stores NULL; in update mode it
+        # means "unchanged", matching this importer's blank-cell contract (an
+        # explicit None can't clear it there anyway — EngagementCreate.has_values
+        # treats an all-None section as nothing to write).
+        if kind == "designation" and not holds_designation(raw):
+            continue
+
         try:
             value = _coerce(kind, header, raw)
         except _CellError as exc:
@@ -758,6 +780,13 @@ def _coerce(kind: str, header: str, raw: str):
         return _coerce_bool(header, raw)
     if kind == "industry":
         return _coerce_industry(header, raw)
+    if kind == "designation":
+        # Negatives were already dropped by _map_row, so what reaches here is the
+        # marker text the alumnus actually holds. normalize_designation is still
+        # the coercion of record (one predicate, one storage form) — it returns
+        # None for anything negative, which would blank the cell rather than
+        # storing it.
+        return normalize_designation(raw)
     raise _CellError(f"{header}: unsupported column type.")  # pragma: no cover
 
 

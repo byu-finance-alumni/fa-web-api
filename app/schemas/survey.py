@@ -142,10 +142,46 @@ class SurveyScheduleItem(BaseModel):
     status: str
     last_run_at: datetime.datetime | None = None
     created_at: datetime.datetime | None = None
+    # Who started this campaign, as a display name (falling back to their email).
+    # The internal ``created_by_user_id`` PK is never disclosed — only the
+    # resolved name leaves the API, matching ``InteractionRead.logged_by``
+    # (FERPA — minimize internal identifiers). None when the schedule predates
+    # the column, or the creator's account has since been deleted (FK SET NULL).
+    created_by: str | None = None
+    # When the campaign was paused — set only while ``status == 'paused'``, and
+    # cleared on resume. The console shows it so "paused" is never an undated
+    # state ("paused 3 days ago" is what tells staff a stopped campaign has been
+    # forgotten about).
+    paused_at: datetime.datetime | None = None
     # Delivered counts per stage from survey_send_log (0=initial, 1/2=reminders).
     sent_initial: int = 0
     sent_reminder_1: int = 0
     sent_reminder_2: int = 0
+
+
+class SurveySchedulePauseAllResult(BaseModel):
+    """Outcome of the engineer blanket pause (``POST /survey/schedules/pause-all``).
+
+    Same shape and contract as :class:`SurveyScheduleCancelAllResult` — the two
+    controls sit together in the console — but reports what was PAUSED, which is
+    reversible: every year named here can be resumed and will pick its cadence up
+    where it left off. Both fields are empty / 0 when nothing was running; the
+    call is idempotent."""
+
+    paused: int
+    graduation_years: list[int]
+
+
+class SurveyScheduleCancelAllResult(BaseModel):
+    """Outcome of the engineer kill switch (``POST /survey/schedules/cancel-all``).
+
+    Reports exactly what was stopped so the console can say so honestly rather
+    than claiming a blanket success: ``cancelled`` is the number of campaigns
+    moved to ``cancelled``, and ``graduation_years`` names them. Both are empty /
+    0 when nothing was running — the call is idempotent."""
+
+    cancelled: int
+    graduation_years: list[int]
 
 
 class SurveyScheduleRunItem(BaseModel):

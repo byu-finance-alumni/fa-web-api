@@ -510,6 +510,71 @@ def test_free_text_designation_imports_and_persists_as_string():
     assert engagement["cfa_designation"] == "CFA all 3 levels"
 
 
+@pytest.mark.parametrize(
+    "cell", ["No", "no", "NO", "  No  ", "N", "false", "0", "N/A", "none", "-"]
+)
+def test_negative_designation_cell_imports_as_blank(cell):
+    # The sheet's column is headed "(Yes/No)" but the underlying column is a
+    # marker-string-or-NULL flag, so a stored "No" would count as HOLDING the
+    # CFA in the designation filter. Jake, 2026-08-01: "auto make the nos into
+    # blank if entered in" — the cell is dropped from the payload entirely
+    # (create stores NULL; update leaves it unchanged, like any blank cell).
+    csv = _csv_bytes(
+        _row_values(
+            byu_id="123456789",
+            first_name="Jane",
+            last_name="Doe",
+            graduation_year="2018",
+            personal_email="jane@example.com",
+            cfa_designation=cell,
+            cfp_designation=cell,
+        )
+    )
+    rows, errors = import_csv.parse_and_map(csv)
+    assert errors == []
+    assert rows[0]["error"] is None
+    # No engagement section at all — nothing else on this row feeds one.
+    engagement = rows[0]["payload"].get("engagement", {})
+    assert "cfa_designation" not in engagement
+    assert "cfp_designation" not in engagement
+
+
+def test_negative_designation_does_not_suppress_a_held_one():
+    # One negative, one held: only the held column reaches the payload.
+    csv = _csv_bytes(
+        _row_values(
+            byu_id="123456789",
+            first_name="Jane",
+            last_name="Doe",
+            graduation_year="2018",
+            personal_email="jane@example.com",
+            cfa_designation="CFA",
+            cfp_designation="No",
+        )
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    engagement = rows[0]["payload"]["engagement"]
+    assert engagement["cfa_designation"] == "CFA"
+    assert "cfp_designation" not in engagement
+
+
+def test_yes_designation_cell_imports_verbatim():
+    # A plain "Yes" is affirmative, so it is stored as-is (prod already holds
+    # "Yes" rows). Only NEGATIVES are blanked — we don't rewrite affirmatives.
+    csv = _csv_bytes(
+        _row_values(
+            byu_id="123456789",
+            first_name="Jane",
+            last_name="Doe",
+            graduation_year="2018",
+            personal_email="jane@example.com",
+            cfa_designation="  Yes  ",
+        )
+    )
+    rows, _ = import_csv.parse_and_map(csv)
+    assert rows[0]["payload"]["engagement"]["cfa_designation"] == "Yes"
+
+
 def test_designation_schema_round_trip_returns_string():
     # EngagementCreate accepts free-text designations and ProgramEngagementRead
     # serializes them back as the stored string (true -> label, never bool).

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import holds_designation
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -122,7 +123,8 @@ _FIELDS: tuple[_Field, ...] = (
     # Finance designations (#529). CFA/CFP are their OWN varchar columns on
     # alumni_program_engagement holding the literal marker ('CFA'/'CFP'), not
     # booleans and not free text: the designation filter maps "CFA" ->
-    # cfa_designation and matches IS NOT NULL (`repositories/alumni.py`), and the
+    # cfa_designation and matches `holds_designation` — non-NULL and not one of
+    # the negatives (`core/dropdowns.py`, `repositories/alumni.py`) — and the
     # exports/import read the same columns. Writing a ticked CFA into
     # `other_designations` instead would drop that alum out of the CFA filter and
     # the designation counts, so the two live apart on purpose.
@@ -233,7 +235,12 @@ def _current(field: _Field, obj: object | None) -> str:
     if obj is None:
         return ""
     raw = getattr(obj, field.column, None)
-    if field.kind in ("bool", "designation"):
+    if field.kind == "designation":
+        # Presence is NOT the question: a column imported as the literal "No" is
+        # a stored (truthy) value that must still read as "No" here, or the
+        # reviewer's before/after diff would claim they already held it.
+        return "Yes" if holds_designation(raw) else "No"
+    if field.kind == "bool":
         return "Yes" if raw else "No"
     return _text(raw)
 

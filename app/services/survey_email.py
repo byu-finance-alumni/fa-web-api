@@ -36,6 +36,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.dropdowns import holds_designation
 from app.core.errors import ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -302,10 +303,14 @@ def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
 # ----------------------------------------------------- respondent (public) ---
 
 
-def _held(value: object) -> str | None:
-    """'Yes' when a designation column holds its marker, else None (so `put`
-    drops the key and the survey renders an unticked box)."""
-    return "Yes" if value is not None and str(value).strip() != "" else None
+def _held(value: str | None) -> str | None:
+    """'Yes' when a designation column says the alum HOLDS it, else None (so `put`
+    drops the key and the survey renders an unticked box).
+
+    Uses the shared :func:`holds_designation` predicate, so an alum whose column
+    was imported as "No" (or any other negative) is NOT pre-ticked — presence
+    alone is not the question."""
+    return "Yes" if holds_designation(value) else None
 
 
 async def get_respondent(
@@ -383,7 +388,9 @@ async def get_respondent(
     # Designations (alumni_program_engagement). The columns hold a marker string
     # ('CFA'/'CFP') when held and NULL when not, but the survey asks a
     # held/not-held question — so send the tickbox's own vocabulary and omit the
-    # key entirely when it isn't held, which renders as an unticked box.
+    # key entirely when it isn't held, which renders as an unticked box. "Not
+    # held" is decided by `holds_designation`, not by presence: an imported "No"
+    # is a stored value but must NOT pre-tick the box.
     put("program.cfa_designation", _held(getattr(eng, "cfa_designation", None)))
     put("program.cfp_designation", _held(getattr(eng, "cfp_designation", None)))
     put("profile.gender", alum.gender)

@@ -341,6 +341,34 @@ def test_get_respondent_prefills_held_designations(fake_settings, monkeypatch):
     assert info.fields["profile.other_designations"] == "Series 7, Series 63"
 
 
+@pytest.mark.parametrize("stored", ["No", "no", "  NO ", "N/A", "false", "0", "   "])
+def test_get_respondent_does_not_prefill_a_negative(fake_settings, monkeypatch, stored):
+    # The column is a marker-or-NULL flag, but nothing stops an intake sheet from
+    # having put "No" there. Presence is NOT the question: an alum recorded as
+    # NOT holding the CFA must see an UNTICKED box, not a pre-ticked one.
+    import types
+
+    monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)
+    eng = types.SimpleNamespace(cfa_designation=stored, cfp_designation="CFP")
+    session = _RespondentSession([_respondent_alum(), None, None, eng])
+    info = asyncio.run(survey_email.get_respondent(session, "tok"))
+    assert "program.cfa_designation" not in info.fields
+    # The held one is unaffected.
+    assert info.fields["program.cfp_designation"] == "Yes"
+
+
+def test_get_respondent_prefills_in_progress_designation(fake_settings, monkeypatch):
+    # "CFP Level 1" is real prod data and is NOT interpreted as a negative — it
+    # pre-ticks, same as today. See tests/test_designations.py for why.
+    import types
+
+    monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)
+    eng = types.SimpleNamespace(cfa_designation=None, cfp_designation="CFP Level 1")
+    session = _RespondentSession([_respondent_alum(), None, None, eng])
+    info = asyncio.run(survey_email.get_respondent(session, "tok"))
+    assert info.fields["program.cfp_designation"] == "Yes"
+
+
 def test_get_respondent_without_engagement_row(fake_settings, monkeypatch):
     # No engagement row at all -> neither designation key is sent.
     monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)

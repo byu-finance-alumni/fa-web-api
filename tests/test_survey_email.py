@@ -283,6 +283,73 @@ def test_get_respondent_invalid_token_is_none(fake_settings):
     assert result is None
 
 
+class _RespondentSession:
+    """Serves get_respondent's four lookups in order: alum, contact, job,
+    engagement."""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    async def execute(self, _stmt):
+        row = self._rows.pop(0)
+
+        class _R:
+            def scalar_one_or_none(self_inner):
+                return row
+
+        return _R()
+
+
+def _respondent_alum():
+    import types
+
+    return types.SimpleNamespace(
+        alumni_id=7,
+        archived=False,
+        first_name="Jordan",
+        last_name="Avery",
+        preferred_first_name=None,
+        employment_status="Employed",
+        linkedin_url=None,
+        graduate_degree=None,
+        graduate_school=None,
+        graduate_graduation_year=None,
+        spouse_first_name=None,
+        spouse_last_name=None,
+        other_designations="Series 7, Series 63",
+        gender=None,
+        marital_status=None,
+        birth_date=None,
+        citizenship=None,
+        home_country=None,
+    )
+
+
+def test_get_respondent_prefills_held_designations(fake_settings, monkeypatch):
+    # #529 — the confirm page pre-ticks CFA/CFP from the DEDICATED columns (which
+    # hold a marker string), sent as the tickbox's "Yes". Not-held is omitted
+    # entirely rather than sent as "No", so the box renders untouched.
+    import types
+
+    monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)
+    eng = types.SimpleNamespace(cfa_designation="CFA", cfp_designation=None)
+    session = _RespondentSession([_respondent_alum(), None, None, eng])
+    info = asyncio.run(survey_email.get_respondent(session, "tok"))
+    assert info.fields["program.cfa_designation"] == "Yes"
+    assert "program.cfp_designation" not in info.fields
+    # The free text is untouched — "CFA Level II Candidate"-style entries stay put.
+    assert info.fields["profile.other_designations"] == "Series 7, Series 63"
+
+
+def test_get_respondent_without_engagement_row(fake_settings, monkeypatch):
+    # No engagement row at all -> neither designation key is sent.
+    monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)
+    session = _RespondentSession([_respondent_alum(), None, None, None])
+    info = asyncio.run(survey_email.get_respondent(session, "tok"))
+    assert "program.cfa_designation" not in info.fields
+    assert "program.cfp_designation" not in info.fields
+
+
 def test_respond_route_404_on_invalid(client, monkeypatch):
     async def none_resp(session, token):
         return None

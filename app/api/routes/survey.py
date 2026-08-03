@@ -45,6 +45,7 @@ from app.schemas.survey import (
     SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
+    SurveySchedulePauseAllResult,
     SurveyScheduleRunSummary,
     SurveySendConfigItem,
     SurveySendConfigUpdateRequest,
@@ -258,6 +259,64 @@ async def create_survey_schedules_bulk(
         session,
         items=body.schedules,
         actor_user_id=user.user_id,
+    )
+
+
+@router.post("/schedules/{grad_year}/pause", response_model=SurveyScheduleItem)
+async def pause_survey_schedule(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> SurveyScheduleItem:
+    """Pause a graduation year's schedule — sending stops until it is resumed.
+
+    The reversible stop, alongside the terminal `cancel`; same full-access gate,
+    since a routine "hold this cohort for a few days" is less drastic than the
+    cancel already available here. Pausing an already-paused campaign succeeds
+    unchanged; pausing a completed or cancelled one is a 409."""
+    item = await survey_schedule.pause_schedule(
+        session, grad_year, actor_user_id=user.user_id
+    )
+    if item is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return item
+
+
+@router.post("/schedules/{grad_year}/resume", response_model=SurveyScheduleItem)
+async def resume_survey_schedule(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> SurveyScheduleItem:
+    """Resume a paused schedule where its cadence left off.
+
+    `start_date` is shifted forward by however long it was paused, so the stage
+    the cron sends next is the one that was due when it stopped — a pause never
+    silently ages a campaign past its reminder windows. Resuming a campaign that
+    is already running succeeds unchanged; resuming a completed or cancelled one
+    is a 409 (cancel stays terminal)."""
+    item = await survey_schedule.resume_schedule(
+        session, grad_year, actor_user_id=user.user_id
+    )
+    if item is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return item
+
+
+@router.post("/schedules/pause-all", response_model=SurveySchedulePauseAllResult)
+async def pause_all_survey_schedules(
+    user: RequireEngineer, session: SessionDep
+) -> SurveySchedulePauseAllResult:
+    """Pause EVERY running survey campaign at once — the reversible kill switch.
+
+    Sits beside `cancel-all` in the engineer console and is gated the same way
+    (RequireEngineer): a blanket stop of every cohort is a maintenance action
+    whatever its reversibility. Each paused year can be resumed individually and
+    picks its cadence up where it stopped. Returns the count + the years paused
+    so the console can report exactly what it stopped; calling it with nothing
+    running succeeds and reports 0."""
+    return await survey_schedule.pause_all_schedules(
+        session, actor_user_id=user.user_id
     )
 
 

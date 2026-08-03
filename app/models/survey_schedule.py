@@ -47,8 +47,9 @@ class SurveySchedule(TimestampMixin, Base):
     )
     # The initial send date. Stage advances weekly from here (0 / 1 / 2).
     start_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
-    # 'scheduled' -> 'active' (first send done) -> 'completed' (all stages sent)
-    # or 'cancelled'. CHECK constraint mirrors these in the DB.
+    # 'scheduled' -> 'active' (first send done) -> 'completed' (all stages sent),
+    # or 'paused' (reversible stop) / 'cancelled' (terminal). CHECK constraint
+    # mirrors these in the DB.
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="scheduled"
     )
@@ -59,6 +60,16 @@ class SurveySchedule(TimestampMixin, Base):
     last_run_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    # When the campaign was paused — NULL unless status == 'paused'. Load-bearing,
+    # not just an audit stamp: the send stage is derived from
+    # ``today - start_date``, so resume shifts ``start_date`` forward by the
+    # paused duration to keep the cadence. See ``survey_schedule.resume_schedule``.
+    paused_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    # The status the campaign held when it was paused ('scheduled' or 'active'),
+    # so resume restores it exactly rather than guessing. Cleared on resume.
+    paused_from_status: Mapped[str | None] = mapped_column(String(20))
     # created_at / updated_at come from TimestampMixin.
 
 

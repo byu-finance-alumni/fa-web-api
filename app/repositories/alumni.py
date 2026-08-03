@@ -249,8 +249,8 @@ def build_alumni_query(
     gender: str | None = None,
     # Industry bucket (#351/#352): ``unknown`` (blank/missing primary industry)
     # or ``other`` (a primary industry that isn't a canonical finance industry).
-    # Distinct from the exact ``industry`` facet below, which still matches a
-    # specific industry name (primary or secondary).
+    # Distinct from the exact ``industry`` facet below, which matches a specific
+    # primary-industry name.
     industry_group: str | None = None,
     # Location proximity (#358). A SQLAlchemy predicate (built by
     # ``geo_search.alumni_location_filter`` from a resolved location query) matched
@@ -262,9 +262,23 @@ def build_alumni_query(
     # (multi-select). Each is matched case-insensitively, exact, literal-escaped.
     employer: "str | list[str] | None" = None,
     past_employer: "str | list[str] | None" = None,
+    # Industry facets (#584). ``industry`` matches the PRIMARY industry only and
+    # ``secondary_industry`` the SECONDARY one — they are separate boxes in the
+    # search UI. Jake, 2026-08-03: one param matching "primary OR secondary" made
+    # a primary-industry search silently pull in people whose *secondary* industry
+    # happened to match, so a "Consulting" search couldn't be trusted to mean
+    # "works in Consulting". Splitting them narrows ``industry`` deliberately.
     industry: "str | list[str] | None" = None,
+    secondary_industry: "str | list[str] | None" = None,
     title: "str | list[str] | None" = None,
     seniority: "str | list[str] | None" = None,
+    # Employment status (#584) — the person-level ``alumni.employment_status``
+    # column (Full-time / Graduate Student / Unemployed / ...), not an employment
+    # -record field. Free text that also holds off-list legacy values from the
+    # intake sheet ("Employed", "Stay at home parent"), which are deliberate, so
+    # this is a plain exact (case-insensitive) match with no normalization —
+    # whatever is stored is what the filter-options list offers and matches.
+    employment_status: "str | list[str] | None" = None,
     city: "str | list[str] | None" = None,
     state: "str | list[str] | None" = None,
     tag: "str | list[str] | None" = None,
@@ -300,7 +314,9 @@ def build_alumni_query(
     mentor_willing: bool = False,
     guest_speaker_willing: bool = False,
     # Professional-certification flags on the program-engagement profile. Each
-    # narrows to alumni who hold that designation (correlated EXISTS).
+    # narrows to alumni who hold that designation (correlated EXISTS). All three
+    # go through ``_holds_designation``, so a cell typed "No" never counts (#362).
+    cfp: bool = False,
     cfa: bool = False,
     cpa: bool = False,
     # Designation facet (#404): a list of certification tokens (CFP / CFA / CPA).
@@ -508,15 +524,26 @@ def build_alumni_query(
         )
     industries = _as_values(industry)
     if industries:
+        # PRIMARY industry only (#584) — see the param docs above. Passing both
+        # ``industry`` and ``secondary_industry`` AND-s them (two separate
+        # conditions), which is what the two-box UI implies: "primary is X and
+        # secondary is Y", not "either column mentions X or Y".
         conditions.append(
             select(CurrentEmployment.current_employment_id)
             .where(
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
-                or_(
-                    _ilike_any(CurrentEmployment.current_industry, industries),
-                    _ilike_any(
-                        CurrentEmployment.current_industry_secondary, industries
-                    ),
+                _ilike_any(CurrentEmployment.current_industry, industries),
+            )
+            .exists()
+        )
+    secondary_industries = _as_values(secondary_industry)
+    if secondary_industries:
+        conditions.append(
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                _ilike_any(
+                    CurrentEmployment.current_industry_secondary, secondary_industries
                 ),
             )
             .exists()
@@ -541,6 +568,11 @@ def build_alumni_query(
             )
             .exists()
         )
+    employment_statuses = _as_values(employment_status)
+    if employment_statuses:
+        # Lives on the alumni row itself, so no EXISTS is needed — a direct
+        # column predicate keeps the plan flat.
+        conditions.append(_ilike_any(Alumni.employment_status, employment_statuses))
     # City / state are the alumnus's WORK location (current_employment) — the
     # employer's address is the only address this system holds, and it is what
     # the geography map plots and the List's City/State columns show (#287).
@@ -728,6 +760,16 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(is_speaker)
+    if cfp:
+        is_cfp = (
+            select(AlumniProgramEngagement.engagement_profile_id)
+            .where(
+                AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                _holds_designation(AlumniProgramEngagement.cfp_designation),
+            )
+            .exists()
+        )
+        conditions.append(is_cfp)
     if cfa:
         is_cfa = (
             select(AlumniProgramEngagement.engagement_profile_id)

@@ -196,7 +196,23 @@ async def list_alumni(
     ] = None,
     industry: Annotated[
         list[str] | None,
-        Query(description="Industry / work area (primary or secondary) — repeatable."),
+        Query(
+            description=(
+                "PRIMARY industry / work area — repeatable (OR), exact match. "
+                "Narrowed to the primary column (#584): it no longer also matches "
+                "the secondary industry — use 'secondary_industry' for that."
+            )
+        ),
+    ] = None,
+    secondary_industry: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "SECONDARY industry / work area (#584) — repeatable (OR), exact "
+                "match. Combined with 'industry' it AND-s: primary is X AND "
+                "secondary is Y."
+            )
+        ),
     ] = None,
     title: Annotated[
         list[str] | None,
@@ -205,6 +221,19 @@ async def list_alumni(
     seniority: Annotated[
         list[str] | None,
         Query(description="Seniority level(s) — repeatable, exact match."),
+    ] = None,
+    employment_status: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Employment status(es) (#584) — repeatable (OR), exact match. "
+                "Canonical values: Full-time, Part-time, Self-Employed, Graduate "
+                "Student, Military, Not in the Labor Force, Unemployed. The column "
+                "is free text and also holds off-list legacy values, so anything on "
+                "file is accepted; 'filter-options.employment_statuses' lists what "
+                "actually exists in the data."
+            )
+        ),
     ] = None,
     city: Annotated[
         list[str] | None,
@@ -279,6 +308,9 @@ async def list_alumni(
     mentor_willing: Annotated[bool, Query(description="Only alumni willing to mentor.")] = False,
     guest_speaker_willing: Annotated[
         bool, Query(description="Only alumni willing to guest speak.")
+    ] = False,
+    cfp: Annotated[
+        bool, Query(description="Only alumni holding the CFP designation.")
     ] = False,
     cfa: Annotated[
         bool, Query(description="Only alumni holding the CFA designation.")
@@ -456,8 +488,10 @@ async def list_alumni(
         employer=employer,
         past_employer=past_employer,
         industry=industry,
+        secondary_industry=secondary_industry,
         title=title,
         seniority=seniority,
+        employment_status=employment_status,
         city=city,
         state=state,
         tag=tag,
@@ -475,6 +509,7 @@ async def list_alumni(
         donor=donor,
         mentor_willing=mentor_willing,
         guest_speaker_willing=guest_speaker_willing,
+        cfp=cfp,
         cfa=cfa,
         cpa=cpa,
         designations=designation_filter,
@@ -509,8 +544,14 @@ async def list_alumni(
             "employer": "|".join(employer) if employer else None,
             "past_employer": "|".join(past_employer) if past_employer else None,
             "industry": "|".join(industry) if industry else None,
+            "secondary_industry": (
+                "|".join(secondary_industry) if secondary_industry else None
+            ),
             "title": "|".join(title) if title else None,
             "seniority": "|".join(seniority) if seniority else None,
+            "employment_status": (
+                "|".join(employment_status) if employment_status else None
+            ),
             "city": "|".join(city) if city else None,
             "state": "|".join(state) if state else None,
             "tag": "|".join(tag) if tag else None,
@@ -521,6 +562,7 @@ async def list_alumni(
             "contacted_after": contacted_after.isoformat() if contacted_after else None,
             "contacted_before": (contacted_before.isoformat() if contacted_before else None),
             "never_contacted": never_contacted or None,
+            "cfp": cfp or None,
             "cfa": cfa or None,
             "cpa": cpa or None,
             "designations": "|".join(designation_filter) if designation_filter else None,

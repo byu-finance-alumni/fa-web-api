@@ -15,7 +15,15 @@ class FilterOptions(BaseModel):
     past_employers: list[str]
     titles: list[str]
     seniority_levels: list[str]
+    # Split industry facets (#584): ``industries`` feeds the PRIMARY-industry
+    # select and only holds primary values; ``secondary_industries`` feeds the new
+    # secondary select. Previously ``industries`` was the union of both columns,
+    # back when one filter matched either.
     industries: list[str]
+    secondary_industries: list[str]
+    # Distinct employment statuses actually on file — free text, so this includes
+    # off-list legacy values alongside the canonical seven.
+    employment_statuses: list[str]
     cities: list[str]
     states: list[str]
     tags: list[str]

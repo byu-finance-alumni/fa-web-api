@@ -256,11 +256,45 @@ def test_employer_filter():
     assert "current_employer ILIKE" in sql
 
 
-def test_industry_filter_checks_primary_and_secondary():
+def test_industry_filter_is_primary_only():
+    # #584: ``industry`` used to match primary OR secondary. Jake split them, so
+    # a primary-industry search must NOT reach into the secondary column — an
+    # alumnus whose SECONDARY industry is Investment Banking is now found via
+    # ``secondary_industry`` instead (deliberately fewer results here).
     sql = _sql(build_alumni_query(industry="Investment Banking"))
     assert "EXISTS" in sql
     assert "current_industry ILIKE" in sql
+    assert "current_industry_secondary ILIKE" not in sql
+
+
+def test_secondary_industry_filter_is_secondary_only():
+    sql = _sql(build_alumni_query(secondary_industry="Investment Banking"))
+    assert "EXISTS" in sql
     assert "current_industry_secondary ILIKE" in sql
+    # Only the secondary column is matched: the sole ILIKE is the secondary one.
+    assert sql.count("ILIKE") == 1
+
+
+def test_industry_and_secondary_industry_are_anded():
+    # Two boxes in the UI -> two separate EXISTS conditions, AND-combined.
+    sql = _sql(
+        build_alumni_query(industry="Consulting", secondary_industry="Real Estate")
+    )
+    assert "current_industry ILIKE" in sql
+    assert "current_industry_secondary ILIKE" in sql
+    assert sql.count("EXISTS") == 2
+
+
+def test_industry_filters_accept_multiple_values():
+    sql = _sql(
+        build_alumni_query(
+            industry=["Consulting", "Corporate Finance"],
+            secondary_industry=["Real Estate", "Insurance"],
+        )
+    )
+    # Repeatable params OR within a column, AND across the two columns.
+    assert sql.count("current_industry ILIKE") == 2
+    assert sql.count("current_industry_secondary ILIKE") == 2
 
 
 def test_city_filter():
@@ -392,10 +426,69 @@ def test_cfa_and_cpa_combine():
     assert sql.count("EXISTS (SELECT") == 2
 
 
-def test_cert_filters_absent_by_default():
-    sql = _sql(build_alumni_query())
+def test_cfp_filter():
+    # #362: the CFP flag was filterable only through the ``designations`` list;
+    # it now has the same standalone boolean as CFA/CPA.
+    sql = _sql(build_alumni_query(cfp=True))
+    assert "EXISTS" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "alumni_program_engagement" in sql
+    assert "cfp_designation IS NOT NULL" in sql
+    # A stored "No" must not count as holding the CFP, so presence alone is not
+    # enough — the negatives are excluded in SQL (see test_designations.py).
+    assert "lower(trim(alumni_program_engagement.cfp_designation)) NOT IN" in sql
+    # Only the CFP flag is referenced.
     assert "cfa_designation" not in sql
     assert "cpa_designation" not in sql
+
+
+def test_cfp_cfa_and_cpa_combine():
+    # All three requested -> three correlated EXISTS, ANDed (holds all three).
+    sql = _sql(build_alumni_query(cfp=True, cfa=True, cpa=True))
+    assert "cfp_designation IS NOT NULL" in sql
+    assert "cfa_designation IS NOT NULL" in sql
+    assert "cpa_designation IS NOT NULL" in sql
+    assert sql.count("EXISTS (SELECT") == 3
+
+
+def test_cert_filters_absent_by_default():
+    sql = _sql(build_alumni_query())
+    assert "cfp_designation" not in sql
+    assert "cfa_designation" not in sql
+    assert "cpa_designation" not in sql
+
+
+# --- #584 employment-status filter -------------------------------------------
+
+
+def test_employment_status_filter():
+    # The column lives on the alumni row, so it filters directly — no EXISTS.
+    sql = _sql(build_alumni_query(employment_status="Full-time"))
+    assert "employment_status ILIKE" in sql
+    assert "EXISTS" not in sql
+
+
+def test_employment_status_filter_accepts_multiple_values():
+    sql = _sql(
+        build_alumni_query(employment_status=["Full-time", "Graduate Student"])
+    )
+    assert sql.count("employment_status ILIKE") == 2
+    assert " OR " in sql
+
+
+def test_employment_status_filter_passes_off_list_values_through():
+    # The column is free text and prod deliberately keeps off-list legacy values
+    # (see the 2026-08-01 cleanup: casing only). The filter must not normalize or
+    # reject them — the value is matched exactly as given.
+    stmt = build_alumni_query(employment_status="Stay at home parent")
+    assert "employment_status ILIKE" in _sql(stmt)
+    assert "Stay at home parent" in _bind_values(stmt)
+
+
+def test_employment_status_filter_absent_by_default():
+    # The column is always in the SELECT list (it's an alumni column), so assert
+    # on the predicate rather than the mere mention of the name.
+    assert "employment_status ILIKE" not in _sql(build_alumni_query())
 
 
 # --- #404 designation list filter (CFP / CFA / CPA, ANY semantics) ------------

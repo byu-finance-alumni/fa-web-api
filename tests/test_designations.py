@@ -138,6 +138,25 @@ def test_sql_filter_excludes_negative_values(kwargs):
     assert "''" in sql
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cfp": True},
+        {"designations": ["CFP"]},
+        {"q": "CFP"},
+    ],
+)
+def test_cfp_sql_filter_excludes_negative_values(kwargs):
+    # #362 added the standalone ``cfp`` flag. It must reject a "No" exactly like
+    # the CFA/CPA paths do — a bare IS NOT NULL would count an alumnus whose
+    # intake sheet said "No" as a CFP holder.
+    sql = _sql(build_alumni_query(**kwargs))
+    assert "cfp_designation IS NOT NULL" in sql
+    assert "lower(trim(alumni_program_engagement.cfp_designation)) NOT IN" in sql
+    assert "'no'" in sql
+    assert "''" in sql
+
+
 def test_sql_filter_negatives_match_the_python_predicate():
     # One source of truth: every token the Python predicate rejects is in the
     # SQL exclusion list (plus the empty string for blank cells).

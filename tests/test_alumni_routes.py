@@ -165,6 +165,53 @@ def test_needs_survey_omitted_does_not_forward_threshold(client, monkeypatch):
     assert captured["survey_due_before"] is None
 
 
+# --- #584 / #362 new list filters --------------------------------------------
+#
+# The route is the only place these params are declared, forwarded AND echoed in
+# the search-audit summary; the summary echo is what lets a saved/shared search
+# round-trip, so it is asserted alongside the forwarding.
+
+
+def test_new_filters_are_forwarded_and_echoed(client, monkeypatch):
+    from app.api.routes import alumni as alumni_routes
+
+    captured: dict = {}
+    logged: dict = {}
+
+    async def fake_list_alumni(session, **kwargs):
+        captured.update(kwargs)
+        return [], 0
+
+    async def fake_log_search(session, **kwargs):
+        logged.update(kwargs)
+        return None
+
+    monkeypatch.setattr(alumni_routes.service, "list_alumni", fake_list_alumni)
+    monkeypatch.setattr(alumni_routes.service, "log_search", fake_log_search)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+
+    response = client.get(
+        "/alumni",
+        params={
+            "cfp": "true",
+            "industry": "Consulting",
+            "secondary_industry": "Real Estate",
+            "employment_status": ["Full-time", "Graduate Student"],
+        },
+    )
+    assert response.status_code == 200
+    assert captured["cfp"] is True
+    assert captured["industry"] == ["Consulting"]
+    assert captured["secondary_industry"] == ["Real Estate"]
+    assert captured["employment_status"] == ["Full-time", "Graduate Student"]
+
+    filters = logged["filters"]
+    assert filters["cfp"] is True
+    assert filters["industry"] == "Consulting"
+    assert filters["secondary_industry"] == "Real Estate"
+    assert filters["employment_status"] == "Full-time|Graduate Student"
+
+
 # --- Hygiene / preview / duplicate-blocking (fake session) -------------------
 
 

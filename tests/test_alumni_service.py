@@ -386,9 +386,11 @@ def test_filter_options_scopes_every_query_to_visible_population():
         assert "is_alumni IS true" in sql
 
 
-def test_filter_options_industries_union_primary_and_secondary():
-    # #184: the list filter matches primary OR secondary industry, so the option
-    # list unions both columns, deduped + sorted.
+def test_filter_options_splits_primary_and_secondary_industries():
+    # #584: the option lists no longer union the two columns. The filters are
+    # split (``industry`` = primary, ``secondary_industry`` = secondary), so each
+    # select gets exactly the values its own column can match — unioning would
+    # offer the primary select options that return zero rows (#184).
     session = _FilterOptionsSession(
         [
             ("current_industry_secondary", ["Private Equity", "Investment Banking"]),
@@ -396,12 +398,18 @@ def test_filter_options_industries_union_primary_and_secondary():
         ]
     )
     opts = asyncio.run(service.filter_options(session))
-    # Deduped across the two columns and sorted; the secondary-only value is
-    # present even though it never appears in current_industry.
-    assert opts["industries"] == [
-        "Asset Management",
-        "Investment Banking",
-        "Private Equity",
-    ]
+    assert opts["industries"] == ["Investment Banking", "Asset Management"]
+    assert opts["secondary_industries"] == ["Private Equity", "Investment Banking"]
     # Both the primary and the secondary industry column are actually queried.
     assert any("current_industry_secondary" in sql for sql in session.seen)
+
+
+def test_filter_options_employment_statuses_come_from_the_data():
+    # #584: read live off ``alumni.employment_status`` rather than the canonical
+    # 7-value dropdown, so the off-list legacy values that prod deliberately
+    # keeps ("Stay at home parent") are still selectable.
+    session = _FilterOptionsSession(
+        [("employment_status", ["Full-time", "Stay at home parent"])]
+    )
+    opts = asyncio.run(service.filter_options(session))
+    assert opts["employment_statuses"] == ["Full-time", "Stay at home parent"]

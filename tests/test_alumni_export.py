@@ -66,6 +66,23 @@ def test_filters_dict_no_survey_cutoff_when_flag_unset():
     assert "survey_due_before" not in out
 
 
+def test_export_filters_carry_the_new_list_facets():
+    # The body model is extra="forbid" and mirrors GET /alumni one-for-one, so an
+    # export of a filtered view returns exactly that view (#584 / #362).
+    out = _filters_dict(
+        AlumniExportFilters(
+            industry=["Consulting"],
+            secondary_industry=["Real Estate"],
+            employment_status=["Full-time"],
+            cfp=True,
+        )
+    )
+    assert out["industry"] == ["Consulting"]
+    assert out["secondary_industry"] == ["Real Estate"]
+    assert out["employment_status"] == ["Full-time"]
+    assert out["cfp"] is True
+
+
 class _FakeResult:
     def __init__(self, rows):
         self._rows = rows

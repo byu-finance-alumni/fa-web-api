@@ -72,10 +72,24 @@ def test_alumni_employer_escapes_wildcards():
 
 
 def test_alumni_industry_escapes_wildcards():
+    # One ESCAPE clause, not two: since #584 ``industry`` matches the primary
+    # column only, the secondary column is reached via ``secondary_industry``.
     stmt = build_alumni_query(industry="Tech_%")
     sql = _sql(stmt)
-    assert sql.count(ESCAPE_CLAUSE) == 2  # primary + secondary industry
+    assert sql.count(ESCAPE_CLAUSE) == 1
     assert "Tech\\_\\%" in _params(stmt).values()
+
+
+def test_alumni_secondary_industry_escapes_wildcards():
+    stmt = build_alumni_query(secondary_industry="Tech_%")
+    assert ESCAPE_CLAUSE in _sql(stmt)
+    assert "Tech\\_\\%" in _params(stmt).values()
+
+
+def test_alumni_employment_status_escapes_wildcards():
+    stmt = build_alumni_query(employment_status="Full_time%")
+    assert ESCAPE_CLAUSE in _sql(stmt)
+    assert "Full\\_time\\%" in _params(stmt).values()
 
 
 def test_alumni_ilike_count_unchanged():

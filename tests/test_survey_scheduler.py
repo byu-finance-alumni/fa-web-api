@@ -41,7 +41,7 @@ def _rcpts(ids):
     ]
 
 
-def _sched(year, start, status="scheduled"):
+def _sched(year, start, status="scheduled", created_by=None):
     return SimpleNamespace(
         survey_schedule_id=year,
         graduation_year=year,
@@ -49,6 +49,7 @@ def _sched(year, start, status="scheduled"):
         status=status,
         last_run_at=None,
         created_at=None,
+        created_by_user_id=created_by,
     )
 
 
@@ -457,8 +458,10 @@ class QueueSession:
         self._q = list(results)
         self.added = []
         self.commits = 0
+        self.executed = 0
 
     async def execute(self, _stmt):
+        self.executed += 1
         return self._q.pop(0)
 
     def add(self, obj):
@@ -500,6 +503,9 @@ def test_create_schedule_replaces_existing():
         [
             _Res(one=existing),  # existence check -> found
             _Res(one=existing),  # get_schedule re-query
+            _Res(rows=[]),  # per-stage counts
+            # The upsert stamped created_by_user_id, so the creator-name lookup
+            # runs (it is skipped entirely when no row has a creator).
             _Res(rows=[]),
         ]
     )
@@ -631,6 +637,139 @@ def test_list_schedules_includes_stage_counts():
     assert items[0].sent_initial == 3
     assert items[0].sent_reminder_1 == 1
     assert items[0].sent_reminder_2 == 0
+
+
+# ------------------------------------------------------- who started it -------
+
+
+def test_list_schedules_resolves_creator_names_in_one_query():
+    # Two schedules by two different users: the name lookup must be ONE query for
+    # the whole list (the engineer console lists every year — a per-row lookup
+    # would be an N+1).
+    session = QueueSession(
+        [
+            _Res(
+                scalars_all=[
+                    _sched(2001, datetime.date(2026, 5, 1), created_by=7),
+                    _sched(2000, datetime.date(2026, 5, 1), created_by=8),
+                ]
+            ),
+            _Res(rows=[]),  # per-stage counts
+            _Res(
+                rows=[
+                    (7, "Jake", "Gunnell", "jake@byu.edu"),
+                    (8, None, None, "tanya@byu.edu"),  # no name on file
+                ]
+            ),
+        ]
+    )
+    items = asyncio.run(survey_schedule.list_schedules(session))
+    # Full name when present, email as the fallback — never the internal user id.
+    assert [i.created_by for i in items] == ["Jake Gunnell", "tanya@byu.edu"]
+    assert session.executed == 3  # schedules + counts + one creator lookup
+
+
+def test_list_schedules_skips_creator_query_when_none_recorded():
+    session = QueueSession(
+        [
+            _Res(scalars_all=[_sched(2000, datetime.date(2026, 5, 1))]),
+            _Res(rows=[]),
+        ]
+    )
+    items = asyncio.run(survey_schedule.list_schedules(session))
+    assert items[0].created_by is None
+    assert session.executed == 2  # no creator lookup at all
+
+
+# ------------------------------------------------------------- cancel all -----
+
+
+def test_cancel_all_cancels_runnable_and_reports_years():
+    session = QueueSession([_Res(scalars_all=[1901, 1900])])
+    result = asyncio.run(
+        survey_schedule.cancel_all_schedules(session, actor_user_id=1)
+    )
+    assert result.cancelled == 2
+    assert result.graduation_years == [1900, 1901]  # sorted for a stable report
+    assert session.commits == 1
+    audit = _audits(session)[0]
+    assert audit.action_type == "cancel_all_survey_schedules"
+    assert audit.entity_type == "survey_campaign"
+    assert audit.user_id == 1
+    assert "cancelled=2" in audit.new_value
+    assert "1900,1901" in audit.new_value
+
+
+def test_cancel_all_is_idempotent_when_nothing_active():
+    session = QueueSession([_Res(scalars_all=[])])
+    result = asyncio.run(
+        survey_schedule.cancel_all_schedules(session, actor_user_id=1)
+    )
+    assert result.cancelled == 0
+    assert result.graduation_years == []
+    # A no-op press is still audited — reaching for the kill switch is itself an
+    # intervention worth tracing.
+    audit = _audits(session)[0]
+    assert audit.new_value == "cancelled=0 grad_years=none"
+
+
+# ------------------------------------------------- cancel-all route (gating) ---
+
+
+def _engineer_ctx(*roles, user_id=1):
+    import uuid
+
+    from app.schemas.auth import UserContext
+
+    return UserContext(
+        user_id=user_id,
+        auth_user_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        roles=list(roles),
+    )
+
+
+def _cancel_all(session, ctx=None):
+    """POST /survey/schedules/cancel-all against ``session``, as ``ctx`` (or
+    unauthenticated when ctx is None). Returns the response."""
+    from fastapi.testclient import TestClient
+
+    from app.api.dependencies.auth import get_current_db_user
+    from app.core.database import get_session
+    from app.main import app
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    if ctx is not None:
+        app.dependency_overrides[get_current_db_user] = lambda: ctx
+    try:
+        with TestClient(app) as test_client:
+            return test_client.post("/survey/schedules/cancel-all")
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_current_db_user, None)
+
+
+def test_cancel_all_route_requires_auth():
+    resp = _cancel_all(None)
+    assert resp.status_code == 401
+
+
+def test_cancel_all_route_forbidden_below_engineer():
+    # super_admin is the highest NON-engineer role and still can't blanket-stop
+    # every cohort — the per-year cancel stays their tool.
+    resp = _cancel_all(None, _engineer_ctx("super_admin"))
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+
+
+def test_cancel_all_route_engineer_cancels_and_reports():
+    session = QueueSession([_Res(scalars_all=[1900, 1901])])
+    resp = _cancel_all(session, _engineer_ctx("engineer"))
+    assert resp.status_code == 200
+    assert resp.json() == {"cancelled": 2, "graduation_years": [1900, 1901]}
+    assert _audits(session)[0].action_type == "cancel_all_survey_schedules"
 
 
 # --------------------------------------------------------------- cron route ---

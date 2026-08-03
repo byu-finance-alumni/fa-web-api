@@ -29,15 +29,18 @@ from __future__ import annotations
 
 import datetime
 import logging
+from collections.abc import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ServiceError
 from app.models.audit import AuditLog
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
+from app.models.user import User
 from app.schemas.survey import (
+    SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
     SurveyScheduleRunItem,
@@ -126,10 +129,45 @@ async def _sent_counts_by_stage(
     }
 
 
+async def _creator_names(
+    session: AsyncSession, schedules: Sequence[SurveySchedule]
+) -> dict[int, str]:
+    """Display names of the users who started these campaigns, keyed by user_id.
+
+    Resolved for the WHOLE list in one query — the console lists every graduation
+    year, so a per-row lookup would be an N+1. Name formatting mirrors
+    ``profile._full_name`` (first + last, falling back to the email); it is
+    duplicated rather than imported so this service keeps no dependency on the
+    profile service. Only the resolved name is ever surfaced — the raw
+    ``created_by_user_id`` stays internal (FERPA, see ``SurveyScheduleItem``)."""
+    ids = {
+        s.created_by_user_id
+        for s in schedules
+        if getattr(s, "created_by_user_id", None) is not None
+    }
+    if not ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                User.user_id, User.first_name, User.last_name, User.email
+            ).where(User.user_id.in_(ids))
+        )
+    ).all()
+    names: dict[int, str] = {}
+    for user_id, first, last, email in rows:
+        full = " ".join(p for p in (first, last) if p).strip()
+        names[user_id] = full or email
+    return names
+
+
 def _to_item(
-    sched: SurveySchedule, counts: dict[tuple[int, int], int]
+    sched: SurveySchedule,
+    counts: dict[tuple[int, int], int],
+    creators: dict[int, str],
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
+    created_by_id = getattr(sched, "created_by_user_id", None)
     return SurveyScheduleItem(
         survey_schedule_id=sched.survey_schedule_id,
         graduation_year=year,
@@ -137,6 +175,7 @@ def _to_item(
         status=sched.status,
         last_run_at=sched.last_run_at,
         created_at=getattr(sched, "created_at", None),
+        created_by=creators.get(created_by_id) if created_by_id else None,
         sent_initial=counts.get((year, STAGE_INITIAL), 0),
         sent_reminder_1=counts.get((year, STAGE_REMINDER_1), 0),
         sent_reminder_2=counts.get((year, STAGE_REMINDER_2), 0),
@@ -158,7 +197,8 @@ async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
         .all()
     )
     counts = await _sent_counts_by_stage(session)
-    return [_to_item(s, counts) for s in schedules]
+    creators = await _creator_names(session, schedules)
+    return [_to_item(s, counts, creators) for s in schedules]
 
 
 async def get_schedule(
@@ -175,7 +215,8 @@ async def get_schedule(
     if sched is None:
         return None
     counts = await _sent_counts_by_stage(session)
-    return _to_item(sched, counts)
+    creators = await _creator_names(session, [sched])
+    return _to_item(sched, counts, creators)
 
 
 async def _upsert_schedule(
@@ -284,6 +325,51 @@ async def cancel_schedule(
     existing.status = STATUS_CANCELLED
     await session.commit()
     return await get_schedule(session, graduation_year)
+
+
+async def cancel_all_schedules(
+    session: AsyncSession, *, actor_user_id: int | None
+) -> SurveyScheduleCancelAllResult:
+    """Kill switch: cancel EVERY runnable (scheduled/active) campaign at once.
+
+    A single ``UPDATE ... RETURNING`` rather than a read-then-write loop, so the
+    stop is atomic — the daily cron can't pick up a year that this call has
+    already decided to stop. Only ``scheduled``/``active`` rows are touched
+    (``_RUNNABLE_STATUSES`` — the exact set ``_load_schedules_due`` picks up), so
+    completed and already-cancelled campaigns keep their history. Idempotent:
+    with nothing running it cancels nothing and reports 0.
+
+    Always writes ONE audit row, even for a no-op — reaching for the kill switch
+    is itself an intervention worth tracing, and the row records which years were
+    stopped. For an engineer actor that row is rerouted into
+    ``engineer_action_log`` by the audit hook (#199), which is where this action's
+    trail actually lands since the endpoint is engineer-only.
+    """
+    result = await session.execute(
+        update(SurveySchedule)
+        .where(SurveySchedule.status.in_(_RUNNABLE_STATUSES))
+        .values(status=STATUS_CANCELLED)
+        .returning(SurveySchedule.graduation_year)
+        .execution_options(synchronize_session=False)
+    )
+    years = sorted(result.scalars().all())
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="cancel_all_survey_schedules",
+            entity_type="survey_campaign",
+            # No single entity — the years cancelled are named in new_value.
+            entity_id=None,
+            new_value=(
+                f"cancelled={len(years)} "
+                f"grad_years={','.join(str(y) for y in years) or 'none'}"
+            ),
+        )
+    )
+    await session.commit()
+    return SurveyScheduleCancelAllResult(
+        cancelled=len(years), graduation_years=years
+    )
 
 
 # --------------------------------------------------------------- send cap ------

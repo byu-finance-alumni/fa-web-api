@@ -142,10 +142,28 @@ class SurveyScheduleItem(BaseModel):
     status: str
     last_run_at: datetime.datetime | None = None
     created_at: datetime.datetime | None = None
+    # Who started this campaign, as a display name (falling back to their email).
+    # The internal ``created_by_user_id`` PK is never disclosed — only the
+    # resolved name leaves the API, matching ``InteractionRead.logged_by``
+    # (FERPA — minimize internal identifiers). None when the schedule predates
+    # the column, or the creator's account has since been deleted (FK SET NULL).
+    created_by: str | None = None
     # Delivered counts per stage from survey_send_log (0=initial, 1/2=reminders).
     sent_initial: int = 0
     sent_reminder_1: int = 0
     sent_reminder_2: int = 0
+
+
+class SurveyScheduleCancelAllResult(BaseModel):
+    """Outcome of the engineer kill switch (``POST /survey/schedules/cancel-all``).
+
+    Reports exactly what was stopped so the console can say so honestly rather
+    than claiming a blanket success: ``cancelled`` is the number of campaigns
+    moved to ``cancelled``, and ``graduation_years`` names them. Both are empty /
+    0 when nothing was running — the call is idempotent."""
+
+    cancelled: int
+    graduation_years: list[int]
 
 
 class SurveyScheduleRunItem(BaseModel):

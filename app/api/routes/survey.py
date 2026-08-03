@@ -26,7 +26,7 @@ from fastapi import (
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireFullAccess
+from app.api.dependencies.auth import RequireEngineer, RequireFullAccess
 from app.api.routes.alumni import (
     _HEADSHOT_MAX_BYTES,
     _HEADSHOT_MIME_TYPES,
@@ -42,6 +42,7 @@ from app.schemas.survey import (
     SurveyRespondInfo,
     SurveyResponseItem,
     SurveyScheduleBulkRequest,
+    SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
     SurveyScheduleRunSummary,
@@ -215,7 +216,12 @@ async def send_survey_campaign(
 async def list_survey_schedules(
     user: RequireFullAccess, session: SessionDep
 ) -> list[SurveyScheduleItem]:
-    """All auto-send schedules (newest cohort first) + per-stage sent counts."""
+    """All auto-send schedules (newest cohort first) + per-stage sent counts.
+
+    Also backs the engineer Surveys console (which needs who started each
+    campaign and when) — the console reads this rather than a second endpoint,
+    since it wants exactly this list. The engineer holds every capability, so
+    the full-access gate already admits them."""
     return await survey_schedule.list_schedules(session)
 
 
@@ -266,6 +272,24 @@ async def cancel_survey_schedule(
     if item is None:
         raise NotFoundError("No schedule exists for that graduation year.")
     return item
+
+
+@router.post("/schedules/cancel-all", response_model=SurveyScheduleCancelAllResult)
+async def cancel_all_survey_schedules(
+    user: RequireEngineer, session: SessionDep
+) -> SurveyScheduleCancelAllResult:
+    """Stop EVERY running survey campaign at once — the engineer kill switch.
+
+    Cancels all scheduled/active schedules in one statement, which is what stops
+    the daily cron sending (it only picks up those two statuses). Deliberately
+    narrower than the full-access per-year cancel: a blanket stop of every cohort
+    is a maintenance action, so it is engineer-gated (RequireEngineer) like the
+    rest of the engineer console. Returns the count + the years cancelled so the
+    console can report exactly what it stopped; calling it with nothing running
+    succeeds and reports 0."""
+    return await survey_schedule.cancel_all_schedules(
+        session, actor_user_id=user.user_id
+    )
 
 
 async def _run_cron(request: Request, session: AsyncSession) -> SurveyScheduleRunSummary:

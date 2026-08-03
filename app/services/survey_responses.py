@@ -75,7 +75,10 @@ class _Field:
     label: str
     group: str  # alumni | contact | employment | engagement
     column: str
-    kind: str  # text | int | bool
+    kind: str  # text | int | bool | date | designation
+    # `designation` only: the canonical string written to the column when the alum
+    # ticks the box. Lives HERE, server-side, never in the payload — see `_coerce`.
+    marker: str | None = None
 
 
 # The whitelist of fields an alum may submit + where each writes. Order matches
@@ -116,8 +119,38 @@ _FIELDS: tuple[_Field, ...] = (
         "graduate_graduation_year",
         "int",
     ),
+    # Finance designations (#529). CFA/CFP are their OWN varchar columns on
+    # alumni_program_engagement holding the literal marker ('CFA'/'CFP'), not
+    # booleans and not free text: the designation filter maps "CFA" ->
+    # cfa_designation and matches IS NOT NULL (`repositories/alumni.py`), and the
+    # exports/import read the same columns. Writing a ticked CFA into
+    # `other_designations` instead would drop that alum out of the CFA filter and
+    # the designation counts, so the two live apart on purpose.
+    #
+    # Anything with a survey link can POST to this whitelist, so `designation`
+    # deliberately ignores the submitted text and writes the marker from the field
+    # definition — a `text` kind here would let a stranger put 100 arbitrary
+    # characters into a column the rest of the app reads as "holds the CFA".
     _Field(
-        "profile.other_designations", "Finance designations", "alumni", "other_designations", "text"
+        "program.cfa_designation",
+        "CFA designation",
+        "engagement",
+        "cfa_designation",
+        "designation",
+        "CFA",
+    ),
+    _Field(
+        "program.cfp_designation",
+        "CFP designation",
+        "engagement",
+        "cfp_designation",
+        "designation",
+        "CFP",
+    ),
+    # Everything else the alum holds stays free text (the survey collects it in
+    # three "Other" blanks and joins them with ", ").
+    _Field(
+        "profile.other_designations", "Other designations", "alumni", "other_designations", "text"
     ),
     # Personal & family (alumni table). Columns already exist — no migration.
     _Field("profile.gender", "Gender", "alumni", "gender", "text"),
@@ -193,11 +226,14 @@ def _text(value: object) -> str:
 
 
 def _current(field: _Field, obj: object | None) -> str:
-    """The on-file value as a display string ('Yes'/'No' for booleans)."""
+    """The on-file value as a display string ('Yes'/'No' for booleans). A
+    designation column is a held/not-held fact to the alum, so its marker string
+    reads as 'Yes' too — the reviewer's diff should say what changed, not which
+    literal we store."""
     if obj is None:
         return ""
     raw = getattr(obj, field.column, None)
-    if field.kind == "bool":
+    if field.kind in ("bool", "designation"):
         return "Yes" if raw else "No"
     return _text(raw)
 
@@ -205,7 +241,7 @@ def _current(field: _Field, obj: object | None) -> str:
 def _after(field: _Field, raw: object) -> str:
     """The submitted value as a display string, normalized to match `_current`."""
     value = _text(raw)
-    if field.kind == "bool":
+    if field.kind in ("bool", "designation"):
         return "Yes" if value.lower() in _TRUE else "No"
     return value
 
@@ -215,6 +251,11 @@ def _coerce(field: _Field, raw: object):
     value = _text(raw)
     if field.kind == "bool":
         return value.lower() in _TRUE
+    if field.kind == "designation":
+        # The payload only says whether the box was ticked; WHAT gets stored comes
+        # from the field definition, so a public submit can never write anything
+        # other than the canonical marker (or NULL) into a filtered column.
+        return field.marker if value.lower() in _TRUE else None
     if field.kind == "int":
         try:
             return int(value) if value else None

@@ -59,9 +59,14 @@ class AlumniExportFilters(BaseModel):
     industry_group: str | None = None
     employer: list[str] | None = None
     past_employer: list[str] | None = None
+    # Split industry facets (#584): ``industry`` is the PRIMARY column only and
+    # ``secondary_industry`` the secondary one, matching GET /alumni — so an
+    # export of a filtered view still returns exactly that view.
     industry: list[str] | None = None
+    secondary_industry: list[str] | None = None
     title: list[str] | None = None
     seniority: list[str] | None = None
+    employment_status: list[str] | None = None
     city: list[str] | None = None
     state: list[str] | None = None
     tag: list[str] | None = None
@@ -80,6 +85,7 @@ class AlumniExportFilters(BaseModel):
     donor: bool = False
     mentor_willing: bool = False
     guest_speaker_willing: bool = False
+    cfp: bool = False
     cfa: bool = False
     cpa: bool = False
     missing_email: bool = False

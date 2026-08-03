@@ -122,19 +122,18 @@ async def filter_options(session: AsyncSession) -> dict:
         .exists()
     ]
 
-    # Industries span the PRIMARY and SECONDARY columns because the list filter
-    # matches either (repositories.alumni.build_alumni_query), so the option list
-    # must offer both. Union the two distinct sets, dedupe + sort, then re-cap so
-    # options and results agree (#184).
+    # Industries used to be ONE unioned list because one ``industry`` filter
+    # matched either column. The filter is now split (#584) — ``industry`` hits
+    # the primary column, ``secondary_industry`` the secondary one — so each
+    # dropdown gets its own distinct list. Unioning them here again would offer
+    # the primary select values only the secondary column holds, i.e. options
+    # that return zero rows, which is exactly what #184 forbids.
     primary_industries = await _distinct_values(
         session, CurrentEmployment.current_industry, scope=employment_scope
     )
     secondary_industries = await _distinct_values(
         session, CurrentEmployment.current_industry_secondary, scope=employment_scope
     )
-    industries = sorted(set(primary_industries) | set(secondary_industries))[
-        :_OPTIONS_CAP
-    ]
 
     return {
         "employers": await _distinct_values(
@@ -149,7 +148,16 @@ async def filter_options(session: AsyncSession) -> dict:
         "seniority_levels": await _distinct_values(
             session, CurrentEmployment.seniority_level, scope=employment_scope
         ),
-        "industries": industries,
+        "industries": primary_industries,
+        "secondary_industries": secondary_industries,
+        # Employment status (#584) is read LIVE off the alumni rows rather than
+        # from the canonical 7-value dropdown, because the column is free text and
+        # deliberately still holds off-list legacy values ("Employed", "Stay at
+        # home parent"). Offering the vocab list instead would hide those alumni
+        # behind an option the UI never shows.
+        "employment_statuses": await _distinct_values(
+            session, Alumni.employment_status, scope=alumni_scope
+        ),
         # City/State options come off the EMPLOYMENT record, matching what the
         # list filter matches on (repositories.alumni.build_alumni_query) and
         # what the map plots (#287). They used to read AlumniContactInfo, which

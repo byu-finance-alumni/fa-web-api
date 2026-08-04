@@ -39,6 +39,16 @@ class _Result:
     def one(self):
         return self._rows[0]
 
+    def scalar(self):
+        """First column of the first row — None when there is no row.
+
+        What an aggregate read (`SELECT count(*) ...`) expects. An unqueued
+        result therefore reads as "no rows", not as an AttributeError."""
+        row = self._rows[0] if self._rows else None
+        if isinstance(row, tuple):
+            return row[0] if row else None
+        return row
+
     def scalar_one_or_none(self):
         if self._one != "__unset__":
             return self._one

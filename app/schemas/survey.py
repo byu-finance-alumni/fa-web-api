@@ -68,9 +68,11 @@ class GraduationYearCount(BaseModel):
 
     graduation_year: int
     total_alumni: int
-    # Distinct alumni in this grad year who have submitted a survey response (any
-    # status — pending/applied/rejected; a reply is a reply). Drives the console's
-    # "N replied" count.
+    # Distinct alumni in this grad year who have really replied within the last
+    # 365 days — `pending` or `applied` (`survey_email.RESPONDED_STATUSES`).
+    # Drives the console's "N replied" count. A `rejected` response is NOT a
+    # reply: staff threw that submission away, nothing reached the record, so the
+    # alum stays surveyable and still counts as a non-responder.
     responded: int = 0
 
 
@@ -105,9 +107,10 @@ class SurveySendResult(BaseModel):
 
 class SurveyUsage(BaseModel):
     """Real Resend send usage for the console's daily/monthly tallies — emails
-    actually sent today and this calendar month (summed from the `send_survey`
-    audit rows). UTC day/month boundaries, matching the rest of the app's date
-    filtering."""
+    actually sent today and this calendar month, counted from `survey_send_log`.
+    NOT from the audit trail: an engineer actor's audit row is rerouted to
+    `engineer_action_log`, which left the meter reading zero. UTC day/month
+    boundaries, matching the rest of the app's date filtering."""
 
     sent_today: int
     sent_this_month: int
@@ -191,6 +194,15 @@ class SurveyScheduleItem(BaseModel):
     sent_initial: int = 0
     sent_reminder_1: int = 0
     sent_reminder_2: int = 0
+    # NEEDS MANUAL FOLLOW-UP (#359): alumni who received all three of THIS
+    # cycle's emails and still never replied — #151's third step, which had no
+    # implementation before. Without it `status='completed'` reads identically
+    # whether the cohort all answered or none of them did. Cycle-scoped, so a
+    # previous campaign's non-responders are not carried into this one, and a
+    # `rejected` submission does not count as a reply (staff threw it away, so
+    # the alum still needs chasing). The names are at
+    # ``GET /survey/schedules/{year}/non-responders``.
+    non_responders: int = 0
 
 
 class SurveySchedulePauseAllResult(BaseModel):
@@ -229,12 +241,43 @@ class SurveyScheduleRunItem(BaseModel):
     # Set when Resend rate-limited us mid-run (429): seconds to wait before the
     # remaining recipients go out. Picked up on the next cron run.
     retry_after_seconds: int | None = None
+    # Set on the run that COMPLETES a campaign (#359): how many alumni received
+    # every stage of this cycle and never replied, i.e. how many now need manual
+    # follow-up. None on any other run — the campaign is still sending, so the
+    # question isn't answerable yet. 0 is a real answer (everyone replied) and is
+    # not the same as None.
+    non_responders: int | None = None
 
 
 class SurveyScheduleRunSummary(BaseModel):
     """Summary of a cron run over every due schedule."""
 
     ran: list[SurveyScheduleRunItem]
+    # True when this run did nothing because another send (the cron, or an
+    # admin's manual send) already held the send lock (#358). `ran` is empty and
+    # not one email went out. This is a NORMAL, successful outcome, not an
+    # error: Vercel Cron is at-least-once, sending is irreversible, and anything
+    # that was due is still due on the next run. Reported rather than silent so
+    # an empty `ran` is never ambiguous between "nothing was owed" and "someone
+    # else is already doing it".
+    skipped_locked: bool = False
+
+
+class SurveyNonResponder(BaseModel):
+    """One alum who needs manual follow-up (#359): they received every email of
+    their year's current campaign and never replied.
+
+    Enough to act on — a name and an address — and nothing more. The count alone
+    (``SurveyScheduleItem.non_responders``) tells staff there is work; this tells
+    them who to call."""
+
+    alumni_id: int
+    name: str
+    # The personal email the survey was sent to. None only if the contact row has
+    # since lost it.
+    email: str | None = None
+    # When the last of their three emails went out — how cold the trail is.
+    last_sent_at: datetime.datetime | None = None
 
 
 # ------------------------------------------------------------- send cap --------

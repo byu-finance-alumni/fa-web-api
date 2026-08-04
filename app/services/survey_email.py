@@ -16,6 +16,10 @@ Design notes:
 - Delivery is CLAIMED BEFORE IT IS SENT (insert + commit, then Resend). Emailing
   is irreversible and a log row is not, so this fails toward "possibly missed"
   rather than "sent twice".
+- Only ONE send runs at a time, cron or manual: `send_lock` is a Postgres
+  advisory lock held for the whole send (#358). The claim already stops two
+  runners emailing the same alum; the lock is what stops them each spending the
+  full daily budget from independent reads of it.
 - `survey_send_log` is the usage ledger (`get_send_usage`), not the audit trail —
   an engineer actor's audit row is rerouted to `engineer_action_log` and would
   read as zero usage.
@@ -39,17 +43,20 @@ import datetime
 import hashlib
 import hmac
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from html import escape
 
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import database
 from app.core.config import get_settings
 from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS, holds_designation
-from app.core.errors import ServiceError
+from app.core.errors import ConflictError, ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -101,6 +108,12 @@ RESPONDED_STATUSES: tuple[str, ...] = ("pending", "applied")
 # These live here, not in `survey_schedule`, because they describe the send log —
 # which both the scheduled and the manual sender now write. `survey_schedule`
 # re-exports them so its own callers/tests are unaffected.
+#
+# THE CADENCE IS SETTLED (Jake, 2026-08-03 — #359). Reminders go out one week and
+# two weeks after the initial. Issue #151's original text said two weeks then
+# three; the shipped 7/14 is what was chosen, and #151 is amended to match. So
+# these offsets are a DECISION, not an accident of implementation — do not
+# "correct" them toward #151's older wording.
 STAGE_INITIAL = 0
 STAGE_REMINDER_1 = 1
 STAGE_REMINDER_2 = 2
@@ -935,6 +948,84 @@ async def campaign_max_stage(session: AsyncSession, graduation_year: int) -> int
     return ceiling_stage_for(elapsed)
 
 
+# --------------------------------------------------------------- send lock ----
+#
+# ONE send at a time, account-wide (#358).
+#
+# `_claim_batch` already makes it impossible for two runners to email the same
+# alum — the claim is an atomic `ON CONFLICT DO NOTHING ... RETURNING`. What it
+# cannot do is stop them OVERSHOOTING THE DAILY BUDGET: each reads
+# `survey_schedule._run_allowance` before either has written a claim, so both
+# believe the whole day's allowance is theirs and jointly spend twice it. That
+# pushes the account past the Resend plan limit, which comes back as the 429s the
+# scheduler then has to absorb.
+#
+# A concurrent run is not hypothetical: both GET and POST `/survey/cron/run` are
+# live, Vercel Cron is at-least-once, and the likeliest collision of all is an
+# admin pressing "Send now" while the daily cron is mid-run.
+#
+# Why a Postgres advisory lock and not a module-level flag: the API runs as many
+# independent serverless instances, so nothing in Python memory is shared between
+# the two runners that need to see each other.
+#
+# Why a DEDICATED connection holding an open transaction, rather than taking the
+# lock on the caller's session:
+#
+#   * A send commits repeatedly as it goes (every batch is claimed and committed
+#     before it is sent). `pg_try_advisory_xact_lock` on the caller's session
+#     would therefore be RELEASED by the first batch's commit, roughly a second
+#     into a run that can last minutes — the guard would cover the budget read
+#     and nothing else.
+#   * Session-scoped locks (`pg_advisory_lock`) survive commits but not the
+#     pooler: on the transaction pooler (:6543) a connection is only pinned to a
+#     backend FOR THE DURATION OF A TRANSACTION, so a lock taken outside one can
+#     be left behind on a backend we never see again — an un-releasable lock that
+#     would wedge the cron permanently. Under NullPool (what both the serverless
+#     and transaction-pooler paths use) the connection is closed at commit
+#     anyway.
+#
+# A transaction-scoped lock held inside one long-lived transaction on a
+# connection of its own is correct under both poolers, and it CANNOT leak: if the
+# process dies the transaction dies with it and Postgres drops the lock.
+#
+# The lock is a `try`, never a wait. A run that cannot get it returns cleanly and
+# says so; it never blocks and never raises. Skipping is the right outcome —
+# sending is irreversible and the whole send path deliberately fails toward
+# "possibly missed" rather than "sent twice" (see `_claim_batch`) — and whatever
+# this run would have done is still owed, so the next cron does it.
+
+# Arbitrary but STABLE 64-bit key. Anything else taking a Postgres advisory lock
+# in this app must not reuse it. (Date + issue number, so its origin is legible.)
+_SEND_LOCK_KEY = 20260803358
+
+
+@asynccontextmanager
+async def send_lock() -> AsyncIterator[bool]:
+    """Hold the exclusive survey-send lock for the duration of the block.
+
+    Yields True when this caller owns it, False when another send already does.
+    Never blocks and never raises on contention — the caller decides what a
+    declined send means (the cron reports a skipped run; the manual send 409s).
+
+    Yields True when no database is configured (unit tests, a DB-less boot):
+    there is no second runner to race, and no connection to take a lock on.
+    """
+    engine = database.engine
+    if engine is None:
+        yield True
+        return
+    # A connection of our own, so the caller's per-batch commits cannot end the
+    # transaction this lock lives in. See the section notes above.
+    async with engine.connect() as conn, conn.begin():
+        acquired = bool(
+            await conn.scalar(
+                text("SELECT pg_try_advisory_xact_lock(:key)"),
+                {"key": _SEND_LOCK_KEY},
+            )
+        )
+        yield acquired
+
+
 # ----------------------------------------------------- claim-then-send core ---
 
 
@@ -1277,18 +1368,40 @@ async def send_campaign(
     outcome into the console's result shape. Everything that matters — who is
     eligible, who has already had this stage, the send log, the audit row, the
     commit boundary — is the shared helper's, identical to the cron's.
+
+    A REAL send takes :func:`send_lock` first, so it cannot run alongside the
+    daily cron (#358) — the two spending the same daily budget from independent
+    reads of it is how the account gets pushed past the Resend plan limit, and
+    "admin presses Send now while the 18:00 cron is mid-run" is the likeliest way
+    that happens. A declined send is a 409: the caller is a person waiting on an
+    answer, so it says so rather than reporting a silent "sent 0". A DRY RUN
+    takes no lock — it sends nothing, spends no budget, and staff must be able to
+    preview a cohort at any time, including while the cron is running.
     """
     settings = get_settings()
     base_url = settings.survey_app_base_url
     max_stage = await campaign_max_stage(session, graduation_year)
-    outcome = await send_survey_stage(
-        session,
-        graduation_year=graduation_year,
-        max_stage=max_stage,
-        actor_user_id=actor_user_id,
-        dry_run=dry_run,
-        limit=limit,
-    )
+
+    async def _send() -> SendOutcome:
+        return await send_survey_stage(
+            session,
+            graduation_year=graduation_year,
+            max_stage=max_stage,
+            actor_user_id=actor_user_id,
+            dry_run=dry_run,
+            limit=limit,
+        )
+
+    if dry_run:
+        outcome = await _send()
+    else:
+        async with send_lock() as acquired:
+            if not acquired:
+                raise ConflictError(
+                    "A survey send is already running. Wait for it to finish "
+                    "and try again — nothing was sent."
+                )
+            outcome = await _send()
     # What is left of THIS stage: the targets we did not send to. (Before, this
     # was measured against every eligible alum, which counted people who had
     # already received this exact email as still owed it.)

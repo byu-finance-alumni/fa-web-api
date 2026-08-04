@@ -133,6 +133,37 @@ class SurveyScheduleBulkRequest(BaseModel):
     schedules: list[SurveyScheduleCreateRequest]
 
 
+class SurveyNewCycleRequest(BaseModel):
+    """Start the next survey campaign for a graduation year (#357).
+
+    Carries only the new start date — the cycle number is server-assigned, never
+    client-supplied, so a caller can neither skip a cycle nor re-open an old one
+    and re-email against its log."""
+
+    start_date: datetime.date
+
+
+class SurveyNewCyclePreview(BaseModel):
+    """What ``POST /survey/schedules/{year}/new-cycle`` WOULD do (#357).
+
+    Backs the confirmation staff see before starting the next annual campaign.
+    Starting a cycle emails the whole eligible cohort again and cannot be
+    undone, so the dialog states the blast size in real numbers rather than
+    asking "are you sure?" about an abstraction."""
+
+    graduation_year: int
+    current_cycle: int
+    next_cycle: int
+    # The campaign's status right now — a cycle started while the previous one is
+    # still running is a likely mistake, so the UI can warn on it.
+    current_status: str
+    # Eligible alumni the new cycle would email (same eligibility as the send).
+    would_email: int
+    # How many of those already received the CURRENT cycle — i.e. the people who
+    # would get a second email. This is the number that makes the ask concrete.
+    previously_emailed: int
+
+
 class SurveyScheduleItem(BaseModel):
     """One survey schedule + how many emails each stage has sent so far."""
 
@@ -140,6 +171,9 @@ class SurveyScheduleItem(BaseModel):
     graduation_year: int
     start_date: datetime.date
     status: str
+    # Which campaign this year is on (#357). 1 until someone starts a second
+    # cycle. The per-stage counts below are scoped to THIS cycle, not all time.
+    cycle_seq: int = 1
     last_run_at: datetime.datetime | None = None
     created_at: datetime.datetime | None = None
     # Who started this campaign, as a display name (falling back to their email).

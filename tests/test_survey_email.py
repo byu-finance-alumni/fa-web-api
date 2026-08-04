@@ -194,7 +194,7 @@ def test_send_stops_and_reports_retry_after_on_429(fake_settings, monkeypatch):
     # Exactly the delivered 100 are recorded: the throttled batch's claim was
     # RELEASED (a 429 means Resend queued nothing), so those 100 are still owed.
     assert len(session.send_log) == 100
-    assert {stage for _y, _a, stage in session.send_log} == {0}
+    assert {stage for _y, _a, stage, _c in session.send_log} == {0}
     # The audit row is still written — and, unlike before, so is every claim,
     # each committed before its own send rather than all at the end.
     assert session.committed >= 1

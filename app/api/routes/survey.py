@@ -39,6 +39,8 @@ from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.schemas.survey import (
     GraduationYearCount,
+    SurveyNewCyclePreview,
+    SurveyNewCycleRequest,
     SurveyRespondInfo,
     SurveyResponseItem,
     SurveyScheduleBulkRequest,
@@ -241,6 +243,56 @@ async def create_survey_schedule(
         start_date=body.start_date,
         actor_user_id=user.user_id,
     )
+
+
+@router.get(
+    "/schedules/{grad_year}/new-cycle/preview",
+    response_model=SurveyNewCyclePreview,
+)
+async def preview_survey_new_cycle(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> SurveyNewCyclePreview:
+    """What starting a new survey cycle for this year would do (#357).
+
+    Read-only: nothing is scheduled and nothing is sent. Backs the confirmation
+    shown before the irreversible `new-cycle` call, so staff see how many alumni
+    would be emailed — and how many of those already received the current
+    cycle — before committing to it."""
+    preview = await survey_schedule.preview_new_cycle(session, grad_year)
+    if preview is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return preview
+
+
+@router.post("/schedules/{grad_year}/new-cycle", response_model=SurveyScheduleItem)
+async def start_survey_new_cycle(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    body: SurveyNewCycleRequest,
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> SurveyScheduleItem:
+    """Start the NEXT survey campaign for a graduation year (#357).
+
+    Advances the year's cycle, making the whole eligible cohort emailable again
+    while every previous cycle's send log stays intact as history. Nothing is
+    deleted.
+
+    Deliberately separate from `POST /schedules`, which REPLACES a year's
+    schedule without advancing the cycle (Jake, 2026-08-03). That one is the
+    "I mistyped the start date" correction and must never re-email anyone; this
+    one is the annual re-run and always will. Confirm with the user against
+    `new-cycle/preview` first — the send it sets up cannot be recalled."""
+    item = await survey_schedule.start_new_cycle(
+        session,
+        graduation_year=grad_year,
+        start_date=body.start_date,
+        actor_user_id=user.user_id,
+    )
+    if item is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return item
 
 
 @router.post("/schedules/bulk", response_model=list[SurveyScheduleItem])

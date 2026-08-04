@@ -167,7 +167,11 @@ def test_select_stage_targets_picks_the_lowest_stage_still_owed(fake_settings):
     recipients = _rcpts([1, 2, 3])
     stage, targets = asyncio.run(
         survey_email.select_stage_targets(
-            session, graduation_year=_YEAR, recipients=recipients, max_stage=2
+            session,
+            graduation_year=_YEAR,
+            recipients=recipients,
+            max_stage=2,
+            cycle_seq=1,
         )
     )
     # Stage 2's window is open, but stage 1 still owes alum 3 — finish that first.
@@ -181,7 +185,11 @@ def test_select_stage_targets_returns_none_when_nothing_is_owed(fake_settings):
         session.seed_sent(_YEAR, stage, [1, 2])
     stage, targets = asyncio.run(
         survey_email.select_stage_targets(
-            session, graduation_year=_YEAR, recipients=_rcpts([1, 2]), max_stage=2
+            session,
+            graduation_year=_YEAR,
+            recipients=_rcpts([1, 2]),
+            max_stage=2,
+            cycle_seq=1,
         )
     )
     # (None, []) is the ONLY honest basis for completing a campaign.
@@ -194,7 +202,11 @@ def test_select_stage_targets_never_exceeds_the_ceiling(fake_settings):
     session.seed_sent(_YEAR, 0, [1])
     stage, targets = asyncio.run(
         survey_email.select_stage_targets(
-            session, graduation_year=_YEAR, recipients=_rcpts([1]), max_stage=0
+            session,
+            graduation_year=_YEAR,
+            recipients=_rcpts([1]),
+            max_stage=0,
+            cycle_seq=1,
         )
     )
     # Day 0: the reminders are genuinely not due, so nothing is owed YET — which
@@ -221,7 +233,7 @@ def _patch_send(monkeypatch, *, recipients, batch, schedules=None, allowance=Non
     monkeypatch.setattr(survey_schedule, "_run_allowance", fake_allowance)
 
 
-def _sched(year, start, status="scheduled"):
+def _sched(year, start, status="scheduled", cycle_seq=1):
     return SimpleNamespace(
         survey_schedule_id=year,
         graduation_year=year,
@@ -232,6 +244,7 @@ def _sched(year, start, status="scheduled"):
         created_by_user_id=None,
         paused_at=None,
         paused_from_status=None,
+        cycle_seq=cycle_seq,
     )
 
 
@@ -274,9 +287,9 @@ def test_every_send_is_recorded_in_the_send_log(call_site, fake_settings, monkey
     # One row per email, at a REAL stage (never a synthetic "manual" -1, which
     # would satisfy the unique constraint alongside a stage-0 cron row).
     assert sorted(session.send_log) == [
-        (_YEAR, 1, 0),
-        (_YEAR, 2, 0),
-        (_YEAR, 3, 0),
+        (_YEAR, 1, 0, 1),
+        (_YEAR, 2, 0, 1),
+        (_YEAR, 3, 0, 1),
     ]
     # The audit row is still written for the trail (it is just no longer the
     # ledger — see get_send_usage).
@@ -326,7 +339,9 @@ def test_no_stage_minus_one(fake_settings, monkeypatch):
     _patch_send(monkeypatch, recipients=_rcpts([1]), batch=batch)
     session = SendLogSession()
     _run_manual(session)
-    assert {stage for _y, _a, stage in session.send_log} == {survey_email.STAGE_INITIAL}
+    assert {stage for _y, _a, stage, _c in session.send_log} == {
+        survey_email.STAGE_INITIAL
+    }
 
 
 def test_manual_send_stage_follows_the_schedule_when_there_is_one(
@@ -349,10 +364,10 @@ def test_manual_send_stage_follows_the_schedule_when_there_is_one(
     )
     _run_manual(session)
     assert sorted(session.send_log) == [
-        (_YEAR, 1, 0),
-        (_YEAR, 1, 1),
-        (_YEAR, 2, 0),
-        (_YEAR, 2, 1),
+        (_YEAR, 1, 0, 1),
+        (_YEAR, 1, 1, 1),
+        (_YEAR, 2, 0, 1),
+        (_YEAR, 2, 1, 1),
     ]
 
 
@@ -611,3 +626,113 @@ def test_recipients_are_ordered_so_truncation_is_reproducible():
     assert "ORDER BY alumni.alumni_id" in _sql(
         survey_email.eligible_alumni_query(_YEAR)
     )
+
+
+# =========================== fix: a grad year can be surveyed again (#357) ====
+#
+# `survey_send_log` was UNIQUE (graduation_year, alumni_id, stage) with no
+# campaign key, and nothing ever deletes from it — so "have we emailed this
+# person?" was a question about ALL TIME. A year's second campaign therefore
+# selected zero targets at every stage and reported active -> completed having
+# emailed nobody. Annual re-surveying is the product's core loop, so this bit on
+# the next cycle rather than hypothetically.
+#
+# These pin the cycle scoping at the three places it has to hold: target
+# selection, the send itself, and the release path that undoes a claim.
+
+
+def test_select_stage_targets_is_scoped_to_the_cycle(fake_settings):
+    """THE #357 regression, at its narrowest point.
+
+    Identical send log, identical recipients — only the cycle differs. Cycle 1
+    is fully drained; cycle 2 owes everyone. Before the fix both answered
+    "nothing owed", which is what silently completed a campaign that had emailed
+    nobody."""
+    session = SendLogSession()
+    for stage in (0, 1, 2):
+        session.seed_sent(_YEAR, stage, [1, 2, 3], cycle_seq=1)
+
+    drained_stage, drained = asyncio.run(
+        survey_email.select_stage_targets(
+            session,
+            graduation_year=_YEAR,
+            recipients=_rcpts([1, 2, 3]),
+            max_stage=2,
+            cycle_seq=1,
+        )
+    )
+    assert (drained_stage, drained) == (None, [])
+
+    stage, targets = asyncio.run(
+        survey_email.select_stage_targets(
+            session,
+            graduation_year=_YEAR,
+            recipients=_rcpts([1, 2, 3]),
+            max_stage=2,
+            cycle_seq=2,
+        )
+    )
+    assert stage == survey_email.STAGE_INITIAL
+    assert [r.alumni_id for r in targets] == [1, 2, 3]
+
+
+def test_a_second_cycle_reemails_the_whole_cohort(fake_settings, monkeypatch):
+    """End to end: the cohort that completed cycle 1 is emailed again in cycle 2.
+
+    This is the user-visible bug — a 21-day campaign that emailed nobody while
+    reporting itself active then completed."""
+    sent_to = []
+
+    async def batch(emails):
+        sent_to.extend(e["to"][0] for e in emails)
+        return (None, None)
+
+    _patch_send(
+        monkeypatch,
+        recipients=_rcpts([1, 2, 3]),
+        batch=batch,
+        schedules=[_sched(_YEAR, _TODAY, cycle_seq=2)],
+    )
+
+    session = SendLogSession()
+    for stage in (0, 1, 2):
+        session.seed_sent(_YEAR, stage, [1, 2, 3], cycle_seq=1)
+
+    _run_cron(session)
+
+    assert sorted(sent_to) == ["a1@example.com", "a2@example.com", "a3@example.com"]
+    # Logged under cycle 2...
+    assert session.logged(_YEAR, survey_email.STAGE_INITIAL, cycle_seq=2) == {1, 2, 3}
+    # ...and cycle 1's history is untouched. A new cycle adds rows, never
+    # rewrites or deletes the previous campaign's record.
+    assert session.logged(_YEAR, survey_email.STAGE_INITIAL, cycle_seq=1) == {1, 2, 3}
+
+
+def test_release_in_a_later_cycle_keeps_the_earlier_cycles_row(
+    fake_settings, monkeypatch
+):
+    """A throttled claim in cycle 2 must not delete cycle 1's delivery record.
+
+    The release DELETE matches (year, alumni, stage); unscoped it would also
+    match the previous cycle's row — destroying the record of an email that
+    really was delivered last year. Silent, and unrecoverable."""
+
+    async def batch(emails):
+        raise survey_email.ResendRateLimited(retry_after=30)
+
+    _patch_send(
+        monkeypatch,
+        recipients=_rcpts([1, 2]),
+        batch=batch,
+        schedules=[_sched(_YEAR, _TODAY, cycle_seq=2)],
+    )
+
+    session = SendLogSession()
+    session.seed_sent(_YEAR, survey_email.STAGE_INITIAL, [1, 2], cycle_seq=1)
+
+    _run_cron(session)
+
+    # Cycle 2's claim was released (they go out next run)...
+    assert session.logged(_YEAR, survey_email.STAGE_INITIAL, cycle_seq=2) == set()
+    # ...while last cycle's delivered rows survive intact.
+    assert session.logged(_YEAR, survey_email.STAGE_INITIAL, cycle_seq=1) == {1, 2}

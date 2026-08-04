@@ -65,20 +65,23 @@ class SendLogSession:
         self.added = []
         self.commits = 0
         self.executed = 0
-        self.send_log: set[tuple[int, int, int]] = set()
+        # (graduation_year, alumni_id, stage, cycle_seq) — mirrors the real
+        # UNIQUE constraint, cycle included (#357). Keying without the cycle
+        # would make this fake unable to reproduce the bug it now guards.
+        self.send_log: set[tuple[int, int, int, int]] = set()
         self._fail_commit_after = fail_commit_after
 
     # -- helpers -------------------------------------------------------------
 
-    def seed_sent(self, graduation_year, stage, alumni_ids):
+    def seed_sent(self, graduation_year, stage, alumni_ids, cycle_seq=1):
         for alumni_id in alumni_ids:
-            self.send_log.add((graduation_year, alumni_id, stage))
+            self.send_log.add((graduation_year, alumni_id, stage, cycle_seq))
 
-    def logged(self, graduation_year, stage):
+    def logged(self, graduation_year, stage, cycle_seq=1):
         return {
             alumni_id
-            for year, alumni_id, s in self.send_log
-            if year == graduation_year and s == stage
+            for year, alumni_id, s, cycle in self.send_log
+            if year == graduation_year and s == stage and cycle == cycle_seq
         }
 
     # -- session surface -----------------------------------------------------
@@ -110,7 +113,10 @@ class SendLogSession:
         year, stage = params.get("graduation_year_1"), params.get("stage_1")
         if year is None or stage is None:
             return None
-        return sorted(self.logged(year, stage))
+        # cycle_seq defaults to 1 so a query written before #357 still reads the
+        # first cycle rather than silently matching every cycle at once.
+        cycle = params.get("cycle_seq_1", 1)
+        return sorted(self.logged(year, stage, cycle))
 
     def add(self, obj):
         self.added.append(obj)
@@ -131,7 +137,12 @@ class SendLogSession:
         claimed = []
         for row in stmt._multi_values[0]:
             values = {col.name: value for col, value in row.items()}
-            key = (values["graduation_year"], values["alumni_id"], values["stage"])
+            key = (
+                values["graduation_year"],
+                values["alumni_id"],
+                values["stage"],
+                values.get("cycle_seq", 1),
+            )
             if key in self.send_log:
                 continue  # ON CONFLICT DO NOTHING -> not returned
             self.send_log.add(key)
@@ -142,9 +153,12 @@ class SendLogSession:
         params = dict(stmt.compile().params)
         year = params.get("graduation_year_1")
         stage = params.get("stage_1")
+        # Cycle-scoped, matching the real DELETE (#357): a release in cycle N
+        # must not remove cycle N-1's row for the same alum + stage.
+        cycle = params.get("cycle_seq_1", 1)
         ids = set(params.get("alumni_id_1") or [])
         self.send_log -= {
-            (year, alumni_id, stage) for alumni_id in ids
+            (year, alumni_id, stage, cycle) for alumni_id in ids
         }
 
 

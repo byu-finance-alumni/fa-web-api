@@ -622,8 +622,15 @@ CREATE INDEX IF NOT EXISTS idx_survey_responses_alumni_id ON survey_responses (a
 -- Survey send scheduler (#542). `survey_schedule` holds one row per graduation
 -- year (initial send date + campaign state); a daily Vercel cron sends the due
 -- stage. `survey_send_log` is the append-only record of every delivered email —
--- its UNIQUE (graduation_year, alumni_id, stage) prevents double-emailing across
--- cron runs. See migrations/2026-07-29_survey_scheduler.sql.
+-- its UNIQUE (graduation_year, alumni_id, stage, cycle_seq) prevents
+-- double-emailing across cron runs. See migrations/2026-07-29_survey_scheduler.sql.
+-- `cycle_seq` is the CAMPAIGN identity (#357): a year's first campaign is cycle
+-- 1, and starting the next annual one increments it. Without it the send log was
+-- an ALL-TIME record, so a re-surveyed year selected zero targets at every stage
+-- and "completed" having emailed nobody. It is deliberately an opaque counter,
+-- not a date — a campaign starting in late December sends its reminders in
+-- January, so a year-derived cycle would flip mid-campaign and re-send the
+-- initial to the whole cohort. See migrations/2026-08-03_survey_campaign_cycle.sql.
 -- `paused` is the REVERSIBLE stop (`cancelled` is terminal). `paused_at` is load-
 -- bearing, not just an audit stamp: the send stage is derived from
 -- `today - start_date`, so resume shifts `start_date` forward by the paused
@@ -639,11 +646,13 @@ CREATE TABLE survey_schedule (
     last_run_at         timestamptz,
     paused_at           timestamptz,
     paused_from_status  varchar(20),
+    cycle_seq           int NOT NULL DEFAULT 1,
     created_at          timestamptz NOT NULL DEFAULT now(),
     updated_at          timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_survey_schedule_created_by FOREIGN KEY (created_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
     CONSTRAINT ck_survey_schedule_status CHECK (status IN ('scheduled', 'active', 'paused', 'completed', 'cancelled')),
-    CONSTRAINT ck_survey_schedule_paused_from_status CHECK (paused_from_status IS NULL OR paused_from_status IN ('scheduled', 'active'))
+    CONSTRAINT ck_survey_schedule_paused_from_status CHECK (paused_from_status IS NULL OR paused_from_status IN ('scheduled', 'active')),
+    CONSTRAINT ck_survey_schedule_cycle_seq CHECK (cycle_seq >= 1)
 );
 
 CREATE TABLE survey_send_log (
@@ -651,11 +660,14 @@ CREATE TABLE survey_send_log (
     graduation_year     int NOT NULL,
     alumni_id           bigint NOT NULL,
     stage               smallint NOT NULL,
+    cycle_seq           int NOT NULL DEFAULT 1,
     sent_at             timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_survey_send_log_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
-    CONSTRAINT uq_survey_send_log_year_alumni_stage UNIQUE (graduation_year, alumni_id, stage)
+    CONSTRAINT ck_survey_send_log_cycle_seq CHECK (cycle_seq >= 1),
+    CONSTRAINT uq_survey_send_log_year_alumni_stage UNIQUE (graduation_year, alumni_id, stage, cycle_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_survey_send_log_year_stage ON survey_send_log (graduation_year, stage);
+CREATE INDEX IF NOT EXISTS ix_survey_send_log_year_cycle_stage ON survey_send_log (graduation_year, cycle_seq, stage);
 
 -- Survey send cap (#542 follow-up). Single-row config (id pinned to 1) the
 -- scheduler paces against: when `enabled`, sends at most `daily_limit`/day and

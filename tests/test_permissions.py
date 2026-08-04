@@ -58,11 +58,18 @@ def test_default_grants_reproduce_historical_guards():
         Capability.VIEW,
         Capability.ALUMNI_EDIT,
         Capability.ALUMNI_FULL,
+        # events.create / events.import were split out of alumni.full (#378) and
+        # seeded to exactly the roles that held it, so event authoring is
+        # unchanged for full_access.
+        Capability.EVENTS_CREATE,
+        Capability.EVENTS_IMPORT,
     }
     assert caps("super_admin") == {
         Capability.VIEW,
         Capability.ALUMNI_EDIT,
         Capability.ALUMNI_FULL,
+        Capability.EVENTS_CREATE,
+        Capability.EVENTS_IMPORT,
         Capability.USER_ADMIN,
         # donations.manage and profile.completeness are newer capabilities (not
         # among the original hardcoded guards) whose default grant includes

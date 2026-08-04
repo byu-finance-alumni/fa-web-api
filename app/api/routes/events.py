@@ -1,4 +1,20 @@
-"""Event listing routes."""
+"""Event routes.
+
+Authorization here is capability-based (see ``app/core/capabilities.py``), and
+after #378 it is deliberately not uniform:
+
+* reads (list / options / detail / attendee roster) — ``view``
+* **create one event** (``POST /events``) — ``events.create``
+* **bulk upload** (``/events/import`` template, preview, commit) —
+  ``events.import``
+* edit / delete / attendee-roster writes / attendee export — ``alumni.full``
+
+``events.create`` and ``events.import`` were split OUT of ``alumni.full`` so an
+engineer can widen who may author events without also handing over alumni
+create/archive/import. Both are seeded to exactly the roles that already held
+``alumni.full`` (full_access + super_admin, plus the engineer hard-override), so
+the split is behaviour-preserving until the permission matrix is edited.
+"""
 
 import csv
 import datetime
@@ -10,7 +26,12 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.dependencies.auth import (
+    RequireEventsCreate,
+    RequireEventsImport,
+    RequireFullAccess,
+    RequireViewAccess,
+)
 from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
@@ -135,10 +156,18 @@ async def event_options(_: RequireViewAccess, session: SessionDep) -> dict:
     return {"types": [r[0] for r in rows if r[0]]}
 
 
-# --- Bulk CSV import (full_access) -------------------------------------------
+# --- Bulk CSV import (events.import capability) -------------------------------
 #
 # Declared BEFORE the ``/{event_id}`` routes so the literal ``/import/...`` paths
 # win over the ``/{event_id}`` patterns (route matching is declaration-ordered).
+#
+# Gated on the editable ``events.import`` capability (#378) rather than the
+# blanket ``alumni.full``. All three legs of the flow — template, dry-run
+# preview, and commit — carry the SAME guard on purpose: the preview reads real
+# alumni (it resolves Net IDs and reports who matched), so leaving it on a looser
+# guard would leak roster data to a role that cannot import. Seeded to exactly
+# the roles that held ``alumni.full``, so nothing changes until an engineer edits
+# the matrix.
 
 
 async def _read_capped(file: UploadFile) -> bytes | None:
@@ -168,8 +197,8 @@ def _too_large_response() -> JSONResponse:
 
 
 @router.get("/import/template")
-async def events_import_template(_: RequireFullAccess) -> Response:
-    """Download the events bulk-import CSV template (full_access): the exact
+async def events_import_template(_: RequireEventsImport) -> Response:
+    """Download the events bulk-import CSV template (``events.import``): the exact
     columns plus a few example rows (two attendees share one event to show how
     rows group into a single event)."""
     return Response(
@@ -215,7 +244,7 @@ def _headers_bad_preview(header_errors: list[str], meta: dict) -> dict:
 
 @router.post("/import/preview", response_model=EventImportPreview)
 async def preview_import_events(
-    _: RequireFullAccess,
+    _: RequireEventsImport,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
     event_name: EventNameForm,
@@ -224,7 +253,7 @@ async def preview_import_events(
     event_location: EventLocationForm = None,
     event_notes: EventNotesForm = None,
 ) -> dict | JSONResponse:
-    """Dry-run a single-event attendee CSV import (full_access, NO writes).
+    """Dry-run a single-event attendee CSV import (``events.import``, NO writes).
 
     The event's identity (title/date/type/…) comes from the wizard as form
     fields; the CSV is the attendee roster. Resolves attendees by Net ID and
@@ -244,7 +273,7 @@ async def preview_import_events(
 
 @router.post("/import", response_model=EventImportResult)
 async def import_events_commit(
-    user: RequireFullAccess,
+    user: RequireEventsImport,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
     event_name: EventNameForm,
@@ -253,7 +282,7 @@ async def import_events_commit(
     event_location: EventLocationForm = None,
     event_notes: EventNotesForm = None,
 ) -> dict | JSONResponse:
-    """Commit a single-event attendee CSV import (full_access). Re-evaluates and,
+    """Commit a single-event attendee CSV import (``events.import``). Re-evaluates and,
     if the event identity is valid and new, inserts the event + its matched
     attendees in one transaction (audit logging fires for the event and each
     attendee); unmatched attendees are skipped and reported. A bad header set
@@ -280,10 +309,17 @@ async def import_events_commit(
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_event(
-    payload: EventCreate, user: RequireFullAccess, session: SessionDep
+    payload: EventCreate, user: RequireEventsCreate, session: SessionDep
 ) -> dict:
-    """Create an event (full_access). Stamps the acting user and audits the
-    write (entity_type "event", action "create")."""
+    """Create an event (``events.create``). Stamps the acting user and audits the
+    write (entity_type "event", action "create").
+
+    Gated on the editable ``events.create`` capability (#378), seeded to the same
+    roles that previously held ``alumni.full``. Note that PATCH/DELETE and the
+    attendee-roster routes below deliberately stay on ``alumni.full`` — this
+    issue scoped the new toggles to authoring (create + bulk upload), and
+    silently widening who can edit or delete existing events would be a
+    different, unreviewed permission change."""
     event = Event(
         event_name=payload.event_name,
         event_type=payload.event_type,

@@ -304,6 +304,15 @@ require_super_admin = require_capability(Capability.USER_ADMIN)
 # defaults to the same roles (super_admin + engineer), so behaviour is unchanged.
 require_donations_manage = require_capability(Capability.DONATIONS_MANAGE)
 require_full_access = require_capability(Capability.ALUMNI_FULL)
+# Event authoring (#378), split out of ALUMNI_FULL as two separate capabilities
+# so the engineer can widen "create an event" without also widening "upload a
+# file that creates an event plus hundreds of attendance rows". Both default to
+# the same roles that held ALUMNI_FULL (full_access + super_admin + engineer),
+# so behaviour is unchanged until the config is edited. These REPLACE (not
+# supplement) the ALUMNI_FULL guard on the routes they cover — requiring both
+# would make the new toggles unusable on their own, defeating the point.
+require_events_create = require_capability(Capability.EVENTS_CREATE)
+require_events_import = require_capability(Capability.EVENTS_IMPORT)
 # Edit an EXISTING alumnus / their nested records — not create/archive/import.
 require_alumni_edit = require_capability(Capability.ALUMNI_EDIT)
 require_view_only = require_capability(Capability.VIEW)
@@ -317,6 +326,8 @@ require_engineer = require_capability(Capability.ENGINEER)
 RequireSuperAdmin = Annotated[UserContext, Depends(require_super_admin)]
 RequireDonationsManage = Annotated[UserContext, Depends(require_donations_manage)]
 RequireFullAccess = Annotated[UserContext, Depends(require_full_access)]
+RequireEventsCreate = Annotated[UserContext, Depends(require_events_create)]
+RequireEventsImport = Annotated[UserContext, Depends(require_events_import)]
 RequireAlumniEdit = Annotated[UserContext, Depends(require_alumni_edit)]
 RequireViewAccess = Annotated[UserContext, Depends(require_view_only)]
 RequireVocabAdmin = Annotated[UserContext, Depends(require_vocab_admin)]

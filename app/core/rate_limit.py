@@ -32,6 +32,7 @@ from fastapi import Depends, HTTPException, Request, status
 from app.api.dependencies.auth import (
     get_current_db_user_allow_must_change,
     require_alumni_edit,
+    require_engineer,
     require_full_access,
     require_super_admin,
     require_view_only,
@@ -162,12 +163,31 @@ RECORD_LOGIN_LIMITER = rate_limiter(
     window_seconds=600,
     actor_guard=get_current_db_user_allow_must_change,
 )
+# Turning maintenance mode ON is the most destructive single call in the app: it
+# invalidates every non-engineer session at once and closes the site. A generous
+# budget (an incident may legitimately involve a few flips) that still brakes a
+# runaway loop or a compromised engineer token from thrashing the switch.
+#
+# THE *DISABLE* ENDPOINT IS DELIBERATELY NOT LIMITED. Turning maintenance OFF is
+# the recovery path, and a limiter on it is itself a lockout: burn the budget —
+# by accident, by a retry loop, or on purpose — and the site stays down for the
+# length of the window with no way to bring it back. Throttling only the
+# destructive direction keeps the brake where the damage is.
+ENABLE_MAINTENANCE_LIMITER = rate_limiter(
+    "maintenance:enable",
+    limit=20,
+    window_seconds=600,
+    actor_guard=require_engineer,
+)
 
 ResetPasswordRateLimit = Annotated[UserContext, Depends(RESET_PASSWORD_LIMITER)]
 CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
 AssignRoleRateLimit = Annotated[UserContext, Depends(ASSIGN_ROLE_LIMITER)]
 DeleteUserRateLimit = Annotated[UserContext, Depends(DELETE_USER_LIMITER)]
 RecordLoginRateLimit = Annotated[UserContext, Depends(RECORD_LOGIN_LIMITER)]
+EnableMaintenanceRateLimit = Annotated[
+    UserContext, Depends(ENABLE_MAINTENANCE_LIMITER)
+]
 
 # --- Alumni mutation routes (#112a) ------------------------------------------
 #

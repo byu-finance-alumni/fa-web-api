@@ -27,6 +27,7 @@ from app.models.event import Event, EventAttendance
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
+from app.models.maintenance import MaintenanceMode
 from app.models.note import Note
 from app.models.role_capability import RoleCapability
 from app.models.survey_response import SurveyResponse
@@ -60,6 +61,7 @@ __all__ = [
     "LoginAttempt",
     "LoginEvent",
     "LoginFailure",
+    "MaintenanceMode",
     "Note",
     "Role",
     "RoleCapability",

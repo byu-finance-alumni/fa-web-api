@@ -53,6 +53,7 @@ from app.schemas.alumni import (
     AlumniPage,
     AlumniRead,
     AlumniUpdateFull,
+    HeadshotUrls,
     minimize_alumni_read,
 )
 from app.schemas.alumni_export import AlumniExportRequest, ExportColumnCatalog
@@ -621,6 +622,10 @@ _HEADSHOT_BULK_MAX_PER_REQUEST = 100
 # How many storage round-trips (mint / probe) we run at once within a request.
 # Bounded so a full batch can't open 100 simultaneous connections to Supabase.
 _HEADSHOT_BULK_CONCURRENCY = 8
+# Per-REQUEST cap on the batch signed-URL read (``GET /alumni/headshots/urls``).
+# The roster asks for one page (25 rows); this bounds how much storage fan-out a
+# single invocation can be asked to do.
+_HEADSHOT_BATCH_MAX = 100
 
 
 def _net_id_from_filename(name: str) -> str:
@@ -798,6 +803,65 @@ async def confirm_headshot_upload(
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
     await session.commit()
     return Response(status_code=204)
+
+
+@router.get("/headshots/urls", response_model=HeadshotUrls)
+async def get_headshot_urls(
+    user: RequireViewAccess,
+    session: SessionDep,
+    alumni_ids: Annotated[list[int], Query()],
+) -> HeadshotUrls:
+    """Signed headshot URLs for a BATCH of alumni, keyed by ``alumni_id``.
+
+    The roster used to call ``GET /alumni/{id}/headshot`` once per visible row —
+    25 function invocations and 25 single-row ``SELECT``s to render one page (a
+    textbook N+1). This does the same work in one request: one query for all the
+    net IDs, then storage round-trips only for the alumni that actually have one.
+    Ids are deduplicated first, so the same alumnus is never signed twice in a
+    single call.
+
+    Same read gate as the single-headshot route (any view role). An id that
+    doesn't exist, an alumnus with no net ID, or one with no image on file all
+    come back ``null`` — the list falls back to the initials avatar — because a
+    roster must not fail because one row has no photo."""
+    unique_ids = list(dict.fromkeys(alumni_ids))
+    if not unique_ids:
+        raise InvalidRequestError("At least one alumni id is required.")
+    if len(unique_ids) > _HEADSHOT_BATCH_MAX:
+        raise InvalidRequestError(
+            f"At most {_HEADSHOT_BATCH_MAX} alumni ids may be requested at once."
+        )
+
+    rows = (
+        await session.scalars(select(Alumni).where(Alumni.alumni_id.in_(unique_ids)))
+    ).all()
+    # Only alumni with a net ID have an object key at all; the rest resolve to
+    # null WITHOUT a storage round-trip.
+    targets: list[tuple[int, str]] = []
+    for alumnus in rows:
+        net_id = (alumnus.net_id or "").strip()
+        if net_id:
+            targets.append((alumnus.alumni_id, net_id))
+
+    urls: dict[int, str | None] = dict.fromkeys(unique_ids)
+    if targets:
+        semaphore = asyncio.Semaphore(_HEADSHOT_BULK_CONCURRENCY)
+
+        async def _sign(net_id: str) -> str | None:
+            async with semaphore:
+                try:
+                    return await supabase_storage.create_signed_url(
+                        _HEADSHOT_BUCKET, net_id
+                    )
+                except ServiceError:
+                    # One unavailable signature costs that row its photo only —
+                    # it must never fail the whole page.
+                    return None
+
+        signed = await asyncio.gather(*(_sign(net_id) for _, net_id in targets))
+        for (alumni_id, _), url in zip(targets, signed, strict=True):
+            urls[alumni_id] = url
+    return HeadshotUrls(urls=urls)
 
 
 @router.get("/{alumni_id}/headshot")

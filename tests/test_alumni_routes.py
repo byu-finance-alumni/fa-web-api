@@ -1160,3 +1160,101 @@ def test_bulk_headshot_routes_are_rate_limited(client):
     ]
     rate_limit.reset()
     assert 429 in statuses
+
+
+# --- Batch headshot URLs (GET /alumni/headshots/urls) -------------------------
+#
+# The roster used to mint one signed URL PER ROW per render. These pin the two
+# properties that make the batch route cheaper than that loop: one storage
+# round-trip per DISTINCT alumnus that actually has a net ID, and none at all for
+# anyone who doesn't.
+
+
+def _sign_stub(calls):
+    async def _create(bucket, path, **kwargs):
+        calls.append((bucket, path))
+        return f"https://storage.test/sign/{bucket}/{path}?token=abc"
+
+    return _create
+
+
+def test_headshot_urls_requires_auth(client):
+    assert client.get("/alumni/headshots/urls?alumni_ids=1").status_code == 401
+
+
+def test_headshot_urls_signs_once_per_alumnus_with_a_net_id(monkeypatch):
+    """One signature per alumnus that HAS a net ID; an alumnus without one (and
+    an id that matches nobody) resolves to null with no storage call at all."""
+    calls: list = []
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "create_signed_url", _sign_stub(calls)
+    )
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5), _alumnus(None, 6)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    try:
+        with TestClient(app) as c:
+            resp = c.get("/alumni/headshots/urls?alumni_ids=5&alumni_ids=6&alumni_ids=7")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    urls = resp.json()["urls"]
+    # Every requested id is answered, so the caller never has to guess.
+    assert set(urls) == {"5", "6", "7"}
+    assert urls["5"].startswith("https://storage.test/sign/headshots/jdoe12")
+    assert urls["6"] is None  # no net_id -> no object key
+    assert urls["7"] is None  # unknown alumnus -> null, not 404
+    assert calls == [("headshots", "jdoe12")]
+
+
+def test_headshot_urls_deduplicates_repeated_ids(monkeypatch):
+    """The same alumnus asked for five times costs ONE signature — the exact
+    waste seen in the storage logs."""
+    calls: list = []
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "create_signed_url", _sign_stub(calls)
+    )
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    try:
+        with TestClient(app) as c:
+            resp = c.get("/alumni/headshots/urls?" + "&".join(["alumni_ids=5"] * 5))
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert calls == [("headshots", "jdoe12")]
+
+
+def test_headshot_urls_survives_an_unavailable_storage_service(monkeypatch):
+    """A storage outage costs that row its photo (initials fallback), never the
+    whole page."""
+
+    async def _boom(bucket, path, **kwargs):
+        raise alumni_routes.ServiceError("storage down")
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "create_signed_url", _boom)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    app.dependency_overrides[get_session] = _with_session(session)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    try:
+        with TestClient(app) as c:
+            resp = c.get("/alumni/headshots/urls?alumni_ids=5")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json()["urls"] == {"5": None}
+
+
+def test_headshot_urls_rejects_an_oversized_batch(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    ids = "&".join(
+        f"alumni_ids={i}" for i in range(alumni_routes._HEADSHOT_BATCH_MAX + 1)
+    )
+    resp = client.get(f"/alumni/headshots/urls?{ids}")
+    assert resp.status_code == 422
+
+
+def test_headshot_urls_requires_at_least_one_id(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    assert client.get("/alumni/headshots/urls").status_code == 422

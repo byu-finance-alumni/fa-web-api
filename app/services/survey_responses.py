@@ -36,7 +36,7 @@ from app.schemas.survey import (
     SurveySubmitResult,
 )
 from app.services import supabase_storage
-from app.services.survey_email import verify_survey_token
+from app.services.survey_email import LINK_DEAD_MESSAGE, verify_survey_token
 
 # A staged survey photo lives in the SAME private bucket as real headshots, but
 # under a `survey-pending/` prefix so it can NEVER overwrite an alum's actual
@@ -303,12 +303,12 @@ async def submit_response(
     no-op (no recognized fields AND no photo) returns early with a null id."""
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
-        raise NotFoundError("This survey link is invalid or has expired.")
+        raise NotFoundError(LINK_DEAD_MESSAGE)
     alum = (
         await session.execute(select(Alumni).where(Alumni.alumni_id == alumni_id))
     ).scalar_one_or_none()
     if alum is None or alum.archived:
-        raise NotFoundError("This survey link is invalid or has expired.")
+        raise NotFoundError(LINK_DEAD_MESSAGE)
 
     payload = {k: _text(v) for k, v in (fields or {}).items() if k in _FIELD_BY_KEY}
     if not payload and not has_photo:
@@ -345,7 +345,7 @@ async def stage_photo(
     (never an alum's live headshot) and recorded on the row for admin review."""
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
-        raise NotFoundError("This survey link is invalid or has expired.")
+        raise NotFoundError(LINK_DEAD_MESSAGE)
     resp = (
         await session.execute(
             select(SurveyResponse).where(

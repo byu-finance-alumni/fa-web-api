@@ -14,6 +14,8 @@ path exists. There is no such write path today, so nothing imports this yet.
 
 from __future__ import annotations
 
+from app.core.errors import InvalidRequestError
+
 # Industries — current_industry, current_industry_secondary, employment_industry.
 #
 # ORDER IS THE DROPDOWN ORDER and is mirrored by ``vocabulary_terms.sort_order``
@@ -255,6 +257,47 @@ def normalize_designation(value: str | None) -> str | None:
     if not holds_designation(value):
         return None
     return str(value).strip()
+
+
+# The designation tokens the ``designations`` FILTER accepts (#404) — the same
+# three flag columns ``app.repositories.alumni._DESIGNATION_COLUMNS`` maps.
+DESIGNATION_TOKENS: tuple[str, ...] = ("CFP", "CFA", "CPA")
+
+
+def parse_designation_tokens(values: str | list[str] | None) -> list[str]:
+    """Normalize + validate the ``designations`` filter input (#404).
+
+    Accepts a single string, a repeatable list, and/or comma-separated values;
+    upper-cases, trims, de-dupes, and validates every token against
+    :data:`DESIGNATION_TOKENS`.
+
+    An unknown token raises :class:`InvalidRequestError` (422) rather than being
+    dropped. That is load-bearing, not defensive: ``build_alumni_query`` only
+    applies the designation EXISTS for tokens it recognizes, so a silently
+    dropped token would leave NO predicate at all — a filtered view would widen
+    to everyone. This is the ONE parser for the filter, shared by
+    ``GET /alumni`` and ``POST /alumni/export`` so the two can never disagree
+    about which population a designation filter means (#366).
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    valid = set(DESIGNATION_TOKENS)
+    out: list[str] = []
+    for raw in values:
+        for piece in str(raw).split(","):
+            token = piece.strip().upper()
+            if not token:
+                continue
+            if token not in valid:
+                raise InvalidRequestError(
+                    f"Unknown designation '{piece.strip()}'. "
+                    f"Valid values: {', '.join(DESIGNATION_TOKENS)}."
+                )
+            if token not in out:
+                out.append(token)
+    return out
 
 
 # Tags — the fixed, canonical engagement tags an alumnus can be labelled with

@@ -28,6 +28,7 @@ from app.api.dependencies.auth import (
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
+from app.core.dropdowns import parse_designation_tokens
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.core.rate_limit import (
     BulkHeadshotRateLimit,
@@ -105,33 +106,10 @@ router = APIRouter(prefix="/alumni", tags=["alumni"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
-# Professional designations accepted by the ``designations`` list filter (#404).
-_VALID_DESIGNATIONS = ("CFP", "CFA", "CPA")
-
-
-def _parse_designations(values: list[str] | None) -> list[str]:
-    """Normalize the repeatable/CSV ``designations`` query param (#404).
-
-    Splits comma-separated values, upper-cases + de-dupes, and validates every
-    token against CFP / CFA / CPA. An unknown value raises a 422 rather than
-    being silently dropped, so a typo surfaces instead of returning everyone."""
-    if not values:
-        return []
-    valid = set(_VALID_DESIGNATIONS)
-    out: list[str] = []
-    for raw in values:
-        for piece in raw.split(","):
-            token = piece.strip().upper()
-            if not token:
-                continue
-            if token not in valid:
-                raise InvalidRequestError(
-                    f"Unknown designation '{piece.strip()}'. "
-                    "Valid values: CFP, CFA, CPA."
-                )
-            if token not in out:
-                out.append(token)
-    return out
+# The repeatable/CSV ``designations`` query param (#404) is normalized +
+# validated by ``dropdowns.parse_designation_tokens`` (values: DESIGNATION_TOKENS
+# = CFP / CFA / CPA) — the SAME parser the export body runs, so the list and the
+# export can't disagree about what a designation filter means (#366).
 
 
 @router.get("", response_model=AlumniPage)
@@ -434,42 +412,20 @@ async def list_alumni(
     is_alumni_filter = {"alumni": True, "friend": False, "all": None}[kind]
     # Designation facet (#404): validate + normalize CFP/CFA/CPA tokens (422 on
     # an unknown value) before they reach the query builder.
-    designation_filter = _parse_designations(designations)
-    # Natural-language location search (#358). When a ``near`` phrase is present we
-    # ask the geocoding module to resolve it to a center + a set of nearby cities;
-    # a ``radius`` override is folded into the phrase so the resolved city set (and
-    # the human label) reflect it consistently. A resolved query yields a match-
-    # predicate we AND into the list filters; an unresolvable phrase falls back to
-    # the normal search, flagged ``resolved=false`` so the UI can show a soft note.
-    location_filter = None
-    location_envelope: dict | None = None
-    if near and near.strip():
-        near_text = near.strip()
-        # A ``radius`` override is encoded into the phrase so the geo module's
-        # resolved city set AND label reflect it. If that phrasing doesn't parse
-        # (e.g. an odd region alias), fall back to the raw phrase so a valid place
-        # still resolves; the override radius is then only echoed in the envelope.
-        resolved = None
-        if radius is not None:
-            resolved = await geo_search.resolve_location_query(
-                session, f"within {radius:g} miles of {near_text}"
-            )
-        if resolved is None:
-            resolved = await geo_search.resolve_location_query(session, near_text)
-        if resolved is not None:
-            match, keys = resolved
-            location_filter = geo_search.alumni_location_filter(keys)
-            location_envelope = {
-                "label": match.label,
-                "radius_miles": (
-                    radius if radius is not None else getattr(match, "radius_miles", None)
-                ),
-                "resolved": True,
-            }
-        else:
-            # Couldn't pinpoint the place — don't filter (normal search still runs)
-            # but tell the UI so it can surface a "couldn't pinpoint" note.
-            location_envelope = {"label": near_text, "resolved": False}
+    designation_filter = parse_designation_tokens(designations)
+    # Natural-language location search (#358): resolve the ``near`` phrase (+ any
+    # ``radius`` override) to a set of nearby cities and AND the resulting match
+    # predicate into the list filters. An unresolvable phrase yields no predicate
+    # and ``resolved=False`` in the envelope, so the normal search still runs and
+    # the UI can show a "couldn't pinpoint" note.
+    #
+    # ``geo_search.resolve_near`` is the SHARED resolution path — the export
+    # (POST /alumni/export) calls the very same function, so a "near Provo" list
+    # and an export launched from it can't disagree about which cities that means
+    # (#366).
+    location_filter, location_envelope = await geo_search.resolve_near(
+        session, near, radius
+    )
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -1545,9 +1501,16 @@ async def export_alumni(
     session: SessionDep,
 ) -> Response | JSONResponse:
     """Export the filtered alumni list as CSV with the chosen columns
-    (full_access). Hits the SAME population the list view shows (same filters).
-    An unknown column key is a 422; a result set larger than the export cap is a
-    413 asking the caller to narrow filters. Audit-logged (``export_alumni``)."""
+    (full_access). Hits the SAME population the list view shows: the body
+    mirrors every ``GET /alumni`` filter and runs the same
+    ``build_alumni_query`` predicates, with ``near``/``radius`` re-resolved
+    through the same geocoding path (#366).
+
+    An unknown column key is a 422; so is an unknown designation token or a
+    ``near`` phrase that can't be pinpointed — both fail closed rather than
+    dropping the predicate and handing back a wider population than the list
+    showed. A result set larger than the export cap is a 413 asking the caller to
+    narrow filters. Audit-logged (``export_alumni``)."""
     try:
         columns = alumni_export.validate_columns(payload.columns)
     except ValueError as exc:

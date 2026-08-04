@@ -430,6 +430,239 @@ def _reject_reason(report: dict) -> str:
     return "Rejected."
 
 
+# --- Attendees into an EXISTING event (#611) ---------------------------------
+#
+# The flow above is "one CSV creates one event". Staff also need the reverse
+# order: create the event on its own (no roster yet), then upload the attendee
+# CSV to that event later. The stages below take the SAME CSV shape
+# (:data:`EXPECTED_HEADERS`, so one template serves both) but target an event
+# that already exists, so there is no event identity to validate or duplicate —
+# only the roster is read, and rows already on the roster are skipped rather
+# than conflicting.
+
+
+async def _existing_attendee_ids(session: AsyncSession, event_id: int) -> set[int]:
+    """alumni_ids already on this event's roster (one query, not per row)."""
+    rows = (
+        await session.execute(
+            select(EventAttendance.alumni_id).where(
+                EventAttendance.event_id == event_id
+            )
+        )
+    ).all()
+    return {r[0] for r in rows}
+
+
+async def evaluate_for_event(
+    session: AsyncSession, rows: list[dict], event: Event
+) -> dict:
+    """Dry-run report for adding ``rows`` to an EXISTING event. NO writes.
+
+    Resolves every Net ID in one batch query and loads the current roster in one
+    more, then classifies each row as matched-new, already-attending, or
+    unmatched. ``importable`` is true when at least one attendee would actually
+    be added — a file where everyone is already on the roster (or nobody
+    matched) is a no-op and says so instead of pretending to import.
+    """
+    matched = await match_net_ids(session, [r["net_id"] for r in rows if r["net_id"]])
+    already = await _existing_attendee_ids(session, event.event_id)
+
+    attendees: list[dict] = []
+    warnings: list[dict] = []
+    seen_net: set[str] = set()
+    matched_count = unmatched_count = existing_count = 0
+
+    for r in rows:
+        if r["error"]:
+            warnings.append({"code": "invalid_row", "message": r["error"]})
+            continue
+        net = r["net_id"]
+        norm = normalize_net_id(net)
+        if norm in seen_net:
+            warnings.append(
+                {
+                    "code": "duplicate_attendee",
+                    "message": (
+                        f"Net ID {net!r} is listed more than once; counted once."
+                    ),
+                }
+            )
+            continue
+        seen_net.add(norm)
+        alumni_id = matched.get(norm)
+        is_existing = alumni_id is not None and alumni_id in already
+        if alumni_id is None:
+            unmatched_count += 1
+        else:
+            matched_count += 1
+            if is_existing:
+                existing_count += 1
+        attendees.append(
+            {
+                "row": r["row"],
+                "net_id": net,
+                "name": r["attendee_name"],
+                "notes": r["notes"],
+                "matched": alumni_id is not None,
+                "alumni_id": alumni_id,
+                "already_attending": is_existing,
+            }
+        )
+
+    new_count = matched_count - existing_count
+    if attendees and matched_count == 0:
+        warnings.append(
+            {
+                "code": "no_attendees_matched",
+                "message": (
+                    "None of the attendee Net IDs matched an active alumnus — "
+                    "nothing would be added. Check you uploaded the right CSV."
+                ),
+            }
+        )
+    elif attendees and new_count == 0:
+        warnings.append(
+            {
+                "code": "all_already_attending",
+                "message": (
+                    "Everyone in this file is already an attendee of this event — "
+                    "nothing would be added."
+                ),
+            }
+        )
+
+    return {
+        "columns_ok": True,
+        "header_errors": [],
+        "event": {
+            "event_id": event.event_id,
+            "event_name": event.event_name,
+            "event_date": event.event_date.isoformat() if event.event_date else None,
+        },
+        "importable": new_count > 0,
+        "summary": {
+            "total_rows": len(rows),
+            "attendees_matched": matched_count,
+            "attendees_unmatched": unmatched_count,
+            "attendees_existing": existing_count,
+            "attendees_new": new_count,
+        },
+        "attendees": attendees,
+        "warnings": warnings,
+    }
+
+
+async def commit_attendees_for_event(
+    session: AsyncSession,
+    rows: list[dict],
+    event: Event,
+    actor_user_id: int | None = None,
+) -> dict:
+    """Re-evaluate and ADD the matched-new attendees to an existing event.
+
+    The event itself is never created, updated, or replaced here — only
+    ``event_attendance`` rows are inserted, under a SAVEPOINT, each audited as
+    ``event``/``add_attendee`` exactly like the manual single-attendee route.
+    Attendees already on the roster are skipped (not conflicts); unmatched Net
+    IDs are reported and skipped, never invented.
+    """
+    report = await evaluate_for_event(session, rows, event)
+    unmatched = [
+        {"row": a["row"], "net_id": a["net_id"], "name": a["name"]}
+        for a in report["attendees"]
+        if not a["matched"]
+    ]
+    skipped_existing = report["summary"]["attendees_existing"]
+
+    if not report["importable"]:
+        return {
+            "imported": False,
+            "event_id": event.event_id,
+            "added": 0,
+            "skipped_existing": skipped_existing,
+            "unmatched": unmatched,
+            "error": _no_op_reason(report),
+        }
+
+    added = 0
+    async with session.begin_nested() as savepoint:
+        try:
+            for att in report["attendees"]:
+                if not att["matched"] or att["already_attending"]:
+                    continue
+                session.add(
+                    EventAttendance(
+                        event_id=event.event_id,
+                        alumni_id=att["alumni_id"],
+                        attendance_notes=att["notes"],
+                    )
+                )
+                session.add(
+                    AuditLog(
+                        user_id=actor_user_id,
+                        action_type="add_attendee",
+                        entity_type="event",
+                        entity_id=event.event_id,
+                        new_value=f"{att['alumni_id']}: {att['name']}",
+                    )
+                )
+                added += 1
+        except Exception as exc:  # noqa: BLE001 - record + report
+            await savepoint.rollback()
+            log.exception(
+                "Unexpected error importing attendees for event %s", event.event_id
+            )
+            return {
+                "imported": False,
+                "event_id": event.event_id,
+                "added": 0,
+                "skipped_existing": skipped_existing,
+                "unmatched": unmatched,
+                "error": f"Unexpected error ({exc.__class__.__name__}).",
+            }
+
+    await session.commit()
+    return {
+        "imported": True,
+        "event_id": event.event_id,
+        "added": added,
+        "skipped_existing": skipped_existing,
+        "unmatched": unmatched,
+        "error": None,
+    }
+
+
+def _no_op_reason(report: dict) -> str:
+    """Why an attendee import would add nobody, in the operator's terms."""
+    for warning in report.get("warnings") or []:
+        if warning["code"] in {"no_attendees_matched", "all_already_attending"}:
+            return warning["message"]
+    return "No new attendees to add."
+
+
+def headers_bad_attendee_preview(header_errors: list[str], event: Event) -> dict:
+    """The preview payload for a file whose columns don't match the template."""
+    return {
+        "columns_ok": False,
+        "header_errors": header_errors,
+        "event": {
+            "event_id": event.event_id,
+            "event_name": event.event_name,
+            "event_date": event.event_date.isoformat() if event.event_date else None,
+        },
+        "importable": False,
+        "summary": {
+            "total_rows": 0,
+            "attendees_matched": 0,
+            "attendees_unmatched": 0,
+            "attendees_existing": 0,
+            "attendees_new": 0,
+        },
+        "attendees": [],
+        "warnings": [],
+    }
+
+
 # --- CSV template ------------------------------------------------------------
 
 

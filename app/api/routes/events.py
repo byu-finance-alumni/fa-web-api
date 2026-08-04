@@ -19,7 +19,12 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.event import Event, EventAttendance
 from app.schemas.event import AttendeeCreate, AttendeeRead, EventCreate, EventUpdate
-from app.schemas.imports import EventImportPreview, EventImportResult
+from app.schemas.imports import (
+    EventAttendeeImportPreview,
+    EventAttendeeImportResult,
+    EventImportPreview,
+    EventImportResult,
+)
 from app.services import import_events
 
 # Reuse the alumni export's formula-injection neutralizer (canonical source:
@@ -517,6 +522,69 @@ async def export_event_attendees(
         content=buffer.getvalue(),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post(
+    "/{event_id}/attendees/import/preview", response_model=EventAttendeeImportPreview
+)
+async def preview_event_attendee_import(
+    event_id: IdPath,
+    _: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict | JSONResponse:
+    """Dry-run an attendee CSV against an EXISTING event (full_access, NO writes).
+
+    Same file shape as ``POST /events/import`` (one template serves both), but
+    the event already exists — so nothing about the event's identity is read
+    from the request and the event is never touched. Reports each row as
+    matched-new, already-attending (skipped), or unmatched (skipped). 404 if the
+    event is unknown; a bad header set surfaces as ``columns_ok: false``."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_events.parse_and_map(file_bytes)
+    if header_errors:
+        return import_events.headers_bad_attendee_preview(header_errors, event)
+    return await import_events.evaluate_for_event(session, rows, event)
+
+
+@router.post("/{event_id}/attendees/import", response_model=EventAttendeeImportResult)
+async def import_event_attendees(
+    event_id: IdPath,
+    user: RequireFullAccess,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict | JSONResponse:
+    """Add an attendee CSV's roster to an EXISTING event (full_access).
+
+    ADDS to the event — it never creates, replaces, or edits the event itself.
+    Attendees already on the roster are skipped rather than 409ing, so re-running
+    the same file is safe; unmatched Net IDs are reported and skipped. Each added
+    attendee is audited as ``event``/``add_attendee``, identical to the manual
+    single-attendee route. 404 if the event is unknown."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    file_bytes = await _read_capped(file)
+    if file_bytes is None:
+        return _too_large_response()
+    rows, header_errors = import_events.parse_and_map(file_bytes)
+    if header_errors:
+        return {
+            "imported": False,
+            "event_id": event_id,
+            "added": 0,
+            "skipped_existing": 0,
+            "unmatched": [],
+            "error": header_errors[0],
+        }
+    return await import_events.commit_attendees_for_event(
+        session, rows, event, actor_user_id=user.user_id
     )
 
 

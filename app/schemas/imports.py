@@ -218,6 +218,66 @@ class EventImportResult(BaseModel):
     event_error: str | None = None
 
 
+# --- Attendees into an EXISTING event (#611) ---------------------------------
+#
+# Same CSV, opposite order: the event already exists, so there is no event
+# identity to validate — only the roster is read, and rows already on it are
+# skipped rather than conflicting.
+
+
+class EventAttendeeImportEvent(BaseModel):
+    """Which event the roster is being added to (echoed back for confirmation)."""
+
+    event_id: int
+    event_name: str | None = None
+    event_date: str | None = None
+
+
+class EventAttendeeImportSummary(BaseModel):
+    total_rows: int
+    attendees_matched: int
+    attendees_unmatched: int
+    #: matched but already on this event's roster — skipped, not an error.
+    attendees_existing: int
+    #: matched and NOT already attending — the rows that would actually be added.
+    attendees_new: int
+
+
+class EventAttendeeImportRow(BaseModel):
+    row: int
+    net_id: str | None = None
+    name: str | None = None
+    notes: str | None = None
+    matched: bool
+    alumni_id: int | None = None
+    already_attending: bool = False
+
+
+class EventAttendeeImportPreview(BaseModel):
+    """``POST /events/{event_id}/attendees/import/preview`` dry-run report."""
+
+    columns_ok: bool
+    header_errors: list[str]
+    event: EventAttendeeImportEvent
+    #: true only when at least one NEW attendee would be added.
+    importable: bool
+    summary: EventAttendeeImportSummary
+    attendees: list[EventAttendeeImportRow]
+    warnings: list[dict]
+
+
+class EventAttendeeImportResult(BaseModel):
+    """``POST /events/{event_id}/attendees/import`` commit result. The event is
+    never created or modified — only attendance rows are added."""
+
+    imported: bool
+    event_id: int
+    added: int
+    skipped_existing: int
+    unmatched: list[EventImportUnmatched]
+    error: str | None = None
+
+
 # --- Donations bulk CSV import -----------------------------------------------
 
 

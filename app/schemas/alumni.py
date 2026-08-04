@@ -855,3 +855,14 @@ def minimize_alumni_read[T: AlumniRead](read: T, *, can_edit: bool) -> T:
     return read.model_copy(
         update={field: None for field in VIEW_ONLY_HIDDEN_FIELDS}
     )
+
+
+class HeadshotUrls(BaseModel):
+    """Signed headshot URLs for a batch of alumni, keyed by ``alumni_id``.
+
+    Every requested id is present in ``urls``; the value is ``None`` when the
+    alumnus has no net ID (the object key) or no image on file. Batching exists
+    so a roster page costs ONE request instead of one per row — see
+    ``GET /alumni/headshots/urls``."""
+
+    urls: dict[int, str | None]

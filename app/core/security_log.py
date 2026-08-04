@@ -22,7 +22,7 @@ from fastapi import Request
 _logger = logging.getLogger("security")
 
 
-def _client_ip(request: Request) -> str | None:
+def client_ip(request: Request) -> str | None:
     """Best-effort real client IP. Vercel/proxies set X-Forwarded-For as
     ``client, proxy1, proxy2`` — the first hop is the originating client."""
     fwd = request.headers.get("x-forwarded-for")
@@ -50,7 +50,7 @@ def log_security_event(
             "status": status_code,
             "method": request.method,
             "path": request.url.path,  # path only — query string may carry PII
-            "ip": _client_ip(request),
+            "ip": client_ip(request),
             "ua": request.headers.get("user-agent"),
             "detail": detail,
         }

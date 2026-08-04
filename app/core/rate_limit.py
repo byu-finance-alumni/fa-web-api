@@ -1,6 +1,6 @@
-"""Best-effort, in-process per-actor rate limiting for destructive admin routes.
+"""Best-effort, in-process rate limiting for destructive and public routes.
 
-This is a simple fixed-window counter keyed by ``(bucket, actor_id)`` held in a
+This is a simple fixed-window counter keyed by ``(bucket, actor_key)`` held in a
 module-level dict. It is intentionally lightweight and dependency-free.
 
 SERVERLESS CAVEAT: the counter lives in process memory, so on a serverless /
@@ -15,13 +15,19 @@ Each limiter is exposed as a FastAPI dependency factory (``rate_limiter(...)``)
 that is added directly to a route signature; it resolves the acting user via the
 same ``require_super_admin`` guard the routes already use, so it never trusts a
 client-supplied identity. Exceeding the limit raises HTTP 429.
+
+The public survey-respond routes have no logged-in actor to key on — the signed
+token in the path is the whole credential — so they use
+``public_token_rate_limiter(...)`` instead, which budgets by hashed token AND by
+client IP. See the "#360" block at the bottom of this module.
 """
 
+import hashlib
 import time
 from collections import defaultdict
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 
 from app.api.dependencies.auth import (
     get_current_db_user_allow_must_change,
@@ -30,12 +36,17 @@ from app.api.dependencies.auth import (
     require_super_admin,
     require_view_only,
 )
+from app.core.security_log import client_ip
 from app.schemas.auth import UserContext
 
-# Module-level state: {bucket_name: {actor_id: [timestamp, timestamp, ...]}}.
+# Module-level state: {bucket_name: {actor_key: [timestamp, timestamp, ...]}}.
+# The actor key is a user id for the authenticated limiters and an opaque string
+# (client IP / hashed token) for the public ones.
 # Timestamps are monotonic seconds; aged-out entries are pruned lazily on each
 # check so the dict can't grow without bound for a steady caller.
-_WINDOWS: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+_WINDOWS: dict[str, dict[int | str, list[float]]] = defaultdict(
+    lambda: defaultdict(list)
+)
 
 # A plain, client-safe message. It is intentionally NOT pre-wrapped in the
 # ``{"error": {...}}`` envelope: the app's ``StarletteHTTPException`` handler
@@ -45,7 +56,9 @@ _WINDOWS: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(li
 _TOO_MANY_REQUESTS_MESSAGE = "Too many requests; please slow down and retry later."
 
 
-def _check(bucket: str, actor_id: int, *, limit: int, window_seconds: float) -> None:
+def _check(
+    bucket: str, actor_id: int | str, *, limit: int, window_seconds: float
+) -> None:
     """Record one hit for ``actor_id`` in ``bucket`` and raise 429 if over ``limit``.
 
     Fixed-window: count the actor's hits inside the trailing ``window_seconds``;
@@ -195,3 +208,91 @@ HeadshotWriteRateLimit = Annotated[
 BulkHeadshotRateLimit = Annotated[
     UserContext, Depends(BULK_HEADSHOT_LIMITER)
 ]
+
+# --- Public, token-gated survey routes (#360) --------------------------------
+#
+# `/survey/respond/{token}` is the one surface here with NO login: the signed
+# token IS the credential, so there is no `UserContext` to key on and
+# `rate_limiter` above does not apply. These three routes were the only
+# unauthenticated write path in the app and carried no brake at all — the WAF
+# was the entire defence. Each submit mints a new survey_response row and
+# unlocks another 20 MiB photo upload into the headshots bucket, so an
+# un-braked token was a storage-fill and review-queue-flood primitive.
+#
+# Two independent budgets per request, both required:
+#
+# * per TOKEN — the precise one. A token addresses exactly one alum's record, so
+#   this is what stops one leaked/forwarded link being replayed into a flood,
+#   whatever address it is replayed from.
+# * per CLIENT IP — the broad one. Catches a single host working several tokens
+#   at once. Deliberately loose, because alumni share egress addresses (one
+#   employer's network, one campus, mobile CGNAT) and blocking a real alum is a
+#   worse outcome than admitting a slow prober, who still has to hold a valid
+#   HMAC to reach anything.
+#
+# Same in-process caveat as every limiter in this module (see the module
+# docstring): per-instance, best-effort, not a hard boundary. The IP is read
+# from X-Forwarded-For, which only Vercel's edge can be trusted to set — a
+# spoofed header evades the IP budget but NOT the per-token one.
+
+_SURVEY_WINDOW = 600.0
+
+
+def _token_key(token: str) -> str:
+    """An opaque, stable key for a survey token.
+
+    Hashed, not raw: this dict outlives the request, and a survey token is a live
+    credential for one alum's PII — it does not belong sitting in process memory
+    (or in a repr / traceback) in usable form. Truncated because collisions here
+    would only merge two callers' budgets, not grant access."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
+
+
+def public_token_rate_limiter(
+    bucket: str, *, token_limit: int, ip_limit: int, window_seconds: float
+):
+    """Build a FastAPI dependency throttling an unauthenticated, token-gated
+    route by BOTH the path token and the client IP.
+
+    Used as a route-level ``dependencies=[...]`` entry rather than an injected
+    ``Annotated`` parameter (the shape the authenticated limiters use): there is
+    no actor to hand back to the endpoint, so there is nothing to inject.
+    """
+
+    async def _dependency(request: Request, token: str) -> None:
+        # Token budget first: it is the one an attacker cannot dodge, so it is
+        # the one that should decide the outcome when both are near their cap.
+        _check(
+            f"{bucket}:token",
+            _token_key(token),
+            limit=token_limit,
+            window_seconds=window_seconds,
+        )
+        _check(
+            f"{bucket}:ip",
+            client_ip(request) or "unknown",
+            limit=ip_limit,
+            window_seconds=window_seconds,
+        )
+
+    return _dependency
+
+
+# Reading the confirm page. The loosest of the three: it is a read, and a real
+# alum reloads, re-opens the link from the email, or comes back later. Still far
+# below what enumeration would need — and enumeration needs a valid HMAC anyway.
+SURVEY_RESPOND_READ_LIMITER = public_token_rate_limiter(
+    "survey:respond_read", token_limit=30, ip_limit=300, window_seconds=_SURVEY_WINDOW
+)
+# Submitting. Each call stages a row in the staff review queue, so this is the
+# self-suppression / queue-flood surface. Ten per token per ten minutes leaves
+# plenty of room for an alum who submits, spots a typo and resubmits.
+SURVEY_SUBMIT_LIMITER = public_token_rate_limiter(
+    "survey:respond_submit", token_limit=10, ip_limit=60, window_seconds=_SURVEY_WINDOW
+)
+# Photo upload. The tightest, because it is the only one that moves real bytes
+# (up to _HEADSHOT_MAX_BYTES each) into storage. A phone upload that fails and is
+# retried a few times still fits.
+SURVEY_PHOTO_LIMITER = public_token_rate_limiter(
+    "survey:respond_photo", token_limit=5, ip_limit=30, window_seconds=_SURVEY_WINDOW
+)

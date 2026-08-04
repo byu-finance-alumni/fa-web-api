@@ -37,6 +37,11 @@ from app.api.routes.alumni import (
 from app.core.config import get_settings
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
+from app.core.rate_limit import (
+    SURVEY_PHOTO_LIMITER,
+    SURVEY_RESPOND_READ_LIMITER,
+    SURVEY_SUBMIT_LIMITER,
+)
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyNewCyclePreview,
@@ -68,18 +73,26 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 router = APIRouter(prefix="/survey", tags=["survey"])
 
 
-@router.get("/respond/{token}", response_model=SurveyRespondInfo)
+@router.get(
+    "/respond/{token}",
+    response_model=SurveyRespondInfo,
+    dependencies=[Depends(SURVEY_RESPOND_READ_LIMITER)],
+)
 async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondInfo:
     """PUBLIC (token-gated, no login): the alum's current on-file info for the
-    confirm page. The signed token is the credential — an invalid/expired one
-    404s."""
+    confirm page. The signed token is the credential — an invalid or expired one
+    404s with the same message either way."""
     info = await survey_email.get_respondent(session, token)
     if info is None:
-        raise NotFoundError("This survey link is invalid or has expired.")
+        raise NotFoundError(survey_email.LINK_DEAD_MESSAGE)
     return info
 
 
-@router.post("/respond/{token}", response_model=SurveySubmitResult)
+@router.post(
+    "/respond/{token}",
+    response_model=SurveySubmitResult,
+    dependencies=[Depends(SURVEY_SUBMIT_LIMITER)],
+)
 async def survey_submit(
     token: str, body: SurveySubmitRequest, session: SessionDep
 ) -> SurveySubmitResult:
@@ -90,7 +103,11 @@ async def survey_submit(
     )
 
 
-@router.post("/respond/{token}/photo", status_code=204)
+@router.post(
+    "/respond/{token}/photo",
+    status_code=204,
+    dependencies=[Depends(SURVEY_PHOTO_LIMITER)],
+)
 async def survey_submit_photo(
     token: str,
     session: SessionDep,

@@ -959,9 +959,10 @@ def test_bulk_confirm_unmatched_and_invalid_names_never_probe_storage(monkeypatc
     assert session.committed is False
 
 
-def test_bulk_confirm_client_failure_is_an_error_row(monkeypatch):
-    """A file the browser could not PUT is reported as an error and its object is
-    never probed or audited."""
+def test_bulk_confirm_client_failure_is_an_error_row_not_a_false_success(monkeypatch):
+    """A file the browser could not PUT is reported as an error and is NEVER
+    audited as uploaded — even though a conforming object is sitting at that key,
+    because that object is the alumnus's PREVIOUS headshot, not this upload."""
     probed: list = []
     monkeypatch.setattr(
         alumni_routes.supabase_storage,
@@ -988,13 +989,54 @@ def test_bulk_confirm_client_failure_is_an_error_row(monkeypatch):
     item = resp.json()["items"][0]
     assert item["status"] == "error"
     assert item["message"] == "Upload failed (503)."
-    assert probed == []
     assert session.committed is False
+    assert [a.action_type for a in session.added if getattr(a, "action_type", None)] == []
+
+
+def test_bulk_confirm_purges_a_bad_object_the_client_claims_it_never_uploaded(
+    monkeypatch,
+):
+    """The ``uploaded`` flag decides what we REPORT, never whether we look.
+
+    Otherwise a client could mint a URL, PUT a non-image, then claim the upload
+    failed — skipping the byte-sniffing entirely and leaving that object serving
+    as the alumnus's headshot with no terminal audit row."""
+    probed: list = []
+    deleted: list = []
+
+    async def _delete(bucket, path):
+        deleted.append(path)
+
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub(("image/png", 1234, b"MZ\x90\x00 not an image"), probed),
+    )
+    monkeypatch.setattr(alumni_routes.supabase_storage, "delete_object", _delete)
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk/confirm",
+                json={"files": [{"filename": "jdoe12.png", "uploaded": False}]},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert probed == ["jdoe12"]
+    assert deleted == ["jdoe12"]
+    assert resp.json()["items"][0]["status"] == "invalid"
+    audits = [a for a in session.added if getattr(a, "action_type", None)]
+    assert [a.action_type for a in audits] == ["upload_headshot_rejected"]
 
 
 def test_bulk_confirm_client_detail_is_sanitized(monkeypatch):
     """The browser's failure detail is reflected back to the operator, so it is
     stripped of control characters and length-capped."""
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub(("image/png", 10, _PNG_BYTES[:16])),
+    )
     session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
     try:
         with _confirm_client(session) as c:

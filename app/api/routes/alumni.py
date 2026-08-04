@@ -1180,7 +1180,15 @@ async def confirm_bulk_headshot_upload(
     sends is trusted: net IDs are re-derived, alumni re-resolved, and each landed
     object re-validated (type, size, sniffed magic bytes). A non-conforming
     object is DELETED and audited ``upload_headshot_rejected``; a conforming one
-    is audited ``upload_headshot``, exactly like the single-headshot path."""
+    is audited ``upload_headshot``, exactly like the single-headshot path.
+
+    The per-file ``uploaded`` flag decides only what we REPORT, never whether we
+    look. Every matched alumnus's object is probed either way, so a client that
+    PUTs a bad image and then claims the upload failed can't skip validation and
+    leave that object sitting in the bucket. Conversely, a file the client says
+    failed is never audited ``upload_headshot`` even if a conforming object is
+    present — that object may be the alumnus's PREVIOUS headshot, and a failed
+    upload must not be recorded as a successful one."""
     if not payload.files:
         raise InvalidRequestError("No files were provided.")
     if len(payload.files) > _HEADSHOT_BULK_MAX_PER_REQUEST:
@@ -1194,13 +1202,8 @@ async def confirm_bulk_headshot_upload(
     # so probing per file would judge the surviving object twice — and could
     # delete a good image on the strength of its overwritten twin.
     pending: dict[str, Alumni] = {}
-    for photo, claim in zip(photos, claims, strict=True):
-        if (
-            photo.error is None
-            and photo.alumnus is not None
-            and photo.object_key
-            and claim.uploaded
-        ):
+    for photo in photos:
+        if photo.error is None and photo.alumnus is not None and photo.object_key:
             pending.setdefault(photo.object_key, photo.alumnus)
 
     semaphore = asyncio.Semaphore(_HEADSHOT_BULK_CONCURRENCY)
@@ -1260,7 +1263,10 @@ async def confirm_bulk_headshot_upload(
                 )
             )
             continue
-        if not claim.uploaded:
+        verdict_status, message, _rejected_field = verdicts[photo.object_key]
+        # A rejected object was purged above; report that regardless of what the
+        # browser claimed, so lying about the outcome can't hide it.
+        if verdict_status != "invalid" and not claim.uploaded:
             detail = _clean_client_detail(claim.message)
             items.append(
                 HeadshotBulkItem(
@@ -1271,7 +1277,6 @@ async def confirm_bulk_headshot_upload(
                 )
             )
             continue
-        verdict_status, message, _rejected_field = verdicts[photo.object_key]
         if verdict_status == "matched":
             service._audit(
                 session,

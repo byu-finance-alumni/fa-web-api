@@ -24,7 +24,7 @@ client IP. See the "#360" block at the bottom of this module.
 
 import hashlib
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
@@ -36,17 +36,37 @@ from app.api.dependencies.auth import (
     require_super_admin,
     require_view_only,
 )
-from app.core.security_log import client_ip
 from app.schemas.auth import UserContext
 
 # Module-level state: {bucket_name: {actor_key: [timestamp, timestamp, ...]}}.
 # The actor key is a user id for the authenticated limiters and an opaque string
 # (client IP / hashed token) for the public ones.
 # Timestamps are monotonic seconds; aged-out entries are pruned lazily on each
-# check so the dict can't grow without bound for a steady caller.
-_WINDOWS: dict[str, dict[int | str, list[float]]] = defaultdict(
-    lambda: defaultdict(list)
-)
+# check.
+#
+# Each bucket is an LRU (OrderedDict, most-recently-touched last) with a HARD
+# CEILING on how many distinct actors it will remember — see
+# :data:`_MAX_ACTORS_PER_BUCKET`.
+_WINDOWS: dict[str, "OrderedDict[int | str, list[float]]"] = defaultdict(OrderedDict)
+
+# The most distinct actors any one bucket will hold before the least recently
+# seen are dropped.
+#
+# This ceiling exists because of the PUBLIC limiters below. While every limiter
+# keyed on an authenticated ``user.user_id``, the key space was the staff account
+# list — a couple of dozen entries that could never grow. ``public_token_rate_limiter``
+# is the first one keyed on ATTACKER-CHOSEN input: the limiter runs as a route
+# dependency, i.e. BEFORE the token is verified, so `GET /survey/respond/<random>`
+# in a loop mints a brand-new key on every request without needing a valid
+# credential. Unbounded, that is an anonymous memory-exhaustion DoS — and
+# ``_WINDOWS`` is shared by every limiter in the app, so it would take the whole
+# instance down with it, not just the survey routes.
+#
+# Evicting the least-recently-touched entry is safe for the thing that matters:
+# a flood's per-IP key is touched on every single request, so it is always the
+# freshest entry in its bucket and can never be the one evicted. What gets
+# dropped is exactly the cold garbage the flood created.
+_MAX_ACTORS_PER_BUCKET = 10_000
 
 # A plain, client-safe message. It is intentionally NOT pre-wrapped in the
 # ``{"error": {...}}`` envelope: the app's ``StarletteHTTPException`` handler
@@ -64,19 +84,32 @@ def _check(
     Fixed-window: count the actor's hits inside the trailing ``window_seconds``;
     if that count (including this one) would exceed ``limit``, raise 429 WITHOUT
     recording the hit (so a blocked caller can't push their own window forward).
+
+    Touching an actor moves it to the front of its bucket's LRU, and the bucket
+    is trimmed to :data:`_MAX_ACTORS_PER_BUCKET` afterwards, so no caller can
+    grow this dict without bound by presenting endless distinct keys.
     """
     now = time.monotonic()
     cutoff = now - window_seconds
-    hits = _WINDOWS[bucket][actor_id]
+    per_bucket = _WINDOWS[bucket]
     # Prune timestamps that have aged out of the window.
-    hits[:] = [t for t in hits if t > cutoff]
-    if len(hits) >= limit:
+    hits = [t for t in per_bucket.get(actor_id, ()) if t > cutoff]
+    over_budget = len(hits) >= limit
+    if not over_budget:
+        hits.append(now)
+    # Re-seat the actor at the FRESH end either way: a blocked caller is the most
+    # active one there is, so its window must not be evicted out from under it
+    # (that would hand it a clean budget).
+    per_bucket[actor_id] = hits
+    per_bucket.move_to_end(actor_id)
+    while len(per_bucket) > _MAX_ACTORS_PER_BUCKET:
+        per_bucket.popitem(last=False)
+    if over_budget:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=_TOO_MANY_REQUESTS_MESSAGE,
             headers={"Retry-After": str(int(window_seconds))},
         )
-    hits.append(now)
 
 
 def reset() -> None:
@@ -231,11 +264,41 @@ BulkHeadshotRateLimit = Annotated[
 #   HMAC to reach anything.
 #
 # Same in-process caveat as every limiter in this module (see the module
-# docstring): per-instance, best-effort, not a hard boundary. The IP is read
-# from X-Forwarded-For, which only Vercel's edge can be trusted to set — a
-# spoofed header evades the IP budget but NOT the per-token one.
+# docstring): per-instance, best-effort, not a hard boundary. The IP comes from
+# :func:`_client_key`, which reads the hop the edge added rather than the one the
+# caller supplied.
 
 _SURVEY_WINDOW = 600.0
+
+
+def _client_key(request: Request) -> str:
+    """The client-IP key for a public limiter, read so a caller cannot choose it.
+
+    Deliberately NOT ``security_log.client_ip``, which takes the LEFTMOST
+    ``X-Forwarded-For`` hop. Leftmost is the right answer for a human reading a
+    log line (it names the originating client) but the wrong one for a budget: a
+    proxy chain APPENDS hops, so the leftmost value is whatever the caller put
+    there. That would let an attacker rotate a fresh fake IP per request to dodge
+    this budget entirely, and — worse — pin a REAL alum's or a whole employer's
+    egress address and burn their budget on purpose, locking them out.
+
+    So: take the hop the trusted edge itself added, which is the RIGHTMOST one,
+    preferring Vercel's own header since nothing upstream of the edge can set it.
+    A spoofed ``X-Forwarded-For`` then only lengthens the chain we ignore.
+
+    The per-token budget is the real control regardless — it needs a valid HMAC,
+    so no header games reach it. This is the loose second layer.
+    """
+    for header in ("x-vercel-forwarded-for", "x-forwarded-for"):
+        raw = request.headers.get(header)
+        if raw:
+            last = raw.split(",")[-1].strip()
+            if last:
+                return last
+    real = request.headers.get("x-real-ip")
+    if real and real.strip():
+        return real.strip()
+    return request.client.host if request.client else "unknown"
 
 
 def _token_key(token: str) -> str:
@@ -270,7 +333,7 @@ def public_token_rate_limiter(
         )
         _check(
             f"{bucket}:ip",
-            client_ip(request) or "unknown",
+            _client_key(request),
             limit=ip_limit,
             window_seconds=window_seconds,
         )

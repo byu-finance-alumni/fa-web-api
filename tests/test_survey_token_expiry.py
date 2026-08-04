@@ -262,6 +262,82 @@ def test_rate_limited_response_carries_the_standard_error_envelope(client, monke
     assert blocked.headers["Retry-After"] == "600"
 
 
+def test_spoofed_forwarded_for_cannot_dodge_the_ip_budget(client, monkeypatch):
+    """A rotating fake X-Forwarded-For must not mint a fresh IP budget each
+    request — the key is the hop the EDGE added (rightmost), not the one the
+    caller prepended."""
+
+    async def none_resp(session, token):
+        return None
+
+    monkeypatch.setattr(survey_email, "get_respondent", none_resp)
+    # Same real client (the last hop), a different forged leading hop each time.
+    for i in range(5):
+        client.get(
+            f"/survey/respond/tok-{i}",
+            headers={"x-forwarded-for": f"9.9.9.{i}, 203.0.113.7"},
+        )
+    ip_bucket = rate_limit._WINDOWS["survey:respond_read:ip"]
+    assert list(ip_bucket) == ["203.0.113.7"]
+    assert len(ip_bucket["203.0.113.7"]) == 5
+
+
+def test_client_key_prefers_the_vercel_edge_header():
+    from starlette.requests import Request as StarletteRequest
+
+    def _req(headers: dict[str, str]) -> StarletteRequest:
+        return StarletteRequest(
+            {
+                "type": "http",
+                "headers": [(k.encode(), v.encode()) for k, v in headers.items()],
+                "client": ("127.0.0.1", 1234),
+            }
+        )
+
+    assert (
+        rate_limit._client_key(
+            _req({"x-vercel-forwarded-for": "1.1.1.1", "x-forwarded-for": "2.2.2.2"})
+        )
+        == "1.1.1.1"
+    )
+    assert rate_limit._client_key(_req({"x-real-ip": "3.3.3.3"})) == "3.3.3.3"
+    assert rate_limit._client_key(_req({})) == "127.0.0.1"
+
+
+def test_limiter_state_cannot_grow_without_bound(client, monkeypatch):
+    """The limiter runs BEFORE the token is verified, so garbage tokens mint
+    keys. Without a ceiling that is an anonymous memory-exhaustion DoS against
+    every limiter in the app, not just this route."""
+
+    async def none_resp(session, token):
+        return None
+
+    monkeypatch.setattr(survey_email, "get_respondent", none_resp)
+    monkeypatch.setattr(rate_limit, "_MAX_ACTORS_PER_BUCKET", 25)
+    for i in range(200):
+        client.get(f"/survey/respond/junk-{i}")
+    token_bucket = rate_limit._WINDOWS["survey:respond_read:token"]
+    assert len(token_bucket) == 25
+    # The flood's OWN per-IP window is touched every request, so it is always the
+    # freshest entry and survives — a flood can never evict its own budget.
+    ip_bucket = rate_limit._WINDOWS["survey:respond_read:ip"]
+    assert len(ip_bucket["testclient"]) == 200
+
+
+def test_a_blocked_caller_keeps_its_window(client, monkeypatch):
+    # The 429 path must still re-seat the actor in the LRU, or a caller being
+    # throttled would be the first thing evicted and would get a clean budget.
+    async def none_resp(session, token):
+        return None
+
+    monkeypatch.setattr(survey_email, "get_respondent", none_resp)
+    for _ in range(40):
+        client.get("/survey/respond/tok-blocked")
+    assert client.get("/survey/respond/tok-blocked").status_code == 429
+    hits = rate_limit._WINDOWS["survey:respond_read:token"]
+    assert len(next(iter(hits.values()))) == 30  # capped at the limit, not growing
+
+
 def test_the_dead_link_message_never_says_which_kind_of_dead(client, monkeypatch):
     """Expired and never-valid must be indistinguishable to a prober, while
     still telling a real alum what to do."""

@@ -52,6 +52,7 @@ from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
 from app.models.user import User
 from app.schemas.survey import (
+    SurveyNewCyclePreview,
     SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
@@ -116,12 +117,32 @@ async def _load_schedules_due(
 async def _sent_counts_by_stage(
     session: AsyncSession,
 ) -> dict[tuple[int, int], int]:
-    """Delivered-email counts keyed by (graduation_year, stage)."""
-    stmt = select(
-        SurveySendLog.graduation_year,
-        SurveySendLog.stage,
-        func.count(),
-    ).group_by(SurveySendLog.graduation_year, SurveySendLog.stage)
+    """Delivered-email counts keyed by (graduation_year, stage), for the year's
+    CURRENT cycle only (#357).
+
+    Joined to ``survey_schedule`` on both the year and its ``cycle_seq`` so the
+    console reports what THIS campaign has sent. Counting the log unscoped is
+    what made a re-scheduled year display last year's totals as though they were
+    this cycle's — the campaign looked like it had run when it had emailed
+    nobody.
+
+    A year with log rows but no schedule row (a manual send for an unscheduled
+    year) has no current cycle to report against, so it is absent here and its
+    counters read 0 — the same as before this change, since the console only
+    renders rows that HAVE a schedule."""
+    stmt = (
+        select(
+            SurveySendLog.graduation_year,
+            SurveySendLog.stage,
+            func.count(),
+        )
+        .join(
+            SurveySchedule,
+            (SurveySchedule.graduation_year == SurveySendLog.graduation_year)
+            & (SurveySchedule.cycle_seq == SurveySendLog.cycle_seq),
+        )
+        .group_by(SurveySendLog.graduation_year, SurveySendLog.stage)
+    )
     return {
         (year, stage): n for year, stage, n in (await session.execute(stmt)).all()
     }
@@ -171,6 +192,7 @@ def _to_item(
         graduation_year=year,
         start_date=sched.start_date,
         status=sched.status,
+        cycle_seq=getattr(sched, "cycle_seq", 1),
         last_run_at=sched.last_run_at,
         created_at=getattr(sched, "created_at", None),
         created_by=creators.get(created_by_id) if created_by_id else None,
@@ -230,7 +252,13 @@ async def _upsert_schedule(
     Replacing resets the campaign to ``scheduled`` with the new start date; the
     delivery log is left intact so an already-sent stage is never re-sent. The
     caller owns the commit, so the single- and bulk-create paths share this
-    upsert while controlling their own transaction boundary."""
+    upsert while controlling their own transaction boundary.
+
+    ``cycle_seq`` is deliberately NOT advanced here (#357). This path is the
+    "I typed the wrong start date" correction, and it must stay non-destructive:
+    advancing the cycle would make every already-emailed alum a target again, so
+    fixing a typo would blast the cohort a second time. Starting the next annual
+    campaign is the separate, explicit :func:`start_new_cycle`."""
     existing = (
         await session.execute(
             select(SurveySchedule).where(
@@ -274,6 +302,117 @@ async def create_schedule(
     item = await get_schedule(session, graduation_year)
     assert item is not None  # just upserted
     return item
+
+
+async def preview_new_cycle(
+    session: AsyncSession, graduation_year: int
+) -> SurveyNewCyclePreview | None:
+    """What starting a new cycle for this year WOULD do — for the confirmation.
+
+    Returns ``None`` when the year has no schedule (nothing to start a new cycle
+    of). Nothing is mutated and nothing is sent.
+
+    The counts exist because "Start new survey cycle" is irreversible: staff see
+    how many alumni would be emailed, and how many of those already received the
+    previous cycle, BEFORE committing. ``previously_emailed`` is the number this
+    cycle would reach who are in the CURRENT cycle's send log — i.e. the people
+    who would get a second email — which is the number that makes the blast size
+    real rather than abstract."""
+    sched = (
+        await session.execute(
+            select(SurveySchedule).where(
+                SurveySchedule.graduation_year == graduation_year
+            )
+        )
+    ).scalar_one_or_none()
+    if sched is None:
+        return None
+    # Same eligibility the send itself uses, so the preview cannot promise a
+    # different population than the campaign would actually reach.
+    recipients = await survey_email._load_recipients(session, graduation_year)
+    eligible, _duplicates = survey_email.dedupe_by_email(recipients)
+    eligible_ids = {r.alumni_id for r in eligible}
+    already = set(
+        (
+            await session.execute(
+                select(SurveySendLog.alumni_id).where(
+                    SurveySendLog.graduation_year == graduation_year,
+                    SurveySendLog.cycle_seq == sched.cycle_seq,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return SurveyNewCyclePreview(
+        graduation_year=graduation_year,
+        current_cycle=sched.cycle_seq,
+        next_cycle=sched.cycle_seq + 1,
+        current_status=sched.status,
+        would_email=len(eligible_ids),
+        previously_emailed=len(eligible_ids & already),
+    )
+
+
+async def start_new_cycle(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    start_date: datetime.date,
+    actor_user_id: int | None,
+) -> SurveyScheduleItem | None:
+    """Begin the NEXT campaign for a graduation year (#357) — the annual re-run.
+
+    Advances ``cycle_seq``, which is what makes the whole cohort eligible again:
+    the send log is scoped by cycle, so a new cycle starts with an empty
+    "already emailed" set while every previous cycle's rows stay intact as
+    history. Nothing is deleted.
+
+    Deliberately SEPARATE from :func:`create_schedule` (Jake, 2026-08-03). The
+    two intents — "fix the start date I mistyped" and "run this year's survey
+    again" — are indistinguishable at the data layer but have opposite
+    consequences, one of them an irreversible second email to the whole cohort.
+    Splitting them means the destructive one is never reachable by accident from
+    the corrective one.
+
+    Returns ``None`` when the year has no schedule to advance; the caller turns
+    that into a 404. Callers MUST confirm with the user first — see
+    :func:`preview_new_cycle` for the counts that confirmation shows."""
+    sched = (
+        await session.execute(
+            select(SurveySchedule).where(
+                SurveySchedule.graduation_year == graduation_year
+            )
+        )
+    ).scalar_one_or_none()
+    if sched is None:
+        return None
+
+    previous_cycle = sched.cycle_seq
+    sched.cycle_seq = previous_cycle + 1
+    sched.start_date = start_date
+    sched.status = STATUS_SCHEDULED
+    sched.created_by_user_id = actor_user_id
+    # A new cycle is not a resumption of the old one: clear the pause state so a
+    # campaign paused in cycle N does not resume-shift cycle N+1's start_date.
+    sched.paused_at = None
+    sched.paused_from_status = None
+    sched.last_run_at = None
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="survey_cycle_started",
+            entity_type="survey_campaign",
+            entity_id=graduation_year,
+            new_value=(
+                f"grad_year={graduation_year} "
+                f"cycle={previous_cycle}->{sched.cycle_seq} "
+                f"start_date={start_date.isoformat()}"
+            ),
+        )
+    )
+    await session.commit()
+    return await get_schedule(session, graduation_year)
 
 
 async def create_schedules_bulk(
@@ -723,11 +862,16 @@ async def run_due_schedules(
         # sends on; nothing changes in between, and it is a pair of indexed
         # lookups on `survey_send_log`. `eligible` is passed through so the
         # cohort query itself is not repeated.
+        # Scoped to the campaign's CURRENT cycle (#357). Read from the schedule
+        # row we already hold rather than re-querying, so this completion check
+        # and the send that follows it agree on which cycle they are in.
+        cycle_seq = getattr(sched, "cycle_seq", survey_email.FIRST_CYCLE)
         _stage, targets = await survey_email.select_stage_targets(
             session,
             graduation_year=year,
             recipients=eligible,
             max_stage=max_stage,
+            cycle_seq=cycle_seq,
         )
 
         if not targets:
@@ -767,6 +911,9 @@ async def run_due_schedules(
             limit=allowance,
             recipients=eligible,
             scheduled=True,
+            # The SAME cycle the completion check above used (#357) — passed,
+            # not re-read, so the two cannot disagree mid-run.
+            cycle_seq=cycle_seq,
         )
         sent = outcome.sent
         retry_after = outcome.retry_after

@@ -4,12 +4,15 @@ Two tables drive the auto-send of the annual "confirm your info" survey:
 
 * ``survey_schedule`` — one row per graduation year: when the campaign starts and
   what state it's in. The daily Vercel cron scans these for due campaigns.
-* ``survey_send_log`` — an append-only record of every (year, alumni, stage)
-  email actually delivered. Its UNIQUE ``(graduation_year, alumni_id, stage)`` is
-  the guardrail that stops a cron run from re-emailing anyone across runs — even
-  if a previous run crashed or was throttled part-way through.
+* ``survey_send_log`` — an append-only record of every (year, alumni, stage,
+  cycle) email actually delivered. Its UNIQUE
+  ``(graduation_year, alumni_id, stage, cycle_seq)`` is the guardrail that stops
+  a cron run from re-emailing anyone across runs — even if a previous run crashed
+  or was throttled part-way through — while still letting the NEXT annual cycle
+  reach the same cohort (#357).
 
-See migration ``database/migrations/2026-07-29_survey_scheduler.sql``.
+See migrations ``database/migrations/2026-07-29_survey_scheduler.sql`` and
+``2026-08-03_survey_campaign_cycle.sql``.
 
 These two tables, with ``survey_responses``, are the SOURCE OF TRUTH for an
 alum's survey history — ``profile._derive_survey_history`` builds the profile's
@@ -70,15 +73,33 @@ class SurveySchedule(TimestampMixin, Base):
     # The status the campaign held when it was paused ('scheduled' or 'active'),
     # so resume restores it exactly rather than guessing. Cleared on resume.
     paused_from_status: Mapped[str | None] = mapped_column(String(20))
+    # Which campaign this year is on (#357). 1 for the first, incremented only by
+    # `start_new_cycle` — the annual re-run. Editing a campaign's start date
+    # leaves it alone, which is what makes correcting a typo safe.
+    #
+    # Deliberately an opaque counter, NOT a date: a campaign starting in late
+    # December sends its reminders in January, so a year-derived cycle would flip
+    # mid-campaign and re-send the initial to the whole cohort. Resume shifts
+    # `start_date` forward too, so it can cross a year boundary on its own.
+    cycle_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     # created_at / updated_at come from TimestampMixin.
 
 
 class SurveySendLog(Base):
     """Append-only log of delivered survey emails.
 
-    The UNIQUE ``(graduation_year, alumni_id, stage)`` is what prevents
-    double-emailing: the scheduler inserts a row per recipient right after each
-    successful Resend batch, then excludes anyone already logged on later runs.
+    The UNIQUE ``(graduation_year, alumni_id, stage, cycle_seq)`` is what
+    prevents double-emailing: the scheduler inserts a row per recipient right
+    after each successful Resend batch, then excludes anyone already logged on
+    later runs.
+
+    ``cycle_seq`` is in that key for #357. Without it the guard was an ALL-TIME
+    question — nothing deletes from this table — so a year's second campaign
+    selected zero targets at every stage and "completed" having emailed nobody.
+    Every read of this table must be scoped to a cycle; an unscoped one silently
+    reverts to that bug.
     """
 
     __tablename__ = "survey_send_log"
@@ -87,12 +108,18 @@ class SurveySendLog(Base):
             "graduation_year",
             "alumni_id",
             "stage",
+            "cycle_seq",
             name="uq_survey_send_log_year_alumni_stage",
         ),
     )
 
     survey_send_log_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     graduation_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The campaign this email belonged to — see `SurveySchedule.cycle_seq`.
+    # Backfilled to 1 for every row that predates #357.
+    cycle_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     alumni_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("alumni.alumni_id", ondelete="CASCADE"),

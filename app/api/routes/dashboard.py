@@ -205,9 +205,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     month_ago = now - datetime.timedelta(days=30)
     today = now.date()
     # First and last day of the current calendar month (server local-UTC date),
-    # used by the two new "this month" KPIs which are calendar-month scoped (not
-    # the rolling 30-day window the older KPIs use). month_end is the last day
-    # of the month (next-month-start minus one day) so the bound is inclusive.
+    # used by the "this month" KPIs which are calendar-month scoped (not the
+    # rolling 30-day window the older KPIs use). month_end is the last day of
+    # the month (next-month-start minus one day) so the bound is inclusive.
     month_start = today.replace(day=1)
     month_end = (
         month_start.replace(year=month_start.year + 1, month=1)
@@ -338,6 +338,30 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         .select_from(AlumniProgramEngagement)
         .join(Alumni, Alumni.alumni_id == AlumniProgramEngagement.alumni_id)
         .where(active, AlumniProgramEngagement.mentor_willing.is_(True))
+    )
+    # Alumni records edited this CALENDAR month (#606) — replaces the
+    # events-attended tile on the dashboard KPI strip. Deliberately calendar-
+    # month scoped ("this month" = the 1st through now), NOT the rolling 30-day
+    # window the older contacted/attended KPIs use; the two windows disagree by
+    # design and the tile label says "this month" so staff can tell them apart.
+    #
+    # SIGNAL: alumni.updated_at (TimestampMixin, auto-bumped on every write).
+    # Caveat for whoever reads this number: updated_at moves on ANY write, so a
+    # bulk CSV import or an automated survey-response apply inflates it — it
+    # answers "how many records changed", not "how many a human hand-edited".
+    # An audit-trail-based "staff edits only" version was considered and
+    # explicitly declined for this issue.
+    #
+    # Single aggregate COUNT with a WHERE on updated_at — never fetch rows and
+    # count in Python (8,000+ alumni). Same `active` predicate as every other
+    # alumni KPI so archived / friend-of-program records can't inflate it.
+    month_start_ts = datetime.datetime.combine(
+        month_start, datetime.time.min, tzinfo=datetime.UTC
+    )
+    alumni_edited_this_month = await session.scalar(
+        select(func.count())
+        .select_from(Alumni)
+        .where(active, Alumni.updated_at >= month_start_ts)
     )
 
     cohort = (
@@ -479,6 +503,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
         "contacted_this_month": int(contacted_this_month or 0),
+        "alumni_edited_this_month": int(alumni_edited_this_month or 0),
         "not_contacted_6mo": int(not_contacted[6] or 0),
         "not_contacted_12mo": int(not_contacted[12] or 0),
         "not_contacted_24mo": int(not_contacted[24] or 0),

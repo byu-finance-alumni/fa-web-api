@@ -456,3 +456,208 @@ def test_route_update_bad_headers_returns_zeroed_result():
     body = resp.json()
     assert body["updated"] == 0
     assert body["errors"] >= 1
+
+
+# --- (h) partial / arbitrary CSVs (app #610) ---------------------------------
+#
+# The round-trip template is the easy path, not the only one: staff can also drop
+# in a CSV carrying a Net ID column plus whichever columns they happen to have.
+# ``parse_and_map_partial`` is the ONLY thing that changes — matching, diffing,
+# the preview, and the confirm-then-apply sequence are the same machinery.
+
+
+def test_partial_parse_accepts_a_subset_of_columns():
+    # Two columns only: the match key and the field being changed.
+    csv = _csv_bytes(["jsmith", "Smith"], headers=["Net ID", "Last Name"])
+    rows, errors, ignored = import_csv.parse_and_map_partial(csv)
+    assert errors == []
+    assert ignored == []
+    assert rows[0]["payload"]["net_id"] == "jsmith"
+    assert rows[0]["payload"]["last_name"] == "Smith"
+
+    # The strict (create-side) parse is deliberately UNCHANGED by this: the same
+    # file is still rejected there, where a missing column IS a broken file.
+    _strict_rows, strict_errors = import_csv.parse_and_map(csv)
+    assert any("Missing required column" in e for e in strict_errors)
+
+
+def test_partial_parse_ignores_unknown_columns_without_failing():
+    csv = _csv_bytes(
+        ["jsmith", "Smith", "purple"],
+        headers=["Net ID", "Last Name", "Favorite Color"],
+    )
+    rows, errors, ignored = import_csv.parse_and_map_partial(csv)
+    assert errors == []
+    # Reported by its ORIGINAL spelling so the user recognizes it, and dropped
+    # from the payload rather than failing the row or the whole upload.
+    assert ignored == ["Favorite Color"]
+    assert rows[0]["payload"]["last_name"] == "Smith"
+    assert "purple" not in str(rows[0]["payload"])
+
+
+def test_partial_parse_normalizes_case_and_spacing_of_known_columns():
+    csv = _csv_bytes(["jsmith", "Smith"], headers=["net  id", "LAST NAME"])
+    rows, errors, ignored = import_csv.parse_and_map_partial(csv)
+    assert errors == []
+    assert ignored == []
+    assert rows[0]["payload"]["net_id"] == "jsmith"
+    assert rows[0]["payload"]["last_name"] == "Smith"
+
+
+def test_partial_parse_requires_an_identity_column():
+    # No Net ID / BYU ID -> nothing could be matched, so this is a hard error.
+    csv = _csv_bytes(["Jane", "Smith"], headers=["First name", "Last Name"])
+    rows, errors, _ignored = import_csv.parse_and_map_partial(csv)
+    assert rows == []
+    assert any("Net ID" in e for e in errors)
+
+
+def test_partial_parse_rejects_a_file_with_nothing_to_update():
+    # An identity column and nothing else: that's a wrong-file signal, not a
+    # legitimate no-op update.
+    csv = _csv_bytes(["jsmith"], headers=["Net ID"])
+    rows, errors, _ignored = import_csv.parse_and_map_partial(csv)
+    assert rows == []
+    assert any("nothing to update" in e for e in errors)
+
+
+def test_partial_parse_still_rejects_duplicate_columns():
+    # Last-wins would silently drop the first column's data, so this stays fatal
+    # in partial mode too — including when the duplicate arrives via spelling.
+    csv = _csv_bytes(
+        ["jsmith", "Smith", "Jones"],
+        headers=["Net ID", "Last Name", "last name"],
+    )
+    rows, errors, _ignored = import_csv.parse_and_map_partial(csv)
+    assert rows == []
+    assert any("Duplicate column" in e for e in errors)
+
+
+def test_partial_file_previews_and_applies_only_the_supplied_column():
+    index = [(1, None, "jsmith", "Jane", "Doe", 2018, False)]
+    existing = Alumni(
+        alumni_id=1,
+        net_id="jsmith",
+        first_name="Jane",
+        last_name="Doe",
+        archived=False,
+    )
+    session = FakeUpdateSession(index_rows=index, alumni={1: existing})
+    csv = _csv_bytes(["jsmith", "Smith"], headers=["Net ID", "Last Name"])
+    rows, errors, _ignored = import_csv.parse_and_map_partial(csv)
+    assert errors == []
+
+    preview = _run(import_csv.evaluate_update(session, rows))
+    assert preview["columns_ok"] is True
+    assert preview["summary"]["with_changes"] == 1
+    assert preview["rows"][0]["changes"] == [
+        {"field": "last_name", "section": "core", "old": "Doe", "new": "Smith"}
+    ]
+
+    result = _run(import_csv.commit_update(session, rows))
+    assert result["updated"] == 1
+    assert existing.last_name == "Smith"
+    # A column the file never carried is untouched, exactly like a blank cell.
+    assert existing.first_name == "Jane"
+
+
+def test_partial_file_omitting_a_section_column_does_not_clear_it():
+    # The single biggest risk of relaxing the header contract: a file that omits
+    # "Current title" entirely must behave like a BLANK title cell, not a clear.
+    index = [(1, None, "jsmith", "Jane", "Doe", 2018, False)]
+    existing = Alumni(alumni_id=1, net_id="jsmith", first_name="Jane", archived=False)
+    employment = CurrentEmployment(
+        current_employment_id=5,
+        alumni_id=1,
+        current_employer="Old Co",
+        current_title="Analyst",
+    )
+    session = FakeUpdateSession(
+        index_rows=index,
+        alumni={1: existing},
+        sections={"current_employment": employment},
+    )
+    csv = _csv_bytes(["jsmith", "New Co"], headers=["Net ID", "Current employer"])
+    rows, errors, _ignored = import_csv.parse_and_map_partial(csv)
+    assert errors == []
+
+    preview = _run(import_csv.evaluate_update(session, rows))
+    changed = {(c["section"], c["field"]) for c in preview["rows"][0]["changes"]}
+    assert ("career", "current_employer") in changed
+    assert ("career", "current_title") not in changed
+
+    result = _run(import_csv.commit_update(session, rows))
+    assert result["updated"] == 1
+    assert employment.current_employer == "New Co"
+    assert employment.current_title == "Analyst"
+
+
+def test_partial_file_unmatched_net_id_is_reported_never_created():
+    index = [(1, None, "jsmith", "Jane", "Doe", 2018, False)]
+    session = FakeUpdateSession(
+        index_rows=index,
+        alumni={1: Alumni(alumni_id=1, net_id="jsmith", archived=False)},
+    )
+    csv = _csv_bytes(["nobody", "Smith"], headers=["Net ID", "Last Name"])
+    rows, errors, _ignored = import_csv.parse_and_map_partial(csv)
+    assert errors == []
+
+    preview = _run(import_csv.evaluate_update(session, rows))
+    assert preview["rows"][0]["status"] == "unmatched"
+    assert preview["summary"]["unmatched"] == 1
+
+    result = _run(import_csv.commit_update(session, rows))
+    assert result["updated"] == 0
+    assert result["unmatched"] == 1
+    assert session.added == []
+
+
+def test_route_preview_accepts_a_partial_csv_and_reports_ignored_columns():
+    import uuid
+
+    from fastapi.testclient import TestClient
+
+    from app.api.dependencies.auth import get_current_db_user
+    from app.core.database import get_session
+    from app.main import app
+    from app.schemas.auth import UserContext
+
+    index = [(1, None, "jsmith", "Jane", "Doe", 2018, False)]
+    session = FakeUpdateSession(
+        index_rows=index,
+        alumni={
+            1: Alumni(
+                alumni_id=1,
+                net_id="jsmith",
+                first_name="Jane",
+                last_name="Doe",
+                archived=False,
+            )
+        },
+    )
+
+    async def _override():
+        yield session
+
+    app.dependency_overrides[get_session] = _override
+    app.dependency_overrides[get_current_db_user] = lambda: UserContext(
+        user_id=1,
+        auth_user_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        roles=["full_access"],
+    )
+    csv = _csv_bytes(
+        ["jsmith", "Smith", "purple"],
+        headers=["Net ID", "Last Name", "Favorite Color"],
+    )
+    with TestClient(app, raise_server_exceptions=False) as c:
+        resp = c.post(
+            "/alumni/import/update/preview",
+            files={"file": ("anything.csv", csv, "text/csv")},
+        )
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["columns_ok"] is True
+    assert body["ignored_columns"] == ["Favorite Color"]
+    assert body["summary"]["with_changes"] == 1
+    assert body["rows"][0]["status"] == "update"

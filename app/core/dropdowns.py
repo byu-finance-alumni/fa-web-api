@@ -173,6 +173,53 @@ def validate_industry(value: str | None) -> str | None:
     return canonical
 
 
+# --- employment status (#568 / #377) -----------------------------------------
+#
+# ``alumni.employment_status`` — what an alumnus is currently doing. Mirror any
+# change here in ``database/dropdowns.md`` and in the frontend's
+# ``EMPLOYMENT_STATUS_OPTIONS`` (fa-web-app/src/constants/dropdowns.ts);
+# ``tests/test_employment_status_vocab.py`` machine-checks this tuple against the
+# doc.
+#
+# DELIBERATELY NOT ENFORCED ON WRITE. The column is a plain ``varchar(50)`` and
+# the schemas only bound its LENGTH, so a record that already stores something
+# off-list ("Employed", "Stay at home parent") stays editable instead of 422-ing
+# on an unrelated field. This tuple is the canonical list the dropdowns, the
+# filter and this module's documentation are built from — not an allow-list.
+# There is intentionally no ``validate_employment_status``.
+#
+# ORDER IS THE DROPDOWN ORDER and is Tanya's (#568), not alphabetical, with
+# "Unknown" pinned last (#377) the same way it is in :data:`INDUSTRIES`.
+EMPLOYMENT_STATUSES: tuple[str, ...] = (
+    "Full-time",
+    "Part-time",
+    "Self-Employed",
+    "Graduate Student",
+    "Military",
+    "Not in the Labor Force",
+    "Unemployed",
+    "Unknown",
+)
+
+# Statuses that are a recorded NON-ANSWER rather than a real one (#572 / #377).
+#
+# "Unknown" means "we asked and we don't know". It became a first-class option in
+# #377 because the 2026-08-04 prod cleanup consolidated the misspelled
+# "unkown"/"UNKOWN" rows onto the literal ``Unknown``, and a value ~65 alumni hold
+# has to be selectable, filterable and importable like any other.
+EMPLOYMENT_STATUS_PLACEHOLDERS: frozenset[str] = frozenset({"Unknown"})
+
+# What the SURVEY offers an alumnus for their OWN status: the canonical list
+# minus the placeholders. "Unknown" is meaningless as a self-description — asking
+# someone to describe themselves as unknown re-collects the very non-answer the
+# survey exists to clear — so it is storable/editable/filterable everywhere but
+# never a choice the alum can pick. Mirrors
+# ``SURVEY_EMPLOYMENT_STATUS_OPTIONS`` in the frontend.
+SURVEY_EMPLOYMENT_STATUSES: tuple[str, ...] = tuple(
+    v for v in EMPLOYMENT_STATUSES if v not in EMPLOYMENT_STATUS_PLACEHOLDERS
+)
+
+
 # --- finance designations (CFA / CFP / CPA) ----------------------------------
 #
 # ``alumni_program_engagement.cfa_designation`` / ``cfp_designation`` /

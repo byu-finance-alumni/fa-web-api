@@ -53,6 +53,8 @@ class Capability:
     VIEW = "view"
     ALUMNI_EDIT = "alumni.edit"
     ALUMNI_FULL = "alumni.full"
+    EVENTS_CREATE = "events.create"
+    EVENTS_IMPORT = "events.import"
     USER_ADMIN = "user_admin"
     DONATIONS_MANAGE = "donations.manage"
     VOCAB_ADMIN = "vocab_admin"
@@ -85,6 +87,33 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         description=(
             "Create and archive alumni, import and export data, and manage "
             "events and the data-quality / tasks tooling."
+        ),
+    ),
+    # Event authoring, split out of alumni.full (#378) so the engineer can widen
+    # (or narrow) who may add events without also handing over alumni
+    # create/archive/import. Deliberately TWO codes, not one: creating a single
+    # event is a one-row write a coordinator might reasonably be trusted with,
+    # while a bulk upload creates an event plus its whole attendee roster from a
+    # file in one shot. Both default to exactly the roles that held alumni.full
+    # (full_access + super_admin, plus the engineer override), so day-one
+    # behaviour is unchanged.
+    CapabilitySpec(
+        code=Capability.EVENTS_CREATE,
+        label="Create events",
+        description=(
+            "Add a new event by hand from the events page. Editing, deleting, "
+            "and managing an existing event's attendee roster stay under "
+            "\"Manage alumni & data\"."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.EVENTS_IMPORT,
+        label="Bulk upload events",
+        description=(
+            "Upload an attendee CSV to create an event and its roster in one "
+            "step, and download the import template. Higher risk than creating "
+            "a single event — one file can add an event and hundreds of "
+            "attendance records at once."
         ),
     ),
     CapabilitySpec(
@@ -162,6 +191,11 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             Capability.VIEW,
             Capability.ALUMNI_EDIT,
             Capability.ALUMNI_FULL,
+            # events.create / events.import default to EXACTLY the roles that
+            # held alumni.full before they were split out (#378), so event
+            # authoring is unchanged on day one.
+            Capability.EVENTS_CREATE,
+            Capability.EVENTS_IMPORT,
             Capability.USER_ADMIN,
             # donations.manage defaults to EXACTLY the roles that held user_admin
             # before it was split out (super_admin + engineer), so gating the
@@ -171,7 +205,13 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
         }
     ),
     RoleName.FULL_ACCESS.value: frozenset(
-        {Capability.VIEW, Capability.ALUMNI_EDIT, Capability.ALUMNI_FULL}
+        {
+            Capability.VIEW,
+            Capability.ALUMNI_EDIT,
+            Capability.ALUMNI_FULL,
+            Capability.EVENTS_CREATE,
+            Capability.EVENTS_IMPORT,
+        }
     ),
     RoleName.STUDENT.value: frozenset({Capability.VIEW, Capability.ALUMNI_EDIT}),
     RoleName.VIEW_ONLY.value: frozenset({Capability.VIEW}),

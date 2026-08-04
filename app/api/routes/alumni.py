@@ -28,7 +28,7 @@ from app.api.dependencies.auth import (
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
-from app.core.dropdowns import parse_designation_tokens
+from app.core.dropdowns import EMPLOYMENT_STATUSES, parse_designation_tokens
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.core.rate_limit import (
     BulkHeadshotRateLimit,
@@ -208,11 +208,11 @@ async def list_alumni(
         Query(
             description=(
                 "Employment status(es) (#584) — repeatable (OR), exact match. "
-                "Canonical values: Full-time, Part-time, Self-Employed, Graduate "
-                "Student, Military, Not in the Labor Force, Unemployed. The column "
-                "is free text and also holds off-list legacy values, so anything on "
-                "file is accepted; 'filter-options.employment_statuses' lists what "
-                "actually exists in the data."
+                "Canonical values: " + ", ".join(EMPLOYMENT_STATUSES) + ". The "
+                "column is free text and also holds off-list legacy values, so "
+                "anything on file is accepted; "
+                "'filter-options.employment_statuses' lists what actually exists "
+                "in the data."
             )
         ),
     ] = None,
@@ -1416,6 +1416,13 @@ async def import_alumni(
 # mass-UPDATE the existing profiles. Distinct from the CREATE-ONLY import above:
 # rows are matched to existing alumni (BYU ID, then Net ID; active only), blank
 # cells are left unchanged, and unmatched rows are reported, never created.
+#
+# The round-trip template is the easy path, not the only one (app #610): these
+# two endpoints parse PARTIALLY (``parse_and_map_partial``), so staff can also
+# drop in an arbitrary CSV — a Net ID column plus whichever columns they happen
+# to have. Columns we don't recognize are ignored and reported back in
+# ``ignored_columns``; columns the file omits are simply left untouched. The
+# preview -> confirm -> apply sequence is unchanged and still mandatory.
 
 
 @router.post("/import/update/preview", response_model=AlumniUpdatePreview)
@@ -1424,22 +1431,25 @@ async def preview_update_import_alumni(
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
-    """Dry-run a bulk UPDATE from a round-trip CSV (full_access, NO writes).
+    """Dry-run a bulk UPDATE from an uploaded CSV (full_access, NO writes).
 
-    Parses + maps the uploaded CSV against the alumni template columns, then for
-    each row resolves the match (BYU ID -> Net ID, active only) and computes a
-    per-field diff against the CURRENT stored values. Returns the structured
-    preview; a bad header set surfaces as ``columns_ok: false``."""
+    Maps whichever of the alumni template columns the file carries (a Net ID or
+    BYU ID column is required; unrecognized columns are ignored and echoed in
+    ``ignored_columns``), then for each row resolves the match (BYU ID -> Net ID,
+    active only) and computes a per-field diff against the CURRENT stored values.
+    Returns the structured preview; an unusable header row surfaces as
+    ``columns_ok: false``."""
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
-    rows, header_errors = import_csv.parse_and_map(
+    rows, header_errors, ignored_columns = import_csv.parse_and_map_partial(
         file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
     )
     if header_errors:
         return {
             "columns_ok": False,
             "header_errors": header_errors,
+            "ignored_columns": ignored_columns,
             "summary": {
                 "total": 0,
                 "matched": 0,
@@ -1449,7 +1459,9 @@ async def preview_update_import_alumni(
             },
             "rows": [],
         }
-    return await import_csv.evaluate_update(session, rows)
+    preview = await import_csv.evaluate_update(session, rows)
+    preview["ignored_columns"] = ignored_columns
+    return preview
 
 
 @router.post("/import/update", response_model=AlumniUpdateResult)
@@ -1458,17 +1470,19 @@ async def update_import_alumni(
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
-    """Commit a bulk UPDATE from a round-trip CSV (full_access).
+    """Commit a bulk UPDATE from an uploaded CSV (full_access).
 
     Re-evaluates and applies every matched, changed row in one transaction, each
     through the single-record edit path (so cleaning + provenance + per-field
-    audit fire). Blank cells are left unchanged; unmatched rows are reported,
-    never created; rows with no effective change are reported ``unchanged``. A bad
-    header set updates nothing."""
+    audit fire). Parses with the same partial header rules as the preview, so the
+    two agree on which columns count. Blank cells are left unchanged, columns the
+    file omits are left unchanged, unrecognized columns are ignored; unmatched
+    rows are reported, never created; rows with no effective change are reported
+    ``unchanged``. An unusable header row updates nothing."""
     file_bytes = await _read_capped(file)
     if file_bytes is None:
         return _too_large_response()
-    rows, header_errors = import_csv.parse_and_map(
+    rows, header_errors, _ignored_columns = import_csv.parse_and_map_partial(
         file_bytes, max_rows=import_csv.MAX_IMPORT_ROWS
     )
     if header_errors:

@@ -289,15 +289,92 @@ def _token_secret() -> str:
     return secret
 
 
-def make_survey_token(alumni_id: int, graduation_year: int) -> str:
-    """A stateless, tamper-evident token: `<b64(payload)>.<b64(hmac)>`."""
-    payload = f"{alumni_id}.{graduation_year}".encode()
+# How long a minted survey link stays usable (#360).
+#
+# SEVEN DAYS, because that is exactly the reminder cadence: stage 0 goes out on
+# day 0, stage 1 on day 7, stage 2 on day 14 (``_STAGE_WINDOW_DAYS``). A token is
+# minted at the moment its email is built (``_build_survey_email`` ->
+# ``_survey_link``), i.e. at send time, so "7 days from issue" means each link
+# stays valid right up to the moment the next reminder issues a fresh one that
+# supersedes it. That alignment IS the design (Jake, 2026-08-03) — do not raise
+# this number without moving the cadence with it.
+#
+# Before this, the token was a bare HMAC over ``alumni_id.graduation_year`` with
+# no time component at all: a forwarded email, a mailing-list archive or a shared
+# browser history handed the holder a PERMANENT read of that alum's employment,
+# both emails, phone, spouse, birth date and citizenship — plus the matching
+# write — and the only revocation was rotating SURVEY_TOKEN_SECRET, which kills
+# every outstanding link at once.
+SURVEY_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
+
+# Tokens minted BEFORE this change carry no issued-at (payload is two fields, not
+# three). They cannot be dated, so they are given one fixed, shared deadline
+# rather than an unbounded life: the same 7 days, measured from the day the fix
+# ships. After it passes, every legacy link is dead for good.
+#
+# A hardcoded instant is deliberate. Anchoring the grace to process start would
+# be worse than useless on a serverless deploy — every cold start would restart
+# the 7 days, so legacy tokens would live forever. If the deploy slips past this
+# date the grace is simply already over, which is the safe direction to fail.
+_LEGACY_TOKEN_VALID_UNTIL = datetime.datetime(2026, 8, 11, tzinfo=datetime.UTC)
+
+
+# The ONE message every token failure gets — malformed, forged, or simply past
+# its 7 days. Deliberately does NOT say which: telling a prober "expired" rather
+# than "invalid" confirms the token was once a real alum's credential.
+#
+# It still has to be useful to the person it is actually shown to, so it names
+# the lifetime, says a replacement is coming, and gives a way out that does not
+# depend on waiting. Lives here, next to the rule it describes, and is used by
+# every public entry point (`api/routes/survey.py`, `survey_responses.py`) so the
+# three routes can never drift into telling an alum three different stories.
+LINK_DEAD_MESSAGE = (
+    "This survey link is no longer usable. Survey links expire seven days after "
+    "they are sent. If our survey is still running you will receive a fresh link "
+    "in your next reminder email — please use the most recent email we sent you. "
+    "If you would rather not wait, contact the BYU Finance department and we will "
+    "send you a new one."
+)
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
+def make_survey_token(
+    alumni_id: int,
+    graduation_year: int,
+    *,
+    issued_at: datetime.datetime | None = None,
+) -> str:
+    """A stateless, tamper-evident, EXPIRING token: `<b64(payload)>.<b64(hmac)>`.
+
+    The payload is ``alumni_id.graduation_year.issued_at`` (issued_at = whole
+    UTC seconds). The expiry rides INSIDE the signed payload rather than beside
+    it, because there is no token row anywhere — the link is the whole credential
+    — so anything not covered by the HMAC would be editable by the recipient.
+    Signing the issue time makes "when was this minted?" as unforgeable as "whose
+    record is this?".
+
+    ``issued_at`` is injectable for tests only; callers mint at send time.
+    """
+    issued = int((issued_at or _now()).timestamp())
+    payload = f"{alumni_id}.{graduation_year}.{issued}".encode()
     sig = hmac.new(_token_secret().encode("utf-8"), payload, hashlib.sha256).digest()
     return f"{_b64(payload)}.{_b64(sig)}"
 
 
-def verify_survey_token(token: str) -> int | None:
-    """Return the alumni_id if the token is valid + untampered, else None."""
+def verify_survey_token(token: str, *, now: datetime.datetime | None = None) -> int | None:
+    """Return the alumni_id if the token is valid, untampered AND unexpired.
+
+    ``None`` covers every failure — malformed, wrong signature, expired — and the
+    callers turn all of them into the SAME 404 message. That is deliberate:
+    distinguishing "expired" from "never existed" would confirm to a prober that
+    a given token was once a real alum's credential.
+
+    Editing the issued-at is not a way in: it is inside the signed payload, so a
+    changed timestamp fails ``compare_digest`` and looks identical to garbage.
+    """
     try:
         payload_b64, sig_b64 = token.split(".", 1)
         payload = _unb64(payload_b64)
@@ -308,9 +385,34 @@ def verify_survey_token(token: str) -> int | None:
     if not hmac.compare_digest(sig, expected):
         return None
     try:
-        alumni_id_str, _ = payload.decode("utf-8").split(".", 1)
-        return int(alumni_id_str)
-    except (ValueError, UnicodeDecodeError):
+        parts = payload.decode("utf-8").split(".")
+    except UnicodeDecodeError:
+        return None
+
+    moment = now or _now()
+    if len(parts) == 2:
+        # Legacy (pre-#360) token: signed, but undatable. Honour it only until the
+        # shared cutoff, so a link already sitting in an alum's inbox still works
+        # for its final week instead of dying the second this deploys.
+        if moment >= _LEGACY_TOKEN_VALID_UNTIL:
+            log.info("Survey token rejected: legacy token past the cutover grace")
+            return None
+    elif len(parts) == 3:
+        try:
+            issued = datetime.datetime.fromtimestamp(int(parts[2]), datetime.UTC)
+        except (ValueError, OverflowError, OSError):
+            return None
+        age = (moment - issued).total_seconds()
+        if age > SURVEY_TOKEN_TTL_SECONDS:
+            # Age only — never the token, the alumni_id or the email address.
+            log.info("Survey token rejected: expired (age %.1f days)", age / 86400)
+            return None
+    else:
+        return None
+
+    try:
+        return int(parts[0])
+    except ValueError:
         return None
 
 
@@ -849,7 +951,11 @@ async def _send_batch(emails: list[dict]) -> tuple[int | None, int | None]:
 
 
 def _survey_link(base_url: str, alumni_id: int, graduation_year: int) -> str:
-    """The recipient's unique, signed confirm link."""
+    """The recipient's unique, signed confirm link.
+
+    Minted here, at send time, so the token's issued-at IS its sent-at and the
+    7-day life (:data:`SURVEY_TOKEN_TTL_SECONDS`) runs out exactly as the next
+    reminder issues its replacement."""
     token = make_survey_token(alumni_id, graduation_year)
     return f"{base_url.rstrip('/')}/survey/{token}"
 

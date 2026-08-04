@@ -985,4 +985,15 @@ CREATE INDEX idx_notes_event_id                       ON notes (event_id);
 CREATE INDEX idx_donations_alumni_id                  ON donations (alumni_id);
 CREATE INDEX idx_donations_year                       ON donations (donation_year);
 
+-- Conference-attendee matching (#612). Expression indexes matching the
+-- normalized exact-equality legs the matcher emits; see
+-- migrations/2026-08-04_attendee_match_indexes.sql for why they must match the
+-- emitted SQL verbatim.
+CREATE INDEX idx_alumni_last_name_norm                ON alumni (lower(trim(last_name)));
+CREATE INDEX idx_alumni_birth_name_norm               ON alumni (lower(trim(birth_name)));
+CREATE INDEX idx_alumni_first_name_norm               ON alumni (lower(trim(first_name)));
+CREATE INDEX idx_alumni_preferred_first_name_norm     ON alumni (lower(trim(preferred_first_name)));
+CREATE INDEX idx_alumni_contact_info_personal_email_norm ON alumni_contact_info (lower(trim(personal_email)));
+CREATE INDEX idx_alumni_contact_info_work_email_norm     ON alumni_contact_info (lower(trim(work_email)));
+
 COMMIT;

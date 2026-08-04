@@ -28,7 +28,7 @@ from app.api.dependencies.auth import (
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
-from app.core.dropdowns import parse_designation_tokens
+from app.core.dropdowns import EMPLOYMENT_STATUSES, parse_designation_tokens
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.core.rate_limit import (
     BulkHeadshotRateLimit,
@@ -208,11 +208,11 @@ async def list_alumni(
         Query(
             description=(
                 "Employment status(es) (#584) — repeatable (OR), exact match. "
-                "Canonical values: Full-time, Part-time, Self-Employed, Graduate "
-                "Student, Military, Not in the Labor Force, Unemployed. The column "
-                "is free text and also holds off-list legacy values, so anything on "
-                "file is accepted; 'filter-options.employment_statuses' lists what "
-                "actually exists in the data."
+                "Canonical values: " + ", ".join(EMPLOYMENT_STATUSES) + ". The "
+                "column is free text and also holds off-list legacy values, so "
+                "anything on file is accepted; "
+                "'filter-options.employment_statuses' lists what actually exists "
+                "in the data."
             )
         ),
     ] = None,

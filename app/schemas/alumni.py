@@ -129,6 +129,11 @@ class AlumniBase(BaseModel):
     citizenship: str | None = Field(default=None, max_length=_CITIZENSHIP_MAX)
     marital_status: str | None = Field(default=None, max_length=_MARITAL_STATUS_MAX)
     home_country: str | None = Field(default=None, max_length=_HOME_COUNTRY_MAX)
+    # employment_status: the canonical options are ``dropdowns.EMPLOYMENT_STATUSES``
+    # (eight since #377 added "Unknown"), but only the LENGTH is enforced here —
+    # on purpose. Prod holds off-list legacy values ("Employed", "Stay at home
+    # parent"), and an allow-list would 422 those records the moment someone edits
+    # an unrelated field on them. See the note on EMPLOYMENT_STATUSES.
     employment_status: str | None = Field(
         default=None, max_length=_EMPLOYMENT_STATUS_MAX
     )

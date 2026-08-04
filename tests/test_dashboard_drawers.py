@@ -178,7 +178,7 @@ def test_summary_event_kpis_filter_active_alumni(client):
     # must join Alumni and filter archived / is_alumni like every other alumni
     # KPI, so friends-of-program and archived records don't inflate them (#179).
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 17)
+    session = _FakeSession([], scalars=[0] * 18)
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/summary")
@@ -410,9 +410,10 @@ def test_summary_includes_this_month_kpis(client):
     # not_contacted_6mo, not_contacted_12mo, not_contacted_24mo,
     # upcoming_follow_ups, duplicate_count, attended_event_this_month,
     # upcoming_events, events_this_month, guest_speakers_this_month,
-    # piff_donors, willing_mentors. The three execute() calls (cohort /
-    # top_employers / by_state) fall back to the empty rows list.
-    scalars = [100, 5, 2, 12, 9, 8, 60, 30, 10, 4, 3, 6, 7, 11, 2, 1, 0]
+    # piff_donors, willing_mentors, alumni_edited_this_month. The three
+    # execute() calls (cohort / top_employers / by_state) fall back to the
+    # empty rows list.
+    scalars = [100, 5, 2, 12, 9, 8, 60, 30, 10, 4, 3, 6, 7, 11, 2, 1, 0, 23]
     app.dependency_overrides[get_session] = _with_session(
         _FakeSession([], scalars=scalars)
     )
@@ -422,6 +423,59 @@ def test_summary_includes_this_month_kpis(client):
     body = response.json()
     assert body["events_this_month"] == 11
     assert body["guest_speakers_this_month"] == 2
+    # #606: the alumni-edited tile reads the LAST scalar in handler order.
+    assert body["alumni_edited_this_month"] == 23
+
+
+# --- #606: "alumni edited this month" KPI ------------------------------------
+
+
+def test_summary_alumni_edited_this_month_counts_updated_at_in_calendar_month(
+    client,
+):
+    # #606: the KPI must be a single aggregate COUNT with a WHERE on
+    # alumni.updated_at — never a fetch-rows-and-count-in-Python (8,000+
+    # records) — and it must apply the same active-alumni predicate as every
+    # other alumni KPI so archived / friend-of-program rows can't inflate it.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 18)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    # Scalar #18 (index 17) — appended after willing_mentors in the handler.
+    sql = _compiled(session.scalar_args[17])
+    assert "count(*)" in sql
+    assert "alumni.updated_at >=" in sql
+    assert "archived" in sql
+    assert "is_alumni" in sql
+    # Aggregate only: no row selection / limit sneaking in.
+    assert "LIMIT" not in sql
+
+
+def test_summary_alumni_edited_month_boundary_is_first_of_month_utc(client):
+    # The window is the CURRENT CALENDAR MONTH (1st 00:00 through now), NOT the
+    # rolling 30-day window the contacted/attended KPIs use. The boundary is
+    # computed from the server's UTC date, matching the other calendar-month
+    # KPIs on this endpoint and the frontend's UTC date helpers.
+    from sqlalchemy.dialects import postgresql
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 18)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    params = session.scalar_args[17].compile(dialect=postgresql.dialect()).params
+    bounds = [v for v in params.values() if isinstance(v, datetime.datetime)]
+    assert len(bounds) == 1
+    bound = bounds[0]
+    today = datetime.datetime.now(datetime.UTC).date()
+    assert bound == datetime.datetime.combine(
+        today.replace(day=1), datetime.time.min, tzinfo=datetime.UTC
+    )
+    assert bound.tzinfo is not None
+    assert bound.utcoffset() == datetime.timedelta(0)
 
 
 def test_summary_industry_breakdown_separates_other_and_unknown(client):
@@ -467,7 +521,7 @@ def test_summary_top_employers_union_covers_history_and_current(client):
     # alumnus. Assert the compiled statement references BOTH source tables and
     # the recency predicate (start_year / is_current / end_year).
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 17)
+    session = _FakeSession([], scalars=[0] * 18)
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/summary")
@@ -482,7 +536,7 @@ def test_summary_top_employers_union_covers_history_and_current(client):
 
 def test_summary_guest_speaker_signal_uses_attendance_status_ilike(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 17)
+    session = _FakeSession([], scalars=[0] * 18)
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/summary")
@@ -614,7 +668,7 @@ def test_summary_contacted_this_month_excludes_archived(client):
     # The contacted-this-month KPI (scalar #6, index 5) must join Alumni and
     # filter archived, matching every other count on the endpoint (#112).
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 17)
+    session = _FakeSession([], scalars=[0] * 18)
     app.dependency_overrides[get_session] = _with_session(session)
     response = client.get("/dashboard/summary")
     app.dependency_overrides.clear()
@@ -654,8 +708,8 @@ def test_summary_response_validates_against_model(client):
     from app.schemas.dashboard import DashboardSummary
 
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    # 17 scalar KPIs; the three distribution queries fall back to empty rows.
-    session = _FakeSession([], scalars=[0] * 17)
+    # 18 scalar KPIs; the three distribution queries fall back to empty rows.
+    session = _FakeSession([], scalars=[0] * 18)
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/summary")

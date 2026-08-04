@@ -68,6 +68,11 @@ class DashboardSummary(BaseModel):
     missing_email: int
     missing_employer: int
     contacted_this_month: int
+    # #606: active alumni whose ``updated_at`` falls in the CURRENT CALENDAR
+    # month (1st 00:00 UTC through now) — not the rolling 30-day window the
+    # contacted/attended KPIs use. Counts any write to the record, including
+    # bulk imports.
+    alumni_edited_this_month: int
     not_contacted_6mo: int
     not_contacted_12mo: int
     not_contacted_24mo: int

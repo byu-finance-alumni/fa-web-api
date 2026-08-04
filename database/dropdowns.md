@@ -112,6 +112,57 @@ the dropdown just above `Graduate Student` (`sort_order` 97).
 
 ---
 
+## Employment Status
+
+Used by: `alumni.employment_status` (person-level: what the alumnus is currently
+doing — **not** an employment-history row).
+
+> **This list is machine-checked.** `tests/test_employment_status_vocab.py`
+> parses the bullets below and fails CI if they drift from `app/core/dropdowns.py`
+> `EMPLOYMENT_STATUSES`. Change both together — order included.
+
+Listed in **dropdown order**, which is Tanya's (#568), *not* alphabetical, with
+`Unknown` pinned last (#377). Unlike Industries this is **not** a
+`vocabulary_terms` category — there is no `/vocabulary/employment_status`
+endpoint and no seed migration; the list lives in code on both sides.
+
+Options:
+- Full-time
+- Part-time
+- Self-Employed
+- Graduate Student
+- Military
+- Not in the Labor Force
+- Unemployed
+- Unknown *(not offered in the survey)*
+
+### Not enforced on write
+
+The column is a plain `varchar(50)` and the backend validates only its **length**.
+That is deliberate: prod holds off-list legacy values (`Employed`, `Stay at home
+parent`, …), and an allow-list would make those records 422 the moment someone
+edits an unrelated field. There is no `validate_employment_status()`. The staff
+dropdowns re-add whatever is on file via `withValue()`, so editing a profile can
+never silently rewrite its stored status.
+
+### Unknown (#377)
+
+`Unknown` means **"we asked and we don't know"** — a recorded non-answer, distinct
+from a blank/unset status ("not yet collected"). It arrived on ~65 prod alumni via
+the free-text intake sheet (as `unkown` / `UNKOWN`) and was consolidated onto the
+literal `Unknown` in Jake's 2026-08-04 prod cleanup, so the app has to treat it as
+a first-class value: selectable, filterable, importable, exportable.
+
+**It is excluded from the survey.** "Unknown" is meaningless as a
+self-description, and offering it back to an alum just re-collects the non-answer
+the survey exists to clear. The survey renders from
+`SURVEY_EMPLOYMENT_STATUSES` (`SURVEY_EMPLOYMENT_STATUS_OPTIONS` in the
+frontend) = this list minus the placeholders, and it displays a *stored*
+`Unknown` as blank (#572) so the alum is prompted for a real answer without the
+untouched value being overwritten.
+
+---
+
 ## Mentor Industries
 
 Used by: `alumni_mentor_industries.industry` (multi-select — one row per industry).

@@ -41,6 +41,7 @@ from app.schemas.survey import (
     GraduationYearCount,
     SurveyNewCyclePreview,
     SurveyNewCycleRequest,
+    SurveyNonResponder,
     SurveyRespondInfo,
     SurveyResponseItem,
     SurveyScheduleBulkRequest,
@@ -312,6 +313,32 @@ async def create_survey_schedules_bulk(
         items=body.schedules,
         actor_user_id=user.user_id,
     )
+
+
+@router.get(
+    "/schedules/{grad_year}/non-responders",
+    response_model=list[SurveyNonResponder],
+)
+async def list_survey_non_responders(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireFullAccess,
+    session: SessionDep,
+) -> list[SurveyNonResponder]:
+    """Who needs MANUAL follow-up for this year's current campaign (#359).
+
+    The alumni who received all three of this cycle's emails and never replied —
+    #151's third step. `SurveyScheduleItem.non_responders` is the same set as a
+    count; this is the call sheet behind it, so "N never responded" is something
+    staff can act on rather than just read.
+
+    Read-only, and gated like the rest of the console (full access) because it
+    returns alumni contact details. Empty list = nobody left to chase; 404 = the
+    year has no campaign at all. Cycle-scoped: a previous campaign's
+    non-responders are not in here."""
+    items = await survey_schedule.list_non_responders(session, grad_year)
+    if items is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return items
 
 
 @router.post("/schedules/{grad_year}/pause", response_model=SurveyScheduleItem)

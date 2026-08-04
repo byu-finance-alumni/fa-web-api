@@ -4,11 +4,25 @@ Auto-sends the annual "confirm your info" survey on a cadence, driven by a daily
 Vercel cron (``POST /survey/cron/run`` → :func:`run_due_schedules`).
 
 Each ``survey_schedule`` row is one graduation year's campaign: an initial send on
-``start_date``, then a 1-week and a 2-week reminder to the non-responders. The
-days elapsed since ``start_date`` set a CEILING on which stage may go out (0 / 1
-/ 2); WHICH stage actually goes out, and whether the campaign is finished at all,
-comes from the delivery log. So the cron is idempotent — it can run every day and
-only sends what is genuinely still owed.
+``start_date``, then a 1-week and a 2-week reminder to the non-responders. That
+cadence is settled — 7 and 14 days, confirmed by Jake on 2026-08-03, with #151's
+older "2 weeks then 3" text amended to match the code rather than the other way
+round (#359). The days elapsed since ``start_date`` set a CEILING on which stage
+may go out (0 / 1 / 2); WHICH stage actually goes out, and whether the campaign
+is finished at all, comes from the delivery log. So the cron is idempotent — it
+can run every day and only sends what is genuinely still owed.
+
+After the last reminder the campaign is ``completed``, which says the SENDING is
+done and nothing about whether it worked. #151's third step — flag the people who
+never replied for manual follow-up — is
+:func:`_cycle_non_responders`: they surface as ``non_responders`` on every
+schedule item and on the completing cron run, with the names behind
+:func:`list_non_responders`. That count is cycle-scoped for the same reason every
+other read of the send log is (#357).
+
+Only one send runs at a time. The cron takes ``survey_email.send_lock`` (a
+Postgres advisory lock) for the whole run and a second, overlapping run returns
+``skipped_locked=True`` rather than sending anything (#358).
 
 Double-emailing is prevented by ``survey_send_log``: the sender CLAIMS each batch
 there (and commits) before it calls Resend, and later runs exclude anyone already
@@ -47,12 +61,16 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, ServiceError
+from app.models.alumni import Alumni
 from app.models.audit import AuditLog
+from app.models.contact import AlumniContactInfo
+from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
 from app.models.user import User
 from app.schemas.survey import (
     SurveyNewCyclePreview,
+    SurveyNonResponder,
     SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
     SurveyScheduleItem,
@@ -69,6 +87,8 @@ log = logging.getLogger(__name__)
 STATUS_SCHEDULED = "scheduled"
 STATUS_ACTIVE = "active"
 STATUS_PAUSED = "paused"
+# `completed` means every stage was sent to everyone owed it — NOT that everyone
+# answered. Who never answered is `non_responders` (see the follow-up section).
 STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
 # The ONLY statuses the cron acts on (`_load_schedules_due`). `paused` is
@@ -148,6 +168,157 @@ async def _sent_counts_by_stage(
     }
 
 
+# ------------------------------------------------- needs manual follow-up -----
+#
+# The third step of #151, which had no implementation at all until #359: after
+# the last reminder, whoever still has not replied must be FLAGGED FOR MANUAL
+# CHECK. Without it `completed` is indistinguishable from "everyone replied" —
+# the campaign ends looking like a success whether it converted the whole cohort
+# or none of it, and nobody can act on the difference.
+#
+# A non-responder is an alum who
+#
+#   1. received EVERY stage of their year's CURRENT campaign (all three log
+#      rows), and
+#   2. has not replied.
+#
+# (1) is why this is cycle-scoped. `survey_send_log` is append-only and spans
+# every campaign a year has ever run, so counting it unscoped would fold last
+# year's non-responders into this year's number and — worse — report a
+# brand-new cycle that has emailed nobody yet as already having a backlog of
+# people who "never responded to it". That is exactly the all-time-vs-this-
+# campaign bug #357 existed to fix, and the join below is the same one
+# `_sent_counts_by_stage` uses.
+#
+# (2) reuses the module's ONE definition of a reply — `RESPONDED_STATUSES`
+# within the 365-day annual window — the same predicate that excludes repliers
+# from a send (`eligible_alumni_query`) and drives the console's "N replied"
+# tally. `rejected` is deliberately NOT a reply: staff threw that submission
+# away, nothing reached the record, so the alum still needs following up. If
+# those two definitions ever drift, an alum can be simultaneously "replied" and
+# "never responded".
+
+# All three stages must be present before someone counts as a non-responder —
+# an alum still owed a reminder has not finished the campaign and is not yet a
+# manual-follow-up case.
+_ALL_STAGES = (STAGE_INITIAL, STAGE_REMINDER_1, STAGE_REMINDER_2)
+
+
+def _cycle_non_responders():
+    """``(graduation_year, alumni_id, last_sent_at)`` for everyone who completed
+    their year's CURRENT campaign without replying — the manual-follow-up set.
+
+    Everything is decided in SQL (a correlated NOT EXISTS + a HAVING over the
+    send log), so it stays one query whatever the cohort size."""
+    replied = (
+        select(SurveyResponse.survey_response_id)
+        .where(
+            SurveyResponse.alumni_id == SurveySendLog.alumni_id,
+            SurveyResponse.submitted_at >= survey_email._resurvey_cutoff(),
+            SurveyResponse.status.in_(survey_email.RESPONDED_STATUSES),
+        )
+        .exists()
+    )
+    return (
+        select(
+            SurveySendLog.graduation_year,
+            SurveySendLog.alumni_id,
+            func.max(SurveySendLog.sent_at).label("last_sent_at"),
+        )
+        # The cycle scope: only log rows belonging to the campaign the year is
+        # on RIGHT NOW. Drop this join and the count becomes an all-time one.
+        .join(
+            SurveySchedule,
+            (SurveySchedule.graduation_year == SurveySendLog.graduation_year)
+            & (SurveySchedule.cycle_seq == SurveySendLog.cycle_seq),
+        )
+        .where(~replied)
+        .group_by(SurveySendLog.graduation_year, SurveySendLog.alumni_id)
+        .having(func.count(func.distinct(SurveySendLog.stage)) == len(_ALL_STAGES))
+    )
+
+
+async def _non_responder_counts(session: AsyncSession) -> dict[int, int]:
+    """How many alumni need manual follow-up, keyed by graduation year.
+
+    Resolved for EVERY year in one query, like ``_sent_counts_by_stage``, so
+    listing the console's schedule table stays a fixed number of round trips."""
+    sub = _cycle_non_responders().subquery()
+    stmt = select(sub.c.graduation_year, func.count()).group_by(
+        sub.c.graduation_year
+    )
+    return {year: n for year, n in (await session.execute(stmt)).all()}
+
+
+async def _non_responder_count(
+    session: AsyncSession, graduation_year: int
+) -> int:
+    """The manual-follow-up count for ONE year's current cycle."""
+    sub = (
+        _cycle_non_responders()
+        .where(SurveySendLog.graduation_year == graduation_year)
+        .subquery()
+    )
+    total = (
+        await session.execute(select(func.count()).select_from(sub))
+    ).scalar()
+    return int(total or 0)
+
+
+async def list_non_responders(
+    session: AsyncSession, graduation_year: int
+) -> list[SurveyNonResponder] | None:
+    """WHO needs manual follow-up for this year — the count made actionable.
+
+    A number alone cannot be worked: staff need the names and addresses to pick
+    up the phone. Returns ``None`` when the year has no schedule (the route
+    404s), which is distinct from a scheduled year with nobody left to chase
+    (an empty list).
+
+    Ordered by name so the list reads like a call sheet and is stable between
+    refreshes. Alumni whose record has since been archived drop out — the join
+    to ``alumni`` is the current record, and chasing an archived one is not a
+    follow-up anyone should be handed."""
+    sched = await _load_schedule_row(session, graduation_year)
+    if sched is None:
+        return None
+    sub = (
+        _cycle_non_responders()
+        .where(SurveySendLog.graduation_year == graduation_year)
+        .subquery()
+    )
+    stmt = (
+        select(
+            Alumni.alumni_id,
+            Alumni.preferred_first_name,
+            Alumni.first_name,
+            Alumni.last_name,
+            AlumniContactInfo.personal_email,
+            sub.c.last_sent_at,
+        )
+        .join(sub, sub.c.alumni_id == Alumni.alumni_id)
+        .outerjoin(
+            AlumniContactInfo,
+            AlumniContactInfo.alumni_id == Alumni.alumni_id,
+        )
+        .where(Alumni.archived.is_(False))
+        .order_by(Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
+    )
+    rows = (await session.execute(stmt)).all()
+    items: list[SurveyNonResponder] = []
+    for alumni_id, preferred, first, last, email, last_sent_at in rows:
+        name = " ".join(p for p in (preferred or first, last) if p).strip()
+        items.append(
+            SurveyNonResponder(
+                alumni_id=alumni_id,
+                name=name or f"Alum #{alumni_id}",
+                email=email,
+                last_sent_at=last_sent_at,
+            )
+        )
+    return items
+
+
 async def _creator_names(
     session: AsyncSession, schedules: Sequence[SurveySchedule]
 ) -> dict[int, str]:
@@ -184,6 +355,7 @@ def _to_item(
     sched: SurveySchedule,
     counts: dict[tuple[int, int], int],
     creators: dict[int, str],
+    non_responders: dict[int, int] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     created_by_id = getattr(sched, "created_by_user_id", None)
@@ -200,6 +372,7 @@ def _to_item(
         sent_initial=counts.get((year, STAGE_INITIAL), 0),
         sent_reminder_1=counts.get((year, STAGE_REMINDER_1), 0),
         sent_reminder_2=counts.get((year, STAGE_REMINDER_2), 0),
+        non_responders=(non_responders or {}).get(year, 0),
     )
 
 
@@ -207,7 +380,8 @@ def _to_item(
 
 
 async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
-    """Every schedule (newest cohort first) with its per-stage delivered counts."""
+    """Every schedule (newest cohort first) with its per-stage delivered counts
+    and its manual-follow-up count."""
     schedules = list(
         (
             await session.execute(
@@ -218,8 +392,9 @@ async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
         .all()
     )
     counts = await _sent_counts_by_stage(session)
+    non_responders = await _non_responder_counts(session)
     creators = await _creator_names(session, schedules)
-    return [_to_item(s, counts, creators) for s in schedules]
+    return [_to_item(s, counts, creators, non_responders) for s in schedules]
 
 
 async def get_schedule(
@@ -236,8 +411,9 @@ async def get_schedule(
     if sched is None:
         return None
     counts = await _sent_counts_by_stage(session)
+    non_responders = await _non_responder_counts(session)
     creators = await _creator_names(session, [sched])
-    return _to_item(sched, counts, creators)
+    return _to_item(sched, counts, creators, non_responders)
 
 
 async def _upsert_schedule(
@@ -830,15 +1006,44 @@ async def run_due_schedules(
     or a spent budget — never re-emails anyone. On a 429, or once the budget is
     spent, we stop the whole run and the next daily cron resumes. Returns a
     per-year summary.
+
+    ONE RUN AT A TIME (#358). The whole thing happens under
+    :func:`survey_email.send_lock`; a second run — another cron delivery, or an
+    admin's manual send — that cannot take the lock returns immediately with
+    ``skipped_locked=True`` and an empty ``ran``. It does not wait and does not
+    error: nothing is lost by skipping, since whatever was due is still due on
+    the next run, and the alternative (two runs each reading the full daily
+    budget before either has claimed anything) spends it twice.
+
+    COMPLETION IS NOT SUCCESS (#359). A completed campaign reports
+    ``non_responders`` — the alumni who received all three emails and never
+    replied. They are the ones #151's third step wanted flagged for manual
+    follow-up, and without the number a campaign that converted nobody looks
+    exactly like one that converted everybody.
     """
     # Fail fast on misconfiguration rather than reporting an empty, clean run.
     # `send_survey_stage` checks these too; this only moves the error earlier.
+    # Deliberately BEFORE the lock: a misconfigured deployment should say so on
+    # every attempt, not depend on winning a race first.
     settings = survey_email.get_settings()
     if not settings.survey_app_base_url:
         raise ServiceError("SURVEY_APP_BASE_URL is not configured.")
     if not settings.survey_from_email:
         raise ServiceError("SURVEY_FROM_EMAIL is not configured.")
 
+    async with survey_email.send_lock() as acquired:
+        if not acquired:
+            log.warning(
+                "Survey cron skipped: another send already holds the lock."
+            )
+            return SurveyScheduleRunSummary(ran=[], skipped_locked=True)
+        return await _run_due_schedules_locked(session, actor_user_id)
+
+
+async def _run_due_schedules_locked(
+    session: AsyncSession, actor_user_id: int | None
+) -> SurveyScheduleRunSummary:
+    """The cron body, run with the send lock held. See :func:`run_due_schedules`."""
     today = _today()
     schedules = await _load_schedules_due(session, today)
     # Snapshot the values we need up front: committing a batch mid-loop expires
@@ -879,10 +1084,27 @@ async def run_due_schedules(
             sched.last_run_at = _now()
             if max_stage >= STAGE_REMINDER_2:
                 # Every stage has been offered AND drained — genuinely finished.
+                # Finished is not the same as answered: report how many of this
+                # cycle's recipients never replied, so `completed` carries the
+                # manual-follow-up backlog with it instead of hiding it (#359).
+                # One extra query, and only on the run that completes a campaign.
                 sched.status = STATUS_COMPLETED
+                needs_followup = await _non_responder_count(session, year)
+                if needs_followup:
+                    log.info(
+                        "Survey campaign %s (cycle %s) completed with %s "
+                        "alumni who never responded — manual follow-up needed.",
+                        year,
+                        cycle_seq,
+                        needs_followup,
+                    )
                 ran.append(
                     SurveyScheduleRunItem(
-                        graduation_year=year, stage=None, sent=0, remaining=0
+                        graduation_year=year,
+                        stage=None,
+                        sent=0,
+                        remaining=0,
+                        non_responders=needs_followup,
                     )
                 )
             else:

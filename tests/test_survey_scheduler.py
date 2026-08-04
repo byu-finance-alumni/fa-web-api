@@ -13,6 +13,7 @@ the actual claim rows rather than against ORM objects handed to `add()`.
 
 import asyncio
 import datetime
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -274,6 +275,58 @@ def test_completed_when_past_last_window_and_everyone_has_had_every_stage(
     assert _logs(session) == []
 
 
+def test_completing_a_campaign_reports_who_never_responded(
+    fake_settings, monkeypatch
+):
+    """`completed` alone cannot be acted on (#359).
+
+    It says the SENDING finished — identically whether the cohort all answered or
+    none of them did. The run that completes a campaign therefore carries the
+    manual-follow-up count with it, so the one moment the campaign is declared
+    over is also the moment staff are told what is left to do by hand."""
+
+    async def batch(emails):  # pragma: no cover - nothing is owed
+        raise AssertionError("no send when the campaign is complete")
+
+    schedule = _sched(2000, _TODAY - datetime.timedelta(days=30), status="active")
+    _patch_run(
+        monkeypatch,
+        schedules=[schedule],
+        recipients=_rcpts([1]),
+        logged={(2000, 0): {1}, (2000, 1): {1}, (2000, 2): {1}},
+        batch=batch,
+    )
+
+    # The one query the completion branch adds: how many of this cycle's
+    # recipients never replied. (Its correctness is proven for real against a
+    # database in tests/test_survey_followup.py.)
+    session = FakeSession([_Res(rows=[(7,)])])
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    assert schedule.status == survey_schedule.STATUS_COMPLETED
+    assert summary.ran[0].stage is None
+    assert summary.ran[0].non_responders == 7
+
+
+def test_a_run_still_sending_does_not_claim_a_follow_up_count(
+    fake_settings, monkeypatch
+):
+    # Mid-campaign the question is not answerable — nobody has had every stage
+    # yet — so the field stays None rather than reporting a misleading 0.
+    async def batch(emails):
+        return (None, None)
+
+    _patch_run(
+        monkeypatch,
+        schedules=[_sched(2000, _TODAY)],
+        recipients=_rcpts([1, 2]),
+        logged={},
+        batch=batch,
+    )
+    summary = asyncio.run(survey_schedule.run_due_schedules(FakeSession()))
+    assert summary.ran[0].non_responders is None
+
+
 def test_past_last_window_still_sends_to_anyone_never_emailed(
     fake_settings, monkeypatch
 ):
@@ -408,6 +461,285 @@ def test_rate_limit_midrun_stops_and_leaves_rest(fake_settings, monkeypatch):
     assert item.retry_after_seconds == 30
     # Only the delivered batch produced log rows — the un-sent 150 have none.
     assert len(_logs(session)) == 100
+
+
+# ------------------------------------------------------------- send lock ------
+#
+# Only one send may be in flight, cron or manual (#358). The claim already stops
+# two runners emailing the same alum; the lock is what stops them each reading
+# the whole daily budget before either has claimed anything and jointly spending
+# twice it, which pushes the account past the Resend plan limit.
+
+
+@asynccontextmanager
+async def _lock(acquired):
+    """Stand-in for `survey_email.send_lock` with a decided outcome."""
+    yield acquired
+
+
+class _FakeConn:
+    def __init__(self, acquired):
+        self._acquired = acquired
+        self.statements = []
+        self.transactions = 0
+        self.open_transaction = False
+        self.closed = False
+
+    def begin(self):
+        conn = self
+
+        class _Txn:
+            async def __aenter__(self):
+                conn.transactions += 1
+                conn.open_transaction = True
+                return self
+
+            async def __aexit__(self, *exc):
+                conn.open_transaction = False
+                return False
+
+        return _Txn()
+
+    async def scalar(self, stmt, params=None):
+        # The lock must be taken INSIDE the transaction — a transaction-scoped
+        # lock outside one is not held at all.
+        assert self.open_transaction, "advisory lock taken outside a transaction"
+        self.statements.append((str(stmt), params))
+        return self._acquired
+
+
+class _FakeEngine:
+    """Just enough engine to observe how the lock is taken."""
+
+    def __init__(self, acquired):
+        self.conn = _FakeConn(acquired)
+        self.connects = 0
+
+    def connect(self):
+        engine = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                engine.connects += 1
+                return engine.conn
+
+            async def __aexit__(self, *exc):
+                engine.conn.closed = True
+                return False
+
+        return _Ctx()
+
+
+def _fake_engine(monkeypatch, acquired):
+    from app.core import database
+
+    engine = _FakeEngine(acquired)
+    monkeypatch.setattr(database, "engine", engine)
+    return engine
+
+
+def _take_lock():
+    """Acquire and immediately release the real lock; returns what it yielded."""
+
+    async def _run():
+        async with survey_email.send_lock() as acquired:
+            return acquired
+
+    return asyncio.run(_run())
+
+
+def test_send_lock_takes_a_transaction_scoped_try_lock_on_its_own_connection(
+    monkeypatch,
+):
+    # Three properties in one, because dropping any of them silently breaks the
+    # guard rather than failing:
+    #   * `pg_try_advisory_xact_lock`, not `pg_advisory_xact_lock` — a run that
+    #     cannot get the lock must return, never queue up behind the first one.
+    #   * a connection of ITS OWN — the send commits after every batch, and a
+    #     lock on the caller's session would be released by the first of those,
+    #     a second into a run that lasts minutes.
+    #   * inside a transaction, asserted by _FakeConn.scalar — a transaction
+    #     lock taken outside one is held for no time at all.
+    engine = _fake_engine(monkeypatch, True)
+    assert _take_lock() is True
+
+    sql, params = engine.conn.statements[0]
+    assert "pg_try_advisory_xact_lock" in sql
+    assert "pg_advisory_xact_lock(" not in sql.replace("pg_try_advisory_xact_lock(", "")
+    assert params == {"key": survey_email._SEND_LOCK_KEY}
+    assert engine.connects == 1
+    assert engine.conn.transactions == 1
+    # Released by leaving the block: the transaction is over and the connection
+    # is closed, either of which drops the lock even if the process then dies.
+    assert engine.conn.open_transaction is False
+    assert engine.conn.closed is True
+
+
+def test_send_lock_reports_false_when_another_send_holds_it(monkeypatch):
+    _fake_engine(monkeypatch, False)
+    assert _take_lock() is False
+
+
+def test_send_lock_is_a_noop_without_a_database(monkeypatch):
+    # Unit tests / a DB-less boot: no connection to lock on, and no second runner
+    # to race either.
+    from app.core import database
+
+    monkeypatch.setattr(database, "engine", None)
+    assert _take_lock() is True
+
+
+def test_a_second_concurrent_run_skips_cleanly_and_sends_nothing(
+    fake_settings, monkeypatch
+):
+    """The whole point of #358: the loser of the race must do NOTHING.
+
+    Not block (the second cron delivery would then sit on a serverless function
+    until it timed out), not raise (an at-least-once cron duplicate is normal
+    traffic, not an error) — just report the skip. Nothing is lost: everything
+    this run would have done is still owed and goes out on the next one, and
+    "possibly missed" is the direction this whole send path deliberately fails
+    in."""
+
+    async def batch(emails):  # pragma: no cover - a skipped run never sends
+        raise AssertionError("a run without the lock must not send")
+
+    schedule = _sched(2000, _TODAY)
+    _patch_run(
+        monkeypatch,
+        schedules=[schedule],
+        recipients=_rcpts([1, 2, 3]),
+        logged={},
+        batch=batch,
+    )
+    monkeypatch.setattr(survey_email, "send_lock", lambda: _lock(False))
+
+    session = FakeSession()
+    summary = asyncio.run(survey_schedule.run_due_schedules(session))
+
+    assert summary.skipped_locked is True
+    assert summary.ran == []
+    assert _logs(session) == []  # not one claim
+    assert _audits(session) == []  # and nothing to audit
+    # The schedule is untouched — in particular it was NOT marked `active`, which
+    # would have overwritten a pause or cancel that landed while the other run
+    # was in flight.
+    assert schedule.status == "scheduled"
+    assert schedule.last_run_at is None
+
+
+def test_the_holder_of_the_lock_runs_normally(fake_settings, monkeypatch):
+    sent_to = []
+
+    async def batch(emails):
+        sent_to.extend(e["to"][0] for e in emails)
+        return (None, None)
+
+    _patch_run(
+        monkeypatch,
+        schedules=[_sched(2000, _TODAY)],
+        recipients=_rcpts([1, 2]),
+        logged={},
+        batch=batch,
+    )
+    monkeypatch.setattr(survey_email, "send_lock", lambda: _lock(True))
+
+    summary = asyncio.run(survey_schedule.run_due_schedules(FakeSession()))
+    assert summary.skipped_locked is False
+    assert summary.ran[0].sent == 2
+
+
+def test_the_budget_is_never_read_by_a_run_without_the_lock(
+    fake_settings, monkeypatch
+):
+    """The lock must come BEFORE the budget read, not after it.
+
+    Reading `_run_allowance` first and locking second reproduces the exact bug:
+    both runners see the full day's allowance, and the second one's answer is
+    already stale by the time it waits its turn."""
+    reads = []
+
+    async def fake_allowance(session):
+        reads.append(True)
+        return 100
+
+    async def fake_due(session, today):  # pragma: no cover - never reached
+        raise AssertionError("a skipped run must not even load the schedules")
+
+    monkeypatch.setattr(survey_schedule, "_run_allowance", fake_allowance)
+    monkeypatch.setattr(survey_schedule, "_load_schedules_due", fake_due)
+    monkeypatch.setattr(survey_email, "send_lock", lambda: _lock(False))
+
+    asyncio.run(survey_schedule.run_due_schedules(FakeSession()))
+    assert reads == []
+
+
+def test_a_misconfigured_deployment_still_errors_without_the_lock(monkeypatch):
+    # The config check sits before the lock on purpose: a missing
+    # SURVEY_FROM_EMAIL must be reported on every attempt, not only to whichever
+    # run happens to win the race.
+    from app.core.errors import ServiceError
+
+    monkeypatch.setattr(
+        survey_email,
+        "get_settings",
+        lambda: SimpleNamespace(
+            survey_app_base_url="https://x.test", survey_from_email=None
+        ),
+    )
+    monkeypatch.setattr(
+        survey_email, "send_lock", lambda: _lock(False)
+    )
+    with pytest.raises(ServiceError):
+        asyncio.run(survey_schedule.run_due_schedules(FakeSession()))
+
+
+def test_manual_send_conflicts_while_another_send_holds_the_lock(
+    fake_settings, monkeypatch
+):
+    # The likeliest collision of all: an admin pressing "Send now" while the
+    # daily cron is mid-run. A person is waiting on the answer, so this says so
+    # (409) rather than reporting a clean "sent 0" that would read as "the cohort
+    # had nothing owed".
+    from app.core.errors import ConflictError
+
+    async def never_sends(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("nothing may be sent without the lock")
+
+    monkeypatch.setattr(survey_email, "send_survey_stage", never_sends)
+    monkeypatch.setattr(survey_email, "send_lock", lambda: _lock(False))
+
+    with pytest.raises(ConflictError):
+        asyncio.run(
+            survey_email.send_campaign(
+                FakeSession(), graduation_year=2000, actor_user_id=1, dry_run=False
+            )
+        )
+
+
+def test_a_dry_run_takes_no_lock(fake_settings, monkeypatch):
+    # A preview sends nothing and spends no budget, so staff must be able to run
+    # one at any time — including while the cron is sending.
+    taken = []
+
+    def _watched():
+        taken.append(True)
+        return _lock(False)
+
+    async def no_recipients(session, year):
+        return []
+
+    monkeypatch.setattr(survey_email, "send_lock", _watched)
+    monkeypatch.setattr(survey_email, "_load_recipients", no_recipients)
+
+    result = asyncio.run(
+        survey_email.send_campaign(
+            FakeSession(), graduation_year=2000, actor_user_id=1, dry_run=True
+        )
+    )
+    assert taken == []
+    assert result.sent == 0
+    assert result.dry_run is True
 
 
 # ------------------------------------------------------------- send cap -------
@@ -592,6 +924,16 @@ class _Res:
     def all(self):
         return self._rows
 
+    def scalar(self):
+        """First column of the first row (what an aggregate read expects)."""
+        row = self._rows[0] if self._rows else None
+        return row[0] if isinstance(row, tuple) else row
+
+
+# `_to_item` is fed by TWO whole-table reads — the per-stage sent counts and the
+# manual-follow-up counts (#359) — so every queue that reaches it needs both.
+_COUNTS = 2
+
 
 class QueueSession:
     def __init__(self, results):
@@ -618,6 +960,7 @@ def test_create_schedule_inserts_new():
             _Res(one=None),  # existence check -> none
             _Res(one=sched),  # get_schedule re-query
             _Res(rows=[]),  # per-stage counts
+            _Res(rows=[]),  # manual-follow-up counts
         ]
     )
     item = asyncio.run(
@@ -644,6 +987,7 @@ def test_create_schedule_replaces_existing():
             _Res(one=existing),  # existence check -> found
             _Res(one=existing),  # get_schedule re-query
             _Res(rows=[]),  # per-stage counts
+            _Res(rows=[]),  # manual-follow-up counts
             # The upsert stamped created_by_user_id, so the creator-name lookup
             # runs (it is skipped entirely when no row has a creator).
             _Res(rows=[]),
@@ -665,7 +1009,9 @@ def test_create_schedule_replaces_existing():
 
 def test_cancel_schedule_sets_cancelled():
     existing = _sched(2000, datetime.date(2026, 8, 1), status="active")
-    session = QueueSession([_Res(one=existing), _Res(one=existing), _Res(rows=[])])
+    session = QueueSession(
+        [_Res(one=existing), _Res(one=existing), _Res(rows=[]), _Res(rows=[])]
+    )
     item = asyncio.run(survey_schedule.cancel_schedule(session, 2000))
     assert existing.status == "cancelled"
     assert item.status == "cancelled"
@@ -685,8 +1031,9 @@ def test_create_schedules_bulk_inserts_and_updates_many():
             _Res(one=None),  # year 2000 existence -> new
             _Res(one=existing),  # year 2001 existence -> found (update)
             _Res(one=None),  # year 2002 existence -> new
-            # list_schedules re-query: all rows + per-stage counts
+            # list_schedules re-query: all rows + per-stage + follow-up counts
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 8, 1))]),
+            _Res(rows=[]),
             _Res(rows=[]),
         ]
     )
@@ -721,6 +1068,7 @@ def test_create_schedules_bulk_empty_is_noop():
         [
             _Res(scalars_all=[]),  # list_schedules: no rows
             _Res(rows=[]),  # per-stage counts
+            _Res(rows=[]),  # manual-follow-up counts
         ]
     )
     result = asyncio.run(
@@ -740,6 +1088,7 @@ def test_create_schedules_bulk_dedupes_duplicate_year():
         [
             _Res(one=None),  # single existence check for the one deduped year
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 9, 1))]),
+            _Res(rows=[]),
             _Res(rows=[]),
         ]
     )
@@ -770,6 +1119,7 @@ def test_list_schedules_includes_stage_counts():
         [
             _Res(scalars_all=[s1]),
             _Res(rows=[(2001, 0, 3), (2001, 1, 1)]),
+            _Res(rows=[(2001, 4)]),  # 4 alumni need manual follow-up
         ]
     )
     items = asyncio.run(survey_schedule.list_schedules(session))
@@ -795,6 +1145,7 @@ def test_list_schedules_resolves_creator_names_in_one_query():
                 ]
             ),
             _Res(rows=[]),  # per-stage counts
+            _Res(rows=[]),  # manual-follow-up counts
             _Res(
                 rows=[
                     (7, "Jake", "Gunnell", "jake@byu.edu"),
@@ -806,7 +1157,8 @@ def test_list_schedules_resolves_creator_names_in_one_query():
     items = asyncio.run(survey_schedule.list_schedules(session))
     # Full name when present, email as the fallback — never the internal user id.
     assert [i.created_by for i in items] == ["Jake Gunnell", "tanya@byu.edu"]
-    assert session.executed == 3  # schedules + counts + one creator lookup
+    # schedules + per-stage counts + follow-up counts + ONE creator lookup
+    assert session.executed == 3 + 1
 
 
 def test_list_schedules_skips_creator_query_when_none_recorded():
@@ -814,11 +1166,12 @@ def test_list_schedules_skips_creator_query_when_none_recorded():
         [
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 5, 1))]),
             _Res(rows=[]),
+            _Res(rows=[]),
         ]
     )
     items = asyncio.run(survey_schedule.list_schedules(session))
     assert items[0].created_by is None
-    assert session.executed == 2  # no creator lookup at all
+    assert session.executed == 2 + 1  # no creator lookup at all
 
 
 # --------------------------------------------------------- pause / resume -----
@@ -853,7 +1206,7 @@ def test_load_schedules_due_excludes_paused():
 def _pause_session(sched):
     """Query queue for one pause/resume: the row lookup, then get_schedule's
     re-query + per-stage counts (+ the creator lookup when a creator is set)."""
-    results = [_Res(one=sched), _Res(one=sched), _Res(rows=[])]
+    results = [_Res(one=sched), _Res(one=sched)] + [_Res(rows=[])] * _COUNTS
     if sched.created_by_user_id is not None:
         results.append(_Res(rows=[]))
     return QueueSession(results)
@@ -1464,7 +1817,7 @@ def test_cron_runs_with_correct_secret(client, monkeypatch):
         "/survey/cron/run", headers={"Authorization": "Bearer topsecret"}
     )
     assert resp.status_code == 200
-    assert resp.json() == {"ran": []}
+    assert resp.json() == {"ran": [], "skipped_locked": False}
     assert ran == [True]
 
 

@@ -106,6 +106,27 @@ class SessionSupersededError(AuthError):
         super().__init__(message)
 
 
+class MaintenanceModeError(Exception):
+    """Raised when site-wide maintenance mode is on and the caller is not exempt.
+
+    Deliberately NOT a subclass of AuthError/AuthorizationError: the caller's
+    credentials are fine, the *site* is closed. Maps to 503 /
+    ``maintenance_mode`` so clients (and any monitoring) can tell a planned pause
+    apart from a permissions problem, and so the frontend shows the maintenance
+    page rather than signing the user out or sending them to a 403.
+
+    The message is the engineer-authored public maintenance copy — identical for
+    every non-exempt caller, so it reveals nothing about the account.
+
+    Engineers are exempt (``app/services/maintenance.is_exempt``), which is what
+    keeps the switch reversible.
+    """
+
+    def __init__(self, message: str = "The site is temporarily unavailable.") -> None:
+        self.message = message
+        super().__init__(message)
+
+
 @lru_cache
 def _jwk_client(jwks_url: str) -> PyJWKClient:
     return PyJWKClient(jwks_url)

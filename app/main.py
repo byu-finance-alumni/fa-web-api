@@ -28,6 +28,7 @@ from app.api.routes import (
     events,
     geography,
     health,
+    maintenance,
     notes,
     support,
     survey,
@@ -46,6 +47,7 @@ from app.core.security import (
     AuthError,
     AuthorizationError,
     DeactivatedAccountError,
+    MaintenanceModeError,
     MustChangePasswordError,
     SessionSupersededError,
 )
@@ -167,6 +169,7 @@ async def security_headers_middleware(request: Request, call_next):
 
 
 app.include_router(health.router)
+app.include_router(maintenance.router)
 app.include_router(auth.router)
 app.include_router(alumni.router)
 app.include_router(dashboard.router)
@@ -186,6 +189,29 @@ app.include_router(vocabulary.admin_router)
 app.include_router(support.router)
 app.include_router(support.admin_router)
 app.include_router(survey.router)
+
+
+@app.exception_handler(MaintenanceModeError)
+async def maintenance_mode_handler(
+    request: Request, exc: MaintenanceModeError
+) -> JSONResponse:
+    """Return 503 / ``maintenance_mode`` while the site-wide pause is on.
+
+    503 rather than 401/403 on purpose: the caller's credentials are valid and
+    their permissions are fine — the site is closed. The frontend keys on this
+    code to show the maintenance page instead of signing the user out or
+    rendering a permissions error. ``Retry-After`` tells well-behaved clients and
+    crawlers to back off rather than treat it as a permanent failure.
+
+    NOT logged as a security event: a paused user hitting the API is expected
+    behaviour during maintenance, not an intrusion signal, and logging every one
+    of them would bury the real events.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": {"code": "maintenance_mode", "message": exc.message}},
+        headers={"Retry-After": "300"},
+    )
 
 
 @app.exception_handler(SessionSupersededError)

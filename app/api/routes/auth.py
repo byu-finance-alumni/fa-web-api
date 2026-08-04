@@ -18,12 +18,13 @@ from app.api.dependencies.auth import (
 from app.core.capabilities import effective_capabilities
 from app.core.database import get_session
 from app.core.rate_limit import RecordLoginRateLimit
+from app.core.security import MaintenanceModeError
 from app.models.audit import AuditLog
 from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import User
 from app.schemas.auth import AuthenticatedUser, UserContext
-from app.services import login_lockout
+from app.services import login_lockout, maintenance
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,19 @@ async def record_login(
     Best-effort by contract: the frontend never blocks the post-login redirect
     on this call. It is deliberately NOT written to ``audit_logs`` — sign-in
     events are a security log, not the record-change audit trail.
+
+    MAINTENANCE MODE: refused (503 / ``maintenance_mode``) for non-exempt users
+    while the site-wide pause is on, BEFORE anything is written. That ordering is
+    the point — this route is what claims ``active_session_id``, so letting it
+    run would hand a paused user a valid session claim and undo the force-logout
+    the switch just performed. Engineers are exempt, so an engineer can always
+    sign back in and reach the console to turn maintenance off.
     """
+    if not user.is_engineer:
+        status = await maintenance.read_status(session)
+        if status.enabled:
+            raise MaintenanceModeError(status.message or maintenance.REFUSAL_MESSAGE)
+
     now = datetime.datetime.now(datetime.UTC)
     db_user = await session.scalar(
         select(User).where(User.user_id == user.user_id)

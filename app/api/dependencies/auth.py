@@ -23,6 +23,7 @@ from app.core.security import (
     AuthError,
     AuthorizationError,
     DeactivatedAccountError,
+    MaintenanceModeError,
     MustChangePasswordError,
     SessionSupersededError,
     verify_supabase_jwt,
@@ -31,6 +32,7 @@ from app.models.login_attempt import LoginAttempt
 from app.repositories.permissions import load_grants
 from app.repositories.user import get_user_with_roles_by_auth_id
 from app.schemas.auth import AuthenticatedUser, UserContext
+from app.services import maintenance
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +139,41 @@ async def get_current_db_user(
     """
     user = await get_current_db_user_allow_must_change(current, session)
     _enforce_single_session(user)
+    await _enforce_maintenance_mode(session, user)
     if user.must_change_password:
         raise MustChangePasswordError()
     return user
+
+
+async def _enforce_maintenance_mode(
+    session: AsyncSession, user: UserContext
+) -> None:
+    """Refuse non-exempt callers while site-wide maintenance mode is on.
+
+    This is the real pause. Refusing at the login route alone would only stop
+    sign-ins that go through our frontend — a user still holding a valid
+    Supabase token could keep calling the API directly. Enforcing on the strict
+    resolver closes that: while maintenance is on, every data route returns
+    503 / ``maintenance_mode`` for everyone except the exempt set.
+
+    TWO ORDERING RULES MATTER HERE, both about not bricking the site:
+
+      * The exemption is checked FIRST, from roles already loaded on the
+        UserContext, so an engineer never touches the maintenance table at all.
+        Even a completely unreadable ``maintenance_mode`` row cannot affect an
+        engineer's access.
+      * ``read_status`` fails OPEN, so an unreadable row means "site is up" for
+        everyone else too.
+
+    Runs after ``_enforce_single_session`` so a user whose session was ended by
+    the switch gets the ``session_superseded`` signal their client already knows
+    how to act on (sign out) rather than a 503 they'd sit on.
+    """
+    if maintenance.is_exempt(user.roles):
+        return
+    status = await maintenance.read_status(session)
+    if status.enabled:
+        raise MaintenanceModeError(status.message or maintenance.REFUSAL_MESSAGE)
 
 
 def _enforce_single_session(user: UserContext) -> None:

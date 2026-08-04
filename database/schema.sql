@@ -687,6 +687,27 @@ CREATE TABLE survey_send_config (
     CONSTRAINT fk_survey_send_config_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
 
+-- Site-wide maintenance mode. Single-row config (id pinned to 1) holding the
+-- engineer's pause switch: while `enabled`, non-engineers cannot sign in or call
+-- the API (503 / maintenance_mode) and the frontend shows a maintenance page.
+-- `message` is PUBLIC copy (NULL = application default); `enabled_at` /
+-- `enabled_by_user_id` are engineer-console-only and are never returned by the
+-- public status endpoint. Engineers are exempt from the pause, which is what
+-- makes the switch reversible. Force-logout reuses users.active_session_id
+-- (#147) and needs no column here. See
+-- migrations/2026-08-03_maintenance_mode.sql.
+CREATE TABLE maintenance_mode (
+    id                  int PRIMARY KEY DEFAULT 1,
+    enabled             boolean NOT NULL DEFAULT false,
+    message             text,
+    enabled_at          timestamptz,
+    enabled_by_user_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_maintenance_mode_singleton CHECK (id = 1),
+    CONSTRAINT fk_maintenance_mode_enabled_by FOREIGN KEY (enabled_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 CREATE TABLE attachments (
     attachment_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id          bigint NOT NULL,

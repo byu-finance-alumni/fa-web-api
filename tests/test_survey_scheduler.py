@@ -78,14 +78,14 @@ class FakeSession(SendLogSession):
 
 
 def _logs(session):
-    """The (year, alumni_id, stage) rows actually claimed in `survey_send_log`."""
+    """The (year, alumni_id, stage, cycle) rows actually claimed."""
     return sorted(session.send_log)
 
 
 def _sent_ids(session, stage=None):
     return sorted(
         alumni_id
-        for _year, alumni_id, s in session.send_log
+        for _year, alumni_id, s, _cycle in session.send_log
         if stage is None or s == stage
     )
 
@@ -117,12 +117,21 @@ def _patch_run(monkeypatch, *, schedules, recipients, logged, batch, allowance=N
     async def fake_recipients(session, year):
         return recipients
 
-    async def fake_logged(session, year, stage):
+    async def fake_logged(session, year, stage, cycle_seq=1):
         # Whatever the test seeded as already-sent, PLUS anything this run has
         # since claimed on the session — so the stage selection sees the run's
         # own writes, exactly as it would against the real table.
-        seeded = set(logged.get((year, stage), set()))
-        return seeded | getattr(session, "logged", lambda *_: set())(year, stage)
+        #
+        # The seeded dict is keyed (year, stage) only, so it describes cycle 1;
+        # a later cycle correctly starts from an empty seeded set (#357).
+        seeded = (
+            set(logged.get((year, stage), set()))
+            if cycle_seq == survey_email.FIRST_CYCLE
+            else set()
+        )
+        return seeded | getattr(session, "logged", lambda *_: set())(
+            year, stage, cycle_seq
+        )
 
     async def fake_allowance(session):
         # None = cap disabled (unlimited); an int = the shared run budget.
@@ -161,7 +170,7 @@ def test_run_sends_stage0_and_logs_recipients(fake_settings, monkeypatch):
     assert item.remaining == 0
     assert sorted(sent_to) == ["a1@example.com", "a2@example.com", "a3@example.com"]
     # A send_log row per recipient, all stage 0.
-    assert _logs(session) == [(2000, 1, 0), (2000, 2, 0), (2000, 3, 0)]
+    assert _logs(session) == [(2000, 1, 0, 1), (2000, 2, 0, 1), (2000, 3, 0, 1)]
     # Audit row carries sent=N so the usage tally counts scheduled sends.
     audit = _audits(session)[0]
     assert audit.action_type == "send_survey"
@@ -208,7 +217,7 @@ def test_stage_advances_by_date(fake_settings, monkeypatch):
 
     assert summary.ran[0].stage == 1
     assert summary.ran[0].sent == 3
-    assert {stage for _y, _a, stage in _logs(session)} == {1}
+    assert {stage for _y, _a, stage, _c in _logs(session)} == {1}
 
 
 def test_reminder_targets_only_initial_nonresponders(fake_settings, monkeypatch):
@@ -234,7 +243,7 @@ def test_reminder_targets_only_initial_nonresponders(fake_settings, monkeypatch)
 
     assert summary.ran[0].sent == 1
     assert sent_to == ["a2@example.com"]
-    assert _logs(session) == [(2000, 2, 1)]
+    assert _logs(session) == [(2000, 2, 1, 1)]
 
 
 def test_completed_when_past_last_window_and_everyone_has_had_every_stage(
@@ -338,7 +347,7 @@ def test_past_last_window_finishes_an_abandoned_reminder(fake_settings, monkeypa
 
     assert summary.ran[0].stage == survey_schedule.STAGE_REMINDER_1
     assert sent_to == ["a2@example.com"]
-    assert _logs(session) == [(2000, 2, 1)]
+    assert _logs(session) == [(2000, 2, 1, 1)]
     assert schedule.status == survey_schedule.STATUS_ACTIVE
 
 
@@ -504,7 +513,7 @@ def test_initial_sent_before_reminder_when_cap_delayed(fake_settings, monkeypatc
     item = summary.ran[0]
     assert item.stage == 0  # INITIAL, not the day-8 reminder
     assert sorted(sent_to) == ["a2@example.com", "a3@example.com"]
-    assert {stage for _y, _a, stage in _logs(session)} == {0}
+    assert {stage for _y, _a, stage, _c in _logs(session)} == {0}
 
 
 def test_run_allowance_subtracts_usage_and_takes_tighter_budget(

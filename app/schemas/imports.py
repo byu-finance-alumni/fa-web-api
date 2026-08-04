@@ -279,7 +279,7 @@ class HeadshotBulkItem(BaseModel):
 
 
 class HeadshotBulkResult(BaseModel):
-    """``POST /alumni/headshots/bulk`` per-file report + tallies."""
+    """``POST /alumni/headshots/bulk/confirm`` per-file report + tallies."""
 
     total: int
     matched: int
@@ -287,3 +287,54 @@ class HeadshotBulkResult(BaseModel):
     invalid: int
     errors: int
     items: list[HeadshotBulkItem]
+
+
+class HeadshotBulkUploadRequest(BaseModel):
+    """Filenames the browser wants signed upload URLs for (#595). METADATA ONLY
+    — image bytes never travel through the function, which is what broke the old
+    multipart route on Vercel's ~4.5 MB request-body cap."""
+
+    filenames: list[str]
+
+
+class HeadshotBulkUploadTarget(BaseModel):
+    """Per-filename outcome of minting bulk upload URLs.
+
+    ``status`` is one of:
+      * ``ready``    — the net_id matched an alumnus; PUT the image to
+        ``upload_url`` (which is scoped SERVER-SIDE to that alumnus's object
+        key — the browser never chooses a key);
+      * ``no_match`` — no alumnus has that net_id; nothing to upload;
+      * ``invalid``  — the file name has no usable net_id or isn't a
+        JPEG/PNG/WebP by extension.
+    Only ``ready`` carries an ``upload_url``."""
+
+    filename: str
+    net_id: str | None = None
+    status: str
+    message: str
+    upload_url: str | None = None
+
+
+class HeadshotBulkUploadUrls(BaseModel):
+    """``POST /alumni/headshots/bulk/upload-urls`` response."""
+
+    targets: list[HeadshotBulkUploadTarget]
+
+
+class HeadshotBulkConfirmFile(BaseModel):
+    """One file's client-reported upload outcome. ``uploaded`` is the browser's
+    claim that its direct PUT succeeded — the server re-derives the net_id,
+    re-resolves the alumnus, and re-validates the landed object regardless, so
+    this only decides whether an object is worth probing."""
+
+    filename: str
+    uploaded: bool = False
+    message: str | None = None
+
+
+class HeadshotBulkConfirmRequest(BaseModel):
+    """``POST /alumni/headshots/bulk/confirm`` request: every file in the batch
+    with the browser's per-file upload outcome."""
+
+    files: list[HeadshotBulkConfirmFile]

@@ -9,11 +9,9 @@ deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
 (archive), never a hard delete — audit history depends on retained records.
 """
 
+import asyncio
 import datetime
-import io
 import posixpath
-import zipfile
-import zlib
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
@@ -64,8 +62,12 @@ from app.schemas.imports import (
     AlumniImportResult,
     AlumniUpdatePreview,
     AlumniUpdateResult,
+    HeadshotBulkConfirmRequest,
     HeadshotBulkItem,
     HeadshotBulkResult,
+    HeadshotBulkUploadRequest,
+    HeadshotBulkUploadTarget,
+    HeadshotBulkUploadUrls,
 )
 from app.schemas.profile import (
     EducationCreate,
@@ -642,34 +644,27 @@ _HEADSHOT_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 # several MB. Independent of ``MAX_UPLOAD_BYTES`` so it doesn't loosen imports.
 _HEADSHOT_MAX_BYTES = 20 * 1024 * 1024  # 20 MiB
 
-# Bulk headshot import (#401). Extension -> MIME for images pulled out of a ZIP
-# (zip entries carry no content-type of their own). Keys are the canonical
-# allow-list; anything else is rejected as ``invalid``.
+# Bulk headshot import (#401, reworked in #595). Extension -> MIME: a bulk file
+# name is all we get before the bytes land, so the extension picks the MIME we
+# scope the signed upload URL to. It is only ever a LABEL — the real bytes are
+# sniffed at confirm time. Keys are the canonical allow-list; anything else is
+# reported ``invalid``.
 _HEADSHOT_EXT_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
     ".webp": "image/webp",
 }
-# Content types (or a .zip name) that mark the single-file archive path.
-_HEADSHOT_ZIP_MIME_TYPES = frozenset(
-    {"application/zip", "application/x-zip-compressed", "application/octet-stream"}
-)
-# Batch caps: bound the number of images and the TOTAL bytes (uncompressed for a
-# zip) so one request can't exhaust memory. Per-file cap reuses _HEADSHOT_MAX_BYTES.
-_HEADSHOT_BULK_MAX_FILES = 1000
-_HEADSHOT_BULK_MAX_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MiB
-# Hard ceiling on the number of central-directory records we'll even scan. Junk
-# entries (dirs / dotfiles / __MACOSX) are skipped before the file-count cap
-# applies, so without this a zip padded with millions of zero-byte members would
-# force a multi-million-iteration loop. This bounds that scan up front; it's well
-# above _HEADSHOT_BULK_MAX_FILES so a legitimate batch (plus its dir/metadata
-# members) never trips it.
-_HEADSHOT_BULK_MAX_DIR_ENTRIES = 10_000
-# Chunk size for streaming a single zip entry out of the archive. We decompress
-# in bounded pieces and track ACTUAL bytes so a lying central-directory size
-# can't drive an unbounded read.
-_ZIP_READ_CHUNK = 1024 * 1024  # 1 MiB
+# Per-REQUEST batch cap for the two bulk endpoints. Image bytes go browser ->
+# Supabase directly, so the only server cost is one storage round-trip + one
+# audit row per file; this bounds a single function invocation's fan-out (and
+# therefore its duration). Larger imports are chunked by the client into
+# successive requests, so this is NOT a ceiling on how many photos can be
+# imported — only on how many ride in one call.
+_HEADSHOT_BULK_MAX_PER_REQUEST = 100
+# How many storage round-trips (mint / probe) we run at once within a request.
+# Bounded so a full batch can't open 100 simultaneous connections to Supabase.
+_HEADSHOT_BULK_CONCURRENCY = 8
 
 
 def _net_id_from_filename(name: str) -> str:
@@ -717,37 +712,6 @@ def _image_content_error(data: bytes, expected_mime: str) -> str | None:
     if sniffed != expected_mime:
         return "File content does not match its declared image type."
     return None
-
-
-def _read_zip_entry_capped(
-    zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int
-) -> bytes | None:
-    """Stream-decompress a single zip entry, aborting the instant the ACTUAL
-    decompressed size exceeds ``cap``.
-
-    We deliberately never gate on ``info.file_size``: that value comes from the
-    archive's central directory and is fully attacker-controlled, so it can lie
-    (small, to slip past a size check, or huge, to trigger a giant read). Instead
-    we open the entry and read it in bounded chunks, counting real bytes, and bail
-    out with None once we cross ``cap``. Returns None (rather than raising) for an
-    over-cap entry OR a corrupt/undecompressable stream (e.g. CRC mismatch from a
-    forged size), so the caller reports it as one invalid item instead of failing
-    the whole request."""
-    total = 0
-    chunks: list[bytes] = []
-    try:
-        with zf.open(info) as fh:
-            while True:
-                chunk = fh.read(_ZIP_READ_CHUNK)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > cap:
-                    return None
-                chunks.append(chunk)
-    except (zipfile.BadZipFile, zlib.error, OSError, EOFError):
-        return None
-    return b"".join(chunks)
 
 
 async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
@@ -914,135 +878,28 @@ async def delete_headshot(
     return Response(status_code=204)
 
 
-# One prepared image awaiting a net_id match + upload. ``error`` is set when the
-# file failed pre-upload validation (bad MIME / empty / too large), in which case
-# ``data`` is None and it is reported as ``invalid`` without a DB lookup.
-class _HeadshotEntry:
-    __slots__ = ("filename", "net_id", "data", "content_type", "error")
-
-    def __init__(
-        self,
-        filename: str,
-        *,
-        net_id: str | None = None,
-        data: bytes | None = None,
-        content_type: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        self.filename = filename
-        self.net_id = net_id
-        self.data = data
-        self.content_type = content_type
-        self.error = error
-
-
-def _prepare_zip_entries(archive: bytes) -> list[_HeadshotEntry] | JSONResponse:
-    """Expand a bulk-import ZIP into per-image entries (validated, capped).
-
-    Skips directories and macOS metadata (``__MACOSX`` / dotfiles). Guards against
-    zip bombs WITHOUT ever trusting the archive's self-declared sizes: each entry
-    is stream-decompressed in bounded chunks and aborted the instant its ACTUAL
-    bytes cross the per-file cap, and the running total of real bytes is held under
-    the batch cap. A file over the per-file cap, undecompressable, of a non-image
-    extension, or whose real content doesn't match its extension is kept as an
-    ``invalid`` entry (so it shows up in the report) rather than silently dropped
-    or crashing the request. Returns a 413 response if the archive holds too many
-    records / images or its real contents exceed the total cap, or 400 if it isn't
-    a readable ZIP."""
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(archive))
-    except zipfile.BadZipFile:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": {
-                    "code": "invalid_request",
-                    "message": "The uploaded file is not a valid ZIP archive.",
-                }
-            },
-        )
-    entries: list[_HeadshotEntry] = []
-    total = 0
-    with zf:
-        # Bound the central-directory scan up front: junk entries are skipped
-        # below before the file-count cap applies, so a zip padded with millions
-        # of zero-byte members would otherwise force a giant loop. Reject the
-        # whole archive if it declares more records than we'll ever scan.
-        if len(zf.infolist()) > _HEADSHOT_BULK_MAX_DIR_ENTRIES:
-            return _bulk_too_many_response()
-        for info in zf.infolist():
-            name = info.filename
-            base = posixpath.basename(name.replace("\\", "/"))
-            if info.is_dir() or not base:
-                continue
-            if base.startswith(".") or name.startswith("__MACOSX"):
-                continue
-            if len(entries) >= _HEADSHOT_BULK_MAX_FILES:
-                return _bulk_too_many_response()
-            net_id = _net_id_from_filename(name)
-            content_type = _headshot_mime_for_ext(name)
-            if content_type is None:
-                entries.append(
-                    _HeadshotEntry(
-                        base,
-                        net_id=net_id or None,
-                        error="File must be a JPEG, PNG, or WebP image.",
-                    )
-                )
-                continue
-            # Stream the entry with a hard per-file cap on REAL bytes; None means
-            # it blew the cap or couldn't be decompressed (e.g. a forged size /
-            # bad CRC) — either way it's one invalid item, never a crash.
-            data = _read_zip_entry_capped(zf, info, _HEADSHOT_MAX_BYTES)
-            if data is None:
-                entries.append(
-                    _HeadshotEntry(
-                        base,
-                        net_id=net_id or None,
-                        error="Image exceeds the per-file size limit or is unreadable.",
-                    )
-                )
-                continue
-            if not data:
-                entries.append(
-                    _HeadshotEntry(
-                        base, net_id=net_id or None, error="The image is empty."
-                    )
-                )
-                continue
-            total += len(data)
-            if total > _HEADSHOT_BULK_MAX_TOTAL_BYTES:
-                return _bulk_too_large_response()
-            # Zip entries carry no content-type; the extension is just a label, so
-            # verify the real bytes are that image type before trusting them.
-            content_error = _image_content_error(data, content_type)
-            if content_error is not None:
-                entries.append(
-                    _HeadshotEntry(base, net_id=net_id or None, error=content_error)
-                )
-                continue
-            entries.append(
-                _HeadshotEntry(
-                    base, net_id=net_id or None, data=data, content_type=content_type
-                )
-            )
-    return entries
-
-
-def _bulk_too_large_response() -> JSONResponse:
-    mib = _HEADSHOT_BULK_MAX_TOTAL_BYTES // (1024 * 1024)
-    return JSONResponse(
-        status_code=413,
-        content={
-            "error": {
-                "code": "payload_too_large",
-                "message": (
-                    f"The images exceed the {mib} MB total upload limit. "
-                    "Split into smaller batches."
-                ),
-            }
-        },
-    )
+# --- Bulk headshot import: direct-to-storage (#401, reworked in #595) ---------
+#
+# The original route took the whole batch as ONE multipart body. Vercel rejects
+# any request over ~4.5 MB at the edge — before our function runs — and that
+# platform error carries no CORS headers, so the browser reported a bogus CORS
+# failure for every batch bigger than a couple of photos. Bytes must therefore
+# never traverse the function.
+#
+# The flow is now the same one the single headshot already uses:
+#   1. POST /alumni/headshots/bulk/upload-urls — filenames ONLY. The server
+#      derives each net ID, resolves the alumnus, and mints a signed upload URL
+#      scoped to THAT alumnus's object key. Unmatched / non-image names are
+#      reported and get no URL, so they can never be uploaded.
+#   2. The browser PUTs each image straight to Supabase Storage.
+#   3. POST /alumni/headshots/bulk/confirm — filenames + per-file outcome. The
+#      server re-derives every net ID, re-resolves every alumnus, sniffs the
+#      landed object's real bytes, deletes anything non-conforming, writes the
+#      audit trail, and returns the authoritative per-file report.
+#
+# Both requests are pure JSON metadata, so a request stays a few KB no matter
+# how large the photos are. Batches over _HEADSHOT_BULK_MAX_PER_REQUEST are
+# chunked by the client into successive calls.
 
 
 def _bulk_too_many_response() -> JSONResponse:
@@ -1052,115 +909,93 @@ def _bulk_too_many_response() -> JSONResponse:
             "error": {
                 "code": "payload_too_large",
                 "message": (
-                    f"Too many images in one request (limit "
-                    f"{_HEADSHOT_BULK_MAX_FILES}). Split into smaller batches."
+                    f"Too many files in one request (limit "
+                    f"{_HEADSHOT_BULK_MAX_PER_REQUEST}). Send them in smaller batches."
                 ),
             }
         },
     )
 
 
-@router.post("/headshots/bulk", response_model=HeadshotBulkResult)
-async def bulk_upload_headshots(
-    user: BulkHeadshotRateLimit,
-    session: SessionDep,
-    files: Annotated[
-        list[UploadFile],
-        File(
-            description=(
-                "Either a single .zip of images OR multiple image files. Each "
-                "image's net_id is its file name minus extension."
-            )
-        ),
-    ],
-) -> HeadshotBulkResult | JSONResponse:
-    """Bulk-upload alumni headshots (full_access and up, #401).
+def _clean_client_detail(message: str | None) -> str | None:
+    """Sanitize a browser-supplied failure detail before it is echoed back in the
+    per-file report: printable characters only, hard length cap. The value never
+    reaches the DB or the logs, but it IS reflected to the operator, so it gets
+    the same treatment as any other untrusted string."""
+    if not message:
+        return None
+    cleaned = "".join(ch for ch in message if ch.isprintable()).strip()
+    if not cleaned:
+        return None
+    return cleaned[:120]
 
-    Accepts EITHER a single ``.zip`` of images OR several image files in one
-    multipart request. For each image the net_id is the file name minus its
-    extension; the alumnus is looked up by net_id (case-insensitive) and, when
-    matched, the JPEG/PNG/WebP is stored in the private ``headshots`` bucket under
-    the net_id key (overwriting any existing image) — the SAME validation, bucket,
-    and key as the single-headshot upload. Returns a per-file report; a matched
-    upload is audited (``upload_headshot``). Per-file (20 MB) and total (200 MB)
-    size caps apply; an oversized batch or bad archive is a 413 / 400."""
-    if not files:
-        raise InvalidRequestError("No files were uploaded.")
 
-    is_zip = len(files) == 1 and (
-        (files[0].filename or "").lower().endswith(".zip")
-        or (files[0].content_type or "").split(";")[0].strip().lower()
-        in _HEADSHOT_ZIP_MIME_TYPES
-    )
+class _BulkPhoto:
+    """One filename in a bulk photo import, resolved SERVER-SIDE.
 
-    entries: list[_HeadshotEntry]
-    if is_zip:
-        archive = await _read_capped(files[0], _HEADSHOT_BULK_MAX_TOTAL_BYTES)
-        if archive is None:
-            return _bulk_too_large_response()
-        prepared = _prepare_zip_entries(archive)
-        if isinstance(prepared, JSONResponse):
-            return prepared
-        entries = prepared
-    else:
-        if len(files) > _HEADSHOT_BULK_MAX_FILES:
-            return _bulk_too_many_response()
-        entries = []
-        total = 0
-        for upload in files:
-            filename = upload.filename or "(unnamed)"
-            net_id = _net_id_from_filename(filename)
-            content_type = (upload.content_type or "").split(";")[0].strip().lower()
-            if content_type not in _HEADSHOT_MIME_TYPES:
-                entries.append(
-                    _HeadshotEntry(
-                        filename,
-                        net_id=net_id or None,
-                        error="File must be a JPEG, PNG, or WebP image.",
-                    )
-                )
-                continue
-            data = await _read_capped(upload, _HEADSHOT_MAX_BYTES)
-            if data is None:
-                entries.append(
-                    _HeadshotEntry(
-                        filename,
-                        net_id=net_id or None,
-                        error="Image exceeds the per-file size limit.",
-                    )
-                )
-                continue
-            if not data:
-                entries.append(
-                    _HeadshotEntry(
-                        filename, net_id=net_id or None, error="The image is empty."
-                    )
-                )
-                continue
-            total += len(data)
-            if total > _HEADSHOT_BULK_MAX_TOTAL_BYTES:
-                return _bulk_too_large_response()
-            # The multipart Content-Type is a client-supplied label; verify the
-            # real bytes are that image type before trusting/storing them.
-            content_error = _image_content_error(data, content_type)
-            if content_error is not None:
-                entries.append(
-                    _HeadshotEntry(
-                        filename, net_id=net_id or None, error=content_error
-                    )
-                )
-                continue
-            entries.append(
-                _HeadshotEntry(
+    ``error`` is set when the name itself is unusable (no net ID, or not a
+    JPEG/PNG/WebP by extension); ``alumnus`` is None when no alumnus owns the net
+    ID. Both verdicts — and the storage key — are decided here, never by the
+    browser. ``upload_url`` is filled in by the minting route."""
+
+    __slots__ = ("filename", "net_id", "content_type", "alumnus", "error", "upload_url")
+
+    def __init__(
+        self,
+        filename: str,
+        *,
+        net_id: str | None = None,
+        content_type: str | None = None,
+        alumnus: Alumni | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.filename = filename
+        self.net_id = net_id
+        self.content_type = content_type
+        self.alumnus = alumnus
+        self.error = error
+        self.upload_url: str | None = None
+
+    @property
+    def object_key(self) -> str:
+        """The alumnus's STORED net ID — the object key we scope uploads to.
+
+        Deliberately not the net ID parsed out of the file name: only a value
+        that came back from the database may address an object, so a crafted
+        file name can never point the upload at another key."""
+        return (self.alumnus.net_id or "").strip() if self.alumnus else ""
+
+
+async def _resolve_bulk_photos(
+    session: AsyncSession, filenames: list[str]
+) -> list[_BulkPhoto]:
+    """Map each file name to its net ID, image type, and alumnus (one query, no
+    N+1). Case-insensitive on the net ID, matching the single-headshot path."""
+    photos: list[_BulkPhoto] = []
+    for raw in filenames:
+        filename = (raw or "").strip() or "(unnamed)"
+        net_id = _net_id_from_filename(filename)
+        content_type = _headshot_mime_for_ext(filename)
+        if content_type is None:
+            photos.append(
+                _BulkPhoto(
                     filename,
                     net_id=net_id or None,
-                    data=data,
-                    content_type=content_type,
+                    error="File must be a JPEG, PNG, or WebP image.",
                 )
             )
+            continue
+        if not net_id:
+            photos.append(
+                _BulkPhoto(
+                    filename,
+                    error="Could not derive a net ID from the file name.",
+                )
+            )
+            continue
+        photos.append(_BulkPhoto(filename, net_id=net_id, content_type=content_type))
 
-    # Batch-resolve every candidate net_id to its alumnus in one query (no N+1).
-    wanted = {e.net_id.lower() for e in entries if e.data is not None and e.net_id}
+    wanted = {p.net_id.lower() for p in photos if p.error is None and p.net_id}
     matches: dict[str, Alumni] = {}
     if wanted:
         rows = (
@@ -1172,70 +1007,295 @@ async def bulk_upload_headshots(
             key = (alumnus.net_id or "").strip().lower()
             if key:
                 matches[key] = alumnus
+    for photo in photos:
+        if photo.error is None and photo.net_id:
+            photo.alumnus = matches.get(photo.net_id.lower())
+    return photos
 
-    items: list[HeadshotBulkItem] = []
-    uploaded = 0
-    for entry in entries:
-        if entry.error is not None:
-            items.append(
-                HeadshotBulkItem(
-                    filename=entry.filename,
-                    net_id=entry.net_id,
+
+@router.post("/headshots/bulk/upload-urls", response_model=HeadshotBulkUploadUrls)
+async def create_bulk_headshot_upload_urls(
+    user: BulkHeadshotRateLimit,
+    session: SessionDep,
+    payload: HeadshotBulkUploadRequest,
+) -> HeadshotBulkUploadUrls | JSONResponse:
+    """Mint per-file signed upload URLs for a bulk photo import (full_access+).
+
+    Takes FILE NAMES ONLY — no image bytes — so the request stays a few KB no
+    matter how big the batch is. Each name's net ID is its basename minus the
+    extension, matched to an alumnus case-insensitively; a name that matches
+    nobody, or isn't a JPEG/PNG/WebP, comes back reported and WITHOUT a URL, so
+    it can never be uploaded. Every minted URL is scoped by the server to that
+    alumnus's own object key, so the browser never chooses where bytes land and
+    never sees the service key.
+
+    Like the single-headshot route, minting writes an ``upload_headshot_started``
+    audit row: it is the attributable precondition for an image change, so the
+    FERPA trail survives a browser that never reaches confirm. Confirm writes the
+    terminal ``upload_headshot`` / ``upload_headshot_rejected``."""
+    if not payload.filenames:
+        raise InvalidRequestError("No file names were provided.")
+    if len(payload.filenames) > _HEADSHOT_BULK_MAX_PER_REQUEST:
+        return _bulk_too_many_response()
+
+    photos = await _resolve_bulk_photos(session, payload.filenames)
+    ready = [
+        p for p in photos if p.error is None and p.alumnus is not None and p.object_key
+    ]
+
+    semaphore = asyncio.Semaphore(_HEADSHOT_BULK_CONCURRENCY)
+
+    async def _mint(photo: _BulkPhoto) -> str | None:
+        async with semaphore:
+            try:
+                return await supabase_storage.create_signed_upload_url(
+                    _HEADSHOT_BUCKET, photo.object_key
+                )
+            except ServiceError:
+                # One unavailable mint is reported for that file only — it must
+                # not fail the whole batch.
+                return None
+
+    if ready:
+        for photo, url in zip(
+            ready, await asyncio.gather(*(_mint(p) for p in ready)), strict=True
+        ):
+            photo.upload_url = url
+
+    targets: list[HeadshotBulkUploadTarget] = []
+    minted = 0
+    for photo in photos:
+        if photo.error is not None:
+            targets.append(
+                HeadshotBulkUploadTarget(
+                    filename=photo.filename,
+                    net_id=photo.net_id,
                     status="invalid",
-                    message=entry.error,
+                    message=photo.error,
                 )
             )
             continue
-        if not entry.net_id:
-            items.append(
-                HeadshotBulkItem(
-                    filename=entry.filename,
-                    net_id=None,
-                    status="invalid",
-                    message="Could not derive a net ID from the file name.",
-                )
-            )
-            continue
-        alumnus = matches.get(entry.net_id.lower())
-        if alumnus is None:
-            items.append(
-                HeadshotBulkItem(
-                    filename=entry.filename,
-                    net_id=entry.net_id,
+        if photo.alumnus is None or not photo.object_key:
+            targets.append(
+                HeadshotBulkUploadTarget(
+                    filename=photo.filename,
+                    net_id=photo.net_id,
                     status="no_match",
                     message="No alumnus has this net ID.",
                 )
             )
             continue
-        key = (alumnus.net_id or "").strip()
-        try:
-            await supabase_storage.upload_object(
-                _HEADSHOT_BUCKET, key, entry.data, entry.content_type
-            )
-        except ServiceError:
-            items.append(
-                HeadshotBulkItem(
-                    filename=entry.filename,
-                    net_id=entry.net_id,
+        if photo.upload_url is None:
+            targets.append(
+                HeadshotBulkUploadTarget(
+                    filename=photo.filename,
+                    net_id=photo.net_id,
                     status="error",
-                    message="The file storage service rejected the upload.",
+                    message="The file storage service is unavailable — try again.",
                 )
             )
             continue
         service._audit(
-            session, user.user_id, "upload_headshot", alumnus.alumni_id, new_value=key
+            session,
+            user.user_id,
+            "upload_headshot_started",
+            photo.alumnus.alumni_id,
+            new_value=photo.object_key,
         )
-        uploaded += 1
-        items.append(
-            HeadshotBulkItem(
-                filename=entry.filename,
-                net_id=entry.net_id,
-                status="matched",
-                message="Headshot uploaded.",
+        minted += 1
+        targets.append(
+            HeadshotBulkUploadTarget(
+                filename=photo.filename,
+                net_id=photo.net_id,
+                status="ready",
+                message="Ready to upload.",
+                upload_url=photo.upload_url,
             )
         )
 
-    if uploaded:
+    if minted:
+        await session.commit()
+    return HeadshotBulkUploadUrls(targets=targets)
+
+
+async def _verify_landed_headshot(key: str) -> tuple[str, str, str | None]:
+    """Validate one object that landed via a direct PUT.
+
+    Returns ``(status, message, rejected_field)``; ``rejected_field`` is set only
+    when the object must be deleted. Defense in depth: the bucket's own MIME
+    allow-list and size limit are the primary guard, but we re-check the type and
+    size here AND sniff the real leading bytes — a browser-supplied Content-Type
+    on a direct PUT is only a label, so the magic bytes are the sole trustworthy
+    signal that the object really is a JPEG/PNG/WebP. FAILS OPEN if the object
+    can't be probed at all (falling back to an existence check), so a storage
+    hiccup never rejects a legitimate upload."""
+    content_type, size, head = await supabase_storage.probe_object_head(
+        _HEADSHOT_BUCKET, key
+    )
+    if content_type is None and size is None and head is None:
+        try:
+            exists = (
+                await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, key)
+                is not None
+            )
+        except ServiceError:
+            exists = False
+        if not exists:
+            return ("error", "No uploaded image was found in storage.", None)
+        return ("matched", "Headshot uploaded.", None)
+    if content_type is not None and content_type not in _HEADSHOT_MIME_TYPES:
+        return (
+            "invalid",
+            "Headshot must be a JPEG, PNG, or WebP image.",
+            "content_type",
+        )
+    if size is not None and size > _HEADSHOT_MAX_BYTES:
+        mib = _HEADSHOT_MAX_BYTES // (1024 * 1024)
+        return ("invalid", f"Image exceeds the {mib} MB per-file size limit.", "size")
+    if head:
+        if content_type is not None:
+            content_error = _image_content_error(head, content_type)
+        else:
+            content_error = (
+                None
+                if _sniff_image_mime(head) is not None
+                else "File content is not a JPEG, PNG, or WebP image."
+            )
+        if content_error is not None:
+            return ("invalid", content_error, "content")
+    return ("matched", "Headshot uploaded.", None)
+
+
+@router.post("/headshots/bulk/confirm", response_model=HeadshotBulkResult)
+async def confirm_bulk_headshot_upload(
+    user: BulkHeadshotRateLimit,
+    session: SessionDep,
+    payload: HeadshotBulkConfirmRequest,
+) -> HeadshotBulkResult | JSONResponse:
+    """Validate + audit the objects a bulk photo import landed (full_access+).
+
+    Takes every file in the batch with the browser's per-file upload outcome and
+    returns the authoritative report the wizard renders (``matched`` /
+    ``no_match`` / ``invalid`` / ``error`` plus tallies). Nothing the browser
+    sends is trusted: net IDs are re-derived, alumni re-resolved, and each landed
+    object re-validated (type, size, sniffed magic bytes). A non-conforming
+    object is DELETED and audited ``upload_headshot_rejected``; a conforming one
+    is audited ``upload_headshot``, exactly like the single-headshot path.
+
+    The per-file ``uploaded`` flag decides only what we REPORT, never whether we
+    look. Every matched alumnus's object is probed either way, so a client that
+    PUTs a bad image and then claims the upload failed can't skip validation and
+    leave that object sitting in the bucket. Conversely, a file the client says
+    failed is never audited ``upload_headshot`` even if a conforming object is
+    present — that object may be the alumnus's PREVIOUS headshot, and a failed
+    upload must not be recorded as a successful one."""
+    if not payload.files:
+        raise InvalidRequestError("No files were provided.")
+    if len(payload.files) > _HEADSHOT_BULK_MAX_PER_REQUEST:
+        return _bulk_too_many_response()
+
+    claims = list(payload.files)
+    photos = await _resolve_bulk_photos(session, [f.filename for f in claims])
+
+    # Validate each landed object ONCE PER STORAGE KEY. Two files can map to the
+    # same net ID (jdoe.jpg + jdoe.png) and the second PUT overwrites the first,
+    # so probing per file would judge the surviving object twice — and could
+    # delete a good image on the strength of its overwritten twin.
+    pending: dict[str, Alumni] = {}
+    for photo in photos:
+        if photo.error is None and photo.alumnus is not None and photo.object_key:
+            pending.setdefault(photo.object_key, photo.alumnus)
+
+    semaphore = asyncio.Semaphore(_HEADSHOT_BULK_CONCURRENCY)
+
+    async def _verify(key: str) -> tuple[str, str, str | None]:
+        async with semaphore:
+            return await _verify_landed_headshot(key)
+
+    keys = list(pending)
+    verdicts: dict[str, tuple[str, str, str | None]] = {}
+    if keys:
+        for key, verdict in zip(
+            keys, await asyncio.gather(*(_verify(k) for k in keys)), strict=True
+        ):
+            verdicts[key] = verdict
+
+    audited = 0
+    # Purge + audit every object that failed validation, once per key.
+    for key, (verdict_status, _message, rejected_field) in verdicts.items():
+        if verdict_status != "invalid" or rejected_field is None:
+            continue
+        try:
+            await supabase_storage.delete_object(_HEADSHOT_BUCKET, key)
+        except ServiceError:
+            # The audit below still records the rejection; a stuck object is a
+            # storage problem, not a reason to report the file as accepted.
+            pass
+        service._audit(
+            session,
+            user.user_id,
+            "upload_headshot_rejected",
+            pending[key].alumni_id,
+            field_name=rejected_field,
+            new_value=key,
+        )
+        audited += 1
+
+    items: list[HeadshotBulkItem] = []
+    for photo, claim in zip(photos, claims, strict=True):
+        if photo.error is not None:
+            items.append(
+                HeadshotBulkItem(
+                    filename=photo.filename,
+                    net_id=photo.net_id,
+                    status="invalid",
+                    message=photo.error,
+                )
+            )
+            continue
+        if photo.alumnus is None or not photo.object_key:
+            items.append(
+                HeadshotBulkItem(
+                    filename=photo.filename,
+                    net_id=photo.net_id,
+                    status="no_match",
+                    message="No alumnus has this net ID.",
+                )
+            )
+            continue
+        verdict_status, message, _rejected_field = verdicts[photo.object_key]
+        # A rejected object was purged above; report that regardless of what the
+        # browser claimed, so lying about the outcome can't hide it.
+        if verdict_status != "invalid" and not claim.uploaded:
+            detail = _clean_client_detail(claim.message)
+            items.append(
+                HeadshotBulkItem(
+                    filename=photo.filename,
+                    net_id=photo.net_id,
+                    status="error",
+                    message=detail or "The photo could not be uploaded — try again.",
+                )
+            )
+            continue
+        if verdict_status == "matched":
+            service._audit(
+                session,
+                user.user_id,
+                "upload_headshot",
+                photo.alumnus.alumni_id,
+                new_value=photo.object_key,
+            )
+            audited += 1
+        items.append(
+            HeadshotBulkItem(
+                filename=photo.filename,
+                net_id=photo.net_id,
+                status=verdict_status,
+                message=message,
+            )
+        )
+
+    if audited:
         await session.commit()
 
     return HeadshotBulkResult(
@@ -1246,7 +1306,6 @@ async def bulk_upload_headshots(
         errors=sum(1 for i in items if i.status == "error"),
         items=items,
     )
-
 
 @router.get("/import/template")
 async def alumni_import_template(

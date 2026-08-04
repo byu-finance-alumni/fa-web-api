@@ -90,8 +90,10 @@ RESPONDED_STATUSES: tuple[str, ...] = ("pending", "applied")
 #
 # A campaign sends in three stages: the initial email, then a 1-week and a 2-week
 # reminder to whoever has not replied. `survey_send_log` is UNIQUE on
-# (graduation_year, alumni_id, stage), so the stage is what makes "have we
-# already emailed this person?" answerable — and it is why a manual send must
+# (graduation_year, alumni_id, stage, cycle_seq), so the stage is what makes
+# "have we already emailed this person?" answerable WITHIN a campaign, and
+# `cycle_seq` is what keeps that question about THIS campaign rather than all
+# time (#357) — and it is why a manual send must
 # pick a REAL stage rather than a synthetic "manual" one: a `stage = -1` would
 # satisfy the unique constraint alongside a stage-0 cron row and let the same
 # alum be emailed twice, which is exactly the incident this all exists to stop.
@@ -141,13 +143,44 @@ def _resurvey_cutoff() -> datetime.datetime:
     )
 
 
+FIRST_CYCLE = 1
+"""The cycle a year is on before anyone has started a second campaign for it —
+and the cycle a send belongs to when the year has no schedule row at all (a
+manual console send for an unscheduled year). Matches the migration's backfill,
+so pre-#357 log rows and a fresh manual send agree."""
+
+
+async def current_cycle_seq(session: AsyncSession, graduation_year: int) -> int:
+    """The campaign cycle a send for this year belongs to right now (#357).
+
+    Read from the year's ``survey_schedule`` row, which is the only thing that
+    ever advances it. A year with no schedule has never had a cycle started, so
+    its manual sends belong to cycle 1 — the same cycle the migration backfilled
+    onto existing rows, so a manual send before and after this change lands in
+    the same bucket."""
+    seq = (
+        await session.execute(
+            select(SurveySchedule.cycle_seq).where(
+                SurveySchedule.graduation_year == graduation_year
+            )
+        )
+    ).scalar_one_or_none()
+    return seq if seq is not None else FIRST_CYCLE
+
+
 async def logged_alumni_ids(
-    session: AsyncSession, graduation_year: int, stage: int
+    session: AsyncSession, graduation_year: int, stage: int, cycle_seq: int
 ) -> set[int]:
-    """alumni_ids already emailed for (year, stage) — the double-send guard."""
+    """alumni_ids already emailed for (year, stage, cycle) — the double-send guard.
+
+    ``cycle_seq`` is NOT optional and must not be defaulted: an unscoped read
+    here is exactly the #357 bug (the guard becomes an all-time question, so a
+    second campaign for the year finds everyone already logged and emails
+    nobody)."""
     stmt = select(SurveySendLog.alumni_id).where(
         SurveySendLog.graduation_year == graduation_year,
         SurveySendLog.stage == stage,
+        SurveySendLog.cycle_seq == cycle_seq,
     )
     return set((await session.execute(stmt)).scalars().all())
 
@@ -832,6 +865,7 @@ async def select_stage_targets(
     graduation_year: int,
     recipients: list[Recipient],
     max_stage: int,
+    cycle_seq: int,
 ) -> tuple[int | None, list[Recipient]]:
     """Pick the stage this send should cover, and who still needs it.
 
@@ -857,13 +891,20 @@ async def select_stage_targets(
     Reminders reach only initial-recipients without needing a separate check: we
     only reach the loop when stage 0 has no targets left, which means every
     remaining recipient is already logged for stage 0.
+
+    Every log read here is scoped to ``cycle_seq`` (#357), so "already emailed"
+    means "already emailed IN THIS CAMPAIGN". Unscoped, a year's second campaign
+    saw last year's rows, found no targets at any stage, and completed having
+    emailed nobody.
     """
-    logged_initial = await logged_alumni_ids(session, graduation_year, STAGE_INITIAL)
+    logged_initial = await logged_alumni_ids(
+        session, graduation_year, STAGE_INITIAL, cycle_seq
+    )
     initial_targets = [r for r in recipients if r.alumni_id not in logged_initial]
     if initial_targets:
         return STAGE_INITIAL, initial_targets
     for stage in range(STAGE_REMINDER_1, max_stage + 1):
-        already = await logged_alumni_ids(session, graduation_year, stage)
+        already = await logged_alumni_ids(session, graduation_year, stage, cycle_seq)
         targets = [r for r in recipients if r.alumni_id not in already]
         if targets:
             return stage, targets
@@ -902,6 +943,7 @@ async def _claim_batch(
     *,
     graduation_year: int,
     stage: int,
+    cycle_seq: int,
     batch: list[Recipient],
 ) -> list[Recipient]:
     """Reserve ``batch`` in ``survey_send_log`` and COMMIT, before sending.
@@ -927,6 +969,7 @@ async def _claim_batch(
                     "graduation_year": graduation_year,
                     "alumni_id": r.alumni_id,
                     "stage": stage,
+                    "cycle_seq": cycle_seq,
                 }
                 for r in batch
             ]
@@ -946,6 +989,7 @@ async def _release_claim(
     *,
     graduation_year: int,
     stage: int,
+    cycle_seq: int,
     batch: list[Recipient],
 ) -> None:
     """Undo a claim Resend DEFINITIVELY refused (a 429, or a non-2xx answer).
@@ -953,6 +997,12 @@ async def _release_claim(
     Only rows :func:`_claim_batch` itself inserted are ever passed here — an
     ``ON CONFLICT DO NOTHING`` never returns a pre-existing row — so this can
     never delete the record of a genuinely delivered email.
+
+    ``cycle_seq`` is part of that guarantee, not decoration (#357). Without it
+    this DELETE matches (year, alumni, stage) across EVERY cycle, so releasing a
+    throttled claim in cycle 2 would silently delete the cycle-1 row recording an
+    email that really was delivered last year — destroying send history and
+    making that alum re-sendable in the earlier cycle's accounting.
     """
     if not batch:
         return
@@ -960,6 +1010,7 @@ async def _release_claim(
         delete(SurveySendLog).where(
             SurveySendLog.graduation_year == graduation_year,
             SurveySendLog.stage == stage,
+            SurveySendLog.cycle_seq == cycle_seq,
             SurveySendLog.alumni_id.in_([r.alumni_id for r in batch]),
         )
     )
@@ -972,6 +1023,7 @@ async def _send_and_log(
     *,
     graduation_year: int,
     stage: int,
+    cycle_seq: int,
     base_url: str,
     from_field: str,
 ) -> tuple[int, int | None, ServiceError | None]:
@@ -995,10 +1047,14 @@ async def _send_and_log(
     error: ServiceError | None = None
     for chunk in _chunks(recipients, _BATCH_MAX):
         claimed = await _claim_batch(
-            session, graduation_year=graduation_year, stage=stage, batch=chunk
+            session,
+            graduation_year=graduation_year,
+            stage=stage,
+            cycle_seq=cycle_seq,
+            batch=chunk,
         )
         if not claimed:
-            continue  # someone else already owns this (year, alumni, stage)
+            continue  # someone else already owns this (year, alumni, stage, cycle)
         emails = [
             _build_survey_email(
                 r,
@@ -1015,6 +1071,7 @@ async def _send_and_log(
                 session,
                 graduation_year=graduation_year,
                 stage=stage,
+                cycle_seq=cycle_seq,
                 batch=claimed,
             )
             retry_after = exc.retry_after
@@ -1036,6 +1093,7 @@ async def _send_and_log(
                 session,
                 graduation_year=graduation_year,
                 stage=stage,
+                cycle_seq=cycle_seq,
                 batch=claimed,
             )
             error = exc
@@ -1078,6 +1136,7 @@ async def send_survey_stage(
     limit: int | None = None,
     recipients: list[Recipient] | None = None,
     scheduled: bool = False,
+    cycle_seq: int | None = None,
 ) -> SendOutcome:
     """Send one stage of a year's survey — the ONLY way either caller sends.
 
@@ -1125,11 +1184,24 @@ async def send_survey_stage(
             ",".join(str(r.alumni_id) for r in duplicates[:20]),
         )
 
+    # Which campaign this send belongs to (#357). Resolved ONCE and threaded
+    # through target selection, claiming and any release, so a single send can
+    # never straddle two cycles — re-reading it per batch would let a concurrent
+    # "start new cycle" split one send across both.
+    #
+    # The cron passes the cycle it already read off the schedule row it is
+    # iterating; re-resolving it here would make the completion check and the
+    # send that follows it two independent reads that can disagree. Only the
+    # manual path, which has no schedule in hand, looks it up.
+    if cycle_seq is None:
+        cycle_seq = await current_cycle_seq(session, graduation_year)
+
     stage, targets = await select_stage_targets(
         session,
         graduation_year=graduation_year,
         recipients=eligible,
         max_stage=max_stage,
+        cycle_seq=cycle_seq,
     )
     prepared = [] if stage is None else targets
     if limit is not None:
@@ -1144,6 +1216,7 @@ async def send_survey_stage(
             prepared,
             graduation_year=graduation_year,
             stage=stage,
+            cycle_seq=cycle_seq,
             base_url=base_url,
             from_field=from_field,
         )
@@ -1158,7 +1231,7 @@ async def send_survey_stage(
             entity_type="survey_campaign",
             entity_id=graduation_year,
             new_value=(
-                f"grad_year={graduation_year} stage={stage} "
+                f"grad_year={graduation_year} stage={stage} cycle={cycle_seq} "
                 f"scheduled={scheduled} recipients={len(eligible)} "
                 f"targets={len(targets)} prepared={len(prepared)} "
                 f"sent={sent} dry_run={dry_run}"

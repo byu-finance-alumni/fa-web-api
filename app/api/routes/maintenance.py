@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireEngineer
 from app.core.database import get_session
+from app.core.rate_limit import EnableMaintenanceRateLimit
 from app.schemas.maintenance import (
     MaintenanceEnableRequest,
     MaintenanceEnableResult,
@@ -65,7 +66,7 @@ async def get_maintenance_state(
 
 @router.post("/enable", response_model=MaintenanceEnableResult)
 async def enable_maintenance(
-    user: RequireEngineer,
+    user: EnableMaintenanceRateLimit,
     session: SessionDep,
     body: MaintenanceEnableRequest | None = None,
 ) -> MaintenanceEnableResult:
@@ -75,6 +76,11 @@ async def enable_maintenance(
     the live session of every signed-in non-engineer account. Engineers — the
     caller included — keep their session and their access, so this same console
     can turn it back off without signing in again.
+
+    Rate-limited (``ENABLE_MAINTENANCE_LIMITER``, which resolves the actor
+    through ``require_engineer``, so the route stays engineer-gated). The
+    matching ``/disable`` is deliberately NOT limited — see the note on the
+    limiter for why throttling the recovery direction would be a lockout.
     """
     return await maintenance.enable(
         session,

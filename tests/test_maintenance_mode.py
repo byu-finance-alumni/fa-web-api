@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import auth as auth_deps
 from app.api.dependencies.auth import get_current_user, get_permission_config
+from app.core import rate_limit
 from app.core.capabilities import DEFAULT_GRANTS
 from app.core.database import get_session
 from app.core.security import MaintenanceModeError
@@ -39,8 +40,10 @@ AUTH_UUID = "11111111-1111-1111-1111-111111111111"
 def _clear_maintenance_cache():
     """``read_status`` memoises per process; every test starts from a clean read."""
     maintenance.reset_cache()
+    rate_limit.reset()
     yield
     maintenance.reset_cache()
+    rate_limit.reset()
 
 
 # --- Fakes -------------------------------------------------------------------
@@ -130,7 +133,14 @@ def _db_user(*roles: str, user_id: int = 1, active_session_id: str | None = None
     )
 
 
-def _client(session, *, roles: tuple[str, ...] | None, monkeypatch, token_session=None):
+def _client(
+    session,
+    *,
+    roles: tuple[str, ...] | None,
+    monkeypatch,
+    token_session=None,
+    active_session_id: str | None = None,
+):
     """A TestClient wired so the REAL auth resolver chain runs.
 
     ``roles=None`` means unauthenticated (no token override, so the bearer
@@ -145,7 +155,7 @@ def _client(session, *, roles: tuple[str, ...] | None, monkeypatch, token_sessio
 
     if roles is not None:
         async def _fake_lookup(_session, _auth_uuid):
-            return _db_user(*roles)
+            return _db_user(*roles, active_session_id=active_session_id)
 
         monkeypatch.setattr(auth_deps, "get_user_with_roles_by_auth_id", _fake_lookup)
         app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
@@ -337,6 +347,102 @@ def test_non_engineer_cannot_read_the_engineer_state(monkeypatch, clean_override
         resp = client.get("/maintenance")
 
     assert resp.status_code == 403
+
+
+# --- Rate limiting: braked in one direction only -----------------------------
+
+
+def test_turning_maintenance_on_is_rate_limited(monkeypatch, clean_overrides):
+    """A runaway loop can't thrash the switch — enabling has a budget."""
+    session = FakeSession(maintenance_row=_row(enabled=False))
+
+    with _client(session, roles=("engineer",), monkeypatch=monkeypatch) as client:
+        codes = [client.post("/maintenance/enable").status_code for _ in range(21)]
+
+    assert codes[:20] == [200] * 20
+    assert codes[20] == 429
+
+
+def test_turning_maintenance_OFF_is_never_rate_limited(monkeypatch, clean_overrides):
+    """THE RECOVERY DIRECTION MUST NOT HAVE A BUDGET.
+
+    A limiter on disable is itself a lockout: burn the budget — by accident, by a
+    retry loop, or deliberately — and the site stays down for the length of the
+    window with nothing that can bring it back. Well past the enable budget here,
+    so a shared limiter would have tripped.
+    """
+    session = FakeSession(maintenance_row=_row(enabled=True))
+
+    with _client(session, roles=("engineer",), monkeypatch=monkeypatch) as client:
+        codes = [client.post("/maintenance/disable").status_code for _ in range(40)]
+
+    assert set(codes) == {200}
+
+
+def test_the_enable_limiter_still_refuses_non_engineers(
+    monkeypatch, clean_overrides
+):
+    """The limiter resolves its actor through ``require_engineer``, so wrapping
+    the route in it must not weaken the gate."""
+    session = FakeSession(maintenance_row=_row(enabled=False))
+
+    with _client(session, roles=("super_admin",), monkeypatch=monkeypatch) as client:
+        resp = client.post("/maintenance/enable")
+
+    assert resp.status_code == 403
+    assert session.commits == 0
+
+
+# --- Routes deliberately OUTSIDE the gate ------------------------------------
+#
+# The maintenance gate lives on the STRICT resolver, so the three routes on the
+# force-password-change-exempt resolver are not covered by it. That is a
+# decision, not an oversight, and these tests pin it so it stays visible: if
+# someone later moves the gate onto the base resolver, the session probe below
+# starts failing and takes the force-logout signal down with it.
+
+
+def test_the_session_probe_still_answers_while_maintenance_is_active(
+    monkeypatch, clean_overrides
+):
+    """The force-logout is only observable because this route stays open.
+
+    A paused user's browser polls it to learn its session was ended and sign
+    itself out. If maintenance 503'd it, force-logged-out clients would sit on a
+    dead session with no idea, and never reach the maintenance page.
+    """
+    session = FakeSession(maintenance_row=_row(enabled=True))
+    sentinel = maintenance._new_sentinel()
+
+    with _client(
+        session,
+        roles=("view_only",),
+        monkeypatch=monkeypatch,
+        token_session="their-real-session",
+        active_session_id=sentinel,
+    ) as client:
+        resp = client.get("/auth/session/active")
+
+    assert resp.status_code == 200
+    # The sentinel doesn't match their token's session, so the client is told to
+    # sign out — which is exactly what "force logout" means from the browser.
+    assert resp.json()["active"] is False
+
+
+def test_auth_context_still_answers_while_maintenance_is_active(
+    monkeypatch, clean_overrides
+):
+    """Accepted exception: ``/auth/context`` returns the CALLER'S OWN identity
+    only — no alumni data, nobody else's record — and the frontend needs it to
+    decide that this user is not an engineer and belongs on the maintenance page.
+    """
+    session = FakeSession(maintenance_row=_row(enabled=True))
+
+    with _client(session, roles=("view_only",), monkeypatch=monkeypatch) as client:
+        resp = client.get("/auth/context")
+
+    assert resp.status_code == 200
+    assert resp.json()["roles"] == ["view_only"]
 
 
 # --- The public status endpoint ---------------------------------------------

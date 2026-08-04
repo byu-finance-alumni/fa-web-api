@@ -156,6 +156,24 @@ async def _enforce_maintenance_mode(
     resolver closes that: while maintenance is on, every data route returns
     503 / ``maintenance_mode`` for everyone except the exempt set.
 
+    THREE ROUTES ARE OUTSIDE THIS GATE, and it is worth being explicit rather
+    than letting "every route" read as absolute. They are the ones on the
+    force-password-change-EXEMPT resolver above, which does not call this:
+
+      * ``GET /auth/session/active`` — MUST stay reachable. It is how a paused
+        user's browser learns its session was ended and signs itself out; 503ing
+        it would leave force-logged-out clients sitting on a dead session.
+      * ``GET /auth/context`` — returns only the CALLER'S OWN identity, roles,
+        and capabilities. No alumni data, nobody else's record. A paused user can
+        still read it while their access token lives out its remaining minutes;
+        that is accepted, because the frontend relies on it to decide where to
+        send them (the ``(app)`` layout reads it, finds they are not an engineer,
+        and redirects to the maintenance page).
+      * ``POST /auth/password/complete`` — clears the caller's own temp-password
+        flag and nothing else.
+
+    Everything that reads or writes application data goes through this gate.
+
     TWO ORDERING RULES MATTER HERE, both about not bricking the site:
 
       * The exemption is checked FIRST, from roles already loaded on the

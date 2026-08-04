@@ -167,11 +167,15 @@ async def _load_status(session: AsyncSession) -> MaintenanceStatus:
 async def read_status(session: AsyncSession) -> MaintenanceStatus:
     """The public switch state, cached for ``_CACHE_TTL_SECONDS`` per process.
 
-    FAILS OPEN. If the row cannot be read — the migration has not been applied
-    yet, the table is missing, the database blipped — this reports DISABLED (or
-    the last value it successfully read) instead of raising. A control that can
-    lock every user out must never be driven by an unreadable value, so the
-    error case resolves to "site is up".
+    NEVER RAISES. If the row cannot be read — the migration has not been applied
+    yet, the table is missing, the database blipped — this returns the last value
+    it successfully read, or DISABLED if it has never read one. A control that
+    can hide the whole application must not be driven by an unreadable value.
+
+    So it fails OPEN from a cold start (unreadable and never read => site is up),
+    and STICKY otherwise (an error mid-window keeps the window closed rather than
+    flapping the site open for a few seconds). Neither direction can strand an
+    engineer: the gate exempts them before it ever calls this.
     """
     global _cached
     now = time.monotonic()

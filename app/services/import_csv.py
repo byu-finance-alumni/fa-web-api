@@ -558,7 +558,13 @@ def parse_and_map(
     *,
     friend: bool = False,
 ) -> tuple[list[dict], list[str]]:
-    """Parse a CSV and map each data row to an ``AlumniCreateFull`` payload dict.
+    """Strict parse: the file's columns must match the template EXACTLY.
+
+    Thin wrapper over :func:`_parse_and_map` used by the CREATE-side imports,
+    where a missing column really is a broken file. See
+    :func:`parse_and_map_partial` for the lenient UPDATE-side variant.
+
+    Parse a CSV and map each data row to an ``AlumniCreateFull`` payload dict.
 
     Returns ``(rows, header_errors)``:
 
@@ -589,6 +595,51 @@ def parse_and_map(
 
     The CSV is decoded as ``utf-8-sig`` so an Excel BOM is stripped.
     """
+    rows, header_errors, _ignored = _parse_and_map(
+        file_bytes, max_rows=max_rows, friend=friend, partial=False
+    )
+    return rows, header_errors
+
+
+def parse_and_map_partial(
+    file_bytes: bytes,
+    max_rows: int | None = MAX_IMPORT_ROWS,
+) -> tuple[list[dict], list[str], list[str]]:
+    """Lenient parse for the UPDATE path — an ARBITRARY CSV, not the template.
+
+    Returns ``(rows, header_errors, ignored_columns)``. Same row shape as
+    :func:`parse_and_map`; the difference is entirely in how the header row is
+    judged (see :func:`_validate_partial_headers`):
+
+      * columns the file DOESN'T carry are fine — an absent column simply means
+        "don't touch that field", exactly like the blank cell it would contain
+        (``_map_row`` already skips headers it can't map, and
+        ``_build_update_model`` merges each section on top of the record's
+        CURRENT values, so a missing column can't blank anything out);
+      * columns we don't recognize are IGNORED and returned in
+        ``ignored_columns`` for the caller to surface, instead of failing the
+        upload;
+      * a Net ID (or BYU ID) column IS required — with nothing to match on,
+        every row would be reported unmatched;
+      * duplicate columns are still a hard error (last-wins would silently drop
+        the earlier column's data), as is a file with no recognizable field
+        column at all (that's the wrong file, not a partial one).
+
+    This is deliberately NOT wired into the create-side imports: there, a
+    missing column is a broken file and must stay a hard error.
+    """
+    return _parse_and_map(file_bytes, max_rows=max_rows, friend=False, partial=True)
+
+
+def _parse_and_map(
+    file_bytes: bytes,
+    *,
+    max_rows: int | None,
+    friend: bool,
+    partial: bool,
+) -> tuple[list[dict], list[str], list[str]]:
+    """Shared parse/map core behind :func:`parse_and_map` (strict) and
+    :func:`parse_and_map_partial` (lenient). See those for the contract."""
     expected = _expected_headers(friend)
     mapping = _mapping_for(friend)
     text = _decode_upload(file_bytes)
@@ -596,21 +647,30 @@ def parse_and_map(
         return [], [
             "The file could not be read. Re-save it as CSV UTF-8 from Excel "
             "(Save As → 'CSV UTF-8 (Comma delimited)') and re-upload."
-        ]
+        ], []
     reader = csv.reader(io.StringIO(text))
     try:
         header_row = next(reader)
     except StopIteration:
-        return [], ["The file is empty."]
+        return [], ["The file is empty."], []
 
     # Retired header spellings are folded to their current names here, so every
     # downstream step (validation, duplicate detection, _map_row) sees one
-    # canonical header set and a sheet on the old template still imports.
+    # canonical header set and a sheet on the old template still imports. In
+    # partial mode we additionally fold a header that differs from a template
+    # column only by case/spacing/dash style onto that column, so "net id"
+    # matches "Net ID".
     headers = [_canonicalize_header(h.strip()) for h in header_row]
-    header_errors = _validate_headers(headers, expected)
+    ignored: list[str] = []
+    if partial:
+        headers = [_match_known_header(h, expected) for h in headers]
+        header_errors = _validate_partial_headers(headers, expected)
+        ignored = [h for h in headers if h and h not in set(expected)]
+    else:
+        header_errors = _validate_headers(headers, expected)
     if header_errors:
         # Columns are wrong; don't attempt to map rows against a bad header.
-        return [], header_errors
+        return [], header_errors, ignored
 
     rows: list[dict] = []
     # csv row index: header consumed above is spreadsheet row 1, so data rows
@@ -623,9 +683,70 @@ def parse_and_map(
             return [], [
                 f"File exceeds the {max_rows:,}-row import limit. Split into "
                 "smaller batches."
-            ]
+            ], ignored
         rows.append(_map_row(offset, headers, raw_row, mapping, friend))
-    return rows, header_errors
+    return rows, header_errors, ignored
+
+
+# The two identity columns the UPDATE path matches on. A partial file must carry
+# at least one of them; without it every row is unmatchable.
+_UPDATE_ID_HEADERS: tuple[str, ...] = ("Net ID", "BYU ID (9 digits)")
+
+
+def _header_key(header: str) -> str:
+    """Fold a header to a comparison key: casefolded, dashes and whitespace
+    normalized, so 'net id' / 'Net  ID' / 'NET-ID' all collapse together."""
+    folded = re.sub(r"[‐-―\-]+", " ", header)
+    return re.sub(r"\s+", " ", folded).strip().casefold()
+
+
+def _match_known_header(header: str, expected_headers: list[str]) -> str:
+    """Return the template column *header* means, or *header* itself.
+
+    Only ever resolves to a column that already exists in the template — this
+    normalizes spelling, it never guesses at an unknown column.
+    """
+    if not header or header in set(expected_headers):
+        return header
+    key = _header_key(header)
+    for candidate in expected_headers:
+        if _header_key(candidate) == key:
+            return candidate
+    return header
+
+
+def _validate_partial_headers(
+    headers: list[str], expected_headers: list[str]
+) -> list[str]:
+    """Header check for the lenient UPDATE parse. Unknown/absent columns are NOT
+    errors here — only a genuinely unusable header row is."""
+    errors: list[str] = []
+    expected = set(expected_headers)
+    seen = set(headers)
+    # Duplicates stay fatal: last-wins would silently drop the earlier column.
+    for dup in sorted({h for h in headers if h and headers.count(h) > 1}):
+        errors.append(f"Duplicate column: {dup!r}.")
+    # Wrong-delimiter hint (same tell as the strict check).
+    if len(headers) == 1 and (
+        headers[0].count(";") >= 2 or headers[0].count("\t") >= 2
+    ):
+        errors.append(
+            "This looks like a semicolon- or tab-delimited file. Re-save it as "
+            "a comma-delimited CSV and try again."
+        )
+        return errors
+    if not any(h in seen for h in _UPDATE_ID_HEADERS):
+        errors.append(
+            "The file needs a 'Net ID' column (or 'BYU ID (9 digits)') so each "
+            "row can be matched to an existing profile."
+        )
+    recognized = [h for h in headers if h in expected and h not in _UPDATE_ID_HEADERS]
+    if not recognized and not errors:
+        errors.append(
+            "None of this file's other columns match a field in the database, "
+            "so there is nothing to update."
+        )
+    return errors
 
 
 def _validate_headers(headers: list[str], expected_headers: list[str]) -> list[str]:

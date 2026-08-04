@@ -135,6 +135,11 @@ class AlumniUpdatePreview(BaseModel):
 
     columns_ok: bool
     header_errors: list[str]
+    #: Columns in the uploaded file that don't correspond to any field we can
+    #: update. They are skipped (the rest of the row still applies) and listed
+    #: here so the preview can say so out loud rather than dropping them
+    #: silently.
+    ignored_columns: list[str] = []
     summary: AlumniUpdateSummary
     rows: list[AlumniUpdateRowReport]
 

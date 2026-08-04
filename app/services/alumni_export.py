@@ -23,9 +23,11 @@ import io
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import parse_designation_tokens
+from app.core.errors import InvalidRequestError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -37,6 +39,7 @@ from app.schemas.alumni_export import (
     ExportColumn,
     ExportColumnCatalog,
 )
+from app.services import geo_search
 
 log = logging.getLogger(__name__)
 
@@ -379,17 +382,65 @@ def _filters_dict(filters: AlumniExportFilters) -> dict:
     When ``needs_survey`` is requested, derive the biennial-survey cutoff
     server-side (the body never carries a trusted "now") so the export hits the
     same DUE population the list view shows. The export route is full_access and
-    up, which is exactly the admin tier allowed to use this filter."""
-    out = filters.model_dump(exclude_unset=True, exclude={"sort"})
+    up, which is exactly the admin tier allowed to use this filter.
+
+    ``designations`` is normalized + validated through the SAME parser
+    ``GET /alumni`` uses, so an unknown token is a 422 here too. That matters
+    beyond tidiness: ``build_alumni_query`` only emits the designation EXISTS for
+    tokens it recognizes, so an unvalidated typo would drop the predicate
+    entirely and widen the export to every alumnus (#366).
+
+    ``near`` / ``radius`` are EXCLUDED here — they are not ``build_alumni_query``
+    kwargs. They need an async round-trip to the geocoding crosswalk, so
+    :func:`build_export_query` resolves them into ``location_filter``. Anything
+    that builds the export statement must go through that function, never
+    ``build_alumni_query(**_filters_dict(...))`` directly, or the location filter
+    is silently lost.
+    """
+    out = filters.model_dump(exclude_unset=True, exclude={"sort", "near", "radius"})
     if out.get("needs_survey"):
         out["survey_due_before"] = datetime.datetime.now(datetime.UTC) - SURVEY_CADENCE
+    if out.get("designations") is not None:
+        out["designations"] = parse_designation_tokens(out["designations"])
     return out
+
+
+async def build_export_query(
+    session: AsyncSession, filters: AlumniExportFilters
+) -> Select:
+    """The ``SELECT alumni`` statement the export runs (no limit/order).
+
+    The one and only entry point for turning an export body into a query. It
+    calls the SAME ``build_alumni_query`` predicates ``GET /alumni`` uses and
+    resolves ``near``/``radius`` through the SAME ``geo_search.resolve_near``, so
+    the export population equals the list population by construction (#366) —
+    nothing is re-implemented on this side.
+
+    An unresolvable ``near`` phrase raises :class:`InvalidRequestError` (422).
+    The list route can afford to fall back to a location-less search because the
+    operator SEES the widened result and a "couldn't pinpoint" note; an export
+    cannot — a silent fallback would hand over a nationwide CSV for a "near
+    Provo" view, which is the exact disclosure this issue exists to close.
+    """
+    kwargs = _filters_dict(filters)
+    location_filter, envelope = await geo_search.resolve_near(
+        session, filters.near, filters.radius
+    )
+    if envelope is not None and not envelope.get("resolved"):
+        raise InvalidRequestError(
+            f"Could not pinpoint the location '{envelope['label']}'. The export "
+            "was stopped rather than returning alumni outside that area — "
+            "refine the location search (e.g. 'near Provo, UT') and try again."
+        )
+    if location_filter is not None:
+        kwargs["location_filter"] = location_filter
+    return build_alumni_query(**kwargs)
 
 
 async def count_matching(session: AsyncSession, filters: AlumniExportFilters) -> int:
     from sqlalchemy import func
 
-    base = build_alumni_query(**_filters_dict(filters))
+    base = await build_export_query(session, filters)
     total = await session.scalar(select(func.count()).select_from(base.subquery()))
     return int(total or 0)
 
@@ -469,7 +520,7 @@ async def export_csv(
     # so the export population is identical to count_matching's — just ordered
     # and capped. Don't rebuild from .whereclause; that risks dropping query
     # structure for join/EXISTS-based filters.
-    base = build_alumni_query(**_filters_dict(filters))
+    base = await build_export_query(session, filters)
     stmt = base.order_by(Alumni.last_name.asc(), Alumni.alumni_id.asc()).limit(MAX_EXPORT_ROWS)
     alumni = (await session.execute(stmt)).scalars().all()
     ids = [a.alumni_id for a in alumni]

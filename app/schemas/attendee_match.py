@@ -85,6 +85,9 @@ class AttendeeMatchRow(BaseModel):
       * ``ambiguous``  — several plausible records. ALL of them are in
         ``candidates``; the top-scoring one is never silently chosen.
       * ``no_match``   — nothing plausible. Eligible for friend creation.
+      * ``not_reviewed`` — the review hit its aggregate disclosure budget before
+        reaching this row. NOT the same as ``no_match``: re-upload the remaining
+        rows as a smaller file rather than creating friends for them.
     ``friend_fields`` lists the DB fields a friend record built from this row
     would carry, so "create a friend" is not a black box."""
 
@@ -98,10 +101,16 @@ class AttendeeMatchRow(BaseModel):
 
 
 class AttendeeMatchSummary(BaseModel):
+    """``not_reviewed`` counts rows the review deliberately stopped short of:
+    one preview may surface at most ``MAX_CANDIDATES_TOTAL`` alumni records, and
+    saying "not reviewed" is honest where "no match" would read as "she isn't in
+    the database" and invite a duplicate friend record."""
+
     total_rows: int
     matched: int
     ambiguous: int
     no_match: int
+    not_reviewed: int = 0
     already_attending: int
 
 
@@ -207,8 +216,10 @@ class AttendeeApplyResult(BaseModel):
 
 class AttendeeFriendItem(BaseModel):
     """Per-row outcome of creating a friend from a no-match row. ``status`` is
-    ``created``, ``skipped`` (row not in the file / already had a match) or
-    ``rejected`` (the create path refused it — e.g. an exact duplicate)."""
+    ``created``, ``skipped`` (somebody with this name + employer is already on
+    the event's roster — the idempotency guard, so re-posting the same file
+    never creates a second copy) or ``rejected`` (the create path refused it,
+    e.g. an exact duplicate)."""
 
     row: int
     name: str
@@ -226,6 +237,7 @@ class AttendeeFriendResult(BaseModel):
     created: int
     attached: int
     rejected: int
+    skipped: int = 0
     items: list[AttendeeFriendItem] = []
     header_errors: list[str] = []
 

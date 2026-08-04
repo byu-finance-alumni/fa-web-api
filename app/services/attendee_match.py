@@ -87,6 +87,16 @@ _MAX_CANDIDATE_ROWS = 3000
 # How many candidates a single attendee row may carry back to the reviewer.
 # Beyond this the row is still ``ambiguous`` — it just stops being a useful list.
 MAX_CANDIDATES_PER_ROW = 10
+# AGGREGATE cap on candidate records disclosed by ONE preview response.
+#
+# Every candidate carries alumni PII (net id, grad year, employer, emails), and
+# an ambiguous row legitimately returns near-misses who have nothing to do with
+# the conference. Without an aggregate bound, a 2,000-row file of common names
+# would disclose tens of thousands of records in a single call — a roster-harvest
+# shaped like a match preview. Rows past the budget come back ``not_reviewed``
+# with NO candidates and a warning telling the operator to split the file: an
+# honest "we didn't look at this row" rather than a silent "no match".
+MAX_CANDIDATES_TOTAL = 2500
 # Distinct employer patterns fed to the given-name corroboration leg (tier C).
 _MAX_COMPANY_PATTERNS = 60
 # How many rows may be approved / created as friends in one request.
@@ -1019,7 +1029,18 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
 
     reports: list[dict] = []
     seen_keys: dict[tuple, int] = {}
-    tally = {"matched": 0, "ambiguous": 0, "no_match": 0, "already_attending": 0}
+    tally = {
+        "matched": 0,
+        "ambiguous": 0,
+        "no_match": 0,
+        "not_reviewed": 0,
+        "already_attending": 0,
+    }
+    # Aggregate disclosure budget (see MAX_CANDIDATES_TOTAL). Also collects the
+    # ids actually surfaced, so the audit trail can answer "whose data left the
+    # system" and not merely "how many rows".
+    budget = MAX_CANDIDATES_TOTAL
+    disclosed: set[int] = set()
 
     for row in rows:
         row_warnings = list(row["cell_warnings"])
@@ -1050,15 +1071,30 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
                     pool_for_row[candidate["alumni_id"]] = candidate
 
         candidates = rank_candidates(row, list(pool_for_row.values()))
-        for candidate in candidates:
-            candidate["already_attending"] = candidate["alumni_id"] in attending
 
-        if not candidates:
-            status = "no_match"
-        elif len(candidates) == 1:
-            status = "matched"
+        if budget <= 0 and candidates:
+            # The response has already disclosed its whole budget of alumni
+            # records. Say so plainly rather than returning "no match", which
+            # would read as "she isn't in the database" and quietly invite a
+            # duplicate friend record.
+            candidates = []
+            status = "not_reviewed"
+            row_warnings.append(
+                "Not reviewed: this upload reached the limit on how many alumni "
+                "records one review may show. Re-upload the remaining rows as a "
+                "smaller file."
+            )
         else:
-            status = "ambiguous"
+            budget -= len(candidates)
+            for candidate in candidates:
+                candidate["already_attending"] = candidate["alumni_id"] in attending
+                disclosed.add(candidate["alumni_id"])
+            if not candidates:
+                status = "no_match"
+            elif len(candidates) == 1:
+                status = "matched"
+            else:
+                status = "ambiguous"
         tally[status] += 1
         if candidates and all(c["already_attending"] for c in candidates):
             tally["already_attending"] += 1
@@ -1089,6 +1125,18 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
             }
         )
 
+    if tally["not_reviewed"]:
+        warnings.append(
+            {
+                "code": "disclosure_cap",
+                "message": (
+                    f"{tally['not_reviewed']:,} row(s) were not reviewed: one "
+                    f"review may show at most {MAX_CANDIDATES_TOTAL:,} alumni "
+                    "records. Re-upload the remaining rows as a smaller file."
+                ),
+            }
+        )
+
     return {
         "event": {
             "event_id": event.event_id,
@@ -1103,10 +1151,15 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
             "matched": tally["matched"],
             "ambiguous": tally["ambiguous"],
             "no_match": tally["no_match"],
+            "not_reviewed": tally["not_reviewed"],
             "already_attending": tally["already_attending"],
         },
         "rows": reports,
         "warnings": warnings,
+        # NOT part of the response body — popped by the route and written to the
+        # audit log, so the disclosure record names WHO was surfaced rather than
+        # only how many rows were processed.
+        "_disclosed_alumni_ids": sorted(disclosed),
     }
 
 
@@ -1129,6 +1182,27 @@ def _friend_field_labels(payload: dict) -> list[str]:
             if value not in (None, ""):
                 fields.append(f"{section}.{key}")
     return sorted(fields)
+
+
+def friend_identity_key(
+    first_name: object, last_name: object, company: object
+) -> str:
+    """Stable key for "the same person already created from this list".
+
+    Friend records carry no Net ID or BYU ID, so ``create_alumni``'s exact-id
+    duplicate blocker cannot see them: re-posting the same file would happily
+    create a second Jane Doe. The friends route therefore builds this key for
+    everyone already on the event's roster and skips a row that matches, making
+    friend creation idempotent per (event, person) the same way approval is
+    idempotent per (event, alumni).
+    """
+    return "|".join(
+        (
+            _norm_name(first_name),
+            _norm_name(last_name),
+            "".join(company_tokens(company)),
+        )
+    )
 
 
 # --- CSV template ------------------------------------------------------------

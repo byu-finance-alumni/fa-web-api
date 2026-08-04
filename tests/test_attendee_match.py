@@ -476,6 +476,7 @@ async def test_propose_reports_matched_ambiguous_and_no_match():
         "matched": 1,
         "ambiguous": 1,
         "no_match": 1,
+        "not_reviewed": 0,
         "already_attending": 0,
     }
     assert report["event"]["event_id"] == 7
@@ -682,3 +683,157 @@ def test_template_downloads_a_starting_point_csv(approve_client):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
     assert "Maiden name" in response.text
+
+
+# --- Disclosure budget (security review, 2026-08-04) -------------------------
+
+
+@pytest.mark.anyio
+async def test_the_review_stops_disclosing_once_the_budget_is_spent(monkeypatch):
+    """A preview may surface only so many alumni records. Past the budget the
+    row is reported ``not_reviewed`` -- NOT ``no_match``, which would read as
+    "she isn't in the database" and invite a duplicate friend record."""
+    monkeypatch.setattr(attendee_match, "MAX_CANDIDATES_TOTAL", 2)
+    body = "First name,Last name\n" + "".join(
+        f"Michael,Surname{i}\n" for i in range(4)
+    )
+    rows, _errors, _ignored = attendee_match.parse_and_map(_csv(body))
+    session = _FakeSession(
+        [
+            _db_row(alumni_id=100 + i, first_name="Michael", last_name=f"Surname{i}")
+            for i in range(4)
+        ]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    assert report["summary"]["not_reviewed"] == 2
+    tail = report["rows"][-1]
+    assert tail["status"] == "not_reviewed"
+    assert tail["candidates"] == []
+    assert any(w["code"] == "disclosure_cap" for w in report["warnings"])
+
+
+@pytest.mark.anyio
+async def test_the_report_names_whose_records_were_disclosed():
+    """The audit trail has to answer "whose data left the system", not only
+    "how many rows" -- an ambiguous row surfaces near-misses who have nothing
+    to do with the conference."""
+    rows, _errors, _ignored = attendee_match.parse_and_map(
+        _csv("First name,Last name\nJohn,Doe\n")
+    )
+    session = _FakeSession(
+        [
+            _db_row(alumni_id=11, first_name="John", last_name="Doe"),
+            _db_row(alumni_id=12, first_name="John", last_name="Doe"),
+        ]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    assert report["_disclosed_alumni_ids"] == [11, 12]
+
+
+def test_friend_identity_key_is_stable_across_spelling():
+    key = attendee_match.friend_identity_key
+    assert key("Michael", "Smith", "Goldman Sachs & Co.") == key(
+        " michael ", "SMITH", "Goldman Sachs"
+    )
+    assert key("Michael", "Smith", "Goldman") != key("Michael", "Smith", "Fidelity")
+
+
+# --- Route authorization -----------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["view_only", "student", "professor"])
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs"),
+    [
+        ("get", "/events/attendees/match/template", {}),
+        (
+            "post",
+            "/events/7/attendees/match/preview",
+            {"files": {"file": ("a.csv", b"First name\nA\n")}},
+        ),
+        (
+            "post",
+            "/events/7/attendees/match/approve",
+            {"json": {"approvals": []}},
+        ),
+        (
+            "post",
+            "/events/7/attendees/match/friends",
+            {
+                "files": {"file": ("a.csv", b"First name\nA\n")},
+                "data": {"rows": "2"},
+            },
+        ),
+    ],
+)
+def test_every_leg_is_full_access_only(role, method, path, kwargs):
+    """All four legs sit at full_access -- the same rung as the attendee CSV
+    export, which already discloses the same columns. /preview reads real alumni
+    PII to be reviewable at all, so it must not sit on a looser guard than the
+    writes."""
+    session = _RouteSession(_event(), {})
+
+    async def _dep():
+        yield session
+
+    app.dependency_overrides[get_session] = _dep
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    try:
+        with TestClient(app) as client:
+            response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 403
+    finally:
+        app.dependency_overrides.clear()
+
+
+class _FriendsRouteSession:
+    """Event lookup + the "who is already on this roster" query, which is all
+    the friends route touches when every chosen row is skipped."""
+
+    def __init__(self, event, roster_rows):
+        self._event = event
+        self._roster = list(roster_rows)
+        self.began_nested = 0
+
+    async def get(self, _model, _pk):
+        return self._event
+
+    async def execute(self, _stmt):
+        return _Result(self._roster)
+
+    def begin_nested(self):  # pragma: no cover - must never be reached
+        self.began_nested += 1
+        raise AssertionError("a skipped row must not open a savepoint")
+
+    def add(self, _obj):  # pragma: no cover
+        raise AssertionError("a skipped row must not write")
+
+    async def commit(self):  # pragma: no cover
+        raise AssertionError("a skipped row must not commit")
+
+
+def test_rerunning_the_file_does_not_create_a_second_friend(approve_client):
+    """Friend records carry no Net ID, so create_alumni's exact-id duplicate
+    blocker cannot see one -- without this guard a re-post would make a second
+    Jane Doe. Skipping is reported, never silent."""
+    session = _FriendsRouteSession(
+        _event(),
+        # (first_name, preferred_first_name, last_name, current_employer)
+        [("Jane", None, "Doe", "Byrne Capital")],
+    )
+    with approve_client(session) as client:
+        response = client.post(
+            "/events/7/attendees/match/friends",
+            files={
+                "file": (
+                    "a.csv",
+                    _csv("First name,Last name,Company\nJane,Doe,Byrne Capital LLC"),
+                )
+            },
+            data={"rows": "2"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] == 0
+    assert body["skipped"] == 1
+    assert body["items"][0]["status"] == "skipped"

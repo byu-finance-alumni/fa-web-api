@@ -19,6 +19,7 @@ from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
+from app.models.employment import CurrentEmployment
 from app.models.event import Event, EventAttendance
 from app.schemas.alumni import AlumniCreateFull
 from app.schemas.attendee_match import (
@@ -710,6 +711,7 @@ def _empty_match_preview(header_errors: list[str], ignored: list[str]) -> dict:
             "matched": 0,
             "ambiguous": 0,
             "no_match": 0,
+            "not_reviewed": 0,
             "already_attending": 0,
         },
         "rows": [],
@@ -756,6 +758,13 @@ async def preview_attendee_match(
         return _empty_match_preview(header_errors, ignored)
     report = await attendee_match.propose(session, event, rows)
     report["ignored_columns"] = ignored
+    # Disclosure record. Names the alumni whose details were actually surfaced
+    # as candidates -- not just the row counts -- so the trail can answer "whose
+    # data left the system", the way the per-profile ``view_profile`` audit does.
+    # An ambiguous row legitimately returns near-misses who have nothing to do
+    # with the conference, so this is the only place that fact is recorded.
+    # Bounded by attendee_match.MAX_CANDIDATES_TOTAL.
+    disclosed: list[int] = report.pop("_disclosed_alumni_ids", [])
     session.add(
         AuditLog(
             user_id=user.user_id,
@@ -766,7 +775,10 @@ async def preview_attendee_match(
                 f"rows={report['summary']['total_rows']}; "
                 f"matched={report['summary']['matched']}; "
                 f"ambiguous={report['summary']['ambiguous']}; "
-                f"no_match={report['summary']['no_match']}"
+                f"no_match={report['summary']['no_match']}; "
+                f"not_reviewed={report['summary']['not_reviewed']}; "
+                f"disclosed={len(disclosed)}; "
+                f"alumni_ids={','.join(str(i) for i in disclosed)}"
             ),
         )
     )
@@ -945,8 +957,37 @@ async def create_attendee_friends(
             header_errors=header_errors,
         )
 
+    # Idempotency for the friends leg. A friend record carries no Net ID or BYU
+    # ID, so create_alumni's exact-id duplicate blocker cannot see one: without
+    # this, re-posting the same file after a partial success would create a
+    # SECOND Jane Doe. Key everyone already attached to this event by
+    # normalized name + employer and skip a row that matches -- mirroring the
+    # per-(event, alumni) idempotency the approve route already has.
+    roster = (
+        await session.execute(
+            select(
+                Alumni.first_name,
+                Alumni.preferred_first_name,
+                Alumni.last_name,
+                CurrentEmployment.current_employer,
+            )
+            .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
+            .outerjoin(
+                CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
+            )
+            .where(EventAttendance.event_id == event_id)
+        )
+    ).all()
+    on_roster: set[str] = set()
+    for first, preferred, last, employer in roster:
+        on_roster.add(attendee_match.friend_identity_key(first, last, employer))
+        if preferred:
+            on_roster.add(
+                attendee_match.friend_identity_key(preferred, last, employer)
+            )
+
     items: list[AttendeeFriendItem] = []
-    created = attached = rejected = 0
+    created = attached = rejected = skipped = 0
 
     # Batch the whole set into ONE transaction: create_alumni commits
     # internally, so its commit/refresh are temporarily neutralized (the pattern
@@ -963,6 +1004,24 @@ async def create_attendee_friends(
     for row in parsed:
         if row["row"] not in wanted:
             continue
+        identity = attendee_match.friend_identity_key(
+            row.get("first_name"), row.get("last_name"), row.get("company")
+        )
+        if identity in on_roster:
+            skipped += 1
+            items.append(
+                AttendeeFriendItem(
+                    row=row["row"],
+                    name=row["display_name"],
+                    status="skipped",
+                    message=(
+                        "Someone with this name and employer is already on this "
+                        "event's roster; nothing was created."
+                    ),
+                )
+            )
+            continue
+        on_roster.add(identity)
         async with session.begin_nested() as savepoint:
             try:
                 model = AlumniCreateFull(**row["payload"])
@@ -1025,6 +1084,7 @@ async def create_attendee_friends(
         created=created,
         attached=attached,
         rejected=rejected,
+        skipped=skipped,
         items=items,
         header_errors=[],
     )

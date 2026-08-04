@@ -377,3 +377,54 @@ def alumni_location_filter(keys: list[CityKey]) -> ColumnElement[bool]:
     city_norm = func.lower(func.trim(cast(CurrentEmployment.current_city, String)))
     state_code = _alumni_state_code_expr()
     return tuple_(city_norm, state_code).in_([(cn, st) for cn, st in keys])
+
+
+async def resolve_near(
+    session: AsyncSession,
+    near: str | None,
+    radius: float | None = None,
+) -> tuple[ColumnElement[bool] | None, dict | None]:
+    """Turn a ``near`` phrase (+ optional ``radius`` override) into a filter.
+
+    THE single place a ``near``/``radius`` pair becomes a ``location_filter`` for
+    ``build_alumni_query``. ``GET /alumni`` and ``POST /alumni/export`` both call
+    this, so a list and an export of that same list can never resolve the phrase
+    differently and end up on different populations (#366).
+
+    Returns ``(location_filter, envelope)``:
+
+    * ``(None, None)`` — no phrase given; no location predicate at all.
+    * ``(predicate, {"label", "radius_miles", "resolved": True})`` — resolved.
+      An empty key set yields a match-nothing predicate (see
+      :func:`alumni_location_filter`), never a widened result.
+    * ``(None, {"label": <phrase>, "resolved": False})`` — the phrase isn't a
+      place we can pinpoint. The caller decides what that means: the list falls
+      back to a normal (unfiltered-by-location) search and surfaces the flag in
+      the response envelope; the export refuses, because silently exporting a
+      wider population than the operator asked for is a disclosure (#366).
+
+    A ``radius`` override is folded into the phrase so the resolved city set AND
+    the human label both reflect it. If that phrasing doesn't parse (e.g. an odd
+    region alias), we retry the raw phrase so a valid place still resolves; the
+    override radius is then only echoed in the envelope.
+    """
+    if not near or not near.strip():
+        return None, None
+    near_text = near.strip()
+    resolved = None
+    if radius is not None:
+        resolved = await resolve_location_query(
+            session, f"within {radius:g} miles of {near_text}"
+        )
+    if resolved is None:
+        resolved = await resolve_location_query(session, near_text)
+    if resolved is None:
+        return None, {"label": near_text, "resolved": False}
+    match, keys = resolved
+    return alumni_location_filter(keys), {
+        "label": match.label,
+        "radius_miles": (
+            radius if radius is not None else getattr(match, "radius_miles", None)
+        ),
+        "resolved": True,
+    }

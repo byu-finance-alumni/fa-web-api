@@ -69,6 +69,19 @@ class AlumniExportFilters(BaseModel):
     employment_status: list[str] | None = None
     city: list[str] | None = None
     state: list[str] | None = None
+    # Location proximity search (#358/#366). The plain-English phrase the list
+    # view sent as ``?near=`` plus its optional ``?radius=`` override — NOT a
+    # resolved city set: the export re-resolves the phrase through the very same
+    # ``geo_search.resolve_near`` the list route uses, so both land on the same
+    # cities. Without these the export of a "near Provo" view silently widened to
+    # every alumnus nationwide (#366).
+    #
+    # A phrase that cannot be pinpointed is a 422 on this path (the list falls
+    # back to an unfiltered search and shows a "couldn't pinpoint" note; an
+    # export has no such affordance, and quietly handing over a nationwide file
+    # when the operator asked for one metro is a disclosure).
+    near: str | None = None
+    radius: float | None = Field(default=None, ge=1, le=3000)
     tag: list[str] | None = None
     status_label: list[str] | None = None
     leadership_role: list[str] | None = None
@@ -82,14 +95,26 @@ class AlumniExportFilters(BaseModel):
     contacted_before: datetime.date | None = None
     never_contacted: bool = False
     attended_event: bool = False
+    # Guest-speaker-AT-AN-EVENT window (#366) — the dashboard "Guest speakers
+    # this month" deep-link's date bounds. Distinct from the alumnus-level
+    # ``guest_speaker_willing`` flag below.
+    spoke_after: datetime.date | None = None
+    spoke_before: datetime.date | None = None
     donor: bool = False
     mentor_willing: bool = False
     guest_speaker_willing: bool = False
     cfp: bool = False
     cfa: bool = False
     cpa: bool = False
+    # Designation facet (#404/#366): CFP / CFA / CPA tokens, ANY semantics. Sent
+    # as-typed and validated through the SAME parser GET /alumni uses
+    # (``dropdowns.parse_designation_tokens``) — an unknown token is a 422, never
+    # a silently dropped predicate that would widen the export to everyone.
+    designations: list[str] | None = None
+    graduate_degree: bool = False
     missing_email: bool = False
     missing_employer: bool = False
+    missing_phone: bool = False
     duplicate: bool = False
     # Friends/alumni split (#218). Unset -> the query builder's default
     # (alumni only), so an export mirrors the default Alumni list view. Send

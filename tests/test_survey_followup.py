@@ -65,6 +65,21 @@ def _ddl(conn):
             " submitted_at TIMESTAMP NOT NULL)"
         )
     )
+    # An engineer reset supersedes both a reply and the emails that preceded it
+    # (#395), so both halves of the non-responder query now reach this table.
+    # Empty here: with no resets recorded, every row counts exactly as before.
+    conn.execute(
+        text(
+            "CREATE TABLE survey_reset_log ("
+            " survey_reset_id INTEGER PRIMARY KEY,"
+            " alumni_id INTEGER NOT NULL,"
+            " reset_seq INTEGER NOT NULL,"
+            " reset_at TIMESTAMP NOT NULL,"
+            " reset_by_user_id INTEGER,"
+            " sends_superseded INTEGER NOT NULL DEFAULT 0,"
+            " responses_superseded INTEGER NOT NULL DEFAULT 0)"
+        )
+    )
     conn.execute(
         text(
             "CREATE TABLE alumni ("

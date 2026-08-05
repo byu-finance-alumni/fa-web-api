@@ -930,9 +930,11 @@ class _Res:
         return row[0] if isinstance(row, tuple) else row
 
 
-# `_to_item` is fed by TWO whole-table reads — the per-stage sent counts and the
-# manual-follow-up counts (#359) — so every queue that reaches it needs both.
-_COUNTS = 2
+# `_to_item` is fed by THREE whole-table reads — the per-stage sent counts, the
+# manual-follow-up counts (#359) and the all-time sent counts that decide whether
+# a campaign may be deleted (#398) — so every queue that reaches it needs all
+# three.
+_COUNTS = 3
 
 
 class QueueSession:
@@ -961,6 +963,7 @@ def test_create_schedule_inserts_new():
             _Res(one=sched),  # get_schedule re-query
             _Res(rows=[]),  # per-stage counts
             _Res(rows=[]),  # manual-follow-up counts
+            _Res(rows=[]),  # all-time sent counts (#398)
         ]
     )
     item = asyncio.run(
@@ -988,6 +991,7 @@ def test_create_schedule_replaces_existing():
             _Res(one=existing),  # get_schedule re-query
             _Res(rows=[]),  # per-stage counts
             _Res(rows=[]),  # manual-follow-up counts
+            _Res(rows=[]),  # all-time sent counts (#398)
             # The upsert stamped created_by_user_id, so the creator-name lookup
             # runs (it is skipped entirely when no row has a creator).
             _Res(rows=[]),
@@ -1010,7 +1014,13 @@ def test_create_schedule_replaces_existing():
 def test_cancel_schedule_sets_cancelled():
     existing = _sched(2000, datetime.date(2026, 8, 1), status="active")
     session = QueueSession(
-        [_Res(one=existing), _Res(one=existing), _Res(rows=[]), _Res(rows=[])]
+        [
+            _Res(one=existing),
+            _Res(one=existing),
+            _Res(rows=[]),
+            _Res(rows=[]),
+            _Res(rows=[]),
+        ]
     )
     item = asyncio.run(survey_schedule.cancel_schedule(session, 2000))
     assert existing.status == "cancelled"
@@ -1033,6 +1043,7 @@ def test_create_schedules_bulk_inserts_and_updates_many():
             _Res(one=None),  # year 2002 existence -> new
             # list_schedules re-query: all rows + per-stage + follow-up counts
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 8, 1))]),
+            _Res(rows=[]),
             _Res(rows=[]),
             _Res(rows=[]),
         ]
@@ -1069,6 +1080,7 @@ def test_create_schedules_bulk_empty_is_noop():
             _Res(scalars_all=[]),  # list_schedules: no rows
             _Res(rows=[]),  # per-stage counts
             _Res(rows=[]),  # manual-follow-up counts
+            _Res(rows=[]),  # all-time sent counts (#398)
         ]
     )
     result = asyncio.run(
@@ -1088,6 +1100,7 @@ def test_create_schedules_bulk_dedupes_duplicate_year():
         [
             _Res(one=None),  # single existence check for the one deduped year
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 9, 1))]),
+            _Res(rows=[]),
             _Res(rows=[]),
             _Res(rows=[]),
         ]
@@ -1120,6 +1133,7 @@ def test_list_schedules_includes_stage_counts():
             _Res(scalars_all=[s1]),
             _Res(rows=[(2001, 0, 3), (2001, 1, 1)]),
             _Res(rows=[(2001, 4)]),  # 4 alumni need manual follow-up
+            _Res(rows=[(2001, 4)]),  # 4 emails ever sent for the year (#398)
         ]
     )
     items = asyncio.run(survey_schedule.list_schedules(session))
@@ -1127,6 +1141,8 @@ def test_list_schedules_includes_stage_counts():
     assert items[0].sent_initial == 3
     assert items[0].sent_reminder_1 == 1
     assert items[0].sent_reminder_2 == 0
+    # All-time, not this cycle — it is what decides delete vs cancel (#398).
+    assert items[0].emails_sent_all_time == 4
 
 
 # ------------------------------------------------------- who started it -------
@@ -1146,6 +1162,7 @@ def test_list_schedules_resolves_creator_names_in_one_query():
             ),
             _Res(rows=[]),  # per-stage counts
             _Res(rows=[]),  # manual-follow-up counts
+            _Res(rows=[]),  # all-time sent counts (#398)
             _Res(
                 rows=[
                     (7, "Jake", "Gunnell", "jake@byu.edu"),
@@ -1157,8 +1174,8 @@ def test_list_schedules_resolves_creator_names_in_one_query():
     items = asyncio.run(survey_schedule.list_schedules(session))
     # Full name when present, email as the fallback — never the internal user id.
     assert [i.created_by for i in items] == ["Jake Gunnell", "tanya@byu.edu"]
-    # schedules + per-stage counts + follow-up counts + ONE creator lookup
-    assert session.executed == 3 + 1
+    # schedules + per-stage + follow-up + all-time counts + ONE creator lookup
+    assert session.executed == 4 + 1
 
 
 def test_list_schedules_skips_creator_query_when_none_recorded():
@@ -1167,11 +1184,12 @@ def test_list_schedules_skips_creator_query_when_none_recorded():
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 5, 1))]),
             _Res(rows=[]),
             _Res(rows=[]),
+            _Res(rows=[]),
         ]
     )
     items = asyncio.run(survey_schedule.list_schedules(session))
     assert items[0].created_by is None
-    assert session.executed == 2 + 1  # no creator lookup at all
+    assert session.executed == 3 + 1  # no creator lookup at all
 
 
 # --------------------------------------------------------- pause / resume -----

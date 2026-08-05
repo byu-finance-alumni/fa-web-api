@@ -61,6 +61,7 @@ ALTER TABLE public.survey_schedule       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.survey_send_log       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.survey_send_config    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.survey_reset_log      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.survey_campaign_retirement ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.maintenance_mode      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notes                 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.donations             ENABLE ROW LEVEL SECURITY;

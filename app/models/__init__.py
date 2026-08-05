@@ -32,6 +32,7 @@ from app.models.note import Note
 from app.models.role_capability import RoleCapability
 from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
+from app.models.survey_retirement import SurveyCampaignRetirement
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
@@ -68,6 +69,7 @@ __all__ = [
     "RoleCapability",
     "StatusLabel",
     "Survey",
+    "SurveyCampaignRetirement",
     "SurveyResetLog",
     "SurveyResponse",
     "SurveySchedule",

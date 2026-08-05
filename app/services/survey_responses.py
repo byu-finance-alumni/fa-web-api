@@ -107,7 +107,11 @@ _FIELDS: tuple[_Field, ...] = (
     _Field("contact.country", "Residence country", "contact", "country", "text"),
     _Field("profile.spouse_first_name", "Spouse first name", "alumni", "spouse_first_name", "text"),
     _Field("profile.spouse_last_name", "Spouse last name", "alumni", "spouse_last_name", "text"),
-    _Field("contact.personal_email", "Permanent email", "contact", "personal_email", "text"),
+    # "Personal email", not "Permanent email" (#392): the profile UI, the intake
+    # sheet and staff all call this column the personal email, and the survey
+    # calling it something else made "it says I have no personal email" hard to
+    # reconcile with a form that plainly showed one. One name everywhere.
+    _Field("contact.personal_email", "Personal email", "contact", "personal_email", "text"),
     _Field("contact.work_email", "Work email", "contact", "work_email", "text"),
     _Field("contact.phone", "Phone", "contact", "phone", "text"),
     _Field("profile.linkedin_url", "LinkedIn", "alumni", "linkedin_url", "text"),

@@ -249,9 +249,10 @@ class QueueSession:
 
 
 def test_list_graduation_years_shape():
-    # Two executes now: year counts, then distinct-responder counts. Same rows for
-    # both here is fine — the shape assertion only checks the year/total columns.
-    session = QueueSession([[(2024, 5), (1900, 3)], []])
+    # Three executes now: year counts, distinct-responder counts, then the
+    # per-year unreachable counts (#392). The shape assertion only checks the
+    # year/total columns, so empty rows for the latter two are fine.
+    session = QueueSession([[(2024, 5), (1900, 3)], [], []])
     result = asyncio.run(survey_email.list_graduation_years(session))
     assert [(g.graduation_year, g.total_alumni) for g in result] == [(2024, 5), (1900, 3)]
 
@@ -275,11 +276,15 @@ def test_list_graduation_years_includes_responded():
     session = QueueSession([
         [(2024, 5), (1900, 3)],  # year counts
         [(2024, 2)],             # only 2024 has responders
+        [(1900, 1)],             # only 1900 has an unreachable alum (#392)
     ])
     result = asyncio.run(survey_email.list_graduation_years(session))
-    assert [(g.graduation_year, g.total_alumni, g.responded) for g in result] == [
-        (2024, 5, 2),
-        (1900, 3, 0),
+    assert [
+        (g.graduation_year, g.total_alumni, g.responded, g.unreachable)
+        for g in result
+    ] == [
+        (2024, 5, 2, 0),
+        (1900, 3, 0, 1),
     ]
 
 

@@ -466,6 +466,11 @@ TAGS: tuple[str, ...] = (
     "Company Event Sponsor",
     "Case Competition Host",
     "PIFF Donor",
+    # Not willingness — what the alum has already done for the program. Tagged
+    # for the same reason as the nine: an untagged flag renders only in the
+    # editor-only Tags tab, invisible to view-only staff (Jake, 2026-08-05).
+    "Hired a Finance Intern",
+    "Hired a Finance Grad",
 )
 
 # The nine "ways to get involved" the survey asks about, as tag name → the
@@ -503,6 +508,12 @@ ENGAGEMENT_FLAG_TAGS: dict[str, str] = {
     "Company Event Sponsor": "company_event_sponsor_willing",
     "Case Competition Host": "case_competition_host_willing",
     "PIFF Donor": "piff_donor",
+    # Not willingness — facts about what the alum has already done for the
+    # program. They belong here anyway: the survey asks them, so leaving them
+    # untagged left them visible ONLY inside the editor-only Tags tab, which is
+    # the exact invisibility #629 was filed to end (Jake, 2026-08-05).
+    "Hired a Finance Intern": "hired_finance_intern",
+    "Hired a Finance Grad": "hired_finance_full_time",
 }
 
 

@@ -1,7 +1,7 @@
 """Unified-notes service: CRUD for notes attached to an alumni, an interaction,
 or an event.
 
-Authorization is enforced at the route layer (``RequireFullAccess`` for writes,
+Authorization is enforced at the route layer (``RequireNotesManage`` for writes,
 ``RequireViewAccess`` for reads). This layer validates the attach target exists,
 maps the unified ``(entity_type, entity_id)`` pair to the right FK column, and
 records a FERPA audit row for every write — auditing against the OWNING alumni
@@ -125,7 +125,7 @@ def _audit(
     """Record a note write in the audit trail.
 
     The actor is always present on the API path (writes go through
-    ``RequireFullAccess``). Guard anyway: if a future non-HTTP caller supplies no
+    ``RequireNotesManage``). Guard anyway: if a future non-HTTP caller supplies no
     actor, log a warning (never the note body) rather than silently producing an
     unaudited write."""
     if actor_user_id is None:

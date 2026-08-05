@@ -67,9 +67,16 @@ def test_user_context_from_orm_user():
 # --- require_roles guards -----------------------------------------------------
 
 
+# `require_full_access` is gone (#379) — the blanket `alumni.full` capability was
+# dissolved into per-section codes. `require_alumni_create` stands in for it
+# below: it is one of the twelve replacements and is seeded to exactly the roles
+# that used to hold `alumni.full`, so these role-boundary assertions test the
+# same boundary they always did.
+
+
 def test_full_access_passes_both_guards():
     ctx = _ctx("full_access")
-    assert asyncio.run(auth_deps.require_full_access(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_create(ctx, CONFIG)) is ctx
     assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
 
 
@@ -77,7 +84,9 @@ def test_view_only_can_read_but_not_write():
     ctx = _ctx("view_only")
     assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
     with pytest.raises(AuthorizationError):
-        asyncio.run(auth_deps.require_full_access(ctx, CONFIG))
+        asyncio.run(auth_deps.require_alumni_create(ctx, CONFIG))
+    # ...except the one write every role holds: logging an interaction (#379).
+    assert asyncio.run(auth_deps.require_interactions_create(ctx, CONFIG)) is ctx
 
 
 def test_no_roles_is_denied_everywhere():
@@ -85,14 +94,16 @@ def test_no_roles_is_denied_everywhere():
     with pytest.raises(AuthorizationError):
         asyncio.run(auth_deps.require_view_only(ctx, CONFIG))
     with pytest.raises(AuthorizationError):
-        asyncio.run(auth_deps.require_full_access(ctx, CONFIG))
+        asyncio.run(auth_deps.require_alumni_create(ctx, CONFIG))
+    with pytest.raises(AuthorizationError):
+        asyncio.run(auth_deps.require_interactions_create(ctx, CONFIG))
 
 
 def test_super_admin_passes_every_guard():
     ctx = _ctx("super_admin")
     assert ctx.is_super_admin
     assert asyncio.run(auth_deps.require_super_admin(ctx, CONFIG)) is ctx
-    assert asyncio.run(auth_deps.require_full_access(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_create(ctx, CONFIG)) is ctx
     assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
 
 
@@ -109,7 +120,7 @@ def test_engineer_passes_every_guard():
     ctx = _ctx("engineer")
     assert ctx.is_engineer
     assert asyncio.run(auth_deps.require_super_admin(ctx, CONFIG)) is ctx
-    assert asyncio.run(auth_deps.require_full_access(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_alumni_create(ctx, CONFIG)) is ctx
     assert asyncio.run(auth_deps.require_alumni_edit(ctx, CONFIG)) is ctx
     assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
     assert asyncio.run(auth_deps.require_vocab_admin(ctx, CONFIG)) is ctx
@@ -124,9 +135,22 @@ def test_student_can_edit_and_read_but_not_create_or_admin():
     # Read + edit-existing are allowed.
     assert asyncio.run(auth_deps.require_view_only(ctx, CONFIG)) is ctx
     assert asyncio.run(auth_deps.require_alumni_edit(ctx, CONFIG)) is ctx
-    # Create / archive / import (full_access), user admin, and vocab admin are not.
+    # Logging an interaction is open to every role (#379).
+    assert asyncio.run(auth_deps.require_interactions_create(ctx, CONFIG)) is ctx
+    # Create / archive / import / export / photos, event + notes + survey
+    # management, donation reads, the advanced reports, user admin and vocab
+    # admin are all still closed to a student.
     for guard in (
-        auth_deps.require_full_access,
+        auth_deps.require_alumni_create,
+        auth_deps.require_alumni_archive,
+        auth_deps.require_alumni_import,
+        auth_deps.require_alumni_export,
+        auth_deps.require_alumni_photos,
+        auth_deps.require_events_manage,
+        auth_deps.require_notes_manage,
+        auth_deps.require_surveys_manage,
+        auth_deps.require_donations_view,
+        auth_deps.require_reports_advanced,
         auth_deps.require_super_admin,
         auth_deps.require_vocab_admin,
     ):

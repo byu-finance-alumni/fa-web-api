@@ -845,7 +845,6 @@ _DELEGATED_USER_ADMIN = {
         {
             Capability.VIEW,
             Capability.ALUMNI_EDIT,
-            Capability.ALUMNI_FULL,
             Capability.USER_ADMIN,
         }
     ),

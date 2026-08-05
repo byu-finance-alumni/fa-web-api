@@ -14,7 +14,7 @@ from sqlalchemy import and_, extract, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.dependencies.auth import RequireReportsAdvanced, RequireViewAccess
 from app.core.database import get_session
 from app.core.dropdowns import WHEEL_INDUSTRIES
 from app.models.alumni import Alumni
@@ -668,7 +668,7 @@ async def event_participation(
 
 @router.get("/activity", response_model=ActivityFeed)
 async def activity_feed(
-    actor: RequireFullAccess,
+    actor: RequireReportsAdvanced,
     session: SessionDep,
     q: Annotated[
         str | None,
@@ -807,7 +807,7 @@ async def activity_feed(
 
 
 @router.get("/data-quality", response_model=DataQuality)
-async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
+async def data_quality(_: RequireReportsAdvanced, session: SessionDep) -> dict:
     """The data-quality alert counts (same predicates as the summary KPIs),
     for the dedicated data-quality page.
 
@@ -861,7 +861,7 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
 
 @router.get("/contacted-this-month", response_model=list[InteractionActivity])
 async def contacted_this_month_list(
-    actor: RequireFullAccess, session: SessionDep
+    actor: RequireReportsAdvanced, session: SessionDep
 ) -> list[dict]:
     """The alumni behind the "Contacted this month" KPI — one row per distinct
     alumnus contacted in the last 30 days, carrying their most recent
@@ -912,7 +912,7 @@ async def contacted_this_month_list(
 
 @router.get("/follow-ups", response_model=list[FollowUpRow])
 async def upcoming_follow_ups_list(
-    actor: RequireFullAccess, session: SessionDep
+    actor: RequireReportsAdvanced, session: SessionDep
 ) -> list[dict]:
     """The open tasks behind the "Upcoming follow-ups" KPI (incomplete, due
     today or later), soonest due first — same predicate as the KPI count.

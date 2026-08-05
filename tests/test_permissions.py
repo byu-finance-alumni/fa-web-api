@@ -16,6 +16,7 @@ from app.api.dependencies.auth import get_current_db_user, get_permission_config
 from app.api.routes import engineer as engineer_routes
 from app.core.capabilities import (
     ALL_CAPABILITY_CODES,
+    ALUMNI_FULL_REPLACEMENTS,
     ASSIGNABLE_CAPABILITY_CODES,
     DEFAULT_GRANTS,
     Capability,
@@ -52,24 +53,31 @@ def test_default_grants_reproduce_historical_guards():
     def caps(*r):
         return effective_capabilities(DEFAULT_GRANTS, list(r))
 
-    assert caps("view_only") == {Capability.VIEW}
-    assert caps("student") == {Capability.VIEW, Capability.ALUMNI_EDIT}
+    # interactions.create is held by EVERY role (#379). It is not a widening:
+    # the interaction routes were already open to any view-access role (#129).
+    assert caps("view_only") == {
+        Capability.VIEW,
+        Capability.INTERACTIONS_CREATE,
+    }
+    assert caps("student") == {
+        Capability.VIEW,
+        Capability.ALUMNI_EDIT,
+        Capability.INTERACTIONS_CREATE,
+    }
+    # The twelve ALUMNI_FULL_REPLACEMENTS (#379) — which include the events.create
+    # / events.import pair split out earlier (#378) — are seeded to exactly the
+    # roles that held the retired `alumni.full`, so nothing moved for full_access.
     assert caps("full_access") == {
         Capability.VIEW,
         Capability.ALUMNI_EDIT,
-        Capability.ALUMNI_FULL,
-        # events.create / events.import were split out of alumni.full (#378) and
-        # seeded to exactly the roles that held it, so event authoring is
-        # unchanged for full_access.
-        Capability.EVENTS_CREATE,
-        Capability.EVENTS_IMPORT,
+        Capability.INTERACTIONS_CREATE,
+        *ALUMNI_FULL_REPLACEMENTS,
     }
     assert caps("super_admin") == {
         Capability.VIEW,
         Capability.ALUMNI_EDIT,
-        Capability.ALUMNI_FULL,
-        Capability.EVENTS_CREATE,
-        Capability.EVENTS_IMPORT,
+        Capability.INTERACTIONS_CREATE,
+        *ALUMNI_FULL_REPLACEMENTS,
         Capability.USER_ADMIN,
         # donations.manage and profile.completeness are newer capabilities (not
         # among the original hardcoded guards) whose default grant includes
@@ -85,17 +93,21 @@ def test_no_roles_has_no_capabilities():
 
 
 def test_config_edit_grants_capability_to_a_role():
-    # Granting alumni.full to student via the config takes effect immediately.
+    # Granting alumni.import to student via the config takes effect immediately.
     config = dict(DEFAULT_GRANTS)
     config["student"] = frozenset(
-        {Capability.VIEW, Capability.ALUMNI_EDIT, Capability.ALUMNI_FULL}
+        {Capability.VIEW, Capability.ALUMNI_EDIT, Capability.ALUMNI_IMPORT}
     )
-    assert Capability.ALUMNI_FULL in effective_capabilities(config, ["student"])
+    assert Capability.ALUMNI_IMPORT in effective_capabilities(config, ["student"])
 
 
 def test_union_across_multiple_roles():
     caps = effective_capabilities(DEFAULT_GRANTS, ["view_only", "student"])
-    assert caps == {Capability.VIEW, Capability.ALUMNI_EDIT}
+    assert caps == {
+        Capability.VIEW,
+        Capability.ALUMNI_EDIT,
+        Capability.INTERACTIONS_CREATE,
+    }
 
 
 def test_engineer_capability_is_not_assignable():
@@ -190,10 +202,13 @@ def test_matrix_returns_full_config_for_engineer():
     eng = next(r for r in body["roles"] if r["role"] == "engineer")
     assert eng["editable"] is False
     assert set(eng["capabilities"]) == set(ALL_CAPABILITY_CODES)
-    # view_only row: only view, editable.
+    # view_only row: view + the universal interactions.create (#379), editable.
     prof = next(r for r in body["roles"] if r["role"] == "view_only")
     assert prof["editable"] is True
-    assert prof["capabilities"] == [Capability.VIEW]
+    assert prof["capabilities"] == [
+        Capability.VIEW,
+        Capability.INTERACTIONS_CREATE,
+    ]
     # The engineer capability is marked non-assignable in the registry.
     eng_cap = next(c for c in body["capabilities"] if c["code"] == "engineer")
     assert eng_cap["assignable"] is False
@@ -268,7 +283,7 @@ def test_toggle_forbidden_for_non_engineer():
     with TestClient(app) as client:
         resp = client.patch(
             "/engineer/permissions",
-            json={"role": "student", "capability": "alumni.full", "granted": True},
+            json={"role": "student", "capability": "alumni.import", "granted": True},
         )
     app.dependency_overrides.clear()
     assert resp.status_code == 403
@@ -303,13 +318,13 @@ def test_toggle_happy_path_grants_and_audits(monkeypatch):
         yield session
 
     async def _fake_set_grant(s, *, role_id, capability_code, granted):
-        assert role_id == 4 and capability_code == "alumni.full" and granted is True
+        assert role_id == 4 and capability_code == "alumni.import" and granted is True
         return True
 
     async def _fake_load_grants(s):
         cfg = dict(DEFAULT_GRANTS)
         cfg["student"] = frozenset(
-            {Capability.VIEW, Capability.ALUMNI_EDIT, Capability.ALUMNI_FULL}
+            {Capability.VIEW, Capability.ALUMNI_EDIT, Capability.ALUMNI_IMPORT}
         )
         return cfg
 
@@ -324,14 +339,14 @@ def test_toggle_happy_path_grants_and_audits(monkeypatch):
     with TestClient(app) as client:
         resp = client.patch(
             "/engineer/permissions",
-            json={"role": "student", "capability": "alumni.full", "granted": True},
+            json={"role": "student", "capability": "alumni.import", "granted": True},
         )
     app.dependency_overrides.clear()
 
     assert resp.status_code == 200
     body = resp.json()
     student = next(r for r in body["roles"] if r["role"] == "student")
-    assert "alumni.full" in student["capabilities"]
+    assert "alumni.import" in student["capabilities"]
     assert any(
         getattr(a, "action_type", None) == "grant_capability"
         for a in session.added

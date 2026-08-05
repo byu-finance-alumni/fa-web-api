@@ -44,10 +44,12 @@ from app.core.rate_limit import (
 )
 from app.schemas.survey import (
     GraduationYearCount,
+    SurveyAlumniState,
     SurveyNewCyclePreview,
     SurveyNewCycleRequest,
     SurveyNonResponder,
     SurveyRecipientBreakdown,
+    SurveyResetResult,
     SurveyRespondInfo,
     SurveyResponseItem,
     SurveyScheduleBulkRequest,
@@ -64,7 +66,7 @@ from app.schemas.survey import (
     SurveyUnreachableAlum,
     SurveyUsage,
 )
-from app.services import survey_email, survey_responses, survey_schedule
+from app.services import survey_email, survey_reset, survey_responses, survey_schedule
 
 # The test cohort lives in grad year 1900 (below the normal 1950 floor), so allow
 # it explicitly here.
@@ -503,6 +505,65 @@ async def cancel_all_survey_schedules(
     succeeds and reports 0."""
     return await survey_schedule.cancel_all_schedules(
         session, actor_user_id=user.user_id
+    )
+
+
+# ------------------------------------------- per-alumnus campaign reset -------
+
+
+@router.get(
+    "/alumni/{alumni_id}/state",
+    response_model=SurveyAlumniState,
+)
+async def survey_alumnus_state(
+    alumni_id: int,
+    user: RequireEngineer,
+    session: SessionDep,
+) -> SurveyAlumniState:
+    """One alumnus's survey state: what was emailed, what came back, and what is
+    holding them out of the next send (#395).
+
+    Read-only, and the REQUIRED first half of the reset below — the engineer has
+    to be able to see that someone looks "blocked" only because they legitimately
+    replied three months ago, in which case deleting that reply is the wrong
+    move. `blocked_reasons` says so in plain words; empty means a reset would
+    unblock nothing and only destroy history.
+
+    Engineer-gated (`RequireEngineer` = the non-assignable `engineer`
+    capability), matching its destructive twin: the read exists to inform that
+    one decision, so widening it would only invite the reset to be run blind.
+    """
+    return await survey_reset.get_state(session, alumni_id)
+
+
+@router.post("/alumni/{alumni_id}/reset", response_model=SurveyResetResult)
+async def survey_reset_alumnus(
+    alumni_id: int,
+    user: RequireEngineer,
+    session: SessionDep,
+) -> SurveyResetResult:
+    """Clear ONE alumnus's survey campaign state so they can be surveyed again
+    (#395) — the UI replacement for hand-running DELETE statements.
+
+    IRREVERSIBLE AND DESTRUCTIVE. It permanently deletes that person's submitted
+    survey answers, including a `pending` one nobody has reviewed yet, along with
+    the record of the emails they were sent. Nothing is applied to their profile
+    on the way out and there is no undo. Callers must show
+    `GET /survey/alumni/{alumni_id}/state` first.
+
+    Gated on `RequireEngineer` — the `engineer` capability, which is the one
+    capability the permission editor cannot grant to another role. Deliberately
+    NOT `surveys.manage`: that capability IS assignable, so gating on it would
+    let an engineer hand permanent destruction of alumni submissions to any role
+    that merely needs to review responses. Same reasoning as the pause-all /
+    cancel-all switches, which are engineer-gated for being maintenance actions.
+
+    Scoped to exactly one alumnus. There is no bulk or cohort variant; the annual
+    cohort re-run is `POST /schedules/{grad_year}/new-cycle`, which deletes
+    nothing.
+    """
+    return await survey_reset.reset_alumnus(
+        session, alumni_id, actor_user_id=user.user_id
     )
 
 

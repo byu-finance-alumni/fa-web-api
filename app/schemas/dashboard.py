@@ -49,7 +49,9 @@ class DashboardIndustryBreakdown(BaseModel):
     ``unknown`` (active alumni with NO industry on file) are SEPARATE buckets,
     distinct from each other. ``graduate_student`` (#294) is likewise its own
     bucket — alumni whose current industry is "Graduate Student" — split out of
-    ``other`` so the dashboard can show it as its own bar.
+    ``other`` so the dashboard can show it as its own bar. "Military" (#608) gets
+    NO such bucket — Jake kept the chart about finance sectors, so it folds into
+    ``other`` like any other non-wheel value.
     """
 
     industries: list[DashboardIndustryCount]

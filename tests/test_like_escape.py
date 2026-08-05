@@ -6,6 +6,8 @@ the term's metacharacters are escaped and an ``ESCAPE '\\'`` clause is emitted.
 No database needed (mirrors ``test_alumni_search`` / ``test_audit_search``).
 """
 
+import re
+
 from sqlalchemy.dialects import postgresql
 
 from app.repositories.alumni import build_alumni_query
@@ -57,12 +59,14 @@ def test_escape_empty_string():
 # --- alumni query builder ----------------------------------------------------
 
 
-def test_alumni_q_escapes_wildcards_and_emits_escape_clause():
+def test_alumni_q_deletes_wildcards_instead_of_escaping_them():
+    # Since #620 the free-text q is matched on the NORMALIZED form, which keeps
+    # only [a-z0-9] -- so a LIKE metacharacter cannot survive into the pattern at
+    # all and there is nothing left to escape. Strictly safer than escaping.
     stmt = build_alumni_query(q="50%_admin")
-    sql = _sql(stmt)
-    assert ESCAPE_CLAUSE in sql
-    # The bound search term carries escaped metacharacters, not raw wildcards.
-    assert any(p == "%50\\%\\_admin%" for p in _params(stmt).values())
+    values = list(_params(stmt).values())
+    assert "%50admin%" in values
+    assert not any(isinstance(v, str) and ("%_" in v or "\\" in v) for v in values)
 
 
 def test_alumni_employer_escapes_wildcards():
@@ -92,12 +96,24 @@ def test_alumni_employment_status_escapes_wildcards():
     assert "Full\\_time\\%" in _params(stmt).values()
 
 
-def test_alumni_ilike_count_unchanged():
-    # Escaping must not change which columns are searched. The free-text q
-    # matches 8 name/id columns: first, last, preferred, birth (maiden #216),
-    # middle, byu_id, net_id, other_designations (#404). A plain name query adds
-    # no designation-holder EXISTS.
-    assert _sql(build_alumni_query(q="smith")).count("ILIKE") == 8
+def test_alumni_q_column_set_unchanged():
+    # Normalization must not change WHICH alumni-row columns are searched. The
+    # free-text q still reaches 8 of them: first, last, preferred, birth (maiden
+    # #216), middle, byu_id, net_id, other_designations (#404) -- plus, since
+    # #620, the employment record (covered in tests/test_alumni_search.py).
+    sql = _sql(build_alumni_query(q="smith"))
+    for column in (
+        "first_name",
+        "last_name",
+        "preferred_first_name",
+        "birth_name",
+        "middle_name",
+        "byu_id",
+        "net_id",
+        "other_designations",
+    ):
+        assert re.search(rf"alumni_search_norm\(alumni_\d+\.{column}\)", sql)
+    assert "alumni_program_engagement" not in sql
 
 
 # --- audit query builder -----------------------------------------------------

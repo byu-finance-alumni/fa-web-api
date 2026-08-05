@@ -165,6 +165,25 @@ def test_designations_parity_is_case_and_comma_insensitive(client, captured, ses
     )
 
 
+def test_free_text_q_parity(client, captured, session):
+    # #620 widened q to the employment record and made it typo/spacing tolerant.
+    # The list and the export must still describe the SAME population — the
+    # ranking that reorders the list lives in the ORDER BY only.
+    _assert_same_population(client, captured, session, "q=Goldman+Sachs", q="Goldman Sachs")
+
+
+def test_routed_free_text_q_parity(client, captured, session):
+    # A routed sentence ("at <employer> in <place>") is several AND-ed
+    # predicates; every one of them has to reach the export too.
+    _assert_same_population(
+        client,
+        captured,
+        session,
+        "q=at+goldman+schs+in+new+york",
+        q="at goldman schs in new york",
+    )
+
+
 def test_graduate_degree_parity(client, captured, session):
     _assert_same_population(
         client, captured, session, "graduate_degree=true", graduate_degree=True

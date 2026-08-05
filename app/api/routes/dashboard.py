@@ -25,6 +25,7 @@ from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
+from app.repositories.alumni import has_employer_or_not_applicable
 from app.schemas.auth import UserContext
 from app.schemas.dashboard import (
     ActivityFeed,
@@ -132,15 +133,14 @@ def _has_phone_exists():
 
 
 def _has_employer_exists():
-    """Correlated EXISTS: the alumnus has a current employer on file."""
-    return (
-        select(CurrentEmployment.current_employment_id)
-        .where(
-            CurrentEmployment.alumni_id == Alumni.alumni_id,
-            CurrentEmployment.current_employer.is_not(None),
-        )
-        .exists()
-    )
+    """An employer is on file, OR the alumnus's status means none is expected.
+
+    Imported wholesale from the repository (#608) so this KPI, the Data-quality
+    tile and the ``/alumni?missing_employer=1`` drill-down it deep-links to are
+    the SAME predicate — a count that doesn't match its own list is the recurring
+    bug class here. Named for what it feeds (the negation is "missing employer").
+    """
+    return has_employer_or_not_applicable()
 
 
 def _contacted_since_exists(cutoff: datetime.datetime):
@@ -473,7 +473,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         if canonical is not None:
             industry_counts[canonical] += n
         else:
-            # Literal "Other" or any value outside the finance vocab.
+            # Literal "Other", "Military" (#608 — deliberately NOT its own bar;
+            # the chart stays about finance sectors) or any value outside the
+            # finance vocab.
             other_count += n
     # Unknown = active alumni with no (non-blank) industry on file, PLUS those
     # explicitly marked "Unknown" (#295). ``known_total`` already counts the

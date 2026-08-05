@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import employer_applies
 from app.core.us_states import to_full_name as _state_full_name
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
@@ -705,7 +706,14 @@ def recommended_warnings(effective: dict) -> list[dict]:
                 "message": "No email on file — this alum can't be contacted.",
             }
         )
-    if not career.get("current_employer"):
+    # Missing employer (#608). Suppressed for the statuses where an employer is
+    # inapplicable or optional — Military (Jake: "the branch does not matter"),
+    # Unemployed, Not in the Labor Force, Graduate Student. Nagging about data
+    # that isn't wanted is how a warning list gets ignored wholesale. Single
+    # source of truth: ``EMPLOYER_NOT_APPLICABLE_STATUSES``.
+    if not career.get("current_employer") and employer_applies(
+        effective.get("employment_status")
+    ):
         warnings.append(
             {
                 "code": "missing_employer",
@@ -773,6 +781,11 @@ _EFFECTIVE_CORE_FIELDS = (
     "first_name",
     "last_name",
     "graduation_year",
+    # #608 — ``recommended_warnings`` suppresses the missing-employer nudge for
+    # statuses that make an employer inapplicable, so an UPDATE preview has to see
+    # the STORED status when the payload doesn't resend it. Without it here, an
+    # unrelated edit to an Unemployed alumnus would show the warning again.
+    "employment_status",
 )
 
 

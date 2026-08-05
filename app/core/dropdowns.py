@@ -28,6 +28,12 @@ from app.core.errors import InvalidRequestError
 # Sorted case-insensitively ("Financial Services" before "FP&A"), with the
 # "Unknown" value, the "Graduate Student" indicator and the "Other" catch-all
 # pinned last, in that order (#295 / #294 / #282).
+#
+# "Military" (#608) sits in the ALPHABETICAL BODY between "Law" and "Private
+# Banking" — unlike "Graduate Student" it is a real answer to "what do you do",
+# not a status indicator, so it is not pinned to the tail. Inserting it there
+# shifts every later body index by one, which is why its migration re-upserts
+# the whole body's sort_order rather than appending a single row.
 INDUSTRIES: tuple[str, ...] = (
     "Asset Management",
     "Commercial Banking",
@@ -40,6 +46,7 @@ INDUSTRIES: tuple[str, ...] = (
     "FP&A",
     "Investment Banking",
     "Law",
+    "Military",
     "Private Banking",
     "Private Credit",
     "Private Equity",
@@ -97,14 +104,21 @@ def filter_primary_industries(values: list[str]) -> list[str]:
 
 # Dashboard wheel: the 15 finance industries Tanya wants shown as their own slice
 # (2026-07-11). Everything else in INDUSTRIES (Law, Corporate Banking, FP&A,
-# Sales and Trading, Credit Risk, Unknown, Graduate Student) plus any non-vocab
-# value folds into "Other". Both the dashboard breakdown AND the alumni-list
-# ``industry_group=other`` filter key off this set so the wheel slice and its
-# drill-down stay in sync.
+# Sales and Trading, Credit Risk, Military, Unknown, Graduate Student) plus any
+# non-vocab value folds into "Other". Both the dashboard breakdown AND the
+# alumni-list ``industry_group=other`` filter key off this set so the wheel slice
+# and its drill-down stay in sync.
 #
 # "Graduate Student" (#294) is a non-wheel industry — it does NOT get its own
 # wheel slice — but the frontend dashboard surfaces it as its own clickable
 # indicator at the BOTTOM of the industry list, separate from the "Other" fold.
+#
+# "Military" (#608) is non-wheel and gets NO bar of its own — Jake chose to keep
+# the industry chart about FINANCE SECTORS, so it simply folds into the "Other"
+# catch-all like Law or FP&A. That fold is the default behaviour of this set, so
+# there is deliberately no special case for it anywhere in the breakdown; the
+# only Military-specific logic in the codebase is the primary-OR-secondary search
+# widening in ``repositories/alumni.py`` (the reservist case).
 #
 # "Unknown" (#295) is likewise a non-wheel industry and simply folds into "Other"
 # on the wheel — it gets NO separate dashboard indicator. It is distinct from a
@@ -117,6 +131,7 @@ _NON_WHEEL_INDUSTRIES = frozenset(
         "FP&A",
         "Sales and Trading",
         "Credit Risk",
+        "Military",
         "Unknown",
         "Graduate Student",
         "Other",
@@ -218,6 +233,79 @@ EMPLOYMENT_STATUS_PLACEHOLDERS: frozenset[str] = frozenset({"Unknown"})
 SURVEY_EMPLOYMENT_STATUSES: tuple[str, ...] = tuple(
     v for v in EMPLOYMENT_STATUSES if v not in EMPLOYMENT_STATUS_PLACEHOLDERS
 )
+
+# --- statuses for which a blank employer is COMPLETE data (#608) --------------
+#
+# The "missing employer" data-hygiene flag counted every employer-less alumnus,
+# regardless of what they told us they were doing. For someone recorded as
+# Unemployed that is not a gap in our data — it is the data. Flagging it anyway
+# is a false alarm, and a review queue full of false alarms is a review queue
+# people stop reading.
+#
+# These four are the statuses where an employer is inapplicable or optional —
+# nothing here is a gap someone should be chasing:
+#   * "Military"              — Jake, 2026-08-04 (#608): "the branch does not
+#     matter." We still WANT the branch when we know it (it is stored in the
+#     ordinary employer field and the profile renders it as "Military/<branch>"),
+#     but it is not required and it is not chased, so a serving alumnus with no
+#     employer must not count as missing one or as an incomplete profile.
+#   * "Unemployed"            — by definition has no employer.
+#   * "Not in the Labor Force" — by definition not working (retired, caregiving,
+#     etc.). Same as above; the distinction is about job-seeking, not employment.
+#   * "Graduate Student"      — enrolled, not employed. The codebase already
+#     treats the literal string "graduate student" as a non-employer placeholder
+#     in the dashboard's Top-employers chart (``_NON_EMPLOYER_VALUES``), so this
+#     only makes the hygiene flag agree with a judgement already made.
+#
+# DELIBERATELY NOT EXEMPT — "Self-Employed" (their own company is the employer
+# and we want its name), "Full-time"/"Part-time" (obviously), and "Unknown" (we
+# do not know what they are doing, so we cannot claim the blank employer was
+# intentional — that is the very gap the flag exists to surface). Widening past
+# these four needs a decision from Jake, not a judgement call here: every status
+# added silently removes people from the only worklist that would fix them.
+#
+# Matched case-insensitively on the trimmed value: employment_status is a plain
+# varchar with no write validation, so prod holds casing drift from imports.
+EMPLOYER_NOT_APPLICABLE_STATUSES: tuple[str, ...] = (
+    "Military",
+    "Unemployed",
+    "Not in the Labor Force",
+    "Graduate Student",
+)
+EMPLOYER_NOT_APPLICABLE_BY_LOWER: frozenset[str] = frozenset(
+    v.lower() for v in EMPLOYER_NOT_APPLICABLE_STATUSES
+)
+
+
+def employer_applies(employment_status: str | None) -> bool:
+    """False when *employment_status* means there is no employer to record.
+
+    The single source of truth for the "missing employer" exemption, shared by
+    the per-record hygiene warning, the dashboard/data-quality counts and the
+    ``?missing_employer=1`` drill-down so all three describe the same population.
+    An absent/blank status returns ``True`` (we cannot assume the blank is
+    intentional).
+    """
+    if employment_status is None:
+        return True
+    return employment_status.strip().lower() not in EMPLOYER_NOT_APPLICABLE_BY_LOWER
+
+
+# --- military service display (#608) -----------------------------------------
+#
+# The status value that means "serving". Mirrored by ``MILITARY_STATUS`` in the
+# frontend (fa-web-app/src/constants/dropdowns.ts), which owns the
+# "Military/<branch>" profile rendering.
+MILITARY_STATUS = "Military"
+
+
+def is_military_status(employment_status: str | None) -> bool:
+    """True when *employment_status* records military service.
+
+    Trimmed + case-insensitive: the column has no write validation, so prod holds
+    casing drift from the free-text intake sheet.
+    """
+    return (employment_status or "").strip().lower() == MILITARY_STATUS.lower()
 
 
 # --- finance designations (CFA / CFP / CPA) ----------------------------------

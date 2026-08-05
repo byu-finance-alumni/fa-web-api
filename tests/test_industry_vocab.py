@@ -209,17 +209,32 @@ def test_military_sits_in_the_alphabetical_body_not_the_pinned_tail() -> None:
     assert i < len(INDUSTRIES) - 3
 
 
-def test_military_is_selectable_as_a_primary_industry() -> None:
-    """The whole point: it must be pickable as an alumnus's CURRENT industry."""
+def test_military_is_selectable_as_either_primary_or_secondary() -> None:
+    """Jake's reservist case (#608): someone can serve AND hold a civilian job,
+    e.g. primary Investment Banking + secondary Military. employment_status is a
+    single value and can't express that; industry has two slots, which is why
+    Military lives here too. So it must be offered in BOTH dropdowns."""
     assert "Military" in PRIMARY_INDUSTRIES
     assert "Military" in SECONDARY_INDUSTRIES
     assert validate_industry("military") == "Military"
 
 
 def test_military_is_not_a_wheel_industry() -> None:
-    """It isn't one of Tanya's 15 finance industries, so it gets no wheel slice
-    — the Graduate Student treatment, not a new finance bar."""
+    """Jake kept the dashboard industry chart about FINANCE SECTORS, so Military
+    gets no bar of its own and simply folds into the "Other" catch-all — the
+    default behaviour of _NON_WHEEL_INDUSTRIES, not a special case."""
     assert "Military" not in WHEEL_INDUSTRIES
+
+
+def test_military_has_no_dashboard_bucket_of_its_own() -> None:
+    """Guard the "folds into Other" decision at the contract level: if someone
+    later adds a `military` bucket to the breakdown, this fails and they have to
+    re-check with Jake first. Contrast `graduate_student`, which IS a bucket."""
+    from app.schemas.dashboard import DashboardIndustryBreakdown
+
+    fields = set(DashboardIndustryBreakdown.model_fields)
+    assert "graduate_student" in fields
+    assert "military" not in fields
 
 
 def test_military_body_insert_renumbered_the_rest_of_the_body() -> None:

@@ -452,7 +452,6 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     industry_counts = {name: 0 for name in _FINANCE_INDUSTRIES}
     other_count = 0
     graduate_student_count = 0
-    military_count = 0
     unknown_explicit = 0
     known_total = 0
     for value, n in industry_rows:
@@ -464,13 +463,6 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             # "Other" catch-all so it can be counted and drilled into separately.
             graduate_student_count += n
             continue
-        if lowered == "military":
-            # Military (#608) gets the same treatment as Graduate Student: its own
-            # bar, split out of "Other". The whole reason the industry was added is
-            # that service members were disappearing into the catch-all, so leaving
-            # them in it would defeat the change.
-            military_count += n
-            continue
         if lowered == "unknown":
             # Explicit "Unknown" (#295) is merged INTO the "Unknown" data-gap bar
             # below, alongside alumni with no industry on file — so the dashboard
@@ -481,7 +473,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         if canonical is not None:
             industry_counts[canonical] += n
         else:
-            # Literal "Other" or any value outside the finance vocab.
+            # Literal "Other", "Military" (#608 — deliberately NOT its own bar;
+            # the chart stays about finance sectors) or any value outside the
+            # finance vocab.
             other_count += n
     # Unknown = active alumni with no (non-blank) industry on file, PLUS those
     # explicitly marked "Unknown" (#295). ``known_total`` already counts the
@@ -536,7 +530,6 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             "other": other_count,
             "unknown": unknown_count,
             "graduate_student": graduate_student_count,
-            "military": military_count,
         },
     }
 

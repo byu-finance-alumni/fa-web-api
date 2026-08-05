@@ -311,18 +311,6 @@ def _employer_codes(employment_status):
     return {w["code"] for w in warnings}
 
 
-def _employer_message(employment_status):
-    warnings = hygiene.recommended_warnings(
-        {
-            "contact": {"work_email": "a@b.com"},
-            "career": {},
-            "graduation_year": 2018,
-            "employment_status": employment_status,
-        }
-    )
-    return next(w["message"] for w in warnings if w["code"] == "missing_employer")
-
-
 @pytest.mark.parametrize("status", EMPLOYER_NOT_APPLICABLE_STATUSES)
 def test_missing_employer_suppressed_when_no_employer_can_exist(status):
     """#608 — for these statuses a blank employer IS the complete answer, so
@@ -331,7 +319,8 @@ def test_missing_employer_suppressed_when_no_employer_can_exist(status):
 
 
 @pytest.mark.parametrize(
-    "status", ["unemployed", "  Not In The Labor Force  ", "GRADUATE STUDENT"]
+    "status",
+    ["unemployed", "  Not In The Labor Force  ", "GRADUATE STUDENT", " military "],
 )
 def test_missing_employer_exemption_is_case_and_whitespace_insensitive(status):
     """employment_status has no write validation, so prod holds casing drift
@@ -339,13 +328,19 @@ def test_missing_employer_exemption_is_case_and_whitespace_insensitive(status):
     assert "missing_employer" not in _employer_codes(status)
 
 
+def test_missing_employer_suppressed_for_military(status="Military"):
+    """Jake, 2026-08-04 (#608): "the branch does not matter." Verified live on
+    dev that this flag was real — a Military alumnus with no employer moved
+    missing_employer 0 -> 1."""
+    assert "missing_employer" not in _employer_codes(status)
+
+
 @pytest.mark.parametrize(
-    "status", ["Military", "Full-time", "Part-time", "Self-Employed", "Unknown"]
+    "status", ["Full-time", "Part-time", "Self-Employed", "Unknown"]
 )
 def test_missing_employer_still_flagged_for_the_rest(status):
-    """Deliberately NOT exempt. Military most of all: a branch of service is an
-    employer and a rank is a title (#608), so the gap is real and fillable —
-    exempting it would hide every service member from the review queue."""
+    """Deliberately NOT exempt — Self-Employed (their own company is the employer)
+    and Unknown (we don't know the status, so the blank employer IS the gap)."""
     assert "missing_employer" in _employer_codes(status)
 
 
@@ -354,17 +349,6 @@ def test_missing_employer_not_exempt_when_status_is_blank():
     intentional, so it stays flagged."""
     assert "missing_employer" in _employer_codes(None)
     assert "missing_employer" in _employer_codes("")
-
-
-def test_military_missing_employer_message_says_what_to_record():
-    """#608's actual fix for Military: same flag, actionable wording."""
-    message = _employer_message("Military")
-    assert "branch of service" in message
-    assert message != _employer_message("Full-time")
-
-
-def test_non_military_missing_employer_message_is_unchanged():
-    assert _employer_message("Full-time") == "No current employer on file."
 
 
 def test_missing_employer_never_fires_when_an_employer_is_on_file():

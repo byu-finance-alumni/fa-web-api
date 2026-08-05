@@ -46,10 +46,10 @@ SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
 #                   which the dashboard merges into the same "Unknown" bar.
 #   * ``other``   — has a primary industry, but it isn't one of the 14 wheel
 #                   industries (literal "Other", a non-wheel finance value like
-#                   Law/Corporate Banking, or any non-canonical value) — EXCLUDING
-#                   the three values the dashboard breaks out into their own
-#                   buckets: "Graduate Student" (#294, own bar), "Military" (#608,
-#                   own bar) and "Unknown" (#295, merged into the Unknown bar).
+#                   Law/Corporate Banking, "Military" (#608), or any non-canonical
+#                   value) — EXCLUDING the two values the dashboard breaks out
+#                   into their own buckets: "Graduate Student" (#294, own bar) and
+#                   "Unknown" (#295, merged into the Unknown bar).
 # Lower-cased for a case-insensitive DB comparison (industries are stored as
 # free-text varchars, so casing can drift on import).
 _FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
@@ -60,12 +60,13 @@ _FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
 # (exact ``industry=Graduate Student`` / ``industry_group=unknown``) own them.
 _GRADUATE_STUDENT_LOWER = "graduate student"
 _EXPLICIT_UNKNOWN_LOWER = "unknown"
-# "Military" (#608) is the third such value: non-wheel, but broken out of the
-# "Other" fold into its own dashboard bar, so ``industry_group=other`` must
-# exclude it and the exact ``industry=Military`` drill-down owns it.
+# "Military" (#608) is NOT one of those. Jake chose to keep the industry chart
+# about finance sectors, so Military simply FOLDS INTO the "Other" bar like every
+# other non-wheel value — no bar of its own, and therefore no exclusion here.
+# The constant exists only for the primary-OR-secondary search widening below.
 _MILITARY_LOWER = "military"
 _OTHER_EXCLUDED_LOWER: frozenset[str] = frozenset(
-    {_GRADUATE_STUDENT_LOWER, _EXPLICIT_UNKNOWN_LOWER, _MILITARY_LOWER}
+    {_GRADUATE_STUDENT_LOWER, _EXPLICIT_UNKNOWN_LOWER}
 )
 
 
@@ -517,8 +518,9 @@ def build_alumni_query(
     elif industry_group == "other":
         # Has a primary industry, but it isn't one of the canonical finance
         # industries AND isn't one of the values the dashboard breaks out into
-        # their own bars ("Graduate Student", "Military", "Unknown") — so this
-        # drill-down matches the dashboard "Other" bar exactly.
+        # their own bars ("Graduate Student", "Unknown") — so this drill-down
+        # matches the dashboard "Other" bar exactly. "Military" (#608) is NOT
+        # broken out, so it belongs in here, same as Law or FP&A.
         conditions.append(
             select(CurrentEmployment.current_employment_id)
             .where(
@@ -571,11 +573,44 @@ def build_alumni_query(
         # ``industry`` and ``secondary_industry`` AND-s them (two separate
         # conditions), which is what the two-box UI implies: "primary is X and
         # secondary is Y", not "either column mentions X or Y".
+        #
+        # EXCEPT "Military" (#608). Jake's reservist case: someone can serve AND
+        # hold a civilian job, e.g. primary = Investment Banking, secondary =
+        # Military. employment_status can't express that (it is one value);
+        # industry has two slots, which is the whole reason Military lives here.
+        # So a Military search has to look at BOTH slots or it misses every
+        # reservist — the people the option was added for.
+        #
+        # THIS WIDENING IS MILITARY-ONLY AND MUST STAY THAT WAY. Every other
+        # industry stays primary-only per Jake's 2026-08-03 decision (#584): a
+        # "Consulting" search that quietly returned people whose *secondary* was
+        # Consulting is exactly the bug that decision removed. Do not generalize
+        # this to the rest of the list; ``tests/test_alumni_search.py`` pins both
+        # halves of that rule.
+        military = [v for v in industries if v.strip().lower() == _MILITARY_LOWER]
+        primary_only = [
+            v for v in industries if v.strip().lower() != _MILITARY_LOWER
+        ]
+        matches = []
+        if primary_only:
+            matches.append(
+                _ilike_any(CurrentEmployment.current_industry, primary_only)
+            )
+        if military:
+            matches.append(
+                or_(
+                    _ilike_any(CurrentEmployment.current_industry, military),
+                    _ilike_any(
+                        CurrentEmployment.current_industry_secondary, military
+                    ),
+                )
+            )
         conditions.append(
             select(CurrentEmployment.current_employment_id)
             .where(
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
-                _ilike_any(CurrentEmployment.current_industry, industries),
+                # Multi-select ORs the requested industries together, unchanged.
+                matches[0] if len(matches) == 1 else or_(*matches),
             )
             .exists()
         )

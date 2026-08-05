@@ -719,7 +719,7 @@ def test_summary_response_validates_against_model(client):
     assert model.model_dump() == body
 
 
-# --- #608: Military is its own industry bar ----------------------------------
+# --- #608: Military folds into "Other" ---------------------------------------
 
 
 def _summary_breakdown(client, industry_rows):
@@ -740,32 +740,25 @@ def _summary_breakdown(client, industry_rows):
     return response.json()["industry_breakdown"]
 
 
-def test_military_is_split_out_of_other_into_its_own_bar(client):
-    """#608 — the point of adding the Military industry was that service members
-    were vanishing into the Other catch-all. Folding them straight back into
-    "Other" would have made the new option pointless."""
+def test_military_folds_into_other(client):
+    """Jake (#608) kept the industry chart about FINANCE SECTORS, so Military
+    gets no bar of its own — it lands in the "Other" catch-all like Law or FP&A.
+    That is the default path for a non-wheel industry, deliberately not a special
+    case."""
     breakdown = _summary_breakdown(
         client,
         [("Military", 7), ("Other", 3), ("Consulting", 5)],
     )
-    assert breakdown["military"] == 7
-    assert breakdown["other"] == 3
+    assert breakdown["other"] == 10
+    assert "military" not in breakdown
 
 
 def test_military_is_not_merged_into_the_unknown_data_gap_bar(client):
-    """It gets the Graduate Student treatment, not the Unknown treatment:
-    Military is a real answer, not a recorded non-answer."""
+    """Folding into Other is not the same as folding into Unknown: an alumnus
+    who told us they serve is not a missing-industry record."""
     breakdown = _summary_breakdown(client, [("Military", 7)])
-    # Unknown = the blank remainder only (100 active - 7 with an industry).
-    assert breakdown["unknown"] == 93
-    assert breakdown["military"] == 7
-
-
-def test_military_bucket_is_case_insensitive(client):
-    """current_industry is a free-text varchar; casing drifts through imports."""
-    breakdown = _summary_breakdown(client, [("  military ", 4)])
-    assert breakdown["military"] == 4
-    assert breakdown["other"] == 0
+    assert breakdown["unknown"] == 93  # the blank remainder only
+    assert breakdown["other"] == 7
 
 
 def test_military_is_not_a_wheel_bar(client):
@@ -775,14 +768,14 @@ def test_military_is_not_a_wheel_bar(client):
 
 
 def test_graduate_student_and_unknown_buckets_are_unaffected(client):
-    """Regression guard: adding the Military branch must not disturb the two
-    special-cased values already in this loop."""
+    """Regression guard: Military must not disturb the two values that ARE
+    special-cased out of the Other fold."""
     breakdown = _summary_breakdown(
         client,
         [("Graduate Student", 2), ("Unknown", 3), ("Military", 4), ("Law", 1)],
     )
     assert breakdown["graduate_student"] == 2
-    assert breakdown["military"] == 4
-    assert breakdown["other"] == 1  # Law is non-wheel -> Other
+    # Military + Law both fold into Other.
+    assert breakdown["other"] == 5
     # Explicit "Unknown" merges into the blank-industry data-gap bar.
     assert breakdown["unknown"] == (100 - 10) + 3

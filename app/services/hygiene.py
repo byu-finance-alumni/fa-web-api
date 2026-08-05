@@ -31,7 +31,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import employer_applies, employer_prompt
+from app.core.dropdowns import employer_applies
 from app.core.us_states import to_full_name as _state_full_name
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
@@ -706,18 +706,18 @@ def recommended_warnings(effective: dict) -> list[dict]:
                 "message": "No email on file — this alum can't be contacted.",
             }
         )
-    # Missing employer (#608). Suppressed entirely for the statuses where a blank
-    # employer IS the complete answer (Unemployed / Not in the Labor Force /
-    # Graduate Student) — nagging about data that cannot exist is how a warning
-    # list gets ignored. Military is deliberately NOT suppressed: a branch of
-    # service is an employer, so the gap is real; it just gets a message that says
-    # what to put in the field. Single source of truth: app/core/dropdowns.py.
-    status = effective.get("employment_status")
-    if not career.get("current_employer") and employer_applies(status):
+    # Missing employer (#608). Suppressed for the statuses where an employer is
+    # inapplicable or optional — Military (Jake: "the branch does not matter"),
+    # Unemployed, Not in the Labor Force, Graduate Student. Nagging about data
+    # that isn't wanted is how a warning list gets ignored wholesale. Single
+    # source of truth: ``EMPLOYER_NOT_APPLICABLE_STATUSES``.
+    if not career.get("current_employer") and employer_applies(
+        effective.get("employment_status")
+    ):
         warnings.append(
             {
                 "code": "missing_employer",
-                "message": employer_prompt(status),
+                "message": "No current employer on file.",
             }
         )
     if effective.get("graduation_year") is None:

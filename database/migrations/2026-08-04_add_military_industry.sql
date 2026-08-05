@@ -9,16 +9,21 @@
 --
 -- It is added to the backend INDUSTRIES tuple (app/core/dropdowns.py) as a
 -- NON-WHEEL industry (i.e. IN _NON_WHEEL_INDUSTRIES) — it is not one of Tanya's
--- 15 finance industries, so it gets no wheel slice — but like "Graduate Student"
--- (#294) it is split OUT of the "Other" fold into its own counted dashboard bar.
--- Folding it into "Other" would have reproduced the very disappearance this
--- migration exists to fix. It is deliberately NOT given the "Unknown" (#295)
--- treatment of merging into the data-gap bar: Military is a real answer, not a
--- recorded non-answer.
+-- 15 finance industries. Jake chose to keep the dashboard industry chart about
+-- FINANCE SECTORS, so unlike "Graduate Student" (#294) it gets NO bar of its own
+-- and simply folds into the "Other" catch-all, exactly like Law or FP&A. That is
+-- the default behaviour of _NON_WHEEL_INDUSTRIES, so there is deliberately no
+-- special case for it in the breakdown code.
 --
--- It stays a valid PRIMARY industry (NOT in _PRIMARY_EXCLUDED_INDUSTRIES), so it
--- can be picked as an alumnus's current industry and the controlled-vocab write
--- validation accepts it on profile edits/imports.
+-- It is valid as EITHER the primary or the secondary industry (NOT in
+-- _PRIMARY_EXCLUDED_INDUSTRIES). Jake's reservist case is why: someone can serve
+-- AND hold a civilian job — primary = Investment Banking, secondary = Military.
+-- employment_status cannot express that (it is a single value); industry has two
+-- slots, which is the whole reason Military lives here as well as there.
+--
+-- Consequently a ?industry=Military search matches BOTH slots, unlike every
+-- other industry, which stays primary-only per the 2026-08-03 decision (#584).
+-- That widening is Military-only and is pinned by tests/test_alumni_search.py.
 --
 -- ORDERING. Unlike "Graduate Student"/"Unknown"/"Other" (pinned at 98/97/99),
 -- "Military" belongs in the ALPHABETICAL BODY, between "Law" and "Private

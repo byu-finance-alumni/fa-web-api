@@ -29,7 +29,7 @@ from app.core.dropdowns import (
     EMPLOYMENT_STATUSES,
     SURVEY_EMPLOYMENT_STATUSES,
     employer_applies,
-    employer_prompt,
+    is_military_status,
 )
 from app.schemas.alumni import AlumniCreate, AlumniUpdate
 from app.services import import_csv
@@ -236,22 +236,32 @@ def test_exempt_statuses_are_all_real_statuses() -> None:
     assert set(EMPLOYER_NOT_APPLICABLE_STATUSES) <= set(EMPLOYMENT_STATUSES)
 
 
-def test_exactly_three_statuses_are_exempt() -> None:
-    """Pinned deliberately narrow. These are the statuses where there is NOTHING
-    for a human to go and find — not "statuses where an employer is unusual"."""
+def test_exactly_four_statuses_are_exempt() -> None:
+    """Pinned deliberately narrow: statuses where an employer is inapplicable or
+    optional. Widening this is a decision for Jake — every status added silently
+    removes people from the only worklist that would fix them."""
     assert EMPLOYER_NOT_APPLICABLE_STATUSES == (
+        "Military",
         "Unemployed",
         "Not in the Labor Force",
         "Graduate Student",
     )
 
 
-def test_military_is_not_exempt() -> None:
-    """#608's headline: military service IS employment — a branch is an employer,
-    a rank is a title. A Military record with no employer is a real, fillable gap,
-    so it must keep reaching the review queue. Do not "helpfully" add it here."""
-    assert employer_applies("Military") is True
-    assert employer_applies("  military  ") is True
+def test_military_is_exempt() -> None:
+    """Jake, 2026-08-04 (#608): "the branch does not matter." We still want the
+    branch when we know it, but it is not required and not chased, so a serving
+    alumnus with no employer must not count as missing one."""
+    assert employer_applies("Military") is False
+    assert employer_applies("  military  ") is False
+
+
+@pytest.mark.parametrize("status", ["Self-Employed", "Full-time", "Part-time", "Unknown"])
+def test_the_rest_are_still_flagged(status: str) -> None:
+    """Not exempt: Self-Employed (their own company is the employer and we want
+    its name) and Unknown (we don't know what they're doing, so we can't claim
+    the blank employer was intentional — that IS the gap)."""
+    assert employer_applies(status) is True
 
 
 @pytest.mark.parametrize("status", EMPLOYER_NOT_APPLICABLE_STATUSES)
@@ -268,10 +278,13 @@ def test_employer_applies_for_an_unset_status() -> None:
     assert employer_applies("Unknown") is True
 
 
-def test_employer_prompt_is_military_specific() -> None:
-    assert "branch of service" in employer_prompt("Military")
-    assert "branch of service" not in employer_prompt("Full-time")
-    assert employer_prompt(None) == "No current employer on file."
+def test_is_military_status_is_trimmed_and_case_insensitive() -> None:
+    """Drives the "Military/<branch>" profile display; the column has no write
+    validation so prod holds casing drift from the free-text intake sheet."""
+    assert is_military_status("Military") is True
+    assert is_military_status("  military ") is True
+    assert is_military_status("Full-time") is False
+    assert is_military_status(None) is False
 
 
 def test_doc_documents_the_exemption() -> None:

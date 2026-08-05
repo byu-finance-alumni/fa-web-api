@@ -114,19 +114,30 @@ the dropdown just above `Graduate Student` (`sort_order` 97).
 ### Military (#608)
 
 `Military` was added 2026-08-04 because a service member had **no industry that
-fit** and had to be recorded as `Other` or `Unknown` — which is what pushed them
-out of the dashboard's industry breakdown entirely. (Nothing ever *blocked* a
+fit** and had to be recorded as `Other` or `Unknown`. (Nothing ever *blocked* a
 Military alumnus from having an employer and title; that part of #608 was a data
 gap, not a bug.)
 
-It is a **valid primary industry** and is **not** a dashboard wheel slice — it is
-not one of Tanya's 15 finance industries, so it is in `_NON_WHEEL_INDUSTRIES`. It
-gets the **`Graduate Student` treatment, not the `Unknown` treatment**: its own
-counted bar at the bottom of the industry breakdown, split out of the `Other`
-fold, linking to the alumni list filtered to `current_industry = "Military"`.
-Folding it into `Other` would have recreated the very disappearance the option
-exists to fix; merging it into the `Unknown` data-gap bar would be wrong because
-`Military` is a real answer, not a recorded non-answer.
+**Valid as EITHER primary or secondary.** Jake's reservist case is the reason it
+lives here rather than only in Employment Status: someone can serve *and* hold a
+civilian job — primary `Investment Banking`, secondary `Military`.
+`employment_status` is a single value and cannot express that; industry has two
+slots.
+
+**Searching `industry=Military` matches BOTH slots.** This is a deliberate,
+**Military-only** widening of the 2026-08-03 rule (#584) that `industry` means
+the primary industry only — without it, every reservist is missed by the search,
+which is most of the people the option was added for. Every other industry stays
+primary-only; do not generalize it. `tests/test_alumni_search.py` pins both
+halves.
+
+**On the dashboard it folds into `Other` — it gets NO bar of its own.** Jake:
+keep the industry chart about finance sectors. It is in `_NON_WHEEL_INDUSTRIES`,
+and folding into `Other` is that set's default behaviour, so there is
+deliberately no special case for it in the breakdown code (contrast
+`Graduate Student`, which *is* special-cased into its own bar). The
+`industry_group=other` drill-down therefore includes it, keeping the bar and its
+list in sync.
 
 Unlike the three pinned tail options it sits in the **alphabetical body**, between
 `Law` and `Private Banking` (`sort_order` 11) — it is an ordinary answer to "what
@@ -135,8 +146,10 @@ do you do", and people scan for it under M. Adding it therefore shifted
 `migrations/2026-08-04_add_military_industry.sql` re-upserts the whole body.
 
 `Military` the **industry** is independent of `Military` the **employment status**
-below. The two are entered separately and neither is derived from the other; the
-migration deliberately does no backfill between them.
+below — they are separate columns and neither is derived from the other, and the
+migration does no backfill between them. The staff create/edit forms do *suggest*
+the industry when the status is set to Military, but it is only ever a
+suggestion the user can ignore or change (see below).
 
 ---
 
@@ -191,31 +204,53 @@ untouched value being overwritten.
 
 ### Statuses where a blank employer is complete data (#608)
 
-`EMPLOYER_NOT_APPLICABLE_STATUSES` in `app/core/dropdowns.py` — the three statuses
-for which the **"missing employer" hygiene flag is suppressed**, because there is
-nothing for a human to go and find:
+`EMPLOYER_NOT_APPLICABLE_STATUSES` in `app/core/dropdowns.py` — the statuses for
+which the **"missing employer" hygiene flag is suppressed**, because an employer
+is inapplicable or optional and nobody should be chasing one:
 
+- Military
 - Unemployed
 - Not in the Labor Force
 - Graduate Student
 
+`Military` is on the list on Jake's call, 2026-08-04: *"the branch does not
+matter."* We still **want** the branch when we know it — it is stored in the
+ordinary `current_employer` field and the profile renders it as
+`Military/<branch>` — but it is not required and not chased, so a serving alumnus
+with no employer must not count as missing one or as an incomplete profile.
+
 One constant drives all three surfaces (the per-record create/edit warning, the
-dashboard + Data-quality counts, and the `?missing_employer=1` drill-down and its
-export) so they always describe the same population. Matching is
-case-insensitive on the trimmed value, because the column has no write validation
-and casing drifts through imports.
+dashboard + Data-quality counts including `complete_alumni`, and the
+`?missing_employer=1` drill-down and its export) so they always describe the same
+population. Matching is case-insensitive on the trimmed value, because the column
+has no write validation and casing drifts through imports.
 
-**`Military` is deliberately NOT exempt.** Military service *is* employment — a
-branch is an employer, a rank is a title — so a Military record with no employer
-is a real, fillable gap and must keep appearing in the review queue; exempting it
-would permanently hide every service member from the one worklist that would get
-their branch recorded. What #608 changed for them is the **wording**: the warning
-now says to record the branch of service as the employer instead of the bare "No
-current employer on file" (`employer_prompt()`).
+**Not exempt:** `Self-Employed` (their own company is the employer and we want
+its name), `Full-time` / `Part-time`, and `Unknown` (we do not know what they are
+doing, so we cannot claim the blank employer was intentional — that *is* the gap
+the flag exists to surface). Widening past these four is a decision for Jake, not
+a judgement call in code: every status added silently removes people from the
+only worklist that would fix them.
 
-Also not exempt: `Self-Employed` (their own company is the employer),
-`Full-time` / `Part-time`, and `Unknown` (we do not know the status, so we cannot
-claim the blank employer is intentional — that *is* the gap).
+### Military status suggests the Military industry (#608)
+
+Status and industry are independent columns, so someone can be `Military` by
+status with no industry recorded and then never appear in an industry search for
+Military. The staff **create** and **profile-edit** forms close that gap by
+*suggesting* the industry when the status is set to Military:
+
+- **Suggest, never force.** The user can clear it or pick something else and that
+  choice sticks; nothing is written behind their back on save, and the suggestion
+  never fires twice over a value the user has since changed.
+- **Never clobbers.** An empty primary industry gets the suggestion. If the
+  primary is already filled (e.g. `Investment Banking`) the suggestion goes to the
+  **secondary** slot instead — the reservist case. If both slots hold values,
+  nothing is suggested.
+- **One-way.** Switching the status away from Military does not remove a Military
+  industry the user chose.
+- **Staff forms only.** The **CSV import** and the **survey** are deliberately
+  excluded: a bulk file and an alum's own self-report are taken at face value, not
+  silently amended.
 
 ---
 

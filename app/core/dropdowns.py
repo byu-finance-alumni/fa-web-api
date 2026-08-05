@@ -113,14 +113,12 @@ def filter_primary_industries(values: list[str]) -> list[str]:
 # wheel slice — but the frontend dashboard surfaces it as its own clickable
 # indicator at the BOTTOM of the industry list, separate from the "Other" fold.
 #
-# "Military" (#608) gets the SAME treatment as Graduate Student: non-wheel (it is
-# not one of Tanya's finance industries, so it must not appear on the finance
-# wheel) but broken out of the "Other" fold into its OWN counted bar. Before
-# #608 a service member had no industry that fit and landed in Other/Unknown,
-# which is exactly the disappearance this fixes — folding them straight back into
-# "Other" would have made the new option pointless. It is NOT given the "Unknown"
-# treatment (merge into the data-gap bar) because Military is a real answer, not
-# a recorded non-answer.
+# "Military" (#608) is non-wheel and gets NO bar of its own — Jake chose to keep
+# the industry chart about FINANCE SECTORS, so it simply folds into the "Other"
+# catch-all like Law or FP&A. That fold is the default behaviour of this set, so
+# there is deliberately no special case for it anywhere in the breakdown; the
+# only Military-specific logic in the codebase is the primary-OR-secondary search
+# widening in ``repositories/alumni.py`` (the reservist case).
 #
 # "Unknown" (#295) is likewise a non-wheel industry and simply folds into "Other"
 # on the wheel — it gets NO separate dashboard indicator. It is distinct from a
@@ -244,7 +242,13 @@ SURVEY_EMPLOYMENT_STATUSES: tuple[str, ...] = tuple(
 # is a false alarm, and a review queue full of false alarms is a review queue
 # people stop reading.
 #
-# These three are the statuses where there is NOTHING for a human to go and find:
+# These four are the statuses where an employer is inapplicable or optional —
+# nothing here is a gap someone should be chasing:
+#   * "Military"              — Jake, 2026-08-04 (#608): "the branch does not
+#     matter." We still WANT the branch when we know it (it is stored in the
+#     ordinary employer field and the profile renders it as "Military/<branch>"),
+#     but it is not required and it is not chased, so a serving alumnus with no
+#     employer must not count as missing one or as an incomplete profile.
 #   * "Unemployed"            — by definition has no employer.
 #   * "Not in the Labor Force" — by definition not working (retired, caregiving,
 #     etc.). Same as above; the distinction is about job-seeking, not employment.
@@ -253,21 +257,17 @@ SURVEY_EMPLOYMENT_STATUSES: tuple[str, ...] = tuple(
 #     in the dashboard's Top-employers chart (``_NON_EMPLOYER_VALUES``), so this
 #     only makes the hygiene flag agree with a judgement already made.
 #
-# DELIBERATELY NOT EXEMPT — "Military". Jake's #608 ask is that military service
-# COUNTS as a job, and it does: a service member has an employer (a branch), a
-# title (a rank/role) and a duty station. So a Military record with no employer
-# is a REAL, fillable gap and must keep showing up in the review queue — exempting
-# it would permanently hide every service member from the one worklist that would
-# get their branch recorded. What #608 fixes for them is the WORDING (see
-# ``employer_prompt`` below), not the flag itself.
-#
-# Also not exempt: "Self-Employed" (their own company is the employer),
-# "Part-time"/"Full-time" (obviously), and "Unknown" (we do not know the status,
-# so we cannot claim the blank employer is intentional — that is the very gap).
+# DELIBERATELY NOT EXEMPT — "Self-Employed" (their own company is the employer
+# and we want its name), "Full-time"/"Part-time" (obviously), and "Unknown" (we
+# do not know what they are doing, so we cannot claim the blank employer was
+# intentional — that is the very gap the flag exists to surface). Widening past
+# these four needs a decision from Jake, not a judgement call here: every status
+# added silently removes people from the only worklist that would fix them.
 #
 # Matched case-insensitively on the trimmed value: employment_status is a plain
 # varchar with no write validation, so prod holds casing drift from imports.
 EMPLOYER_NOT_APPLICABLE_STATUSES: tuple[str, ...] = (
+    "Military",
     "Unemployed",
     "Not in the Labor Force",
     "Graduate Student",
@@ -291,22 +291,21 @@ def employer_applies(employment_status: str | None) -> bool:
     return employment_status.strip().lower() not in EMPLOYER_NOT_APPLICABLE_BY_LOWER
 
 
-# The employer nudge, worded for the status. Military service IS employment
-# (#608), so rather than telling a service member's record "no current employer"
-# — which reads as an accusation and gets ignored — say what to actually put in
-# the field. Same flag, same code, actionable message.
-_MILITARY_STATUS_LOWER = "military"
+# --- military service display (#608) -----------------------------------------
+#
+# The status value that means "serving". Mirrored by ``MILITARY_STATUS`` in the
+# frontend (fa-web-app/src/constants/dropdowns.ts), which owns the
+# "Military/<branch>" profile rendering.
+MILITARY_STATUS = "Military"
 
 
-def employer_prompt(employment_status: str | None) -> str:
-    """The ``missing_employer`` warning message for *employment_status*."""
-    if (employment_status or "").strip().lower() == _MILITARY_STATUS_LOWER:
-        return (
-            "No current employer on file — for active-duty alumni record the "
-            "branch of service as the employer (e.g. 'U.S. Air Force') and the "
-            "rank or role as the title."
-        )
-    return "No current employer on file."
+def is_military_status(employment_status: str | None) -> bool:
+    """True when *employment_status* records military service.
+
+    Trimmed + case-insensitive: the column has no write validation, so prod holds
+    casing drift from the free-text intake sheet.
+    """
+    return (employment_status or "").strip().lower() == MILITARY_STATUS.lower()
 
 
 # --- finance designations (CFA / CFP / CPA) ----------------------------------

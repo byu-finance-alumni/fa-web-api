@@ -255,8 +255,8 @@ def test_missing_employer_filter():
 
 
 def test_missing_employer_filter_exempts_statuses_with_no_employer():
-    """#608 — Unemployed / Not in the Labor Force / Graduate Student are not
-    "missing" an employer; there is nothing for anyone to go and find. The
+    """#608 — Military / Unemployed / Not in the Labor Force / Graduate Student
+    are not "missing" an employer; an employer is inapplicable or optional. The
     comparison is lower(trim(coalesce(...))) so import casing drift can't leak
     someone back into the review queue."""
     sql = _sql(build_alumni_query(missing_employer=True)).lower()
@@ -266,14 +266,13 @@ def test_missing_employer_filter_exempts_statuses_with_no_employer():
         assert status.lower() in bound
 
 
-def test_missing_employer_filter_still_counts_military():
-    """#608 — military service IS employment (a branch is an employer), so a
-    Military record with no employer stays a real, fillable gap. Exempting it
-    would hide every service member from the one worklist that gets their branch
-    recorded."""
+def test_missing_employer_filter_exempts_military():
+    """Jake, 2026-08-04 (#608): "the branch does not matter" — a serving alumnus
+    with no employer is not missing one. The list must agree with the dashboard
+    count, which shares this exact predicate."""
     bound = _flat_bind_values(build_alumni_query(missing_employer=True))
-    assert "military" not in bound
-    assert "Military" not in EMPLOYER_NOT_APPLICABLE_STATUSES
+    assert "military" in bound
+    assert "Military" in EMPLOYER_NOT_APPLICABLE_STATUSES
 
 
 def test_duplicate_filter():
@@ -319,6 +318,58 @@ def test_industry_and_secondary_industry_are_anded():
     )
     assert "current_industry ILIKE" in sql
     assert "current_industry_secondary ILIKE" in sql
+    assert sql.count("EXISTS") == 2
+
+
+# --- #608: Military is the ONE industry that searches both slots -------------
+
+
+def test_military_industry_filter_matches_primary_or_secondary():
+    """Jake's reservist case: primary = Investment Banking, secondary = Military.
+    employment_status is a single value and can't express serving AND holding a
+    civilian job; industry has two slots. A Military search that only looked at
+    primary would miss every reservist — most of the people the option exists
+    for."""
+    sql = _sql(build_alumni_query(industry="Military"))
+    assert "current_industry ILIKE" in sql
+    assert "current_industry_secondary ILIKE" in sql
+    # ONE EXISTS with an OR inside, not two AND-ed conditions.
+    assert sql.count("EXISTS") == 1
+
+
+def test_military_widening_is_case_insensitive():
+    """Industries are free-text varchars; a deep-link may carry any casing."""
+    sql = _sql(build_alumni_query(industry="  military "))
+    assert "current_industry_secondary ILIKE" in sql
+
+
+def test_the_military_widening_does_not_leak_to_other_industries():
+    """THE guard on the scope of the exception. Every other industry stays
+    PRIMARY-ONLY per Jake's 2026-08-03 decision (#584) — a "Consulting" search
+    that quietly returned people whose SECONDARY was Consulting is exactly the
+    bug that decision removed. Do not generalize the Military widening."""
+    for value in ("Consulting", "Investment Banking", "Graduate Student", "Other"):
+        sql = _sql(build_alumni_query(industry=value))
+        assert "current_industry ILIKE" in sql
+        assert "current_industry_secondary ILIKE" not in sql, value
+
+
+def test_mixed_multi_select_widens_only_the_military_value():
+    """Consulting OR Military: Consulting stays primary-only while Military
+    reaches both slots, inside a single EXISTS."""
+    sql = _sql(build_alumni_query(industry=["Consulting", "Military"]))
+    assert sql.count("EXISTS") == 1
+    # Two primary ILIKEs (Consulting + Military) and one secondary (Military).
+    assert sql.count("current_employment.current_industry ILIKE") == 2
+    assert sql.count("current_industry_secondary ILIKE") == 1
+
+
+def test_military_industry_still_ands_with_an_explicit_secondary_filter():
+    """The widening must not collapse the two-box semantics: an explicit
+    ``secondary_industry`` is still its own AND-ed condition."""
+    sql = _sql(
+        build_alumni_query(industry="Military", secondary_industry="Real Estate")
+    )
     assert sql.count("EXISTS") == 2
 
 

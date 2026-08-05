@@ -1,6 +1,6 @@
 """Capability registry — the editable permission model (#164).
 
-Authorization used to be hardcoded role allow-lists (``require_full_access`` =
+Authorization used to be hardcoded role allow-lists (one "full access" set =
 ``{engineer, super_admin, full_access}`` …). This module turns those fixed
 buckets into a small set of named **capabilities** whose role assignments are
 data — stored in ``role_capabilities`` and editable by the engineer in the
@@ -52,14 +52,42 @@ class Capability:
 
     VIEW = "view"
     ALUMNI_EDIT = "alumni.edit"
-    ALUMNI_FULL = "alumni.full"
+    INTERACTIONS_CREATE = "interactions.create"
+    ALUMNI_CREATE = "alumni.create"
+    ALUMNI_ARCHIVE = "alumni.archive"
+    ALUMNI_IMPORT = "alumni.import"
+    ALUMNI_EXPORT = "alumni.export"
+    ALUMNI_PHOTOS = "alumni.photos"
     EVENTS_CREATE = "events.create"
     EVENTS_IMPORT = "events.import"
+    EVENTS_MANAGE = "events.manage"
+    NOTES_MANAGE = "notes.manage"
+    SURVEYS_MANAGE = "surveys.manage"
+    DONATIONS_VIEW = "donations.view"
     USER_ADMIN = "user_admin"
     DONATIONS_MANAGE = "donations.manage"
+    REPORTS_ADVANCED = "reports.advanced"
     VOCAB_ADMIN = "vocab_admin"
     PROFILE_COMPLETENESS = "profile.completeness"
     ENGINEER = "engineer"
+
+    # RETIRED (#379). ``alumni.full`` was the blunt "Manage alumni & data"
+    # capability that gated alumni create/archive, import, export, headshots,
+    # event management, notes, the survey console, donation-ledger reads, and the
+    # advanced read-only reports — all behind one switch, so an engineer could
+    # not hand out any one of them without handing out every one of them. It has
+    # been dissolved into the twelve codes above and NO route checks it any more.
+    #
+    # The constant survives for exactly two reasons and must not be granted,
+    # rendered, or guarded on:
+    #   1. :func:`expand_legacy_grants` reads it, so a database whose
+    #      ``role_capabilities`` rows have not been migrated yet still resolves
+    #      the new codes (see the note on that constant);
+    #   2. the migration seeds the new codes FROM the existing ``alumni.full``
+    #      rows, which are deliberately left in place so an API rollback is safe.
+    # It is absent from :data:`CAPABILITIES`, so the permission editor no longer
+    # offers it and ``PATCH /engineer/permissions`` rejects it as unknown.
+    LEGACY_ALUMNI_FULL = "alumni.full"
 
 
 # Ordered registry — drives the permission-editor matrix rows and the
@@ -76,17 +104,99 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         code=Capability.ALUMNI_EDIT,
         label="Edit alumni",
         description=(
-            "Edit existing alumni and their related records — interactions, "
-            "employment, education, leadership, tags, status labels, and tasks. "
-            "Does not include creating or archiving alumni."
+            "Edit existing alumni and their related records — employment, "
+            "education, leadership, tags, status labels, and follow-up tasks. "
+            "Does not include creating or archiving alumni, and no longer "
+            "includes logging interactions (see \"Log interactions\")."
+        ),
+    ),
+    # Logging an interaction, split out of the timeline writes that "Edit alumni"
+    # described (#379). It is the one write the whole directory is trusted with:
+    # a professor who spots an alumnus at a conference should be able to record
+    # it without being handed the ability to edit the record itself. Backed by
+    # long-standing behaviour — view_only could already POST interactions (#129)
+    # — so seeding it to every role changes nothing on day one; it just makes an
+    # access rule that was hidden in code visible and editable in the matrix.
+    CapabilitySpec(
+        code=Capability.INTERACTIONS_CREATE,
+        label="Log interactions",
+        description=(
+            "Record a call, meeting, or email on an alumnus's timeline, and "
+            "edit or delete an interaction. Every role holds this by default. "
+            "Holders who cannot edit alumni may only change interactions they "
+            "logged themselves."
+        ),
+    ),
+    # --- the twelve codes that replaced `alumni.full` (#379) ------------------
+    #
+    # `alumni.full` ("Manage alumni & data") was one switch over alumni
+    # create/archive, both importers, every export, headshots, event management,
+    # notes, the survey console, donation-ledger reads, and the advanced
+    # read-only reports. The lines below are drawn by WHAT AN ADMINISTRATOR HANDS
+    # OUT SEPARATELY, not by endpoint:
+    #
+    #   * create vs archive vs edit are three different levels of trust in the
+    #     same record set — a coordinator may add people without being able to
+    #     make them disappear;
+    #   * import and export are the two bulk doors, in opposite directions: one
+    #     is a data-integrity risk, the other is the FERPA egress risk, and they
+    #     are almost never wanted together;
+    #   * everything that emits a file of people is ONE toggle (`alumni.export`)
+    #     regardless of which screen it hangs off, so "can this role take alumni
+    #     data out of the system" is a single, auditable yes/no;
+    #   * headshots, notes, surveys, and the donation ledger are separate product
+    #     areas an admin thinks about by name;
+    #   * the advanced read-only surfaces (activity feed, data quality, queues,
+    #     task list, map drill-downs) are grouped as one because they are all
+    #     reads that go beyond the basic dashboard — splitting reporting per
+    #     screen buys nothing and makes the matrix unreadable.
+    #
+    # Every one of them seeds to EXACTLY the roles that held `alumni.full`, so
+    # day-one authorization is unchanged.
+    CapabilitySpec(
+        code=Capability.ALUMNI_CREATE,
+        label="Add alumni",
+        description=(
+            "Create new alumni and friend-of-the-program records by hand, "
+            "including the pre-save duplicate check and the records created "
+            "from unmatched conference attendees."
         ),
     ),
     CapabilitySpec(
-        code=Capability.ALUMNI_FULL,
-        label="Manage alumni & data",
+        code=Capability.ALUMNI_ARCHIVE,
+        label="Archive & restore alumni",
         description=(
-            "Create and archive alumni, import and export data, and manage "
-            "events and the data-quality / tasks tooling."
+            "Archive an alumnus (hiding them from the directory) and restore an "
+            "archived record. Kept apart from \"Add alumni\": removing people "
+            "from view is a different level of trust from adding them."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.ALUMNI_IMPORT,
+        label="Import alumni data",
+        description=(
+            "Bulk-load the alumni spreadsheet: the new-record import and the "
+            "bulk update import, with their templates and dry-run previews. One "
+            "file can create or rewrite thousands of records."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.ALUMNI_EXPORT,
+        label="Export alumni data",
+        description=(
+            "Download alumni data as a file — the filtered list export, the "
+            "single-profile export, an event's attendee roster, and the cohort "
+            "download used to prepare a bulk update. This is the one switch "
+            "over personal data leaving the system, so it covers every export "
+            "screen rather than being split per page."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.ALUMNI_PHOTOS,
+        label="Manage headshots",
+        description=(
+            "Upload, replace, and remove alumni headshots, including the bulk "
+            "photo import. Viewing headshots needs only \"View records\"."
         ),
     ),
     # Event authoring, split out of alumni.full (#378) so the engineer can widen
@@ -102,8 +212,8 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         label="Create events",
         description=(
             "Add a new event by hand from the events page. Editing, deleting, "
-            "and managing an existing event's attendee roster stay under "
-            "\"Manage alumni & data\"."
+            "and managing an existing event's attendee roster are covered by "
+            "\"Manage events\"."
         ),
     ),
     CapabilitySpec(
@@ -114,6 +224,43 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "step, and download the import template. Higher risk than creating "
             "a single event — one file can add an event and hundreds of "
             "attendance records at once."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.EVENTS_MANAGE,
+        label="Manage events",
+        description=(
+            "Edit and delete existing events and manage their attendee rosters, "
+            "including matching a conference registration list to alumni. "
+            "Downloading a roster needs \"Export alumni data\"; creating records "
+            "for unmatched attendees needs \"Add alumni\"."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.NOTES_MANAGE,
+        label="Write notes",
+        description=(
+            "Add, edit, and delete the notes attached to an alumnus, an "
+            "interaction, or an event. Reading notes needs only \"View "
+            "records\"."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.SURVEYS_MANAGE,
+        label="Manage surveys",
+        description=(
+            "The survey console: review, apply, and reject responses, and "
+            "schedule, send, pause, and cancel a cohort's campaign. Stopping or "
+            "cancelling EVERY cohort at once stays engineer-only."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.DONATIONS_VIEW,
+        label="View donations",
+        description=(
+            "See the Pay It Forward Fund donor list, totals, and per-alumnus "
+            "giving amounts. Separate from \"Manage donations\" so a role can "
+            "read the ledger without being able to write to it."
         ),
     ),
     CapabilitySpec(
@@ -130,6 +277,17 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "Add, edit, and bulk-import Pay It Forward Fund donation-ledger "
             "records. Distinct from user administration so donation-ledger "
             "writes aren't silently granted when user-admin is delegated (#189)."
+        ),
+    ),
+    CapabilitySpec(
+        code=Capability.REPORTS_ADVANCED,
+        label="Advanced reports & lookups",
+        description=(
+            "The read-only tooling beyond the basic dashboard: the activity "
+            "feed, the data-quality report, the follow-up and "
+            "recently-contacted queues, the open-task list, and the map's "
+            "per-state / per-country / radius alumni lists. One toggle because "
+            "these are all reads — nothing here changes a record."
         ),
     ),
     CapabilitySpec(
@@ -180,22 +338,52 @@ ASSIGNABLE_CAPABILITY_CODES: frozenset[str] = frozenset(
 )
 
 
+# The twelve codes that `alumni.full` used to cover (#379). A role that held
+# `alumni.full` holds exactly this set afterwards — the definition of "nobody
+# gained or lost access". Used by the deploy-order safety net below, mirrored by
+# the seed migration, and asserted in tests/test_capability_split.py.
+ALUMNI_FULL_REPLACEMENTS: frozenset[str] = frozenset(
+    {
+        Capability.ALUMNI_CREATE,
+        Capability.ALUMNI_ARCHIVE,
+        Capability.ALUMNI_IMPORT,
+        Capability.ALUMNI_EXPORT,
+        Capability.ALUMNI_PHOTOS,
+        Capability.EVENTS_CREATE,
+        Capability.EVENTS_IMPORT,
+        Capability.EVENTS_MANAGE,
+        Capability.NOTES_MANAGE,
+        Capability.SURVEYS_MANAGE,
+        Capability.DONATIONS_VIEW,
+        Capability.REPORTS_ADVANCED,
+    }
+)
+
+
 # --- Default grants (seed + empty-table fallback) -----------------------------
 #
 # Reproduces the historical hardcoded guards. Keyed by role NAME (the stable
 # RoleName value), valued by the set of capability codes that role holds.
+#
+# NOTE the two-way contract with `database/migrations/2026-08-04_capability_split.sql`:
+# this dict is what a BRAND-NEW database gets (load_grants falls back here while
+# `role_capabilities` is empty), the migration is what an EXISTING database gets.
+# They must agree, and `tests/test_capability_split.py` pins that they do.
 DEFAULT_GRANTS: dict[str, frozenset[str]] = {
     RoleName.ENGINEER.value: ALL_CAPABILITY_CODES,
     RoleName.SUPER_ADMIN.value: frozenset(
         {
             Capability.VIEW,
             Capability.ALUMNI_EDIT,
-            Capability.ALUMNI_FULL,
-            # events.create / events.import default to EXACTLY the roles that
-            # held alumni.full before they were split out (#378), so event
-            # authoring is unchanged on day one.
-            Capability.EVENTS_CREATE,
-            Capability.EVENTS_IMPORT,
+            # Seeded to EVERY role (#379): logging an interaction is the one
+            # write the whole directory is trusted with. This is not a widening
+            # in practice — the interaction routes were already open to any
+            # view-access role (#129); the capability just makes that rule
+            # visible in the permission editor instead of buried in a guard.
+            Capability.INTERACTIONS_CREATE,
+            # The twelve codes below replaced `alumni.full` (#379) and default to
+            # EXACTLY the roles that held it, so authorization is unchanged.
+            *ALUMNI_FULL_REPLACEMENTS,
             Capability.USER_ADMIN,
             # donations.manage defaults to EXACTLY the roles that held user_admin
             # before it was split out (super_admin + engineer), so gating the
@@ -208,14 +396,61 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
         {
             Capability.VIEW,
             Capability.ALUMNI_EDIT,
-            Capability.ALUMNI_FULL,
-            Capability.EVENTS_CREATE,
-            Capability.EVENTS_IMPORT,
+            Capability.INTERACTIONS_CREATE,
+            *ALUMNI_FULL_REPLACEMENTS,
         }
     ),
-    RoleName.STUDENT.value: frozenset({Capability.VIEW, Capability.ALUMNI_EDIT}),
-    RoleName.VIEW_ONLY.value: frozenset({Capability.VIEW}),
+    RoleName.STUDENT.value: frozenset(
+        {
+            Capability.VIEW,
+            Capability.ALUMNI_EDIT,
+            Capability.INTERACTIONS_CREATE,
+        }
+    ),
+    RoleName.VIEW_ONLY.value: frozenset(
+        {Capability.VIEW, Capability.INTERACTIONS_CREATE}
+    ),
 }
+
+
+def expand_legacy_grants(caps: frozenset[str] | set[str]) -> set[str]:
+    """Resolve a role's stored grants, expanding pre-#379 `alumni.full` rows.
+
+    **This exists to defuse a deploy-ordering trap, not to add behaviour.**
+    ``load_grants`` only falls back to :data:`DEFAULT_GRANTS` when
+    ``role_capabilities`` is EMPTY, and both dev and prod have rows. So on any
+    real database the twelve codes that replaced ``alumni.full`` exist for a role
+    only once the seed migration has run — and if the API deploys before the
+    migration lands, ``full_access``/``super_admin`` would 403 on alumni create,
+    both importers, every export, headshots, event management, notes, the survey
+    console, donation reads, and the reports. That gap has bitten this project
+    before, so it is closed in code rather than left to deploy order: a role whose
+    rows still say ``alumni.full`` and say NOTHING about the new codes is read as
+    holding all twelve.
+
+    The "and says nothing about the new codes" half is what keeps the permission
+    editor working. The moment the migration seeds the explicit rows, the role
+    holds some replacement code, the expansion stops firing, and a revoke in the
+    editor sticks. (Revoking *all twelve* from a role whose stale ``alumni.full``
+    row was never cleaned up would resurrect them — an accepted, documented edge
+    case that disappears once the legacy rows are dropped in a later cleanup
+    migration.)
+
+    ``interactions.create`` is deliberately NOT bridged the same way. Its
+    pre-#379 marker would be "holds view and nothing from #379", which is exactly
+    what a role looks like after an engineer intentionally revokes it — the shim
+    could not tell "not migrated yet" from "deliberately narrowed" and would make
+    the toggle un-revokable. The gap it would have covered is the smallest one
+    here (a professor briefly cannot log an interaction) and closes the moment
+    the seed migration runs, so revocability wins.
+    """
+    resolved = set(caps)
+    if (
+        Capability.LEGACY_ALUMNI_FULL in resolved
+        and not resolved & ALUMNI_FULL_REPLACEMENTS
+    ):
+        resolved |= ALUMNI_FULL_REPLACEMENTS
+    return resolved
 
 
 def effective_capabilities(
@@ -226,11 +461,12 @@ def effective_capabilities(
     The engineer is hard-overridden to hold **every** capability — a corrupt or
     incomplete config can never lock the engineer out of their own console or
     the permission editor. For every other role the result is the union of the
-    capabilities granted to each role the user holds.
+    capabilities granted to each role the user holds, after
+    :func:`expand_legacy_grants` resolves any not-yet-migrated rows.
     """
     if RoleName.ENGINEER.value in roles:
         return set(ALL_CAPABILITY_CODES)
     caps: set[str] = set()
     for role in roles:
-        caps |= config.get(role, frozenset())
+        caps |= expand_legacy_grants(config.get(role, frozenset()))
     return caps

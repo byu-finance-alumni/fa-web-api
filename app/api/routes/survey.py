@@ -26,7 +26,7 @@ from fastapi import (
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireEngineer, RequireFullAccess
+from app.api.dependencies.auth import RequireEngineer, RequireSurveysManage
 from app.api.routes.alumni import (
     _HEADSHOT_MAX_BYTES,
     _HEADSHOT_MIME_TYPES,
@@ -146,7 +146,7 @@ async def survey_submit_photo(
 )
 async def survey_pending_responses(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> list[SurveyResponseItem]:
     """Admin review queue: pending responses for a grad year, each with a diff."""
@@ -155,7 +155,7 @@ async def survey_pending_responses(
 
 @router.post("/responses/{response_id}/apply", status_code=204)
 async def survey_apply_response(
-    response_id: int, user: RequireFullAccess, session: SessionDep
+    response_id: int, user: RequireSurveysManage, session: SessionDep
 ) -> None:
     """Apply a staged response to the alum's record."""
     await survey_responses.apply_response(session, response_id, user.user_id)
@@ -163,7 +163,7 @@ async def survey_apply_response(
 
 @router.post("/responses/{response_id}/reject", status_code=204)
 async def survey_reject_response(
-    response_id: int, user: RequireFullAccess, session: SessionDep
+    response_id: int, user: RequireSurveysManage, session: SessionDep
 ) -> None:
     """Reject a staged response — nothing is written to the record."""
     await survey_responses.reject_response(session, response_id, user.user_id)
@@ -171,7 +171,7 @@ async def survey_reject_response(
 
 @router.get("/graduation-years", response_model=list[GraduationYearCount])
 async def survey_graduation_years(
-    user: RequireFullAccess, session: SessionDep
+    user: RequireSurveysManage, session: SessionDep
 ) -> list[GraduationYearCount]:
     """Distinct graduation years present in the DB (eligible alumni) + counts,
     newest first — powers the console's year picker."""
@@ -180,7 +180,7 @@ async def survey_graduation_years(
 
 @router.get("/usage", response_model=SurveyUsage)
 async def survey_send_usage(
-    user: RequireFullAccess, session: SessionDep
+    user: RequireSurveysManage, session: SessionDep
 ) -> SurveyUsage:
     """Real Resend send usage (emails actually sent today / this calendar month),
     for the console's daily/monthly tallies against the send caps."""
@@ -189,7 +189,7 @@ async def survey_send_usage(
 
 @router.get("/send-config", response_model=SurveySendConfigItem)
 async def get_survey_send_config(
-    user: RequireFullAccess, session: SessionDep
+    user: RequireSurveysManage, session: SessionDep
 ) -> SurveySendConfigItem:
     """The account-wide send cap the scheduler paces against — the daily/monthly
     email budget and whether it's enforced."""
@@ -199,7 +199,7 @@ async def get_survey_send_config(
 @router.post("/send-config", response_model=SurveySendConfigItem)
 async def update_survey_send_config(
     body: SurveySendConfigUpdateRequest,
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveySendConfigItem:
     """Update the send cap. ``enabled=false`` removes the internal cap (e.g. after
@@ -216,7 +216,7 @@ async def update_survey_send_config(
 @router.post("/campaigns/{grad_year}/send", response_model=SurveySendResult)
 async def send_survey_campaign(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
     dry_run: Annotated[bool, Query()] = True,
     limit: Annotated[int | None, Query(ge=1, le=1000)] = None,
@@ -235,7 +235,7 @@ async def send_survey_campaign(
 
 @router.get("/schedules", response_model=list[SurveyScheduleItem])
 async def list_survey_schedules(
-    user: RequireFullAccess, session: SessionDep
+    user: RequireSurveysManage, session: SessionDep
 ) -> list[SurveyScheduleItem]:
     """All auto-send schedules (newest cohort first) + per-stage sent counts.
 
@@ -249,7 +249,7 @@ async def list_survey_schedules(
 @router.post("/schedules", response_model=SurveyScheduleItem)
 async def create_survey_schedule(
     body: SurveyScheduleCreateRequest,
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveyScheduleItem:
     """Create — or replace — the auto-send schedule for a graduation year."""
@@ -269,7 +269,7 @@ async def create_survey_schedule(
 )
 async def preview_survey_new_cycle(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveyNewCyclePreview:
     """What starting a new survey cycle for this year would do (#357).
@@ -288,7 +288,7 @@ async def preview_survey_new_cycle(
 async def start_survey_new_cycle(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
     body: SurveyNewCycleRequest,
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveyScheduleItem:
     """Start the NEXT survey campaign for a graduation year (#357).
@@ -316,7 +316,7 @@ async def start_survey_new_cycle(
 @router.post("/schedules/bulk", response_model=list[SurveyScheduleItem])
 async def create_survey_schedules_bulk(
     body: SurveyScheduleBulkRequest,
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> list[SurveyScheduleItem]:
     """Create — or replace — the auto-send schedule for many graduation years in
@@ -338,7 +338,7 @@ async def create_survey_schedules_bulk(
 )
 async def list_survey_non_responders(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> list[SurveyNonResponder]:
     """Who needs MANUAL follow-up for this year's current campaign (#359).
@@ -361,7 +361,7 @@ async def list_survey_non_responders(
 @router.post("/schedules/{grad_year}/pause", response_model=SurveyScheduleItem)
 async def pause_survey_schedule(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveyScheduleItem:
     """Pause a graduation year's schedule — sending stops until it is resumed.
@@ -381,7 +381,7 @@ async def pause_survey_schedule(
 @router.post("/schedules/{grad_year}/resume", response_model=SurveyScheduleItem)
 async def resume_survey_schedule(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveyScheduleItem:
     """Resume a paused schedule where its cadence left off.
@@ -419,7 +419,7 @@ async def pause_all_survey_schedules(
 @router.post("/schedules/{grad_year}/cancel", response_model=SurveyScheduleItem)
 async def cancel_survey_schedule(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireFullAccess,
+    user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveyScheduleItem:
     """Cancel a graduation year's schedule — no further sends."""

@@ -14,7 +14,7 @@ from sqlalchemy import and_, extract, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.dependencies.auth import RequireReportsAdvanced, RequireViewAccess
 from app.core.database import get_session
 from app.core.dropdowns import WHEEL_INDUSTRIES
 from app.models.alumni import Alumni
@@ -25,6 +25,7 @@ from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
+from app.repositories.alumni import has_employer_or_not_applicable
 from app.schemas.auth import UserContext
 from app.schemas.dashboard import (
     ActivityFeed,
@@ -132,15 +133,14 @@ def _has_phone_exists():
 
 
 def _has_employer_exists():
-    """Correlated EXISTS: the alumnus has a current employer on file."""
-    return (
-        select(CurrentEmployment.current_employment_id)
-        .where(
-            CurrentEmployment.alumni_id == Alumni.alumni_id,
-            CurrentEmployment.current_employer.is_not(None),
-        )
-        .exists()
-    )
+    """An employer is on file, OR the alumnus's status means none is expected.
+
+    Imported wholesale from the repository (#608) so this KPI, the Data-quality
+    tile and the ``/alumni?missing_employer=1`` drill-down it deep-links to are
+    the SAME predicate — a count that doesn't match its own list is the recurring
+    bug class here. Named for what it feeds (the negation is "missing employer").
+    """
+    return has_employer_or_not_applicable()
 
 
 def _contacted_since_exists(cutoff: datetime.datetime):
@@ -473,7 +473,9 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         if canonical is not None:
             industry_counts[canonical] += n
         else:
-            # Literal "Other" or any value outside the finance vocab.
+            # Literal "Other", "Military" (#608 — deliberately NOT its own bar;
+            # the chart stays about finance sectors) or any value outside the
+            # finance vocab.
             other_count += n
     # Unknown = active alumni with no (non-blank) industry on file, PLUS those
     # explicitly marked "Unknown" (#295). ``known_total`` already counts the
@@ -668,7 +670,7 @@ async def event_participation(
 
 @router.get("/activity", response_model=ActivityFeed)
 async def activity_feed(
-    actor: RequireFullAccess,
+    actor: RequireReportsAdvanced,
     session: SessionDep,
     q: Annotated[
         str | None,
@@ -807,7 +809,7 @@ async def activity_feed(
 
 
 @router.get("/data-quality", response_model=DataQuality)
-async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
+async def data_quality(_: RequireReportsAdvanced, session: SessionDep) -> dict:
     """The data-quality alert counts (same predicates as the summary KPIs),
     for the dedicated data-quality page.
 
@@ -861,7 +863,7 @@ async def data_quality(_: RequireFullAccess, session: SessionDep) -> dict:
 
 @router.get("/contacted-this-month", response_model=list[InteractionActivity])
 async def contacted_this_month_list(
-    actor: RequireFullAccess, session: SessionDep
+    actor: RequireReportsAdvanced, session: SessionDep
 ) -> list[dict]:
     """The alumni behind the "Contacted this month" KPI — one row per distinct
     alumnus contacted in the last 30 days, carrying their most recent
@@ -912,7 +914,7 @@ async def contacted_this_month_list(
 
 @router.get("/follow-ups", response_model=list[FollowUpRow])
 async def upcoming_follow_ups_list(
-    actor: RequireFullAccess, session: SessionDep
+    actor: RequireReportsAdvanced, session: SessionDep
 ) -> list[dict]:
     """The open tasks behind the "Upcoming follow-ups" KPI (incomplete, due
     today or later), soonest due first — same predicate as the KPI count.

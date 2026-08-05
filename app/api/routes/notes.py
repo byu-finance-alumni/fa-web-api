@@ -3,9 +3,10 @@
 Notes attach to one of three levels — an alumni profile, an interaction, or an
 event — addressed as ``(entity_type, entity_id)``. Reads require any view-access
 role (notes are visible to everyone, including ``view_only`` / Professor).
-Writes (create / edit / delete) require ``full_access`` and up — ``student`` is
-deliberately excluded, matching the unified-notes spec (write = super_admin +
-full_access only). All enforcement is server-side; the UI gate is not relied on.
+Writes (create / edit / delete) require the ``notes.manage`` capability (#379),
+which is seeded to exactly the roles that previously held ``alumni.full`` —
+super_admin + full_access — so ``student`` stays excluded, matching the
+unified-notes spec. All enforcement is server-side; the UI gate is not relied on.
 """
 
 from typing import Annotated
@@ -13,7 +14,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.dependencies.auth import RequireNotesManage, RequireViewAccess
 from app.api.params import IdPath
 from app.core.database import get_session
 from app.schemas.note import NoteCreate, NoteEntityType, NoteRead, NoteUpdate
@@ -49,10 +50,10 @@ async def list_notes(
 @router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)
 async def create_note(
     payload: NoteCreate,
-    user: RequireFullAccess,
+    user: RequireNotesManage,
     session: SessionDep,
 ) -> NoteRead:
-    """Create a note on an alumni / interaction / event (full_access). 404 if the
+    """Create a note on an alumni / interaction / event (notes.manage). 404 if the
     target entity doesn't exist."""
     return await service.create_note(session, payload, actor_user_id=user.user_id)
 
@@ -61,7 +62,7 @@ async def create_note(
 async def update_note(
     note_id: IdPath,
     payload: NoteUpdate,
-    user: RequireFullAccess,
+    user: RequireNotesManage,
     session: SessionDep,
 ) -> NoteRead:
     """Edit a note's body (full_access). 404 if the note doesn't exist."""
@@ -71,7 +72,7 @@ async def update_note(
 @router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(
     note_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireNotesManage,
     session: SessionDep,
 ) -> None:
     """Delete a note (full_access). 404 if the note doesn't exist. The body is

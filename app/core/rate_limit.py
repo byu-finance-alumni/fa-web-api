@@ -32,10 +32,10 @@ from fastapi import Depends, HTTPException, Request, status
 from app.api.dependencies.auth import (
     get_current_db_user_allow_must_change,
     require_alumni_edit,
+    require_alumni_photos,
     require_engineer,
-    require_full_access,
+    require_interactions_create,
     require_super_admin,
-    require_view_only,
 )
 from app.schemas.auth import UserContext
 
@@ -195,9 +195,10 @@ EnableMaintenanceRateLimit = Annotated[
 # employment create+edit+delete). Without these, only the platform WAF cap
 # applied, so a write-capable role could script bulk edits/deletes. The actor is
 # resolved through the SAME guard the route already uses (so authorization runs
-# once and the identity stays server-trusted): interactions are open to every
-# authenticated role (``require_view_only`` — a professor may log their own), and
-# tasks/employment are edit-tier (``require_alumni_edit``).
+# once and the identity stays server-trusted): interactions are gated on
+# ``require_interactions_create`` (#379 — its own capability, seeded to every
+# role, so a professor may still log their own), and tasks/employment are
+# edit-tier (``require_alumni_edit``).
 #
 # Limits are tuned for normal human editing: 30 writes / minute is far above a
 # person clicking through a profile, but brakes a runaway loop / compromised
@@ -210,7 +211,7 @@ INTERACTION_WRITE_LIMITER = rate_limiter(
     "alumni:interaction_write",
     limit=_MUTATION_LIMIT,
     window_seconds=_MUTATION_WINDOW,
-    actor_guard=require_view_only,
+    actor_guard=require_interactions_create,
 )
 TASK_WRITE_LIMITER = rate_limiter(
     "alumni:task_write",
@@ -226,12 +227,12 @@ EMPLOYMENT_WRITE_LIMITER = rate_limiter(
 )
 # Headshot direct-upload routes (mint signed URL + confirm). Each writes a DB
 # audit row and makes an outbound Supabase call, so brake them like the other
-# alumni mutations; full_access is the managing tier.
+# alumni mutations; the managing gate is the ``alumni.photos`` capability (#379).
 HEADSHOT_WRITE_LIMITER = rate_limiter(
     "alumni:headshot_write",
     limit=_MUTATION_LIMIT,
     window_seconds=_MUTATION_WINDOW,
-    actor_guard=require_full_access,
+    actor_guard=require_alumni_photos,
 )
 # Bulk headshot import (#595) is chunked: image bytes go browser -> Supabase
 # directly, and the client makes TWO small metadata calls (mint upload URLs, then
@@ -245,7 +246,7 @@ BULK_HEADSHOT_LIMITER = rate_limiter(
     "alumni:headshot_bulk",
     limit=100,
     window_seconds=600,
-    actor_guard=require_full_access,
+    actor_guard=require_alumni_photos,
 )
 
 InteractionWriteRateLimit = Annotated[

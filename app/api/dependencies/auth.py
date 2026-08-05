@@ -2,8 +2,9 @@
 
 `get_current_user` verifies the bearer token and returns the token identity.
 `get_current_db_user` resolves that identity to a database user and loads their
-roles. Authorization (`require_full_access` / `require_view_only`) is decided
-from those database roles — never from the token's claims.
+roles. Authorization (the `require_*` capability guards at the bottom of this
+module) is decided from those database roles resolved against the live,
+engineer-editable permission config — never from the token's claims.
 """
 
 import logging
@@ -303,18 +304,44 @@ require_super_admin = require_capability(Capability.USER_ADMIN)
 # delegating user administration does NOT silently grant donation-ledger writes;
 # defaults to the same roles (super_admin + engineer), so behaviour is unchanged.
 require_donations_manage = require_capability(Capability.DONATIONS_MANAGE)
-require_full_access = require_capability(Capability.ALUMNI_FULL)
+# Donation-ledger READS — the donor list, the fund totals, and the per-alumnus
+# giving amounts on a profile (#379). Split out of the retired ALUMNI_FULL so a
+# role can be shown the ledger without being able to write to it.
+require_donations_view = require_capability(Capability.DONATIONS_VIEW)
+# --- the guards that replaced `require_full_access` (#379) --------------------
+#
+# ALUMNI_FULL is retired: it gated alumni create/archive, both importers, every
+# export, headshots, event management, notes, the survey console, donation reads
+# and the advanced reports behind ONE switch. Each guard below now covers exactly
+# one of those. They REPLACE the old guard on the routes they cover — never
+# supplement it — otherwise the new toggles would be unusable on their own.
+# Every one of them defaults to the roles that held ALUMNI_FULL, so day-one
+# authorization is identical.
+require_alumni_create = require_capability(Capability.ALUMNI_CREATE)
+require_alumni_archive = require_capability(Capability.ALUMNI_ARCHIVE)
+require_alumni_import = require_capability(Capability.ALUMNI_IMPORT)
+require_alumni_export = require_capability(Capability.ALUMNI_EXPORT)
+require_alumni_photos = require_capability(Capability.ALUMNI_PHOTOS)
+require_events_manage = require_capability(Capability.EVENTS_MANAGE)
+require_notes_manage = require_capability(Capability.NOTES_MANAGE)
+require_surveys_manage = require_capability(Capability.SURVEYS_MANAGE)
+require_reports_advanced = require_capability(Capability.REPORTS_ADVANCED)
 # Event authoring (#378), split out of ALUMNI_FULL as two separate capabilities
 # so the engineer can widen "create an event" without also widening "upload a
 # file that creates an event plus hundreds of attendance rows". Both default to
 # the same roles that held ALUMNI_FULL (full_access + super_admin + engineer),
-# so behaviour is unchanged until the config is edited. These REPLACE (not
-# supplement) the ALUMNI_FULL guard on the routes they cover — requiring both
-# would make the new toggles unusable on their own, defeating the point.
+# so behaviour is unchanged until the config is edited.
 require_events_create = require_capability(Capability.EVENTS_CREATE)
 require_events_import = require_capability(Capability.EVENTS_IMPORT)
-# Edit an EXISTING alumnus / their nested records — not create/archive/import.
+# Edit an EXISTING alumnus / their nested records — not create/archive/import,
+# and no longer interactions (see require_interactions_create).
 require_alumni_edit = require_capability(Capability.ALUMNI_EDIT)
+# Log / amend an interaction on an alumnus's timeline (#379). Pulled out of the
+# timeline writes that ALUMNI_EDIT described and seeded to EVERY role: the
+# interaction routes were already open to any view-access role (#129), so this
+# does not widen access — it makes a rule that lived only in code visible and
+# editable in the permission matrix.
+require_interactions_create = require_capability(Capability.INTERACTIONS_CREATE)
 require_view_only = require_capability(Capability.VIEW)
 # Controlled-vocabulary administration (editable dropdowns, #82).
 require_vocab_admin = require_capability(Capability.VOCAB_ADMIN)
@@ -325,10 +352,22 @@ require_engineer = require_capability(Capability.ENGINEER)
 
 RequireSuperAdmin = Annotated[UserContext, Depends(require_super_admin)]
 RequireDonationsManage = Annotated[UserContext, Depends(require_donations_manage)]
-RequireFullAccess = Annotated[UserContext, Depends(require_full_access)]
+RequireDonationsView = Annotated[UserContext, Depends(require_donations_view)]
+RequireAlumniCreate = Annotated[UserContext, Depends(require_alumni_create)]
+RequireAlumniArchive = Annotated[UserContext, Depends(require_alumni_archive)]
+RequireAlumniImport = Annotated[UserContext, Depends(require_alumni_import)]
+RequireAlumniExport = Annotated[UserContext, Depends(require_alumni_export)]
+RequireAlumniPhotos = Annotated[UserContext, Depends(require_alumni_photos)]
 RequireEventsCreate = Annotated[UserContext, Depends(require_events_create)]
 RequireEventsImport = Annotated[UserContext, Depends(require_events_import)]
+RequireEventsManage = Annotated[UserContext, Depends(require_events_manage)]
+RequireNotesManage = Annotated[UserContext, Depends(require_notes_manage)]
+RequireSurveysManage = Annotated[UserContext, Depends(require_surveys_manage)]
+RequireReportsAdvanced = Annotated[UserContext, Depends(require_reports_advanced)]
 RequireAlumniEdit = Annotated[UserContext, Depends(require_alumni_edit)]
+RequireInteractionsCreate = Annotated[
+    UserContext, Depends(require_interactions_create)
+]
 RequireViewAccess = Annotated[UserContext, Depends(require_view_only)]
 RequireVocabAdmin = Annotated[UserContext, Depends(require_vocab_admin)]
 RequireEngineer = Annotated[UserContext, Depends(require_engineer)]

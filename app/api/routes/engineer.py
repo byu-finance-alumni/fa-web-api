@@ -75,10 +75,14 @@ def _build_matrix(config: dict[str, frozenset[str]]) -> PermissionMatrix:
         is_engineer = role is RoleName.ENGINEER
         # Engineer always holds everything (and its row is not editable); other
         # roles hold exactly what the config grants them.
+        # Intersected with the registry so a RETIRED code still sitting in
+        # `role_capabilities` (`alumni.full`, which #379 dissolved but the
+        # migration deliberately leaves behind) never leaks into the matrix as a
+        # phantom grant with no row to render it against.
         held = (
             set(ALL_CAPABILITY_CODES)
             if is_engineer
-            else set(config.get(role.value, frozenset()))
+            else set(config.get(role.value, frozenset())) & ALL_CAPABILITY_CODES
         )
         roles.append(
             RoleGrants(

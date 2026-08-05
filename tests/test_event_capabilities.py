@@ -121,8 +121,8 @@ _IMPORT_ROUTES = [
 
 
 def test_event_capabilities_default_to_the_alumni_full_roles():
-    # Seed set == the roles that held alumni.full before the split, so day-one
-    # behaviour is unchanged.
+    # Seed set == the roles that held alumni.full before the split (#378), which
+    # #379 then dissolved entirely; both new codes still land on the same roles.
     for role in ("full_access", "super_admin"):
         caps = effective_capabilities(DEFAULT_GRANTS, [role])
         assert Capability.EVENTS_CREATE in caps
@@ -142,16 +142,11 @@ def test_event_capabilities_default_to_the_alumni_full_roles():
 
 
 def test_create_event_403_when_role_lacks_events_create(client):
-    # full_access keeps alumni.full and everything else — ONLY events.create is
+    # full_access keeps every other capability it holds — ONLY events.create is
     # revoked, so a 403 can only come from the new capability check.
     _use_config(
         _config(
-            full_access={
-                Capability.VIEW,
-                Capability.ALUMNI_EDIT,
-                Capability.ALUMNI_FULL,
-                Capability.EVENTS_IMPORT,
-            }
+            full_access=DEFAULT_GRANTS["full_access"] - {Capability.EVENTS_CREATE}
         )
     )
     _as("full_access")
@@ -193,16 +188,11 @@ def test_create_event_allowed_for_engineer_with_empty_config(client):
 def test_import_routes_403_when_role_lacks_events_import(
     client, method, path, kwargs
 ):
-    # full_access keeps alumni.full AND events.create — only events.import is
-    # revoked.
+    # full_access keeps everything else, including events.create — only
+    # events.import is revoked.
     _use_config(
         _config(
-            full_access={
-                Capability.VIEW,
-                Capability.ALUMNI_EDIT,
-                Capability.ALUMNI_FULL,
-                Capability.EVENTS_CREATE,
-            }
+            full_access=DEFAULT_GRANTS["full_access"] - {Capability.EVENTS_IMPORT}
         )
     )
     _as("full_access")
@@ -269,9 +259,10 @@ def test_events_import_does_not_grant_single_create(client):
 def test_edit_and_roster_routes_still_require_alumni_full(
     client, method, path, kwargs
 ):
-    # Holding BOTH new event capabilities must not unlock editing, deleting, or
-    # the attendee roster — those stay on alumni.full. #378 scoped the new
-    # toggles to authoring (create + bulk upload) only.
+    # Holding BOTH authoring capabilities must not unlock editing, deleting, or
+    # the attendee roster. #378 scoped the new toggles to authoring (create +
+    # bulk upload) only; #379 moved the rest onto events.manage / alumni.export,
+    # which this role deliberately does not hold.
     _use_config(
         _config(
             student={

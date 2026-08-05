@@ -29,9 +29,11 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
+    RequireAlumniCreate,
+    RequireAlumniExport,
     RequireEventsCreate,
     RequireEventsImport,
-    RequireFullAccess,
+    RequireEventsManage,
     RequireViewAccess,
 )
 from app.api.params import IdPath
@@ -226,7 +228,7 @@ async def events_import_template(_: RequireEventsImport) -> Response:
 
 
 @router.get("/attendees/match/template")
-async def attendee_match_template(_: RequireFullAccess) -> Response:
+async def attendee_match_template(_: RequireEventsManage) -> Response:
     """Download a STARTING-POINT conference-attendee CSV (#612, full_access).
 
     Only a starting point: unlike every other importer here, the attendee
@@ -408,7 +410,7 @@ def _audit_value(value) -> str | None:
 async def update_event(
     event_id: IdPath,
     payload: EventUpdate,
-    user: RequireFullAccess,
+    user: RequireEventsManage,
     session: SessionDep,
 ) -> dict:
     """Partially update an event (full_access). Only the fields present in the
@@ -452,7 +454,7 @@ async def update_event(
 
 @router.delete("/{event_id}")
 async def delete_event(
-    event_id: IdPath, user: RequireFullAccess, session: SessionDep
+    event_id: IdPath, user: RequireEventsManage, session: SessionDep
 ) -> dict:
     """Delete an event (full_access). Cascades to its attendance rows (and any
     attached notes) via the FK ``ON DELETE CASCADE``. 404 if the event is
@@ -520,7 +522,7 @@ async def list_event_attendees(
 
 @router.get("/{event_id}/attendees/export")
 async def export_event_attendees(
-    event_id: IdPath, user: RequireFullAccess, session: SessionDep
+    event_id: IdPath, user: RequireAlumniExport, session: SessionDep
 ) -> Response:
     """Download an event's attendee list as CSV — columns **Name, Email, Net ID**
     (#219). Gated at ``full_access`` (a rung above the view-only attendee list)
@@ -597,7 +599,7 @@ async def export_event_attendees(
 async def add_event_attendee(
     event_id: IdPath,
     payload: AttendeeCreate,
-    user: RequireFullAccess,
+    user: RequireEventsManage,
     session: SessionDep,
 ) -> dict:
     """Add an alumni to an event's attendance (full_access). 404 if the event or
@@ -605,8 +607,8 @@ async def add_event_attendee(
     write (entity_type "event", action "add_attendee", entity_id event_id,
     new_value the alumni id/name).
 
-    Note: this is the event-roster management surface and stays ``full_access``
-    on purpose. Recording attendance from an alumnus's PROFILE
+    Note: this is the event-roster management surface and stays on
+    ``events.manage`` on purpose. Recording attendance from an alumnus's PROFILE
     (``POST /alumni/{id}/events``) is profile data-entry and is intentionally
     open to ``student`` via ``RequireAlumniEdit`` — a deliberate split, not an
     oversight. Students manage attendance per-alumnus, not from the event roster."""
@@ -663,7 +665,7 @@ async def add_event_attendee(
 async def remove_event_attendee(
     event_id: IdPath,
     alumni_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireEventsManage,
     session: SessionDep,
 ) -> dict:
     """Remove an alumni from an event's attendance (full_access). 404 if no such
@@ -760,7 +762,7 @@ def _empty_match_preview(header_errors: list[str], ignored: list[str]) -> dict:
 )
 async def preview_attendee_match(
     event_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireEventsManage,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
@@ -828,7 +830,7 @@ async def preview_attendee_match(
 async def approve_attendee_matches(
     event_id: IdPath,
     payload: AttendeeApprovalRequest,
-    user: RequireFullAccess,
+    user: RequireEventsManage,
     session: SessionDep,
 ) -> AttendeeApplyResult:
     """Record attendance for HUMAN-APPROVED matches (full_access).
@@ -938,7 +940,7 @@ RowsForm = Annotated[str, Form()]
 )
 async def create_attendee_friends(
     event_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireAlumniCreate,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
     rows: RowsForm,

@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireFullAccess, RequireViewAccess
+from app.api.dependencies.auth import RequireReportsAdvanced, RequireViewAccess
 from app.core.database import get_session
 from app.models.audit import AuditLog
 from app.schemas.auth import UserContext
@@ -130,7 +130,7 @@ async def country_detail(
 @router.get("/countries/{country}/alumni", response_model=GeoAlumniPage)
 async def country_alumni(
     country: str,
-    actor: RequireFullAccess,
+    actor: RequireReportsAdvanced,
     session: SessionDep,
     filters: FiltersDep,
     sort: Annotated[str, Query(pattern="^(name|year|city)$")] = "name",
@@ -175,7 +175,7 @@ async def state_detail(
 @router.get("/states/{state}/alumni", response_model=GeoAlumniPage)
 async def state_alumni(
     state: str,
-    actor: RequireFullAccess,
+    actor: RequireReportsAdvanced,
     session: SessionDep,
     filters: FiltersDep,
     sort: Annotated[str, Query(pattern="^(name|year|city)$")] = "name",
@@ -198,7 +198,7 @@ async def state_alumni(
 
 @router.get("/radius", response_model=RadiusPage)
 async def radius_alumni(
-    actor: RequireFullAccess,
+    actor: RequireReportsAdvanced,
     session: SessionDep,
     filters: FiltersDep,
     lat: Annotated[float, Query(ge=-90, le=90)],
@@ -227,7 +227,7 @@ async def radius_alumni(
 
 @router.get("/cities", response_model=CityDetail)
 async def city_detail(
-    actor: RequireFullAccess,
+    actor: RequireReportsAdvanced,
     session: SessionDep,
     filters: FiltersDep,
     state: Annotated[str, Query(min_length=1)],

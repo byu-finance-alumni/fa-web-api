@@ -1,12 +1,25 @@
 """Alumni CRUD routes.
 
 Reads require view access (any role). Editing an EXISTING alumnus and their
-nested records (interactions, employment, education, leadership, tags, status
-labels, tasks, event attendance) requires edit access (``student`` and up, via
-``RequireAlumniEdit``). Creating a new alumnus, archiving/restoring, and CSV
-import require ``full_access`` and up (``RequireFullAccess``) — ``student`` is
-deliberately excluded from those. ``DELETE`` on an alumnus is a soft-delete
-(archive), never a hard delete — audit history depends on retained records.
+nested records (employment, education, leadership, tags, status labels, tasks,
+event attendance) requires edit access (``student`` and up, via
+``RequireAlumniEdit``). Logging or amending an interaction is its OWN capability
+(``RequireInteractionsCreate``, #379) held by every role.
+
+The blanket ``RequireFullAccess`` guard is gone (#379); the write/egress
+surfaces it used to cover each have their own capability, so an engineer can
+hand out one without the rest:
+
+  * ``RequireAlumniCreate``  — create an alumnus (and the pre-save hygiene check)
+  * ``RequireAlumniArchive`` — archive / restore
+  * ``RequireAlumniImport``  — the new-record and bulk-update importers
+  * ``RequireAlumniExport``  — every file of alumni data leaving the system,
+    including the single-profile export and the cohort download used to prepare
+    a bulk update
+  * ``RequireAlumniPhotos``  — headshot upload / replace / remove and bulk import
+
+``DELETE`` on an alumnus is a soft-delete (archive), never a hard delete — audit
+history depends on retained records.
 """
 
 import asyncio
@@ -21,8 +34,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     PermissionConfig,
+    RequireAlumniArchive,
+    RequireAlumniCreate,
     RequireAlumniEdit,
-    RequireFullAccess,
+    RequireAlumniExport,
+    RequireAlumniImport,
+    RequireAlumniPhotos,
     RequireViewAccess,
 )
 from app.api.params import IdPath
@@ -57,6 +74,7 @@ from app.schemas.alumni import (
     minimize_alumni_read,
 )
 from app.schemas.alumni_export import AlumniExportRequest, ExportColumnCatalog
+from app.schemas.auth import UserContext
 from app.schemas.filters import FilterOptions
 from app.schemas.imports import (
     AlumniHygienePreview,
@@ -691,7 +709,7 @@ async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
 @router.put("/{alumni_id}/headshot", status_code=204)
 async def upload_headshot(
     alumni_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireAlumniPhotos,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> Response:
@@ -886,7 +904,7 @@ async def get_headshot(
 @router.delete("/{alumni_id}/headshot", status_code=204)
 async def delete_headshot(
     alumni_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireAlumniPhotos,
     session: SessionDep,
 ) -> Response:
     """Remove an alumnus's headshot (full_access and up). A missing image is a
@@ -1329,7 +1347,7 @@ async def confirm_bulk_headshot_upload(
 
 @router.get("/import/template")
 async def alumni_import_template(
-    _: RequireFullAccess,
+    _: RequireAlumniImport,
     kind: Annotated[Literal["alumni", "friend"], Query()] = "alumni",
 ) -> Response:
     """Download the bulk-import CSV template (full_access). ``kind=alumni`` (the
@@ -1347,7 +1365,7 @@ async def alumni_import_template(
 
 @router.post("/import/preview", response_model=AlumniImportPreview)
 async def preview_import_alumni(
-    _: RequireFullAccess,
+    _: RequireAlumniImport,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
     kind: Annotated[Literal["alumni", "friend"], Query()] = "alumni",
@@ -1383,7 +1401,7 @@ async def preview_import_alumni(
 
 @router.post("/import", response_model=AlumniImportResult)
 async def import_alumni(
-    user: RequireFullAccess,
+    user: RequireAlumniImport,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
     kind: Annotated[Literal["alumni", "friend"], Query()] = "alumni",
@@ -1427,7 +1445,7 @@ async def import_alumni(
 
 @router.post("/import/update/preview", response_model=AlumniUpdatePreview)
 async def preview_update_import_alumni(
-    _: RequireFullAccess,
+    _: RequireAlumniImport,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
@@ -1466,7 +1484,7 @@ async def preview_update_import_alumni(
 
 @router.post("/import/update", response_model=AlumniUpdateResult)
 async def update_import_alumni(
-    user: RequireFullAccess,
+    user: RequireAlumniImport,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
@@ -1508,7 +1526,7 @@ async def update_import_alumni(
 
 @router.get("/import/update/export", response_model=None)
 async def export_cohort_update_template(
-    user: RequireFullAccess,
+    user: RequireAlumniExport,
     session: SessionDep,
     grad_year: Annotated[int | None, Query(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)] = None,
     class_year: Annotated[
@@ -1566,7 +1584,7 @@ async def export_cohort_update_template(
 
 
 @router.get("/export/columns", response_model=ExportColumnCatalog)
-async def alumni_export_columns(_: RequireFullAccess) -> ExportColumnCatalog:
+async def alumni_export_columns(_: RequireAlumniExport) -> ExportColumnCatalog:
     """The catalog of exportable columns + the default-checked selection, for the
     export column picker (full_access)."""
     return alumni_export.build_catalog()
@@ -1575,7 +1593,7 @@ async def alumni_export_columns(_: RequireFullAccess) -> ExportColumnCatalog:
 @router.post("/export", response_model=None)
 async def export_alumni(
     payload: AlumniExportRequest,
-    user: RequireFullAccess,
+    user: RequireAlumniExport,
     session: SessionDep,
 ) -> Response | JSONResponse:
     """Export the filtered alumni list as CSV with the chosen columns
@@ -1656,9 +1674,12 @@ async def get_alumni_profile(
 
     The ``pay_it_forward`` roll-up (#403) always includes the donation count and
     last-gift date, but its dollar amounts are gated to amount-viewers
-    (``alumni.full`` — full_access+), mirroring the donations endpoints."""
+    (``donations.view``, #379 — seeded to exactly the roles that previously held
+    ``alumni.full``), mirroring the donations endpoints."""
     include_tasks = user.can_edit_alumni
-    show_amounts = Capability.ALUMNI_FULL in effective_capabilities(config, user.roles)
+    show_amounts = Capability.DONATIONS_VIEW in effective_capabilities(
+        config, user.roles
+    )
     return await profile_service.get_profile(
         session,
         alumni_id,
@@ -1678,7 +1699,7 @@ async def get_alumni_profile(
     response_model_exclude={"audit"},
 )
 async def export_alumni_profile(
-    alumni_id: IdPath, user: RequireFullAccess, session: SessionDep
+    alumni_id: IdPath, user: RequireAlumniExport, session: SessionDep
 ) -> dict:
     """Server-side, audited profile export (full_access).
 
@@ -1703,13 +1724,28 @@ async def add_interaction(
 ) -> InteractionRead:
     """Log an interaction on an alumni's timeline.
 
-    Open to every authenticated role, including view_only ("Professor"): adding
-    an interaction is the one timeline write a professor may perform (#129). The
-    row is stamped with the actor's user id so ownership can later gate edit /
-    delete for view_only users."""
+    Gated on the ``interactions.create`` capability (#379), which is seeded to
+    EVERY role — including view_only ("Professor"): adding an interaction is the
+    one timeline write a professor may perform (#129), and it is now its own
+    grantable capability rather than a special case buried in the view guard.
+    The row is stamped with the actor's user id so ownership gates edit / delete
+    for users without ``alumni.edit``."""
     return await profile_service.add_interaction(
         session, alumni_id, payload, actor_user_id=user.user_id
     )
+
+
+def _can_edit_any_interaction(
+    config: dict[str, frozenset[str]], user: UserContext
+) -> bool:
+    """May this user amend an interaction somebody ELSE logged?
+
+    Reads ``alumni.edit`` off the live permission config instead of the frozen
+    role list on ``UserContext.can_edit_alumni``, so the ownership rule follows
+    what the engineer configured in the permission editor. Seeded grants make
+    this identical to the old role check (engineer / super_admin / full_access /
+    student) on day one."""
+    return Capability.ALUMNI_EDIT in effective_capabilities(config, user.roles)
 
 
 @router.patch(
@@ -1721,21 +1757,27 @@ async def update_interaction(
     interaction_id: IdPath,
     payload: InteractionUpdate,
     user: InteractionWriteRateLimit,
+    config: PermissionConfig,
     session: SessionDep,
 ) -> InteractionRead:
     """Edit an interaction on an alumni's timeline. 404 if the row is missing or
     belongs to another alumnus.
 
-    Edit-tier roles (engineer / super_admin / full_access / student) may edit ANY
-    interaction. A view_only ("Professor") user may edit only the interactions
-    they logged themselves; editing another user's interaction is 403 (#129)."""
+    Requires ``interactions.create`` (#379, held by every role by default).
+    Holders who ALSO hold ``alumni.edit`` may amend ANY interaction; a holder
+    without it — a professor, by default — may amend only the interactions they
+    logged themselves, and gets 403 on someone else's (#129).
+
+    ``can_edit_others`` is resolved from the LIVE permission config rather than
+    from a hardcoded role list, so an engineer who grants ``alumni.edit`` to a
+    role in the permission editor actually widens this too."""
     return await profile_service.update_interaction(
         session,
         alumni_id,
         interaction_id,
         payload,
         actor_user_id=user.user_id,
-        can_edit_others=user.can_edit_alumni,
+        can_edit_others=_can_edit_any_interaction(config, user),
     )
 
 
@@ -1747,21 +1789,20 @@ async def delete_interaction(
     alumni_id: IdPath,
     interaction_id: IdPath,
     user: InteractionWriteRateLimit,
+    config: PermissionConfig,
     session: SessionDep,
 ) -> None:
     """Delete an interaction from an alumni's timeline. 404 if the row is missing
     or belongs to another alumnus.
 
-    Edit-tier roles (engineer / super_admin / full_access / student) may delete
-    ANY interaction. A view_only ("Professor") user may delete only the
-    interactions they logged themselves; deleting another user's interaction is
-    403 (#129)."""
+    Same gate as the edit route: ``interactions.create`` to reach it at all, plus
+    ``alumni.edit`` to remove an interaction somebody else logged (#129/#379)."""
     await profile_service.delete_interaction(
         session,
         alumni_id,
         interaction_id,
         actor_user_id=user.user_id,
-        can_edit_others=user.can_edit_alumni,
+        can_edit_others=_can_edit_any_interaction(config, user),
     )
 
 
@@ -2059,7 +2100,7 @@ def _drop_manual_updated_date(payload: AlumniCreateFull | AlumniUpdateFull):
 
 @router.post("/preview", response_model=AlumniHygienePreview)
 async def preview_create_alumni(
-    payload: AlumniCreateFull, user: RequireFullAccess, session: SessionDep
+    payload: AlumniCreateFull, user: RequireAlumniCreate, session: SessionDep
 ) -> dict:
     """Dry-run data-hygiene preview for a NEW alumni (full_access, no writes).
 
@@ -2101,7 +2142,7 @@ async def preview_update_alumni(
 
 @router.post("", response_model=AlumniRead, status_code=status.HTTP_201_CREATED)
 async def create_alumni(
-    payload: AlumniCreateFull, user: RequireFullAccess, session: SessionDep
+    payload: AlumniCreateFull, user: RequireAlumniCreate, session: SessionDep
 ) -> AlumniRead:
     return await service.create_alumni(
         session, _drop_manual_updated_date(payload), actor_user_id=user.user_id
@@ -2122,7 +2163,7 @@ async def update_alumni(
 
 @router.delete("/{alumni_id}", response_model=AlumniRead)
 async def archive_alumni(
-    alumni_id: IdPath, user: RequireFullAccess, session: SessionDep
+    alumni_id: IdPath, user: RequireAlumniArchive, session: SessionDep
 ) -> AlumniRead:
     """Soft-delete (archive) an alumni record."""
     return await service.archive_alumni(session, alumni_id, actor_user_id=user.user_id)
@@ -2130,7 +2171,7 @@ async def archive_alumni(
 
 @router.post("/{alumni_id}/restore", response_model=AlumniRead)
 async def restore_alumni(
-    alumni_id: IdPath, user: RequireFullAccess, session: SessionDep
+    alumni_id: IdPath, user: RequireAlumniArchive, session: SessionDep
 ) -> AlumniRead:
     """Restore (unarchive) a previously archived alumni record."""
     return await service.restore_alumni(session, alumni_id, actor_user_id=user.user_id)

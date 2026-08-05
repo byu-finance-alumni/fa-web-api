@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireFullAccess
+from app.api.dependencies.auth import RequireReportsAdvanced
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError
 from app.schemas.profile import AdminTaskPage
@@ -24,7 +24,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("", response_model=AdminTaskPage)
 async def list_tasks(
-    _: RequireFullAccess,
+    _: RequireReportsAdvanced,
     session: SessionDep,
     completed: Annotated[
         bool | None,

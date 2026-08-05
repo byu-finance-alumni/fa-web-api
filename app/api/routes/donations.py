@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies.auth import (
     PermissionConfig,
     RequireDonationsManage,
-    RequireFullAccess,
+    RequireDonationsView,
 )
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
@@ -60,9 +60,10 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 def _can_view_amounts(
     user: UserContext, config: dict[str, frozenset[str]]
 ) -> bool:
-    """True if the caller may see dollar amounts: holds ``alumni.full`` under the
-    live permission config (full_access, super_admin, engineer by default)."""
-    return Capability.ALUMNI_FULL in effective_capabilities(config, user.roles)
+    """True if the caller may see dollar amounts: holds ``donations.view`` under
+    the live permission config (#379 — seeded to exactly the roles that held the
+    retired ``alumni.full``: full_access, super_admin, engineer)."""
+    return Capability.DONATIONS_VIEW in effective_capabilities(config, user.roles)
 
 
 def _alumni_name(first: str | None, preferred: str | None, last: str | None, alumni_id: int) -> str:
@@ -82,7 +83,7 @@ def _money(value, show: bool) -> float | None:
 
 @router.get("/donors")
 async def list_donors(
-    user: RequireFullAccess,
+    user: RequireDonationsView,
     config: PermissionConfig,
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -178,7 +179,7 @@ async def list_donors(
 
 @router.get("/summary")
 async def donations_summary(
-    user: RequireFullAccess,
+    user: RequireDonationsView,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:
@@ -227,7 +228,7 @@ async def donations_summary(
 @router.get("/alumni/{alumni_id}")
 async def list_alumni_donations(
     alumni_id: IdPath,
-    user: RequireFullAccess,
+    user: RequireDonationsView,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:

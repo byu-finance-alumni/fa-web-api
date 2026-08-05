@@ -7,7 +7,7 @@ archive, import) ⊇ ``student`` (edit EXISTING alumni records only — no creat
 archive, restore, or import) ⊇ ``view_only`` (read). ``student`` is not a strict
 subset of ``full_access`` in the "fewer rows" sense — it is a *narrower* writer
 that can edit but not create — so it gets its own edit guard rather than being
-layered into ``require_full_access`` (see ``app/api/dependencies/auth.py``).
+layered into the create/archive guards (see ``app/api/dependencies/auth.py``).
 
 These string values are the stable contract stored in ``roles.role_name`` and
 referenced throughout authorization; the database is seeded with them in

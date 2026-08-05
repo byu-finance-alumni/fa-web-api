@@ -435,9 +435,16 @@ def parse_designation_tokens(values: str | list[str] | None) -> list[str]:
     return out
 
 
-# Tags — the fixed, canonical engagement tags an alumnus can be labelled with
-# (alumni_tags join). Free-text is intentionally disallowed so the set stays a
-# clean, filterable vocabulary. Mirror in fa-web-app/src/constants/dropdowns.ts.
+# Tags — the fixed, canonical engagement tags an alumnus can be labelled with.
+# Free-text is intentionally disallowed so the set stays a clean, filterable
+# vocabulary. Mirror in fa-web-app/src/constants/dropdowns.ts.
+#
+# A tag is backed by ONE of two stores, and which one is decided by
+# :data:`ENGAGEMENT_FLAG_TAGS` below, never per call site:
+#
+#   * the nine "ways to get involved" are backed by their boolean column on
+#     ``alumni_program_engagement`` (see ENGAGEMENT_FLAG_TAGS);
+#   * every other tag is backed by an ``alumni_tags`` row.
 TAGS: tuple[str, ...] = (
     "Mentor",
     "Highly Engaged",
@@ -449,7 +456,68 @@ TAGS: tuple[str, ...] = (
     "Club/Recruiting",
     "Finance Orgs",
     "Advisory Boards",
+    # The nine "ways to get involved" (#629). "Mentor" and "Speaker" above are
+    # part of the nine too — they already existed as hand-applied tags, and
+    # reusing them is the point (see ENGAGEMENT_FLAG_TAGS).
+    "Women in Finance Mentor",
+    "Event Helper",
+    "NetTrek Host",
+    "Finance Conference",
+    "Company Event Sponsor",
+    "Case Competition Host",
+    "PIFF Donor",
 )
+
+# The nine "ways to get involved" the survey asks about, as tag name → the
+# ``alumni_program_engagement`` boolean column that IS that tag (#629).
+#
+# WHY THESE ARE DERIVED RATHER THAN MIRRORED INTO ``alumni_tags``
+# ---------------------------------------------------------------
+# The willingness flag already had two writers — the survey apply path and the
+# staff-facing "Ways to get involved" edit form — so survey answers and
+# hand-entry ALREADY converge on one store. Writing a matching ``alumni_tags``
+# row would add a third, and every extra store is a chance for the two to
+# disagree. Deriving keeps exactly one.
+#
+# Withdrawal is the deciding argument. An alum who answers NO next year must
+# leave the list, or staff email people who already opted out. Derived, that is
+# a single flag flip — the chip and the search predicate stop matching in the
+# same instant, with nothing to delete and no window in which the two stores
+# disagree. Mirrored, withdrawal has to DELETE a tag row, and nothing in
+# ``alumni_tags`` records whether a given "Mentor" row came from a survey or
+# from a staff member applying it by hand — so withdrawal would either clobber
+# hand-applied tags or leave opted-out alumni on the list.
+#
+# "Mentor" and "Speaker" deliberately map onto the pre-existing hand-applied
+# tags instead of getting new names. Before #629 the mentor list was already
+# forked in two: `tag=Mentor` matched ``alumni_tags`` and `mentor=1` matched
+# ``mentor_willing``, and on dev those returned 39 and 83 people sharing only
+# 16. One name resolving to one predicate is what un-forks it.
+ENGAGEMENT_FLAG_TAGS: dict[str, str] = {
+    "Mentor": "mentor_willing",
+    "Women in Finance Mentor": "women_in_finance_mentor_willing",
+    "Speaker": "guest_speaker_willing",
+    "Event Helper": "help_at_event_willing",
+    "NetTrek Host": "nettrek_host_willing",
+    "Finance Conference": "finance_conference_willing",
+    "Company Event Sponsor": "company_event_sponsor_willing",
+    "Case Competition Host": "case_competition_host_willing",
+    "PIFF Donor": "piff_donor",
+}
+
+
+def engagement_flag_for_tag(name: str) -> str | None:
+    """Return the engagement column *name* is backed by, or ``None``.
+
+    Case-insensitive, matching the tag filter's ``ILIKE`` comparison, so a
+    deep link carrying `tag=mentor` resolves the same way the UI's `Mentor`
+    does. ``None`` means "an ordinary ``alumni_tags`` tag".
+    """
+    folded = (name or "").strip().casefold()
+    for tag_name, column in ENGAGEMENT_FLAG_TAGS.items():
+        if tag_name.casefold() == folded:
+            return column
+    return None
 
 # Status labels — the fixed, canonical record-status flags (alumni_status_labels
 # join). Mirror in fa-web-app/src/constants/dropdowns.ts.

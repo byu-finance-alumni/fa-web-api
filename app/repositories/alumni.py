@@ -21,6 +21,7 @@ from app.core.dropdowns import (
     DESIGNATION_NEGATIVES,
     EMPLOYER_NOT_APPLICABLE_BY_LOWER,
     WHEEL_INDUSTRIES,
+    engagement_flag_for_tag,
 )
 from app.core.search_terms import parse_free_text
 from app.models.alumni import Alumni
@@ -695,15 +696,50 @@ def build_alumni_query(
         )
     tags = _as_values(tag)
     if tags:
-        conditions.append(
-            select(AlumniTag.alumni_tag_id)
-            .join(Tag, Tag.tag_id == AlumniTag.tag_id)
-            .where(
-                AlumniTag.alumni_id == Alumni.alumni_id,
-                _ilike_any(Tag.tag_name, tags),
+        # A tag name resolves to exactly ONE predicate (#629). The nine "ways to
+        # get involved" are backed by their ``alumni_program_engagement``
+        # boolean; every other tag is backed by an ``alumni_tags`` row. Routing
+        # each name through ``engagement_flag_for_tag`` is what stops
+        # `tag=Mentor` and the `mentor_willing` flag from resolving to two
+        # different half-populated lists, which is what they did before.
+        #
+        # Note the nine deliberately do NOT also match a leftover
+        # ``alumni_tags`` row of the same name. Matching both would resurrect
+        # the fork from the other side: an alumnus who answered NO would keep
+        # matching on the strength of a stale row. The migration
+        # ``2026-08-05_engagement_tag_backfill.sql`` folds the pre-existing
+        # hand-applied Mentor/Speaker rows into the flags so nobody is dropped
+        # by that choice.
+        flag_columns = [
+            getattr(AlumniProgramEngagement, column)
+            for column in (
+                engagement_flag_for_tag(name) for name in tags
             )
-            .exists()
-        )
+            if column is not None
+        ]
+        plain_tags = [name for name in tags if engagement_flag_for_tag(name) is None]
+        # OR within the facet, matching every other multi-value filter here.
+        tag_clauses = []
+        if plain_tags:
+            tag_clauses.append(
+                select(AlumniTag.alumni_tag_id)
+                .join(Tag, Tag.tag_id == AlumniTag.tag_id)
+                .where(
+                    AlumniTag.alumni_id == Alumni.alumni_id,
+                    _ilike_any(Tag.tag_name, plain_tags),
+                )
+                .exists()
+            )
+        if flag_columns:
+            tag_clauses.append(
+                select(AlumniProgramEngagement.engagement_profile_id)
+                .where(
+                    AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+                    or_(*[column.is_(True) for column in flag_columns]),
+                )
+                .exists()
+            )
+        conditions.append(or_(*tag_clauses) if len(tag_clauses) > 1 else tag_clauses[0])
     status_labels = _as_values(status_label)
     if status_labels:
         conditions.append(

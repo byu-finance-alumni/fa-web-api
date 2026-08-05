@@ -15,6 +15,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
 from app.core.security import AuthorizationError
 from app.models.alumni import Alumni
@@ -374,14 +375,24 @@ async def get_profile(
             .order_by(AlumniEngagement.engagement_id)
         )
     ).all()
-    tags = (
-        await session.scalars(
-            select(Tag.tag_name)
-            .join(AlumniTag, AlumniTag.tag_id == Tag.tag_id)
-            .where(AlumniTag.alumni_id == alumni_id)
-            .order_by(Tag.tag_name)
-        )
-    ).all()
+    # Both tag stores, merged (#629) — ordinary `alumni_tags` rows plus the nine
+    # "ways to get involved" derived from `program` above. Rendered in the
+    # profile header, which every role sees, so answering "willing to mentor"
+    # now shows up somewhere instead of nowhere.
+    tags = sorted(
+        {
+            name
+            for name in (
+                await session.scalars(
+                    select(Tag.tag_name)
+                    .join(AlumniTag, AlumniTag.tag_id == Tag.tag_id)
+                    .where(AlumniTag.alumni_id == alumni_id)
+                )
+            ).all()
+            if engagement_flag_for_tag(name) is None
+        }
+        | set(_engagement_tag_names(program))
+    )
     status_labels = (
         await session.scalars(
             select(StatusLabel.status_label_name)
@@ -1135,16 +1146,72 @@ async def delete_leadership(
 
 
 async def _tag_names(session: AsyncSession, alumni_id: int) -> list[str]:
-    return list(
-        (
-            await session.scalars(
-                select(Tag.tag_name)
-                .join(AlumniTag, AlumniTag.tag_id == Tag.tag_id)
-                .where(AlumniTag.alumni_id == alumni_id)
-                .order_by(Tag.tag_name)
-            )
-        ).all()
+    """Every tag on an alumnus, from BOTH stores, as one sorted list (#629).
+
+    The nine "ways to get involved" are read off their
+    ``alumni_program_engagement`` boolean; every other tag is read from
+    ``alumni_tags``. This is the single definition of "what tags does this
+    person have" — the profile read, the add/remove responses and anything
+    else all go through it, so a chip can never appear that the `tag=` filter
+    would not also match.
+
+    A leftover ``alumni_tags`` row for one of the nine (a hand-applied "Mentor"
+    predating #629) is deliberately IGNORED here rather than shown, because the
+    `tag=` filter ignores it too. Showing it would put a chip on a profile that
+    search cannot find, and would keep an alumnus who answered NO looking like
+    a mentor forever. The backfill migration turns those rows into flags first,
+    so nobody loses a tag by this.
+    """
+    rows = (
+        await session.scalars(
+            select(Tag.tag_name)
+            .join(AlumniTag, AlumniTag.tag_id == Tag.tag_id)
+            .where(AlumniTag.alumni_id == alumni_id)
+            .order_by(Tag.tag_name)
+        )
+    ).all()
+    names = {name for name in rows if engagement_flag_for_tag(name) is None}
+    program = await session.scalar(
+        select(AlumniProgramEngagement).where(
+            AlumniProgramEngagement.alumni_id == alumni_id
+        )
     )
+    names.update(_engagement_tag_names(program))
+    return sorted(names)
+
+
+def _engagement_tag_names(
+    program: AlumniProgramEngagement | None,
+) -> list[str]:
+    """The subset of the nine involvement tags whose flag is set on *program*."""
+    if program is None:
+        return []
+    return [
+        tag_name
+        for tag_name, column in ENGAGEMENT_FLAG_TAGS.items()
+        if getattr(program, column, False)
+    ]
+
+
+async def _get_or_create_program_engagement(
+    session: AsyncSession, alumni_id: int
+) -> AlumniProgramEngagement:
+    """The alumnus's engagement row, created empty if they have none yet.
+
+    An alumnus who has never been surveyed and never been edited has no
+    ``alumni_program_engagement`` row at all, so applying an involvement tag by
+    hand has to be able to make one. Every column is NOT NULL with a false
+    server default, so an empty row is a valid "no to everything"."""
+    program = await session.scalar(
+        select(AlumniProgramEngagement).where(
+            AlumniProgramEngagement.alumni_id == alumni_id
+        )
+    )
+    if program is None:
+        program = AlumniProgramEngagement(alumni_id=alumni_id)
+        session.add(program)
+        await session.flush()
+    return program
 
 
 async def _get_or_create_tag(session: AsyncSession, name: str) -> Tag:
@@ -1165,8 +1232,22 @@ async def add_tag(
     """Attach a canonical tag to an alumnus; return the resulting tag list.
 
     Idempotent: re-adding an existing tag is a no-op (existence-checked against
-    the unique constraint), never a 500."""
+    the unique constraint), never a 500.
+
+    One of the nine involvement tags (#629) SETS ITS ENGAGEMENT FLAG rather than
+    inserting an ``alumni_tags`` row, because the flag is that tag's only store.
+    That is what makes hand-applying "Mentor" and answering "willing to mentor
+    students" on the survey land in the same place, and therefore find the same
+    people when someone filters for mentors."""
     await _require_alumni(session, alumni_id)
+    column = engagement_flag_for_tag(payload.tag)
+    if column is not None:
+        program = await _get_or_create_program_engagement(session, alumni_id)
+        if not getattr(program, column):
+            setattr(program, column, True)
+            _audit_alumni(session, actor_user_id, "add_tag", alumni_id)
+            await session.commit()
+        return await _tag_names(session, alumni_id)
     tag = await _get_or_create_tag(session, payload.tag)
     existing = await session.scalar(
         select(AlumniTag.alumni_tag_id).where(
@@ -1187,8 +1268,34 @@ async def remove_tag(
     actor_user_id: int | None,
 ) -> list[str]:
     """Detach a tag from an alumnus; return the resulting tag list. 404 if the
-    alumnus doesn't have that tag."""
+    alumnus doesn't have that tag.
+
+    For one of the nine involvement tags (#629) this CLEARS THE ENGAGEMENT FLAG,
+    and also deletes any leftover pre-#629 ``alumni_tags`` row of the same name
+    so "remove this tag" cannot leave a half of it behind. This is the same
+    operation an alum performs by answering NO on next year's survey, which is
+    the point: withdrawal has one implementation, not two."""
     await _require_alumni(session, alumni_id)
+    column = engagement_flag_for_tag(tag_name)
+    if column is not None:
+        program = await session.scalar(
+            select(AlumniProgramEngagement).where(
+                AlumniProgramEngagement.alumni_id == alumni_id
+            )
+        )
+        if program is None or not getattr(program, column):
+            raise NotFoundError(f"Tag '{tag_name}' is not set on alumni {alumni_id}.")
+        setattr(program, column, False)
+        stale = await session.scalar(
+            select(AlumniTag)
+            .join(Tag, Tag.tag_id == AlumniTag.tag_id)
+            .where(AlumniTag.alumni_id == alumni_id, Tag.tag_name == tag_name)
+        )
+        if stale is not None:
+            await session.delete(stale)
+        _audit_alumni(session, actor_user_id, "remove_tag", alumni_id)
+        await session.commit()
+        return await _tag_names(session, alumni_id)
     assoc = await session.scalar(
         select(AlumniTag)
         .join(Tag, Tag.tag_id == AlumniTag.tag_id)

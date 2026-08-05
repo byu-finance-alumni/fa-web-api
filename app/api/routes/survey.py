@@ -226,6 +226,20 @@ async def send_survey_campaign(
     dry_run: Annotated[bool, Query()] = True,
     limit: Annotated[int | None, Query(ge=1, le=1000)] = None,
 ) -> SurveySendResult:
+    """Send the survey to a graduation year now (dry run by default).
+
+    A REAL send to a year that has NO campaign CREATES one (#405), anchored to
+    the day the initial email actually went out, and says so via
+    `campaign_created`. The campaign is what the daily cron runs the day-0/+7/+14
+    cadence from — without it the manual send delivered the initial and the two
+    reminders silently never fired, with nothing in the UI saying so. It cannot
+    re-send the initial: the campaign opens on the very cycle this send claimed
+    under, so those send-log rows are already its stage 0.
+
+    A dry run creates nothing (it claims nothing, and the creation is driven by
+    what is in `survey_send_log`). An existing campaign is never replaced —
+    changing a campaign's start date is `POST /schedules`, and re-running the
+    year is `POST /schedules/{year}/new-cycle`."""
     return await survey_email.send_campaign(
         session,
         graduation_year=grad_year,

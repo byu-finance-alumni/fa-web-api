@@ -184,6 +184,14 @@ class SurveySendResult(BaseModel):
     # it guessed WRONG: it blamed "they need a personal email on file" for every
     # zero-send, including cohorts that had simply all replied already (#392).
     stage_complete: bool = False
+    # True when this send had to create the year's campaign because there wasn't
+    # one (#405). A manual send used to write send-log rows and no
+    # `survey_schedule` row, and the schedule is what drives the day 0 / +7 / +14
+    # reminders — so the initial went out, both reminders silently never did, and
+    # the console listed no campaign. The send now leaves one behind; this says so
+    # out loud, because "we also started a campaign for this cohort" is a
+    # consequence the operator should see rather than discover.
+    campaign_created: bool = False
     # The full account of the cohort, so the console can state the REAL reason a
     # send was small or empty. Same numbers as the standalone breakdown endpoint
     # — one function produces both.

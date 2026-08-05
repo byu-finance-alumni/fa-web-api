@@ -35,7 +35,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.api.dependencies import auth as auth_deps
 from app.core.capabilities import DEFAULT_GRANTS
-from app.core.errors import ConflictError, NotFoundError
+from app.core.errors import NotFoundError
 from app.core.roles import RoleName
 from app.core.security import AuthorizationError
 from app.main import app
@@ -44,6 +44,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
+from app.models.survey_retirement import SurveyCampaignRetirement
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.schemas.auth import UserContext
 from app.services import survey_email, survey_reset, survey_schedule
@@ -111,6 +112,25 @@ def _ddl(conn):
             " sends_superseded INTEGER NOT NULL DEFAULT 0,"
             " responses_superseded INTEGER NOT NULL DEFAULT 0,"
             " UNIQUE (alumni_id, reset_seq))"
+        )
+    )
+    # Deleted campaigns (#398). Hand-written for the same reason as the reset
+    # log: the service INSERTs without supplying a key. `current_cycle_seq`
+    # consults this for any year with no schedule row, so it has to exist even
+    # for the tests that never delete anything.
+    conn.execute(
+        text(
+            "CREATE TABLE survey_campaign_retirement ("
+            " survey_campaign_retirement_id INTEGER PRIMARY KEY,"
+            " graduation_year INTEGER NOT NULL,"
+            " cycle_seq INTEGER NOT NULL,"
+            " retired_at TIMESTAMP NOT NULL,"
+            " retired_by_user_id INTEGER,"
+            " previous_status VARCHAR(20),"
+            " start_date DATE,"
+            " sends_retired INTEGER NOT NULL DEFAULT 0,"
+            " responses_kept INTEGER NOT NULL DEFAULT 0,"
+            " UNIQUE (graduation_year, cycle_seq))"
         )
     )
     conn.execute(
@@ -238,6 +258,13 @@ class _World:
 
     def schedules(self):
         return self.conn.scalars(select(SurveySchedule)).all()
+
+    def retirement_rows(self, year=_YEAR):
+        return self.conn.scalars(
+            select(SurveyCampaignRetirement)
+            .where(SurveyCampaignRetirement.graduation_year == year)
+            .order_by(SurveyCampaignRetirement.cycle_seq)
+        ).all()
 
     def audits(self):
         return [a for a in self.session.added if isinstance(a, AuditLog)]
@@ -696,6 +723,16 @@ def test_state_of_an_unknown_alumnus_is_a_404(world):
 
 
 # -------------------------------------------- deleting a campaign (#398) ------
+#
+# ANY campaign, whatever its status. The first cut refused to delete one that had
+# ever emailed anyone and offered `cancel` instead — which in practice meant
+# every real campaign (Jake: "it still won't let me delete a campaign in the
+# engineer dashboard"). The refusal was not squeamish, though: `survey_schedule`
+# is the only holder of the year's `cycle_seq`, and dropping it would leave the
+# send-log rows reading as the CURRENT cycle's, so the next campaign for the year
+# would skip everybody (#357). The cycle is now RETIRED instead of the delete
+# being refused — see `test_survey_campaign_delete.py` for the end-to-end proof
+# that the next campaign really does reach those alumni.
 
 
 def test_a_campaign_that_never_sent_anything_can_be_deleted(world):
@@ -708,7 +745,8 @@ def test_a_campaign_that_never_sent_anything_can_be_deleted(world):
 
     assert world.schedules() == []
     assert (result.graduation_year, result.previous_status) == (_YEAR, "active")
-    assert result.responses_kept == 0
+    assert (result.emails_retired, result.responses_kept) == (0, 0)
+    assert (result.retired_cycle, result.next_cycle) == (1, 2)
 
 
 def test_deleting_a_campaign_keeps_the_responses_for_that_year(world):
@@ -723,21 +761,63 @@ def test_deleting_a_campaign_keeps_the_responses_for_that_year(world):
     assert result.responses_kept == 1
 
 
-def test_a_campaign_that_has_emailed_anyone_cannot_be_deleted(world):
-    """Cancel is the honest verb there, and the refusal is load-bearing, not
-    squeamish: `survey_schedule` is the only holder of the year's `cycle_seq`, so
-    dropping it would leave the send-log rows reading as the CURRENT cycle's and
-    the next campaign for the year would skip everybody (#357)."""
+@pytest.mark.parametrize(
+    "status", ["scheduled", "active", "paused", "completed", "cancelled"]
+)
+def test_every_status_can_be_deleted_including_cancelled(world, status):
+    """The complaint, exactly: Jake's campaigns had all either sent or been
+    cancelled, so the console offered him Cancel or nothing at all. `cancelled`
+    is in here deliberately — it was the status with NO control."""
+    world.alum(_TARGET)
+    world.schedule(status=status)
+    world.sent(_TARGET, (0, 1))
+
+    result = world.delete_campaign()
+
+    assert world.schedules() == []
+    assert result.previous_status == status
+    # The emails are RETIRED, not removed: both rows are still in the table.
+    assert result.emails_retired == 2
+    assert len(world.send_rows(_TARGET)) == 2
+
+
+def test_deleting_a_campaign_that_has_emailed_people_keeps_every_row(world):
+    """The rule both same-day features share: a survey control may change what
+    happens NEXT, never what already happened."""
     world.alum(_TARGET)
     world.schedule()
-    world.sent(_TARGET, (0,))
+    world.sent(_TARGET, (0, 1, 2))
+    world.replied(_TARGET, status="pending", photo="survey-pending/7")
 
-    with pytest.raises(ConflictError) as exc:
-        world.delete_campaign()
+    result = world.delete_campaign()
 
-    assert "Cancel it instead" in str(exc.value)
-    assert len(world.schedules()) == 1
-    assert len(world.send_rows(_TARGET)) == 1
+    assert len(world.send_rows(_TARGET)) == 3
+    (response,) = world.response_rows(_TARGET)
+    assert (response.status, response.staged_photo_path) == (
+        "pending",
+        "survey-pending/7",
+    )
+    assert (result.emails_retired, result.responses_kept) == (3, 1)
+
+
+def test_deleting_a_campaign_records_what_it_retired(world):
+    """The tombstone. The schedule row is gone, so without this row nothing says
+    which campaign was deleted, by whom, or what it had done."""
+    world.alum(_TARGET)
+    world.schedule(cycle=2, status="paused")
+    world.sent(_TARGET, (0,), cycle=1)  # a previous, already-finished cycle
+    world.sent(_TARGET, (0, 1), cycle=2)
+    world.replied(_TARGET)
+
+    world.delete_campaign(actor_user_id=42)
+
+    (row,) = world.retirement_rows()
+    assert (row.graduation_year, row.cycle_seq) == (_YEAR, 2)
+    assert (row.previous_status, row.retired_by_user_id) == ("paused", 42)
+    assert row.start_date == datetime.date(2026, 7, 1)
+    # THIS campaign's emails — cycle 1's row belonged to a campaign that was
+    # already history and is not this action's doing.
+    assert (row.sends_retired, row.responses_kept) == (2, 1)
 
 
 def test_deleting_an_unknown_campaign_is_a_404(world):
@@ -747,6 +827,7 @@ def test_deleting_an_unknown_campaign_is_a_404(world):
 def test_deleting_a_campaign_is_audited_as_keeping_the_answers(world):
     world.alum(_TARGET)
     world.schedule()
+    world.sent(_TARGET, (0,))
     world.replied(_TARGET)
 
     world.delete_campaign(actor_user_id=42)
@@ -755,7 +836,12 @@ def test_deleting_a_campaign_is_audited_as_keeping_the_answers(world):
     assert entry.action_type == "delete_survey_schedule"
     assert (entry.entity_type, entry.entity_id) == ("survey_campaign", _YEAR)
     assert entry.user_id == 42
+    # Counts of what was RETIRED, and never the word "permanently": the trail has
+    # to read the way the operation behaves, or whoever reads it next will
+    # believe the emails and answers were destroyed.
+    assert "emails_retired=1 kept" in entry.new_value
     assert "responses_kept=1" in entry.new_value
+    assert "cycle=1" in entry.old_value
 
 
 def test_deleting_a_campaign_does_not_resurrect_a_superseded_response(world):

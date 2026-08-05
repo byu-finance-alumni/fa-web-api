@@ -314,18 +314,29 @@ class SurveySchedulePauseAllResult(BaseModel):
 class SurveyScheduleDeleteResult(BaseModel):
     """Outcome of removing a campaign (``DELETE /survey/schedules/{year}``, #398).
 
-    Only the ``survey_schedule`` row goes. The delete is refused with a 409 for
-    any year that has ever sent an email, so ``emails_sent`` is 0 by
-    construction and is not repeated here; what IS worth reporting back is
-    ``responses_kept``, because the reasonable assumption about a button labelled
-    "delete campaign" is that the alumni's submitted answers went with it. They
-    did not, and the console says the number out loud."""
+    Only the ``survey_schedule`` row goes, whatever the campaign's status. Every
+    number here is a KEPT count, because the reasonable assumption about a button
+    labelled "delete campaign" is that the emails and the alumni's submitted
+    answers went with it. They did not — they were RETIRED, which is a statement
+    about what the next campaign for this year can see, not about what is in the
+    database — and the console says the numbers out loud rather than leaving the
+    assumption standing."""
 
     graduation_year: int
     # What the campaign's status was before it was removed — the console echoes
     # it so "deleted a scheduled campaign" and "deleted a completed one" are
     # distinguishable after the fact.
     previous_status: str
+    # The cycle this campaign was on, now retired: its send-log rows keep this
+    # number and stop counting as current.
+    retired_cycle: int
+    # Where a new campaign for this year starts. Above `retired_cycle` by
+    # construction, which is what makes the alumni it emailed reachable again and
+    # keeps the send log's unique key from refusing their new rows.
+    next_cycle: int
+    # Emails this campaign sent. Still in `survey_send_log`, still on the alumni's
+    # profiles, still counted by the Resend usage meter — they really were sent.
+    emails_retired: int
     # Survey responses for this graduation year still in the database. Untouched.
     responses_kept: int
 

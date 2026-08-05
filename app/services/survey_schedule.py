@@ -66,6 +66,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.survey_response import SurveyResponse
+from app.models.survey_retirement import SurveyCampaignRetirement
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
 from app.models.user import User
@@ -378,12 +379,12 @@ async def _all_time_send_counts(session: AsyncSession) -> dict[int, int]:
     """Emails ever sent for each graduation year, ACROSS EVERY CYCLE (#398).
 
     Distinct from :func:`_sent_counts_by_stage`, which is current-cycle only.
-    This is the number that decides whether a campaign can be DELETED or only
-    CANCELLED: once a year has any send-log row, its schedule row is the only
-    thing holding the cycle counter that keeps those rows scoped to a past
-    campaign, so removing it would make them look like the current cycle's and
-    the next campaign for that year would find everyone already emailed (#357,
-    exactly). Superseded rows are counted too — a reset does not un-send an
+    This is the number the delete confirmation states out loud: "the record of
+    the N emails this year has been sent is kept". It no longer decides WHETHER a
+    campaign may be deleted — any campaign may (see :func:`delete_schedule`) —
+    but it is exactly the figure a person needs to see before pressing a button
+    labelled "delete", because that word reads like those emails go with it.
+    Superseded rows are counted too: neither a reset nor a retirement un-sends an
     email."""
     stmt = select(SurveySendLog.graduation_year, func.count()).group_by(
         SurveySendLog.graduation_year
@@ -476,11 +477,20 @@ async def _upsert_schedule(
     caller owns the commit, so the single- and bulk-create paths share this
     upsert while controlling their own transaction boundary.
 
-    ``cycle_seq`` is deliberately NOT advanced here (#357). This path is the
-    "I typed the wrong start date" correction, and it must stay non-destructive:
-    advancing the cycle would make every already-emailed alum a target again, so
-    fixing a typo would blast the cohort a second time. Starting the next annual
-    campaign is the separate, explicit :func:`start_new_cycle`."""
+    ``cycle_seq`` is deliberately NOT advanced for an EXISTING row (#357). That
+    path is the "I typed the wrong start date" correction, and it must stay
+    non-destructive: advancing the cycle would make every already-emailed alum a
+    target again, so fixing a typo would blast the cohort a second time. Starting
+    the next annual campaign is the separate, explicit :func:`start_new_cycle`.
+
+    A row being created FRESH is a different question, and it is where deleting a
+    campaign is made safe (#398): the year may have retired cycles whose send-log
+    rows are still in the table, so the new campaign starts at
+    :func:`survey_email.current_cycle_seq` — one above the highest retired cycle
+    — rather than at 1. Defaulting to 1 there is the #357 failure: the retired
+    rows would read as this campaign's, everyone would look already-emailed, and
+    it would complete having sent to nobody. For a year that has never had a
+    campaign this is 1, exactly as before."""
     existing = (
         await session.execute(
             select(SurveySchedule).where(
@@ -499,6 +509,9 @@ async def _upsert_schedule(
                 start_date=start_date,
                 status=STATUS_SCHEDULED,
                 created_by_user_id=actor_user_id,
+                cycle_seq=await survey_email.next_cycle_seq(
+                    session, graduation_year
+                ),
             )
         )
 
@@ -901,8 +914,13 @@ async def cancel_schedule(
 
     Terminal and non-destructive: the row stays, keeping its ``cycle_seq`` and
     its place beside the send log, so the year's history still reads as "cycle N
-    ran, and here is what it sent". Cancelling is what a campaign that HAS
-    emailed people gets instead of :func:`delete_schedule` (#398).
+    ran, and here is what it sent".
+
+    NOT a weaker :func:`delete_schedule`, and not superseded by it (#398): delete
+    now works on any campaign, but "stop this cohort's emails and leave the
+    campaign listed" is a different intent from "get this campaign off my
+    screen", and an operator wants both. Cancel is the one that keeps the year on
+    the console with its counts attached.
 
     Audited, matching pause/resume and the two blanket switches — stopping a
     cohort's campaign is an intervention someone will later want explained."""
@@ -938,45 +956,75 @@ async def cancel_schedule(
 # campaigns next to the resume button." A campaign scheduled for the wrong year
 # or created by mistake was stuck there forever — pausing hid it, the row stayed.
 #
-# DELETING A CAMPAIGN MEANS THE SCHEDULE ROW, AND ONLY THAT. `survey_send_log`
+# ANY CAMPAIGN, ANY STATUS (revised the same day). The first cut could only
+# delete a campaign that had never emailed anyone; everything else was offered
+# `cancel`, and an already-cancelled campaign got no control at all. Jake: "it
+# still won't let me delete a campaign in the engineer dashboard" — his campaigns
+# have all either sent or are already cancelled. Told why and offered the
+# options, he chose: delete any campaign, KEEP the emails.
+#
+# DELETING A CAMPAIGN TAKES THE SCHEDULE ROW AND NOTHING ELSE. `survey_send_log`
 # (what we emailed) and `survey_responses` (what alumni told us) are never
 # touched, here or anywhere else — the same rule the per-alumnus reset was
 # rewritten around on the same day.
 #
-# Which makes "delete" the wrong verb for a campaign that has already emailed
-# people, and not just cosmetically. `survey_schedule` is the ONLY holder of a
-# year's `cycle_seq`. Drop the row for a year with send-log rows in cycle 2 and
-# the next campaign for that year starts at cycle 1 again, colliding with cycle
-# 1's log rows: every alum reads as already emailed, `select_stage_targets`
-# returns nothing at every stage, and the campaign "completes" having sent to
-# nobody. That is #357 verbatim — the bug this codebase has already paid for
-# once.
+# THE CONSTRAINT THAT MADE THE REFUSAL REAL, AND HOW IT IS ANSWERED
+# -----------------------------------------------------------------
+# `survey_schedule` is the ONLY holder of a year's `cycle_seq`, and the send log
+# is scoped by it. Drop the row for a year with send-log rows in cycle 2 and the
+# next campaign for that year starts at cycle 1 again: every alum reads as
+# already emailed, `select_stage_targets` returns nothing at every stage, and the
+# campaign "completes" having sent to nobody. That is #357 verbatim — a bug this
+# codebase has already paid for once, and it fails SILENTLY.
 #
-# So the rule is the honest one the issue asks for:
+# So the cycle number is the one thing that must outlive the row, and RETIRING
+# the cycle is what this function does. It writes a `survey_campaign_retirement`
+# row carrying the deleted campaign's `cycle_seq`, and
+# `survey_email.current_cycle_seq` resolves a year with no schedule to one ABOVE
+# the highest retired cycle. The retired campaign's send-log rows keep their own
+# cycle number and simply stop being current:
 #
-#   * never emailed  -> DELETE. Nothing exists that the row is the key to.
-#   * ever emailed   -> CANCEL. The row stays, terminally stopped, next to the
-#                       history it explains.
+#   * the cycle-scoped double-send guard (`logged_alumni_ids`) no longer sees
+#     them, so the alumni that campaign emailed are eligible again;
+#   * the send log's UNIQUE (year, alumni, stage, cycle, reset) cannot collide
+#     with them, so the next campaign's claims are really inserted rather than
+#     swallowed by `_claim_batch`'s ON CONFLICT DO NOTHING — which is the half of
+#     this that would otherwise fail silently, exactly as it would have for the
+#     per-alumnus reset without `reset_seq` (#395).
 #
-# Both stop the cron for the same reason from its point of view: `_load_schedules_due`
-# selects `scheduled`/`active` rows, so a deleted row is not there to select and
-# a cancelled one is not runnable. A mid-flight campaign with reminders still due
-# genuinely stops either way.
+# That is deliberately the SAME mechanism as the reset, one level up: an
+# append-only event that supersedes, never a rewrite of the rows superseded. A
+# reset retires one alumnus's sends by `reset_seq`; this retires one campaign's
+# sends by `cycle_seq`.
+#
+# WHAT A NEW CAMPAIGN FOR THAT YEAR THEN DOES. It emails everyone eligible,
+# INCLUDING the people the deleted campaign emailed. Alumni who ANSWERED are
+# still held out by the 365-day annual re-survey window — unchanged, and the same
+# as after `start_new_cycle`. Deleting a campaign is not a way to re-ask someone
+# who already replied; the per-alumnus reset is.
+#
+# CANCEL SURVIVES, and is not a lesser delete. Stopping a live campaign while
+# keeping it listed is its own thing an operator wants, so both are offered:
+# cancel for a campaign that is still running, delete for any campaign at all.
 
 
 async def delete_schedule(
     session: AsyncSession, graduation_year: int, *, actor_user_id: int | None
 ) -> SurveyScheduleDeleteResult | None:
-    """Delete a graduation year's campaign row (#398).
+    """Delete a graduation year's campaign — whatever its status (#398).
 
-    Returns ``None`` when the year has no schedule (the route 404s). Raises
-    :class:`ConflictError` — a 409 — when the campaign has EVER sent an email,
-    because deleting it then would take the cycle counter with it (see the note
-    above); the console offers cancel instead, and the message says so.
+    Returns ``None`` when the year has no schedule (the route 404s). Never
+    refuses otherwise: `scheduled`, `active`, `paused`, `completed` and
+    `cancelled` all delete, because a campaign nobody can remove is the complaint
+    this is fixing.
 
-    Removes the ``survey_schedule`` row and nothing else. Any survey responses
-    for that year stay in the database and on the alumni's profiles; the count is
-    reported back so the confirmation can state it rather than imply otherwise.
+    Removes the ``survey_schedule`` row and writes ONE
+    ``survey_campaign_retirement`` row in its place, retiring the cycle it was on
+    (see the section notes above). Nothing else changes: every ``survey_send_log``
+    row and every ``survey_responses`` row stays exactly as it is, still on the
+    alumni's profiles, still counted by the Resend usage meter — the emails
+    really were sent. The counts are reported back and audited so the console can
+    say what was retired rather than imply it was destroyed.
     """
     sched = (
         await session.execute(
@@ -988,24 +1036,24 @@ async def delete_schedule(
     if sched is None:
         return None
 
-    emails_sent = int(
+    previous_status = sched.status
+    start_date = sched.start_date
+    cycle_seq = getattr(sched, "cycle_seq", survey_email.FIRST_CYCLE)
+
+    # This campaign's own emails — the rows the retirement moves out of the way.
+    # Scoped to the cycle, because an earlier cycle's rows were retired by
+    # whatever retired THEM and are not this action's doing.
+    emails_retired = int(
         await session.scalar(
             select(func.count())
             .select_from(SurveySendLog)
-            .where(SurveySendLog.graduation_year == graduation_year)
+            .where(
+                SurveySendLog.graduation_year == graduation_year,
+                SurveySendLog.cycle_seq == cycle_seq,
+            )
         )
         or 0
     )
-    if emails_sent:
-        raise ConflictError(
-            f"This campaign has already emailed {emails_sent} "
-            f"{'alum' if emails_sent == 1 else 'alumni'}, so it cannot be "
-            "deleted — the record of those emails is kept, and removing the "
-            "campaign would make the next one for this year skip everybody. "
-            "Cancel it instead: it stops immediately and stays visible as "
-            "history."
-        )
-
     responses_kept = int(
         await session.scalar(
             select(func.count())
@@ -1014,8 +1062,22 @@ async def delete_schedule(
         )
         or 0
     )
-    previous_status = sched.status
-    cycle_seq = getattr(sched, "cycle_seq", 1)
+
+    session.add(
+        SurveyCampaignRetirement(
+            graduation_year=graduation_year,
+            cycle_seq=cycle_seq,
+            # Stamped here rather than left to the column default, so the event
+            # carries the moment the operator acted (and so the row is complete
+            # before it is flushed) — the same choice `reset_alumnus` makes.
+            retired_at=_now(),
+            retired_by_user_id=actor_user_id,
+            previous_status=previous_status,
+            start_date=start_date,
+            sends_retired=emails_retired,
+            responses_kept=responses_kept,
+        )
+    )
     await session.delete(sched)
     session.add(
         AuditLog(
@@ -1025,12 +1087,18 @@ async def delete_schedule(
             entity_id=graduation_year,
             old_value=(
                 f"status={previous_status} cycle={cycle_seq} "
-                f"start_date={sched.start_date.isoformat()}"
+                f"start_date={start_date.isoformat()}"
             ),
             # Spelled out because the obvious reading of "deleted a campaign" is
-            # that the emails and answers went with it. They did not.
+            # that the emails and answers went with it. They did not — they were
+            # RETIRED, which is a statement about what the next campaign can see,
+            # not about what is in the database.
             new_value=(
-                f"deleted (emails_sent=0, responses_kept={responses_kept})"
+                f"deleted; retired cycle={cycle_seq} "
+                f"(emails_retired={emails_retired} kept, "
+                f"responses_kept={responses_kept}); "
+                f"next campaign for {graduation_year} starts at "
+                f"cycle={cycle_seq + 1}"
             ),
         )
     )
@@ -1038,6 +1106,9 @@ async def delete_schedule(
     return SurveyScheduleDeleteResult(
         graduation_year=graduation_year,
         previous_status=previous_status,
+        retired_cycle=cycle_seq,
+        next_cycle=cycle_seq + 1,
+        emails_retired=emails_retired,
         responses_kept=responses_kept,
     )
 

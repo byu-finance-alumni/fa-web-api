@@ -202,9 +202,9 @@ async def get_state(session: AsyncSession, alumni_id: int) -> SurveyAlumniState:
 
     # The cohort's campaign, when their year has one. Its `cycle_seq` is what
     # makes a send-log row current (blocking) rather than old history — the same
-    # cycle scoping the scheduler uses (#357). A year with no schedule is read as
-    # the first cycle, matching `survey_email.FIRST_CYCLE`.
+    # cycle scoping the scheduler uses (#357).
     schedule = None
+    current_cycle = survey_email.FIRST_CYCLE
     if alum.graduation_year is not None:
         schedule = (
             await session.execute(
@@ -213,7 +213,16 @@ async def get_state(session: AsyncSession, alumni_id: int) -> SurveyAlumniState:
                 )
             )
         ).scalar_one_or_none()
-    current_cycle = schedule.cycle_seq if schedule else survey_email.FIRST_CYCLE
+        # Resolved through the ONE resolver, not `schedule.cycle_seq or 1`: if
+        # the year's campaign was DELETED (#398) its cycle is retired and the
+        # current one is above it, so reading 1 here would mark that campaign's
+        # send rows as current and this screen would report the alum as blocked
+        # by a campaign that no longer exists — while the sender, which uses the
+        # same resolver, would happily email them. The console and the send
+        # disagreeing is the standing bug class in this area.
+        current_cycle = await survey_email.current_cycle_seq(
+            session, alum.graduation_year
+        )
 
     resets = await _reset_rows(session, alumni_id)
     reset_count = len(resets)

@@ -64,6 +64,7 @@ from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
+from app.models.survey_retirement import SurveyCampaignRetirement
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.repositories.alumni import build_alumni_query, has_status_label_exists
 from app.schemas.survey import (
@@ -248,14 +249,61 @@ manual console send for an unscheduled year). Matches the migration's backfill,
 so pre-#357 log rows and a fresh manual send agree."""
 
 
-async def current_cycle_seq(session: AsyncSession, graduation_year: int) -> int:
-    """The campaign cycle a send for this year belongs to right now (#357).
+async def retired_cycle_seq(session: AsyncSession, graduation_year: int) -> int:
+    """The highest cycle DELETED for this year, or 0 if none has been (#398).
 
-    Read from the year's ``survey_schedule`` row, which is the only thing that
-    ever advances it. A year with no schedule has never had a cycle started, so
-    its manual sends belong to cycle 1 — the same cycle the migration backfilled
-    onto existing rows, so a manual send before and after this change lands in
-    the same bucket."""
+    A deleted campaign's schedule row is gone, so the only trace of the cycle it
+    held is its ``survey_campaign_retirement`` row. That number is what keeps a
+    later campaign for the year from landing back on top of the retired sends."""
+    seq = (
+        await session.execute(
+            select(func.max(SurveyCampaignRetirement.cycle_seq)).where(
+                SurveyCampaignRetirement.graduation_year == graduation_year
+            )
+        )
+    ).scalar()
+    return int(seq or 0)
+
+
+async def next_cycle_seq(session: AsyncSession, graduation_year: int) -> int:
+    """The cycle a BRAND-NEW campaign for this year must start on (#398).
+
+    One above the highest retired cycle, or 1 for a year that has never had a
+    campaign deleted. Split out from :func:`current_cycle_seq` so creating a
+    schedule — which already knows there is no existing row — asks exactly one
+    question instead of two, and so the "start above the retired sends" rule has
+    a single implementation both callers share."""
+    retired = await retired_cycle_seq(session, graduation_year)
+    return retired + 1 if retired else FIRST_CYCLE
+
+
+async def current_cycle_seq(session: AsyncSession, graduation_year: int) -> int:
+    """The campaign cycle a send for this year belongs to right now (#357, #398).
+
+    THE one resolver. Everything that has to pick a cycle for a year without a
+    schedule row in hand comes through here — the manual console send, and the
+    creation of a new schedule (``survey_schedule._upsert_schedule``) — so the
+    two cannot answer differently and leave a send stranded in a cycle no
+    campaign is on.
+
+    Three cases, in order:
+
+    * **The year has a schedule** — its ``cycle_seq``, which is the only thing
+      ``start_new_cycle`` ever advances.
+    * **The year's campaign was DELETED** (#398) — one above the highest retired
+      cycle. The retired campaign's send-log rows keep their own cycle number and
+      become history: the cycle-scoped double-send guard no longer sees them, so
+      the alumni it emailed are eligible again, and the send log's UNIQUE
+      (year, alumni, stage, cycle, reset) cannot collide with them, so the new
+      claims are really inserted rather than swallowed by ON CONFLICT DO NOTHING.
+      Resolving to 1 here instead is exactly the #357 failure the delete used to
+      be refused over: every alum reads as already emailed and the campaign
+      completes having sent nothing.
+    * **Neither** — cycle 1, the value the #357 migration backfilled onto
+      existing rows, so a manual send for a never-scheduled year lands in the
+      same bucket before and after that change. Repeated manual sends for such a
+      year stay in that one cycle, which is what makes their stage dedupe work.
+    """
     seq = (
         await session.execute(
             select(SurveySchedule.cycle_seq).where(
@@ -263,7 +311,9 @@ async def current_cycle_seq(session: AsyncSession, graduation_year: int) -> int:
             )
         )
     ).scalar_one_or_none()
-    return seq if seq is not None else FIRST_CYCLE
+    if seq is not None:
+        return seq
+    return await next_cycle_seq(session, graduation_year)
 
 
 async def logged_alumni_ids(

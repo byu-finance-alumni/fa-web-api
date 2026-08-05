@@ -960,6 +960,10 @@ def test_create_schedule_inserts_new():
     session = QueueSession(
         [
             _Res(one=None),  # existence check -> none
+            # A brand-new row starts above any RETIRED cycle for the year, so a
+            # campaign deleted earlier cannot leave its send-log rows reading as
+            # this one's (#398). No retirements here -> cycle 1.
+            _Res(rows=[]),  # max(retired cycle_seq) -> none
             _Res(one=sched),  # get_schedule re-query
             _Res(rows=[]),  # per-stage counts
             _Res(rows=[]),  # manual-follow-up counts
@@ -981,6 +985,7 @@ def test_create_schedule_inserts_new():
     assert len(added) == 1
     assert added[0].graduation_year == 2000
     assert added[0].created_by_user_id == 5
+    assert added[0].cycle_seq == 1
 
 
 def test_create_schedule_replaces_existing():
@@ -1039,8 +1044,10 @@ def test_create_schedules_bulk_inserts_and_updates_many():
     session = QueueSession(
         [
             _Res(one=None),  # year 2000 existence -> new
+            _Res(rows=[]),  # ...its retired-cycle lookup (#398)
             _Res(one=existing),  # year 2001 existence -> found (update)
             _Res(one=None),  # year 2002 existence -> new
+            _Res(rows=[]),  # ...its retired-cycle lookup (#398)
             # list_schedules re-query: all rows + per-stage + follow-up counts
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 8, 1))]),
             _Res(rows=[]),
@@ -1099,6 +1106,7 @@ def test_create_schedules_bulk_dedupes_duplicate_year():
     session = QueueSession(
         [
             _Res(one=None),  # single existence check for the one deduped year
+            _Res(rows=[]),  # ...and its retired-cycle lookup (#398)
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 9, 1))]),
             _Res(rows=[]),
             _Res(rows=[]),

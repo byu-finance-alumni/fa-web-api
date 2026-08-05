@@ -700,6 +700,33 @@ CREATE TABLE survey_reset_log (
 );
 CREATE INDEX IF NOT EXISTS ix_survey_reset_log_alumni_at ON survey_reset_log (alumni_id, reset_at DESC);
 
+-- Deleted survey campaigns (#398). Any campaign can be deleted, whatever its
+-- status, and none of its emails or answers are removed with it. `survey_schedule`
+-- is the sole holder of a year's `cycle_seq`, so this row is where that number
+-- survives the delete: `survey_email.current_cycle_seq` resolves a year with no
+-- schedule to max(cycle_seq) + 1 here, which puts the next campaign for the year
+-- ABOVE the retired send-log rows -- so the cycle-scoped double-send guard no
+-- longer sees them and the send log's unique key cannot refuse the new claims.
+-- Resolving to 1 instead is #357: everyone reads as already emailed and the
+-- campaign completes having sent nothing. Same event-that-supersedes shape as
+-- survey_reset_log, one level up (campaign rather than alumnus). See
+-- migrations/2026-08-05_survey_campaign_retirement.sql.
+CREATE TABLE survey_campaign_retirement (
+    survey_campaign_retirement_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    graduation_year     int NOT NULL,
+    cycle_seq           int NOT NULL,
+    retired_at          timestamptz NOT NULL DEFAULT now(),
+    retired_by_user_id  bigint,
+    previous_status     varchar(20),
+    start_date          date,
+    sends_retired       int NOT NULL DEFAULT 0,
+    responses_kept      int NOT NULL DEFAULT 0,
+    CONSTRAINT fk_survey_campaign_retirement_user FOREIGN KEY (retired_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT ck_survey_campaign_retirement_cycle CHECK (cycle_seq >= 1),
+    CONSTRAINT uq_survey_campaign_retirement_year_cycle UNIQUE (graduation_year, cycle_seq)
+);
+CREATE INDEX IF NOT EXISTS ix_survey_campaign_retirement_year_cycle ON survey_campaign_retirement (graduation_year, cycle_seq DESC);
+
 -- Survey send cap (#542 follow-up). Single-row config (id pinned to 1) the
 -- scheduler paces against: when `enabled`, sends at most `daily_limit`/day and
 -- `monthly_limit`/month across every graduation year. See

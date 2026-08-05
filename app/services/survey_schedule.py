@@ -39,6 +39,11 @@ due, never how to send or how to record it. That split is deliberate: the manual
 send used to call the raw sender directly without recording anything, which is
 what produced the unscheduled second send of 2026-08-02.
 
+A campaign is normally created from the console, but a MANUAL send to a year that
+has none creates one too (:func:`create_campaign_for_send`, #405) — otherwise the
+send delivers the initial email and the cron, which only iterates schedule rows,
+never fires either reminder.
+
 A campaign can be stopped two ways. ``cancel`` is terminal — it never resumes.
 ``pause`` is reversible: it drops the row out of the runnable set so the cron
 skips it, and :func:`resume_schedule` shifts ``start_date`` forward by the paused
@@ -654,6 +659,163 @@ async def start_new_cycle(
     )
     await session.commit()
     return await get_schedule(session, graduation_year)
+
+
+# --------------------------------------- campaign left behind by a send (#405) -
+#
+# Jake, 2026-08-05: he cleared every campaign, then sent to a graduation year from
+# the console. Resend confirms the emails; the Surveys console showed no campaign
+# for that year.
+#
+# That was correct as built — `POST /survey/campaigns/{year}/send` writes
+# `survey_send_log` rows and nothing else — and the consequence was not. The
+# SCHEDULE ROW is what the cron iterates, and the cadence (day 0 / +7 / +14) is
+# derived from its `start_date`. With no row there is nothing for the cron to
+# pick up, so a manual send delivers the initial email and THE TWO REMINDERS
+# NEVER FIRE. Nothing says so: the send reports success, the console lists no
+# campaign, and the silence looks like "no campaign was scheduled" rather than
+# "two thirds of a campaign was silently dropped".
+#
+# AUTOMATIC, NOT A REFUSAL. The alternative was to refuse the send until a
+# campaign exists, which is more predictable. Chosen against, for four reasons:
+#
+#   1. There is nothing left for the operator to decide. The cohort is the year
+#      they picked, the cadence is fixed, and the start date is "when the initial
+#      went out" — which the send log already knows exactly. A refusal makes them
+#      re-enter facts the system holds, and the one field they could get wrong
+#      (the start date) is precisely the one that silently mis-times reminders.
+#   2. The failure it prevents is invisible; the state it creates is not. A
+#      spurious campaign is listed in the console and deletable (#398, the same
+#      day). A missing one shows nowhere and drops two emails.
+#   3. Refusing leaves the ALREADY-BROKEN cohorts unfixable from the console —
+#      Jake's cohort has send-log rows and no campaign right now, and pressing
+#      Send again is how it gets one (nothing is re-emailed; see below).
+#   4. Silently sending with no campaign is the one option that is definitely
+#      wrong, and a refusal is not obviously better than the ask in the issue.
+#
+# THE CREATION IS DRIVEN BY THE SEND LOG, NOT BY THIS CALL'S OUTCOME. The
+# campaign exists if and only if an email for (year, current cycle, stage 0) is
+# on record, and its `start_date` is the EARLIEST such row. Three things fall out
+# of that one rule, rather than needing three rules:
+#
+#   * a DRY RUN claims nothing, so there is nothing to find and nothing is
+#     created — the guard is structural, not a second `if dry_run`;
+#   * a send that emailed nobody because nobody was eligible creates no empty
+#     campaign;
+#   * a REPEAT send for a year that was emailed before this fix (sent=0, every
+#     recipient already claimed) still leaves the campaign behind, BACKDATED to
+#     the day those emails really went out — which is the repair path for the
+#     cohorts already in this state. Using `today` there would shift the whole
+#     cadence by however many days had passed.
+#
+# A PARTIAL SEND (the `limit` query param, or Resend throttling the run) creates a
+# campaign that claims nothing about the people it did not reach. Every count the
+# console shows comes from `survey_send_log`, so `sent_initial` is the real,
+# partial number; and `select_stage_targets` scans stage 0 first, so the next cron
+# run finishes the initial for the remainder BEFORE any reminder goes out,
+# whatever the calendar says. The start date is the first delivered email either
+# way, so the reminders are timed off a real event.
+
+
+async def create_campaign_for_send(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    cycle_seq: int,
+    actor_user_id: int | None,
+) -> bool:
+    """Leave a campaign behind for a manual send to an unscheduled year (#405).
+
+    Returns True when a ``survey_schedule`` row was created. Callers must only
+    reach here having established that the year has NO schedule; this never
+    replaces or edits an existing campaign (that is :func:`create_schedule` and
+    :func:`start_new_cycle`, which mean different things).
+
+    ``cycle_seq`` is PASSED IN — the cycle the send itself claimed under — and is
+    never re-resolved here. That is the whole safety argument of this function.
+    A manual send with no schedule resolves its cycle through
+    :func:`survey_email.current_cycle_seq`, which for such a year returns
+    ``next_cycle_seq`` — exactly what ``_upsert_schedule`` would have chosen for a
+    fresh row. So the two agree today by construction, and threading the value
+    through means they cannot be made to disagree by a later edit to either. The
+    campaign therefore opens on the cycle the just-written send-log rows are in,
+    which is what makes those rows read as ITS stage 0: the cycle-scoped
+    double-send guard (``survey_email.logged_alumni_ids``) sees them, finds every
+    recipient already logged for stage 0, and the campaign picks up at the
+    reminders instead of re-emailing the cohort.
+
+    Created ``active``, not ``scheduled``: the initial has already gone out. Both
+    are runnable so the cron behaves identically either way, but ``scheduled``
+    would tell an operator this campaign has not sent anything yet.
+    """
+    start_date = await _first_send_date(
+        session, graduation_year=graduation_year, cycle_seq=cycle_seq
+    )
+    if start_date is None:
+        # Nothing was emailed for this cycle — a dry run, or a send with no
+        # eligible recipients. There is no campaign to leave behind.
+        return False
+
+    session.add(
+        SurveySchedule(
+            graduation_year=graduation_year,
+            start_date=start_date,
+            status=STATUS_ACTIVE,
+            cycle_seq=cycle_seq,
+            created_by_user_id=actor_user_id,
+            last_run_at=_now(),
+        )
+    )
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="create_survey_schedule",
+            entity_type="survey_campaign",
+            entity_id=graduation_year,
+            new_value=(
+                f"created by a manual send; grad_year={graduation_year} "
+                f"cycle={cycle_seq} start_date={start_date.isoformat()} "
+                f"status={STATUS_ACTIVE}"
+            ),
+        )
+    )
+    await session.commit()
+    return True
+
+
+async def _first_send_date(
+    session: AsyncSession, *, graduation_year: int, cycle_seq: int
+) -> datetime.date | None:
+    """The day this cycle's INITIAL email actually went out, or None if it hasn't.
+
+    The reminder cadence is measured from ``start_date``, so a campaign created
+    after the fact has to be anchored to a real event rather than to the clock at
+    the moment somebody pressed a button. ``min(sent_at)`` over the cycle's stage-0
+    rows is that event, recorded by the claim itself.
+
+    Stage 0 specifically: a later stage is only reachable when a schedule already
+    exists, so it cannot be the start of a campaign there is none of.
+
+    Superseded rows (#395) are deliberately NOT filtered out. The question is
+    "when did we first email this cohort", and a reset does not un-send an email;
+    excluding them could only move the start date later, which is the direction
+    that mis-times reminders.
+
+    UTC, matching ``_today()`` — the clock ``_load_schedules_due`` compares
+    ``start_date`` against.
+    """
+    first = await session.scalar(
+        select(func.min(SurveySendLog.sent_at)).where(
+            SurveySendLog.graduation_year == graduation_year,
+            SurveySendLog.cycle_seq == cycle_seq,
+            SurveySendLog.stage == STAGE_INITIAL,
+        )
+    )
+    if first is None:
+        return None
+    if first.tzinfo is not None:
+        first = first.astimezone(datetime.UTC)
+    return first.date()
 
 
 async def create_schedules_bulk(

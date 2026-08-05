@@ -16,6 +16,7 @@ Not a test module (no ``test_`` prefix), so pytest imports it rather than
 collecting it.
 """
 
+import datetime
 from types import SimpleNamespace
 
 from sqlalchemy.sql.dml import Delete, Insert
@@ -79,13 +80,22 @@ class SendLogSession:
         # UNIQUE constraint, cycle included (#357). Keying without the cycle
         # would make this fake unable to reproduce the bug it now guards.
         self.send_log: set[tuple[int, int, int, int]] = set()
+        # When each of those emails went out. The send log is not only the
+        # double-send guard: a campaign created after the fact takes its
+        # `start_date` from `min(sent_at)` for the cycle's stage-0 rows (#405),
+        # so a fake that could not answer "when" could not test the reminder
+        # timing that hangs off it.
+        self.sent_at: dict[tuple[int, int, int, int], datetime.datetime] = {}
         self._fail_commit_after = fail_commit_after
 
     # -- helpers -------------------------------------------------------------
 
-    def seed_sent(self, graduation_year, stage, alumni_ids, cycle_seq=1):
+    def seed_sent(self, graduation_year, stage, alumni_ids, cycle_seq=1, sent_at=None):
+        when = sent_at or datetime.datetime.now(datetime.UTC)
         for alumni_id in alumni_ids:
-            self.send_log.add((graduation_year, alumni_id, stage, cycle_seq))
+            key = (graduation_year, alumni_id, stage, cycle_seq)
+            self.send_log.add(key)
+            self.sent_at[key] = when
 
     def logged(self, graduation_year, stage, cycle_seq=1):
         return {
@@ -135,9 +145,29 @@ class SendLogSession:
         breakdown: these tests are about the SEND, and a send must not depend on
         the reporting counts being populated. Tests that care about the numbers
         drive them through a real (SQLite) session instead.
+
+        A scalar over ``survey_send_log`` is answered from the real store instead
+        — that is the aggregate a campaign created by a manual send takes its
+        start date from (#405), and a canned 0 there is not a datetime.
         """
         self.executed += 1
+        froms = stmt.get_final_froms()
+        if any(getattr(f, "name", None) == "survey_send_log" for f in froms):
+            return self._min_sent_at(stmt)
         return 0
+
+    def _min_sent_at(self, stmt):
+        """``min(sent_at)`` for the (year, stage, cycle) the statement names."""
+        params = dict(stmt.compile().params)
+        year = params.get("graduation_year_1")
+        stage = params.get("stage_1")
+        cycle = params.get("cycle_seq_1", 1)
+        stamps = [
+            self.sent_at[key]
+            for key in self.send_log
+            if key == (year, key[1], stage, cycle) and key in self.sent_at
+        ]
+        return min(stamps) if stamps else None
 
     def add(self, obj):
         self.added.append(obj)
@@ -167,6 +197,9 @@ class SendLogSession:
             if key in self.send_log:
                 continue  # ON CONFLICT DO NOTHING -> not returned
             self.send_log.add(key)
+            # Postgres stamps `sent_at` from its own clock (server default); the
+            # claim never supplies one.
+            self.sent_at[key] = datetime.datetime.now(datetime.UTC)
             claimed.append(values["alumni_id"])
         return claimed
 
@@ -178,9 +211,10 @@ class SendLogSession:
         # must not remove cycle N-1's row for the same alum + stage.
         cycle = params.get("cycle_seq_1", 1)
         ids = set(params.get("alumni_id_1") or [])
-        self.send_log -= {
-            (year, alumni_id, stage, cycle) for alumni_id in ids
-        }
+        released = {(year, alumni_id, stage, cycle) for alumni_id in ids}
+        self.send_log -= released
+        for key in released:
+            self.sent_at.pop(key, None)
 
 
 def audits(session):

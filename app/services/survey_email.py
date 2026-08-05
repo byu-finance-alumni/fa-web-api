@@ -1464,8 +1464,28 @@ async def select_stage_targets(
     return None, []
 
 
-async def campaign_max_stage(session: AsyncSession, graduation_year: int) -> int:
-    """The ceiling stage a MANUAL send for this year may record.
+async def schedule_start_date(
+    session: AsyncSession, graduation_year: int
+) -> datetime.date | None:
+    """The year's campaign start date, or None when it has no campaign at all.
+
+    ONE read answering two questions the manual send has to ask together (#405):
+    which stage it may record, and whether it must leave a campaign behind. Two
+    separate reads would be one extra round trip and one chance for a campaign
+    appearing in between to make the send's two halves disagree about whether
+    there was one.
+    """
+    return (
+        await session.execute(
+            select(SurveySchedule.start_date).where(
+                SurveySchedule.graduation_year == graduation_year
+            )
+        )
+    ).scalar_one_or_none()
+
+
+def max_stage_for_start(start_date: datetime.date | None) -> int:
+    """The ceiling stage a MANUAL send may record, given the campaign's start.
 
     A manual send has no stage of its own — there is one email template — but
     ``survey_send_log`` is UNIQUE on (year, alumni, stage), so it must record a
@@ -1474,18 +1494,20 @@ async def campaign_max_stage(session: AsyncSession, graduation_year: int) -> int
     a synthetic ``stage = -1`` would let the unique constraint hold while the
     same alum received both a manual email and a stage-0 cron email — the very
     incident this is fixing.
+
+    ``None`` (no campaign) therefore means stage 0 — which is also why a campaign
+    created from such a send is anchored to its stage-0 rows: there is no other
+    stage it could have written.
     """
-    start_date = (
-        await session.execute(
-            select(SurveySchedule.start_date).where(
-                SurveySchedule.graduation_year == graduation_year
-            )
-        )
-    ).scalar_one_or_none()
     if start_date is None:
         return STAGE_INITIAL
     elapsed = (datetime.datetime.now(datetime.UTC).date() - start_date).days
     return ceiling_stage_for(elapsed)
+
+
+async def campaign_max_stage(session: AsyncSession, graduation_year: int) -> int:
+    """:func:`max_stage_for_start` for a year, reading the schedule itself."""
+    return max_stage_for_start(await schedule_start_date(session, graduation_year))
 
 
 # --------------------------------------------------------------- send lock ----
@@ -1955,10 +1977,29 @@ async def send_campaign(
     answer, so it says so rather than reporting a silent "sent 0". A DRY RUN
     takes no lock — it sends nothing, spends no budget, and staff must be able to
     preview a cohort at any time, including while the cron is running.
+
+    A REAL send to a year with NO campaign leaves one behind (#405), so the two
+    reminders the cadence owes actually go out and the send is visible in the
+    console. See ``survey_schedule.create_campaign_for_send`` for why that is
+    automatic rather than a refusal, and why it cannot re-send the initial.
     """
+    # Local, because `survey_schedule` imports THIS module: the send belongs here
+    # and the campaign row belongs there, and the manual send is the one caller
+    # that needs both. A module-level import would be a cycle.
+    from app.services import survey_schedule
+
     settings = get_settings()
     base_url = settings.survey_app_base_url
-    max_stage = await campaign_max_stage(session, graduation_year)
+    # One read, two answers: the stage ceiling, and whether this year has a
+    # campaign at all. Taken BEFORE the send, so the question being answered is
+    # "was there a campaign when the operator pressed Send?" rather than "is
+    # there one now?" — this call is about to create one.
+    start_date = await schedule_start_date(session, graduation_year)
+    max_stage = max_stage_for_start(start_date)
+    # Resolved here rather than inside `send_survey_stage`, so the campaign
+    # created below can be given the SAME cycle the send claimed under — passed,
+    # not re-derived, exactly how the cron threads it (#357).
+    cycle_seq = await current_cycle_seq(session, graduation_year)
 
     async def _send() -> SendOutcome:
         return await send_survey_stage(
@@ -1968,8 +2009,10 @@ async def send_campaign(
             actor_user_id=actor_user_id,
             dry_run=dry_run,
             limit=limit,
+            cycle_seq=cycle_seq,
         )
 
+    campaign_created = False
     if dry_run:
         outcome = await _send()
     else:
@@ -1980,6 +2023,19 @@ async def send_campaign(
                     "and try again — nothing was sent."
                 )
             outcome = await _send()
+            if start_date is None:
+                # Inside the lock: the campaign is part of this send, and no
+                # other sender may be mid-flight for the year while it appears.
+                # A send that RAISED never gets here — the operator sees the
+                # error, and their retry creates the campaign backdated to
+                # whatever was claimed, because the creation reads the send log
+                # rather than this call's outcome.
+                campaign_created = await survey_schedule.create_campaign_for_send(
+                    session,
+                    graduation_year=graduation_year,
+                    cycle_seq=cycle_seq,
+                    actor_user_id=actor_user_id,
+                )
     # What is left of THIS stage: the targets we did not send to. (Before, this
     # was measured against every eligible alum, which counted people who had
     # already received this exact email as still owed it.)
@@ -2006,6 +2062,7 @@ async def send_campaign(
         dry_run=dry_run,
         retry_after_seconds=outcome.retry_after,
         stage_complete=outcome.stage is None,
+        campaign_created=campaign_created,
         breakdown=breakdown,
         sample=[
             SurveySendSample(

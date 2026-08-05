@@ -4,20 +4,20 @@ Thin query layer — business rules (soft-delete, manual-edit stamping) live in
 the service. ``build_alumni_query`` is a pure function (no IO) so the filter
 logic can be unit-tested by compiling the statement.
 
-Search currently covers the alumni *core* table (names, external ids,
-graduation year, deceased). Employer / industry / title / city / state / tags /
-status-label search needs the related tables (modeled later); the filter list
-here is structured so those conditions can be added as joins without reshaping
-callers.
+Free-text search (``q``) covers the alumni core table (names, external ids,
+designations) AND, since #620, the related employment record — current employer,
+title, city, state, country and industry, plus past employers — through
+correlated EXISTS subqueries. See ``app.core.search_terms`` (parsing) and
+``app.repositories.alumni_search`` (matching + ranking SQL).
 """
 
 import datetime
-import re
 
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Select, and_, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dropdowns import DESIGNATION_NEGATIVES, WHEEL_INDUSTRIES
+from app.core.search_terms import parse_free_text
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Interaction, Survey
@@ -26,6 +26,7 @@ from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
 from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
+from app.repositories.alumni_search import q_conditions, relevance_expression
 from app.utils.sql import escape_like
 
 # Biennial survey cadence (#160): an alumnus is DUE for surveying when their
@@ -61,41 +62,27 @@ _OTHER_EXCLUDED_LOWER: frozenset[str] = frozenset(
 )
 
 
-# Free-text ``q`` tokenization (#281). Names are stored atomized (first_name
-# 'Kyle', last_name 'Marsh'), so wrapping the whole raw query in %...% can never
-# match a full name — the space is matched literally, not as a separator. The
-# query is split on whitespace/commas ("Marsh, Kyle" == "Kyle Marsh") and the
-# tokens are AND-ed, each token OR-ing across every name column. Capped so a
-# pasted paragraph can't fan out into a huge AND chain of leading-wildcard
-# ILIKEs (none of which can use a btree index).
-_Q_TOKEN_SEPARATORS = re.compile(r"[\s,]+")
-_Q_TOKEN_LIMIT = 5
-
-# The columns EVERY token is matched against (single- or multi-token).
+# Free-text ``q`` (#281, #404, #620). Tokenization, filler removal, preposition
+# routing and normalization live in ``app.core.search_terms``; the matching and
+# ranking SQL lives in ``app.repositories.alumni_search``. Both are pure, so
+# ``build_alumni_query`` stays IO-free and the export can compile it without a
+# database session.
 #
-# Names: Tanya (#281) — "many times they also go by their middle names or females
-# got married and changed their last name so it should be searching all names in
-# their profile." A token may match ANY of these — "Kyle Marsh" matches with
-# 'Kyle' on first_name and 'Marsh' on last_name, so the OR set is per-token, not
-# per-column.
+# The semantics that were true before and are still true:
+#   * Names are stored atomized (first_name 'Kyle', last_name 'Marsh'), so the
+#     query is split into tokens and the tokens AND-ed, each token OR-ing across
+#     every searchable column — "Kyle Marsh" matches 'Kyle' on first_name and
+#     'Marsh' on last_name (#281), and "Marsh, Kyle" is the same query.
+#   * Every token searches birth_name too, so a maiden-name lookup works (#216).
+#   * other_designations is free text that legitimately CONTAINS spaces
+#     ("Series 7"), so it stays in the per-token set (#404).
 #
-# other_designations (#404): free text that legitimately CONTAINS spaces
-# ("Series 7"), so it must stay in the per-token set — token 'Series' and token
-# '7' both match the same cell and the AND is satisfied. Restricting it to
-# single-token queries would break the "Series 7" search.
-_Q_TOKEN_COLUMNS = (
-    Alumni.first_name,
-    Alumni.middle_name,
-    Alumni.last_name,
-    Alumni.preferred_first_name,
-    Alumni.birth_name,
-    Alumni.other_designations,
-)
-
-
-def _q_tokens(q: str) -> list[str]:
-    """Split a free-text query into at most ``_Q_TOKEN_LIMIT`` search tokens."""
-    return [t for t in _Q_TOKEN_SEPARATORS.split(q.strip()) if t][:_Q_TOKEN_LIMIT]
+# What #620 added: the searchable columns now also include the current employer,
+# title, city, state, country and industry plus past employers; every comparison
+# is on a normalized (case-, accent- and punctuation-free) form so a missing
+# space or a typo stops being a way to miss a row; filler words are dropped
+# instead of becoming required matches; and "at ..." / "in ..." route the words
+# that follow them to a narrower field group.
 
 
 def _as_values(value: "str | list[str] | None") -> list[str]:
@@ -153,6 +140,35 @@ _DESIGNATION_COLUMNS = {
 }
 
 
+def _designation_holder_exists(token: str):
+    """Holder-EXISTS for a token that IS a certification (CFP / CFA / CPA), else None.
+
+    A free-text token naming a certification also matches alumni who HOLD it on
+    their program-engagement profile (#404). Passed into the free-text builder
+    so the EXISTS sits INSIDE that token's OR group: "CFA Marsh" reads as "holds
+    a CFA (or has 'CFA' written on the record) AND is named Marsh" — the cert
+    token satisfies its own group via the EXISTS and never has to match a name
+    column too.
+
+    Matched on the WHOLE token, never as a substring: a surname like
+    "Cpapadopoulos" contains "cpa" and would otherwise silently fold every CPA
+    holder into a name search, with nothing in the result list explaining why
+    they are there. A token that is not a certification returns ``None``, so a
+    plain name search adds no engagement join at all.
+    """
+    cert_column = _DESIGNATION_COLUMNS.get(token.upper())
+    if cert_column is None:
+        return None
+    return (
+        select(AlumniProgramEngagement.engagement_profile_id)
+        .where(
+            AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
+            _holds_designation(cert_column),
+        )
+        .exists()
+    )
+
+
 async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
     return await session.get(Alumni, alumni_id)
 
@@ -171,6 +187,7 @@ def alumni_order_by(
     city=None,
     state=None,
     employer=None,
+    relevance=None,
 ) -> tuple:
     """Return the ORDER BY tuple for a list ``sort`` token.
 
@@ -184,7 +201,12 @@ def alumni_order_by(
     tie-broken by last name then the unique PK so tied rows have a total order and
     OFFSET paging can't duplicate/skip across a page boundary (#183). Unknown/
     legacy values — or a related token whose expression wasn't supplied — fall
-    back to name."""
+    back to name.
+
+    ``relevance`` (#620) is the free-text ranking expression and sorts DESC (best
+    first). It gets the SAME last-name + PK tiebreakers as every other token, and
+    for the same reason: a score is not unique, and OFFSET paging over a
+    non-total order silently repeats rows on page 2 and drops others."""
     mapping: dict[str, tuple] = {
         "name": (Alumni.last_name.asc(), Alumni.alumni_id.asc()),
         "grad_desc": (
@@ -222,6 +244,12 @@ def alumni_order_by(
                 Alumni.last_name.asc(),
                 Alumni.alumni_id.asc(),
             )
+    if relevance is not None:
+        mapping["relevance"] = (
+            relevance.desc(),
+            Alumni.last_name.asc(),
+            Alumni.alumni_id.asc(),
+        )
     return mapping.get(sort or "name", (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
 
 
@@ -354,48 +382,15 @@ def build_alumni_query(
     # Alumni / friends split (#218). None -> no predicate (return both).
     if is_alumni is not None:
         conditions.append(Alumni.is_alumni.is_(is_alumni))
-    if q and (q_tokens := _q_tokens(q)):
-        # Tokens are AND-ed (every token must match SOMETHING), each token OR-ing
-        # across the searchable columns — not necessarily the same one (#281).
-        # The birth_name column keeps a maiden-name search working (#216).
-        single_token = len(q_tokens) == 1
-        for token in q_tokens:
-            like = f"%{escape_like(token)}%"
-            q_terms = [c.ilike(like, escape="\\") for c in _Q_TOKEN_COLUMNS]
-            # The external ids are single atomic values that never contain a
-            # space, so they only make sense for a single-token query: AND-ing an
-            # id column against a two-word name query could never match (#281).
-            if single_token:
-                q_terms += [
-                    Alumni.byu_id.ilike(like, escape="\\"),
-                    Alumni.net_id.ilike(like, escape="\\"),
-                ]
-            # A token that IS a professional certification (CFP / CFA / CPA) also
-            # matches alumni who HOLD it on their program-engagement profile
-            # (#404). The token match is decided here in Python (the builder
-            # receives the concrete ``q``), so a plain name search adds no
-            # engagement join. Kept INSIDE this token's OR group so "CFA Marsh"
-            # reads as "holds a CFA (or has 'CFA' written on the record) AND is
-            # named Marsh" — the cert token satisfies its own group via the
-            # EXISTS and never has to match a name column too.
-            #
-            # Matched on the WHOLE token, never as a substring: a surname like
-            # "Cpapadopoulos" contains "cpa" and would otherwise silently fold
-            # every CPA holder into a name search, with nothing in the result
-            # list explaining why they're there. Splitting on commas as well as
-            # whitespace means "CPA", "Holds a CPA" and "CFA, CPA" all still
-            # yield a clean, exactly-matching token.
-            cert_column = _DESIGNATION_COLUMNS.get(token.upper())
-            if cert_column is not None:
-                q_terms.append(
-                    select(AlumniProgramEngagement.engagement_profile_id)
-                    .where(
-                        AlumniProgramEngagement.alumni_id == Alumni.alumni_id,
-                        _holds_designation(cert_column),
-                    )
-                    .exists()
-                )
-            conditions.append(or_(*q_terms))
+    # Free-text search (#620). The sentence is parsed into routed, normalized
+    # segments (see app.core.search_terms) and each segment becomes one
+    # condition; segments are AND-ed. Both this list query and the CSV export go
+    # through here, so they can never describe different populations — the
+    # ranking that makes the LIST readable is applied separately in ``list_page``
+    # and touches no predicate.
+    parsed_q = parse_free_text(q)
+    if parsed_q:
+        conditions.extend(q_conditions(parsed_q, extra=_designation_holder_exists))
     # Per-field partial matches (AND-combined; blanks ignored).
     def _field_like(value: str | None, column) -> None:
         if value and value.strip():
@@ -883,7 +878,11 @@ async def list_page(
     without an N+1 or a row-multiplying join. The single-record schema ignores
     these.
     """
-    sort = filters.pop("sort", "name") or "name"
+    # ``sort`` unset means "pick the sensible default": relevance for a free-text
+    # search (the best answer belongs on page 1, not wherever the alphabet puts
+    # it), last name otherwise. An explicit token from the UI always wins.
+    relevance = relevance_expression(parse_free_text(filters.get("q")))
+    sort = filters.pop("sort", None) or ("relevance" if relevance is not None else "name")
     base = build_alumni_query(**filters)
     total = await session.scalar(select(func.count()).select_from(base.subquery()))
 
@@ -923,14 +922,22 @@ async def list_page(
         .limit(1)
         .scalar_subquery()
     )
-    rows_stmt = select(
+    projection = [
         Alumni,
         current_employer,
         current_industry,
         current_industry_secondary,
         current_city,
         current_state,
-    )
+    ]
+    # The relevance score is SELECTed (as a label) and ordered by NAME rather
+    # than repeated inline in the ORDER BY: the expression is large, and
+    # repeating it makes PostgreSQL evaluate it twice per row for no benefit.
+    order_relevance = None
+    if relevance is not None:
+        projection.append(relevance.label("relevance"))
+        order_relevance = literal_column("relevance")
+    rows_stmt = select(*projection)
     if base.whereclause is not None:
         rows_stmt = rows_stmt.where(base.whereclause)
 
@@ -938,6 +945,10 @@ async def list_page(
     # sorts (industry / city / state, #357) order by the SAME correlated scalar
     # subqueries the row projection uses, so the ordering matches the displayed
     # column exactly. Unknown values fall back to name.
+    #
+    # Relevance ranking (#620) is applied ONLY here, in the ORDER BY — never as a
+    # predicate — so the population the list shows stays byte-identical to the
+    # one the CSV export builds from the same filters.
     rows_stmt = (
         rows_stmt.order_by(
             *alumni_order_by(
@@ -946,6 +957,7 @@ async def list_page(
                 city=current_city,
                 state=current_state,
                 employer=current_employer,
+                relevance=order_relevance,
             )
         )
         .limit(limit)
@@ -953,7 +965,8 @@ async def list_page(
     )
     result = await session.execute(rows_stmt)
     items: list[Alumni] = []
-    for alumnus, employer, industry, industry_secondary, city, state in result.all():
+    for row in result.all():
+        alumnus, employer, industry, industry_secondary, city, state = row[:6]
         alumnus.current_employer = employer
         alumnus.current_industry = industry
         alumnus.current_industry_secondary = industry_secondary

@@ -996,4 +996,43 @@ CREATE INDEX idx_alumni_preferred_first_name_norm     ON alumni (lower(trim(pref
 CREATE INDEX idx_alumni_contact_info_personal_email_norm ON alumni_contact_info (lower(trim(personal_email)));
 CREATE INDEX idx_alumni_contact_info_work_email_norm     ON alumni_contact_info (lower(trim(work_email)));
 
+-- Free-text alumni search (#620). ``alumni_search_norm`` is the canonical
+-- normal form both sides of every comparison collapse to (accents folded, case
+-- folded, every non-alphanumeric character deleted) and the GIN trigram indexes
+-- are what make the exact / prefix / contains / similar legs index scans rather
+-- than a sequential scan. See migrations/2026-08-05_fuzzy_alumni_search.sql --
+-- the index expressions must match the emitted SQL verbatim.
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA extensions;
+
+CREATE OR REPLACE FUNCTION public.immutable_unaccent(text)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS $$
+    SELECT extensions.unaccent('extensions.unaccent'::regdictionary, $1)
+$$;
+
+CREATE OR REPLACE FUNCTION public.alumni_search_norm(text)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    SELECT regexp_replace(
+        lower(public.immutable_unaccent(coalesce($1, ''))),
+        '[^a-z0-9]+', '', 'g'
+    )
+$$;
+
+CREATE INDEX idx_alumni_first_name_trgm             ON alumni USING gin (public.alumni_search_norm(first_name) extensions.gin_trgm_ops);
+CREATE INDEX idx_alumni_middle_name_trgm            ON alumni USING gin (public.alumni_search_norm(middle_name) extensions.gin_trgm_ops);
+CREATE INDEX idx_alumni_last_name_trgm              ON alumni USING gin (public.alumni_search_norm(last_name) extensions.gin_trgm_ops);
+CREATE INDEX idx_alumni_preferred_first_name_trgm   ON alumni USING gin (public.alumni_search_norm(preferred_first_name) extensions.gin_trgm_ops);
+CREATE INDEX idx_alumni_birth_name_trgm             ON alumni USING gin (public.alumni_search_norm(birth_name) extensions.gin_trgm_ops);
+CREATE INDEX idx_alumni_other_designations_trgm     ON alumni USING gin (public.alumni_search_norm(other_designations) extensions.gin_trgm_ops);
+CREATE INDEX idx_alumni_byu_id_trgm                 ON alumni USING gin (public.alumni_search_norm(byu_id) extensions.gin_trgm_ops);
+CREATE INDEX idx_alumni_net_id_trgm                 ON alumni USING gin (public.alumni_search_norm(net_id) extensions.gin_trgm_ops);
+CREATE INDEX idx_current_employment_employer_trgm            ON current_employment USING gin (public.alumni_search_norm(current_employer) extensions.gin_trgm_ops);
+CREATE INDEX idx_current_employment_title_trgm               ON current_employment USING gin (public.alumni_search_norm(current_title) extensions.gin_trgm_ops);
+CREATE INDEX idx_current_employment_city_trgm                ON current_employment USING gin (public.alumni_search_norm(current_city) extensions.gin_trgm_ops);
+CREATE INDEX idx_current_employment_state_trgm               ON current_employment USING gin (public.alumni_search_norm(current_state) extensions.gin_trgm_ops);
+CREATE INDEX idx_current_employment_country_trgm             ON current_employment USING gin (public.alumni_search_norm(current_country) extensions.gin_trgm_ops);
+CREATE INDEX idx_current_employment_industry_trgm            ON current_employment USING gin (public.alumni_search_norm(current_industry) extensions.gin_trgm_ops);
+CREATE INDEX idx_current_employment_industry_secondary_trgm  ON current_employment USING gin (public.alumni_search_norm(current_industry_secondary) extensions.gin_trgm_ops);
+CREATE INDEX idx_employment_history_employer_trgm            ON employment_history USING gin (public.alumni_search_norm(employer_name) extensions.gin_trgm_ops);
+
 COMMIT;

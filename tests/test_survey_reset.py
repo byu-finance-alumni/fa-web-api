@@ -265,6 +265,15 @@ class _World:
             survey_email.logged_alumni_ids(self.session, year, stage, cycle)
         )
 
+    def usage(self):
+        """What the console's "Sent this month" tile reads — the REAL
+        `get_send_usage` query run against these send-log rows.
+
+        Deliberately not a canned fake session (which is all the send-service
+        tests use): the question here is whether a reset changes the number of
+        ROWS that query counts, which a stubbed result cannot answer."""
+        return asyncio.run(survey_email.get_send_usage(self.session))
+
     # -- actions -------------------------------------------------------------
 
     def state(self, alumni_id=_TARGET):
@@ -283,6 +292,20 @@ class _World:
                 self.session, year, actor_user_id=actor_user_id
             )
         )
+
+
+@pytest.fixture
+def no_usage_baseline(monkeypatch):
+    """`get_send_usage` with no manual baseline configured (#544), so the meter
+    is purely a count of send-log rows and the assertions are about those rows
+    and nothing else."""
+
+    class _S:
+        survey_usage_baseline_at = None
+        survey_usage_baseline_today = 0
+        survey_usage_baseline_month = 0
+
+    monkeypatch.setattr(survey_email, "get_settings", lambda: _S())
 
 
 @pytest.fixture
@@ -386,6 +409,69 @@ def test_a_reset_alumnus_can_be_claimed_again_for_the_same_stage(world):
     assert [r.reset_seq for r in rows] == [0, 1]
     # And now the NEW row is the one that blocks; the old one stays inert.
     assert world.logged_for(0) == {_TARGET}
+
+
+# ------------------------------------ the reset must not move the meter -------
+#
+# Jake, 2026-08-05: "our 'sent this month' number is wrong, we should be at three
+# not 2."
+#
+# The first version of #395 made an alumnus surveyable again by DELETING their
+# `survey_send_log` rows -- every year, every cycle, unscoped. It was live on
+# prod between the 14:03 and 15:12 deploys that day. `survey_email.get_send_usage`
+# counts exactly those rows, so resetting ONE alumnus who had already been
+# emailed this month silently dropped the console's "Sent this month" by one, and
+# with it `survey_schedule._run_allowance`, which subtracts the same figure from
+# the daily/monthly cap -- handing the scheduler a budget that had already been
+# spent. That is the precise failure `get_send_usage`'s docstring says the send
+# log exists to prevent, reintroduced from the other side: not an unrecorded
+# send, an UNRECORDED-AFTERWARDS one.
+#
+# The rewrite deletes nothing, so the meter cannot move. These two tests hold the
+# send log and the budget meter together, because nothing else did: every
+# existing usage test runs against a canned session that returns whatever number
+# it was handed, and so would have passed throughout the incident.
+
+
+def test_a_reset_never_reduces_the_send_usage_meter(world, no_usage_baseline):
+    """A reset changes who may be emailed NEXT. It cannot change what was
+    already sent, because those emails were really sent and really cost budget."""
+    now = datetime.datetime.now(datetime.UTC)
+    for alumni_id in (_TARGET, _BYSTANDER, 3):
+        world.alum(alumni_id)
+        world.sent(alumni_id, (0,), when=now)
+    world.schedule()
+
+    before = world.usage()
+    assert (before.sent_this_month, before.sent_today) == (3, 3)
+
+    world.reset(_TARGET)
+
+    after = world.usage()
+    assert (after.sent_this_month, after.sent_today) == (3, 3)
+    # The rows the meter counts are all still there — the reset added a row to
+    # `survey_reset_log` and took nothing away.
+    assert len(world.send_rows(_TARGET)) == 1
+    assert len(world.reset_rows(_TARGET)) == 1
+
+
+def test_a_reset_and_resend_costs_the_budget_two_emails(world, no_usage_baseline):
+    """The other direction, and why the meter is deliberately NOT filtered by
+    `send_not_superseded`: an alum who was reset and emailed again received two
+    emails. Both were paid for, so both must show — hiding the pre-reset one
+    would under-report the account's real Resend spend."""
+    now = datetime.datetime.now(datetime.UTC)
+    world.alum(_TARGET)
+    world.schedule()
+    world.sent(_TARGET, (0,), when=now)
+
+    world.reset(_TARGET)
+    # What `_claim_batch` writes for a reset alumnus on the next send.
+    world.sent(_TARGET, (0,), when=now, reset_seq=1)
+
+    usage = world.usage()
+    assert usage.sent_this_month == 2
+    assert usage.sent_today == 2
 
 
 def test_reset_keeps_a_rejected_response_too(world):

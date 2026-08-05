@@ -16,6 +16,7 @@ import datetime
 from sqlalchemy import Select, and_, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import email_reach
 from app.core.dropdowns import (
     DESIGNATION_NEGATIVES,
     EMPLOYER_NOT_APPLICABLE_BY_LOWER,
@@ -142,6 +143,29 @@ def _as_values(value: "str | list[str] | None") -> list[str]:
 def _ilike_any(column, values: list[str]):
     """OR of case-insensitive exact matches (literal %/_ escaped) for `values`."""
     return or_(*[column.ilike(escape_like(v), escape="\\") for v in values])
+
+
+def has_status_label_exists(labels: "str | list[str]"):
+    """Correlated EXISTS: the alumnus carries ANY of these status labels.
+
+    Public because outbound sends need it in BOTH polarities — ``~`` of it to
+    EXCLUDE suppressed alumni from a send (what ``suppress_labels`` does below),
+    and the plain form to COUNT how many were suppressed so the survey console
+    can report that number separately from "we have no address for them" (#392).
+    Sharing one definition keeps the excluded set and the reported set identical.
+    """
+    return (
+        select(AlumniStatusLabel.alumni_status_label_id)
+        .join(
+            StatusLabel,
+            StatusLabel.status_label_id == AlumniStatusLabel.status_label_id,
+        )
+        .where(
+            AlumniStatusLabel.alumni_id == Alumni.alumni_id,
+            _ilike_any(StatusLabel.status_label_name, _as_values(labels)),
+        )
+        .exists()
+    )
 
 
 # The negatives, lower-cased and pre-sorted for a stable SQL literal, with ""
@@ -698,18 +722,7 @@ def build_alumni_query(
     if suppressed:
         # NOT EXISTS, so it stays a SQL-level predicate over the whole cohort —
         # never a post-query filter in Python (8,000+ alumni).
-        conditions.append(
-            ~select(AlumniStatusLabel.alumni_status_label_id)
-            .join(
-                StatusLabel,
-                StatusLabel.status_label_id == AlumniStatusLabel.status_label_id,
-            )
-            .where(
-                AlumniStatusLabel.alumni_id == Alumni.alumni_id,
-                _ilike_any(StatusLabel.status_label_name, suppressed),
-            )
-            .exists()
-        )
+        conditions.append(~has_status_label_exists(suppressed))
     leadership_roles = _as_values(leadership_role)
     if leadership_roles:
         conditions.append(
@@ -888,13 +901,15 @@ def build_alumni_query(
             )
         )
     if missing_email:
+        # Same definition as the dashboard's `missing_email` KPI (shared via
+        # `email_reach`), so the tile and the list it deep-links to cannot report
+        # different populations. Blank/whitespace now counts as MISSING (#392).
         has_email = (
             select(AlumniContactInfo.contact_info_id)
             .where(
                 AlumniContactInfo.alumni_id == Alumni.alumni_id,
-                or_(
-                    AlumniContactInfo.personal_email.is_not(None),
-                    AlumniContactInfo.work_email.is_not(None),
+                email_reach.has_email_value_sql(
+                    AlumniContactInfo.personal_email, AlumniContactInfo.work_email
                 ),
             )
             .exists()

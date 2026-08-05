@@ -49,11 +49,11 @@ from dataclasses import dataclass
 from html import escape
 
 import httpx
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import database
+from app.core import database, email_reach
 from app.core.config import get_settings
 from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS, holds_designation
 from app.core.errors import ConflictError, ServiceError
@@ -64,12 +64,14 @@ from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
-from app.repositories.alumni import build_alumni_query
+from app.repositories.alumni import build_alumni_query, has_status_label_exists
 from app.schemas.survey import (
     GraduationYearCount,
+    SurveyRecipientBreakdown,
     SurveyRespondInfo,
     SurveySendResult,
     SurveySendSample,
+    SurveyUnreachableAlum,
     SurveyUsage,
 )
 
@@ -423,10 +425,18 @@ def verify_survey_token(token: str, *, now: datetime.datetime | None = None) -> 
 class Recipient:
     alumni_id: int
     first_name: str
+    # The ONE address this person is emailed at. Resolved once, by
+    # `email_reach.resolve_email` — personal preferred, work as fallback (#392).
+    # Singular by construction: there is nowhere to put a second address, so no
+    # caller can accidentally send to both.
     email: str
     # The full "here's what we have on file" list (label, value) shown in the
     # email — the Career Directors' field list, empties as "—".
     on_file: tuple[tuple[str, str], ...]
+    # Which column `email` came from ("personal" / "work") — surfaced in the send
+    # preview and the audit trail so staff can see when a campaign leaned on work
+    # addresses, which is a data-quality signal worth acting on.
+    email_source: str = email_reach.SOURCE_PERSONAL
 
 
 def _on_file_rows(r: Recipient) -> list[tuple[str, str]]:
@@ -458,7 +468,8 @@ def _build_on_file(alum, contact, job) -> tuple[tuple[str, str], ...]:
         ("Residence state", _dash(g(contact, "state"))),
         ("Residence country", _dash(g(contact, "country"))),
         ("Spouse name", _dash(spouse)),
-        ("Permanent email", _dash(g(contact, "personal_email"))),
+        # "Personal email" everywhere (#392) — see survey_responses._FIELDS.
+        ("Personal email", _dash(g(contact, "personal_email"))),
         ("Work email", _dash(g(contact, "work_email"))),
         ("LinkedIn profile", _dash(alum.linkedin_url)),
         ("Graduate school program", _dash(alum.graduate_degree)),
@@ -670,11 +681,17 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
         year: responded for year, responded in (await session.execute(responded_stmt)).all()
     }
 
+    # How many of each year the campaign cannot reach at all (#392) — resolved
+    # for every year in ONE grouped query, like `responded_by_year`, so the
+    # picker stays a fixed number of round trips.
+    unreachable_by_year = await unreachable_counts_by_year(session)
+
     return [
         GraduationYearCount(
             graduation_year=year,
             total_alumni=count,
             responded=responded_by_year.get(year, 0),
+            unreachable=unreachable_by_year.get(year, 0),
         )
         for year, count in rows
     ]
@@ -683,23 +700,13 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
 # ------------------------------------------------------------- send service --
 
 
-# Reserved / placeholder domains that must never be emailed — Resend rejects the
-# whole batch if any `to` uses one, and they're never real inboxes anyway.
-_UNSENDABLE_DOMAINS = frozenset(
-    {"example.com", "example.org", "example.net", "test", "localhost", "invalid"}
-)
-
-
-def _is_sendable_email(email: str | None) -> bool:
-    """A minimal deliverability gate: a real-looking address, not a reserved /
-    placeholder domain (e.g. the REPLACE_WITH_…@example.com test stand-ins)."""
-    if not email or "@" not in email:
-        return False
-    local, _, domain = email.partition("@")
-    domain = domain.strip().lower()
-    if not local.strip() or "." not in domain:
-        return False
-    return domain not in _UNSENDABLE_DOMAINS
+# The deliverability gate and the personal→work recipient rule now live in
+# `app.core.email_reach`, shared with the dashboard's missing-email KPI so the
+# survey and the KPI can no longer answer "has an email" differently (#392).
+# Re-exported under the original private names because tests and call sites here
+# reference them.
+_UNSENDABLE_DOMAINS = email_reach.UNSENDABLE_DOMAINS
+_is_sendable_email = email_reach.is_sendable_email
 
 
 def _chunks(items: list, size: int):
@@ -729,7 +736,16 @@ def eligible_alumni_query(graduation_year: int):
       ``Lost Contact`` / ``Retired`` / ``Inactive`` stay ELIGIBLE by design
       (Jake, 2026-08-03): "lost contact" means we want to reconnect, and this
       survey is the tool for it.
-    * **Has a personal email** — there is nothing to send to otherwise.
+    * **Is reachable by email** — a usable PERSONAL email, or failing that a
+      usable WORK email (#392). Personal is preferred but no longer required:
+      requiring it silently excluded every alumnus who had only a work address
+      from every survey ever sent — no send, no error, no trace. "Usable" is the
+      full deliverability gate (:func:`email_reach.sendable_email_sql`), not
+      ``IS NOT NULL``: a blank string or an ``@example.com`` placeholder is not
+      an address, and counting it as one is how the console came to promise more
+      recipients than the sender would actually take. Which of the two addresses
+      is used is :func:`email_reach.resolve_email`'s decision, made once, in
+      :func:`_load_recipients`.
     * **Has not replied this cycle** — a `pending` or `applied` response within
       365 days. A `rejected` one does NOT count (see
       :data:`RESPONDED_STATUSES`).
@@ -739,16 +755,27 @@ def eligible_alumni_query(graduation_year: int):
     no ORDER BY of its own, so without this an interrupted send resumed on an
     arbitrary subset and "run Send again to continue" was not a true statement.
     """
-    has_personal_email = (
-        select(AlumniContactInfo.contact_info_id)
-        .where(
-            AlumniContactInfo.alumni_id == Alumni.alumni_id,
-            AlumniContactInfo.personal_email.is_not(None),
-        )
-        .exists()
+    return (
+        _survey_cohort_query(graduation_year)
+        .where(_has_reachable_email())
+        .order_by(Alumni.alumni_id)
     )
-    # Already replied within the last year -> skip (the survey is annual).
-    replied_recently = (
+
+
+def _suppressed_label_exists():
+    """Correlated EXISTS: the alumnus carries a Deceased / Do Not Contact label.
+
+    The exact predicate ``build_alumni_query`` negates to exclude them, reused
+    (un-negated) to COUNT them — so the number the console reports as suppressed
+    is by construction the number the send excluded."""
+    return has_status_label_exists(SUPPRESSED_CONTACT_STATUS_LABELS)
+
+
+def _replied_recently_exists():
+    """Correlated EXISTS: replied within the 365-day re-survey window. A
+    ``rejected`` response does not count (:data:`RESPONDED_STATUSES`) — staff
+    threw it away, so the alum is surveyable again."""
+    return (
         select(SurveyResponse.survey_response_id)
         .where(
             SurveyResponse.alumni_id == Alumni.alumni_id,
@@ -757,15 +784,248 @@ def eligible_alumni_query(graduation_year: int):
         )
         .exists()
     )
+
+
+def _has_reachable_email():
+    """Correlated EXISTS: this alumnus has a personal OR work address we could
+    actually send to. The SQL twin of :func:`email_reach.resolve_email` returning
+    something — so the count and the send agree by construction."""
     return (
-        build_alumni_query(
-            graduation_year=graduation_year,
-            deceased=False,
-            suppress_labels=SUPPRESSED_CONTACT_STATUS_LABELS,
+        select(AlumniContactInfo.contact_info_id)
+        .where(
+            AlumniContactInfo.alumni_id == Alumni.alumni_id,
+            email_reach.reachable_email_sql(
+                AlumniContactInfo.personal_email, AlumniContactInfo.work_email
+            ),
         )
-        .where(has_personal_email)
-        .where(~replied_recently)
-        .order_by(Alumni.alumni_id)
+        .exists()
+    )
+
+
+def _survey_cohort_query(graduation_year: int):
+    """The year's cohort MINUS suppression and recent responders — everything the
+    eligible and unreachable sets have in common.
+
+    Factored out so those two sets cannot drift: they are the same query with
+    opposite email predicates, which is what makes
+    ``eligible + unreachable == surveyable cohort`` an identity rather than a
+    hope. Suppressed alumni (deceased / Do Not Contact) are excluded from BOTH —
+    someone we deliberately never email is not an "unreachable" problem for staff
+    to chase, and merging the two would put Do Not Contact names on a call sheet.
+    """
+    # Already replied within the last year -> skip (the survey is annual).
+    return build_alumni_query(
+        graduation_year=graduation_year,
+        deceased=False,
+        suppress_labels=SUPPRESSED_CONTACT_STATUS_LABELS,
+    ).where(~_replied_recently_exists())
+
+
+def unreachable_alumni_query(graduation_year: int):
+    """The mirror of :func:`eligible_alumni_query`: alumni this campaign WANTS to
+    email and cannot, because there is no usable address on either column (#392).
+
+    Same cohort, same suppression, same "hasn't replied this cycle" rule — only
+    the email predicate is inverted. That shared base is deliberate: these people
+    used to be indistinguishable from everyone else the query dropped, so a
+    campaign that reached 180 of 200 alumni looked exactly like one that reached
+    all 180 it had. Staff can now be handed the other 20 by name and chase them
+    another way.
+
+    NOT the same thing as suppression. Deceased / Do Not Contact alumni are
+    filtered out of this list too — they are not a gap to close.
+    """
+    return (
+        _survey_cohort_query(graduation_year)
+        .where(~_has_reachable_email())
+        .order_by(Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
+    )
+
+
+async def count_unreachable(session: AsyncSession, graduation_year: int) -> int:
+    """How many of this year's surveyable alumni have no usable address (#392)."""
+    total = await session.scalar(
+        select(func.count()).select_from(
+            unreachable_alumni_query(graduation_year).order_by(None).subquery()
+        )
+    )
+    return int(total or 0)
+
+
+async def unreachable_counts_by_year(session: AsyncSession) -> dict[int, int]:
+    """:func:`count_unreachable` for EVERY graduation year in one query.
+
+    Drives the console's year picker, which must not fan out into one round trip
+    per year the way a per-year call would.
+    """
+    stmt = (
+        select(Alumni.graduation_year, func.count().label("n"))
+        .where(
+            Alumni.is_alumni.is_(True),
+            Alumni.archived.is_(False),
+            Alumni.graduation_year.is_not(None),
+            Alumni.deceased.is_(False),
+            ~_suppressed_label_exists(),
+            ~_replied_recently_exists(),
+            ~_has_reachable_email(),
+        )
+        .group_by(Alumni.graduation_year)
+    )
+    return {year: int(n) for year, n in (await session.execute(stmt)).all()}
+
+
+async def list_unreachable(
+    session: AsyncSession, graduation_year: int
+) -> list[SurveyUnreachableAlum]:
+    """WHO this campaign cannot email, by name — the count made actionable (#392).
+
+    The same argument as the non-responder call sheet: a number tells staff there
+    is a gap, this tells them whose. Each row carries the reason
+    (:data:`email_reach.REASON_LABELS`) and whatever is in the two email columns,
+    because "there is a typo in the work email" and "we have never had an address
+    for this person" are different jobs — the first is fixable on the spot from
+    this very list.
+
+    Ordered by name so it reads like a worklist and is stable between refreshes.
+    Contains NO suppressed alumni: see :func:`unreachable_alumni_query`.
+    """
+    alumni = (
+        (await session.execute(unreachable_alumni_query(graduation_year)))
+        .scalars()
+        .all()
+    )
+    if not alumni:
+        return []
+    ids = [a.alumni_id for a in alumni]
+    contacts = {
+        c.alumni_id: c
+        for c in (
+            await session.execute(
+                select(AlumniContactInfo).where(AlumniContactInfo.alumni_id.in_(ids))
+            )
+        )
+        .scalars()
+        .all()
+    }
+    items: list[SurveyUnreachableAlum] = []
+    for a in alumni:
+        contact = contacts.get(a.alumni_id)
+        personal = getattr(contact, "personal_email", None)
+        work = getattr(contact, "work_email", None)
+        name = " ".join(
+            p for p in (a.preferred_first_name or a.first_name, a.last_name) if p
+        ).strip()
+        reason = email_reach.unreachable_reason(personal, work)
+        items.append(
+            SurveyUnreachableAlum(
+                alumni_id=a.alumni_id,
+                name=name or f"Alum #{a.alumni_id}",
+                reason=reason,
+                reason_label=email_reach.REASON_LABELS[reason],
+                personal_email=personal,
+                work_email=work,
+            )
+        )
+    return items
+
+
+async def recipient_breakdown(
+    session: AsyncSession,
+    graduation_year: int,
+    *,
+    resolved: tuple[list[Recipient], list[Recipient]] | None = None,
+) -> SurveyRecipientBreakdown:
+    """The ONE account of who this year's survey reaches, and who it does not.
+
+    Every consumer of "how many will this send to" reads this — the console's
+    year picker, the send confirmation, and the send RESULT itself. That is the
+    whole point: this codebase has a standing bug class where a count is derived
+    one way and the send another, and the console then reports numbers that never
+    went out. Here the buckets are not independently computed opinions — they are
+    the same queries the send uses, so they cannot disagree with it.
+
+    The buckets PARTITION the year's alumni (is_alumni, not archived):
+
+        cohort_total = suppressed + already_responded + unreachable + eligible
+
+    and then ``recipients = eligible - duplicate_emails``, the dedupe being a
+    Python step over the loaded rows rather than a SQL one.
+
+    ``suppressed`` and ``unreachable`` are reported as SEPARATE numbers and never
+    summed into a single "not emailed" figure. Deceased / Do Not Contact is a
+    decision the institution made and wants kept; no usable address is a gap it
+    wants closed. A UI that merges them either puts Do Not Contact names on a
+    chase list or hides real gaps behind a suppression total.
+
+    ``resolved`` lets a caller that has ALREADY loaded and deduped the cohort
+    (a send, which must do so anyway) hand those lists over instead of paying for
+    a second full load of an 8,000-row table. It is not a shortcut around the
+    shared definition — it is the very same ``_load_recipients`` +
+    :func:`dedupe_by_email` output, so the reported figure is literally the
+    population that was sent to, not a recomputation that could differ from it.
+    """
+    cohort_total = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Alumni)
+            .where(
+                Alumni.is_alumni.is_(True),
+                Alumni.archived.is_(False),
+                Alumni.graduation_year == graduation_year,
+            )
+        )
+        or 0
+    )
+    suppressed = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Alumni)
+            .where(
+                Alumni.is_alumni.is_(True),
+                Alumni.archived.is_(False),
+                Alumni.graduation_year == graduation_year,
+                or_(Alumni.deceased.is_(True), _suppressed_label_exists()),
+            )
+        )
+        or 0
+    )
+    already_responded = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Alumni)
+            .where(
+                Alumni.is_alumni.is_(True),
+                Alumni.archived.is_(False),
+                Alumni.graduation_year == graduation_year,
+                Alumni.deceased.is_(False),
+                ~_suppressed_label_exists(),
+                _replied_recently_exists(),
+            )
+        )
+        or 0
+    )
+    unreachable = await count_unreachable(session, graduation_year)
+
+    # Loaded, not counted: the dedupe is a Python step, so the only honest way to
+    # report `recipients` is the very same load the send runs — either handed to
+    # us by that send, or run here for a standalone preview.
+    if resolved is None:
+        kept, dropped = dedupe_by_email(
+            await _load_recipients(session, graduation_year)
+        )
+    else:
+        kept, dropped = resolved
+
+    return SurveyRecipientBreakdown(
+        graduation_year=graduation_year,
+        cohort_total=cohort_total,
+        suppressed=suppressed,
+        already_responded=already_responded,
+        unreachable=unreachable,
+        eligible=len(kept) + len(dropped),
+        duplicate_emails=len(dropped),
+        recipients=len(kept),
+        work_email_fallback=_work_fallback_count(kept),
     )
 
 
@@ -833,8 +1093,24 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
     recipients: list[Recipient] = []
     for a in alumni:
         contact = contacts.get(a.alumni_id)
-        email = contact.personal_email if contact else None
-        if not _is_sendable_email(email):
+        # Personal preferred, work as the fallback, exactly once per alumnus
+        # (#392). The query above already required one of these to be usable, so
+        # this returns an address for everyone it loaded — the guard below is a
+        # belt-and-braces against the SQL and Python rules ever drifting apart
+        # again, not a filter the population depends on. Anyone it did drop would
+        # be a bug, so it is logged rather than skipped silently, which is how
+        # the personal-email-only exclusion stayed invisible for so long.
+        email, source = email_reach.resolve_email(
+            getattr(contact, "personal_email", None),
+            getattr(contact, "work_email", None),
+        )
+        if email is None:
+            log.warning(
+                "Survey %s: alumni_id=%s passed the eligibility query but has no "
+                "usable email — SQL and Python reachability rules disagree",
+                graduation_year,
+                a.alumni_id,
+            )
             continue
         job = employ.get(a.alumni_id)
         recipients.append(
@@ -843,6 +1119,7 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
                 first_name=(a.preferred_first_name or a.first_name or "there"),
                 email=email,
                 on_file=_build_on_file(a, contact, job),
+                email_source=source or email_reach.SOURCE_PERSONAL,
             )
         )
     return recipients
@@ -1308,6 +1585,11 @@ async def _send_and_log(
 # ------------------------------------------------- the one send entry point ---
 
 
+def _work_fallback_count(recipients: list[Recipient]) -> int:
+    """How many of these are reached at their WORK address (#392)."""
+    return sum(1 for r in recipients if r.email_source == email_reach.SOURCE_WORK)
+
+
 @dataclass(frozen=True)
 class SendOutcome:
     """What one call to :func:`send_survey_stage` did."""
@@ -1321,6 +1603,10 @@ class SendOutcome:
     sent: int
     retry_after: int | None = None
     duplicate_emails: int = 0
+    # The dropped-for-a-shared-address recipients themselves, so the caller can
+    # report the cohort breakdown without re-loading and re-deduping the whole
+    # year (`eligible` + these two lists ARE the resolved population).
+    duplicates: tuple[Recipient, ...] = ()
 
 
 async def send_survey_stage(
@@ -1432,6 +1718,14 @@ async def send_survey_stage(
                 f"scheduled={scheduled} recipients={len(eligible)} "
                 f"targets={len(targets)} prepared={len(prepared)} "
                 f"sent={sent} dry_run={dry_run}"
+                + (
+                    # How many of this send leaned on the work-email fallback
+                    # (#392) — a permanent record of who was reached at which
+                    # address, and a standing data-quality signal.
+                    f" work_email_fallback={_work_fallback_count(prepared)}"
+                    if _work_fallback_count(prepared)
+                    else ""
+                )
                 + (f" duplicate_emails={len(duplicates)}" if duplicates else "")
                 + (f" throttled_retry_after={retry_after}" if retry_after else "")
                 + (" failed=True" if error is not None else "")
@@ -1456,6 +1750,7 @@ async def send_survey_stage(
         sent=sent,
         retry_after=retry_after,
         duplicate_emails=len(duplicates),
+        duplicates=tuple(duplicates),
     )
 
 
@@ -1513,6 +1808,18 @@ async def send_campaign(
     # already received this exact email as still owed it.)
     done = len(outcome.prepared) if dry_run else outcome.sent
     remaining = len(outcome.targets) - done
+    # The cohort account that lets the console explain the result — especially a
+    # zero. It used to report every `sent=0` as "they need a personal email on
+    # file", which was wrong for every other cause and was the misdiagnosis
+    # behind #392: a cohort that had simply all replied within the 365-day window
+    # was reported as having no email addresses.
+    # Reuses the population the send already resolved rather than re-running the
+    # cohort load — same numbers, and provably the ones that were sent to.
+    breakdown = await recipient_breakdown(
+        session,
+        graduation_year,
+        resolved=(outcome.eligible, list(outcome.duplicates)),
+    )
     return SurveySendResult(
         graduation_year=graduation_year,
         total_recipients=len(outcome.eligible),
@@ -1521,10 +1828,13 @@ async def send_campaign(
         remaining=remaining,
         dry_run=dry_run,
         retry_after_seconds=outcome.retry_after,
+        stage_complete=outcome.stage is None,
+        breakdown=breakdown,
         sample=[
             SurveySendSample(
                 email=r.email,
                 link=_survey_link(base_url, r.alumni_id, graduation_year),
+                email_source=r.email_source,
             )
             for r in outcome.prepared[:3]
         ],

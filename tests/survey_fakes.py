@@ -128,6 +128,17 @@ class SendLogSession:
         cycle = params.get("cycle_seq_1", 1)
         return sorted(self.logged(year, stage, cycle))
 
+    async def scalar(self, stmt):
+        """Scalar reads (the cohort COUNTs behind the recipient breakdown, #392).
+
+        Returns 0 rather than None so a fake session yields a coherent, empty
+        breakdown: these tests are about the SEND, and a send must not depend on
+        the reporting counts being populated. Tests that care about the numbers
+        drive them through a real (SQLite) session instead.
+        """
+        self.executed += 1
+        return 0
+
     def add(self, obj):
         self.added.append(obj)
 

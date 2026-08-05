@@ -60,6 +60,7 @@ from collections.abc import Sequence
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import email_reach
 from app.core.errors import ConflictError, ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -294,6 +295,7 @@ async def list_non_responders(
             Alumni.first_name,
             Alumni.last_name,
             AlumniContactInfo.personal_email,
+            AlumniContactInfo.work_email,
             sub.c.last_sent_at,
         )
         .join(sub, sub.c.alumni_id == Alumni.alumni_id)
@@ -306,8 +308,14 @@ async def list_non_responders(
     )
     rows = (await session.execute(stmt)).all()
     items: list[SurveyNonResponder] = []
-    for alumni_id, preferred, first, last, email, last_sent_at in rows:
+    for alumni_id, preferred, first, last, personal, work, last_sent_at in rows:
         name = " ".join(p for p in (preferred or first, last) if p).strip()
+        # The address the survey went to — personal preferred, work as the
+        # fallback (#392). Showing the personal column unconditionally left this
+        # call sheet blank for exactly the alumni the work-email fallback newly
+        # reaches. Display preference, not the send gate: whatever is on file is
+        # shown, so staff can see (and fix) an address rather than a blank.
+        email = email_reach.preferred_display_email(personal, work)
         items.append(
             SurveyNonResponder(
                 alumni_id=alumni_id,

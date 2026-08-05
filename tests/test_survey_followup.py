@@ -80,7 +80,10 @@ def _ddl(conn):
             "CREATE TABLE alumni_contact_info ("
             " contact_info_id INTEGER PRIMARY KEY,"
             " alumni_id INTEGER NOT NULL,"
-            " personal_email VARCHAR(255))"
+            " personal_email VARCHAR(255),"
+            # The call sheet now reports the address the survey actually went
+            # to, which may be the work email (#392).
+            " work_email VARCHAR(255))"
         )
     )
 

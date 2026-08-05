@@ -24,9 +24,12 @@ from pathlib import Path
 import pytest
 
 from app.core.dropdowns import (
+    EMPLOYER_NOT_APPLICABLE_STATUSES,
     EMPLOYMENT_STATUS_PLACEHOLDERS,
     EMPLOYMENT_STATUSES,
     SURVEY_EMPLOYMENT_STATUSES,
+    employer_applies,
+    employer_prompt,
 )
 from app.schemas.alumni import AlumniCreate, AlumniUpdate
 from app.services import import_csv
@@ -222,3 +225,60 @@ def test_filter_description_is_built_from_the_tuple() -> None:
     )
     for value in EMPLOYMENT_STATUSES:
         assert value in description
+
+
+# --- statuses that make an employer inapplicable (#608) ----------------------
+
+
+def test_exempt_statuses_are_all_real_statuses() -> None:
+    """Typo-guard: the exemption matches on the value, so a misspelling here
+    would silently exempt nobody and no test would otherwise notice."""
+    assert set(EMPLOYER_NOT_APPLICABLE_STATUSES) <= set(EMPLOYMENT_STATUSES)
+
+
+def test_exactly_three_statuses_are_exempt() -> None:
+    """Pinned deliberately narrow. These are the statuses where there is NOTHING
+    for a human to go and find — not "statuses where an employer is unusual"."""
+    assert EMPLOYER_NOT_APPLICABLE_STATUSES == (
+        "Unemployed",
+        "Not in the Labor Force",
+        "Graduate Student",
+    )
+
+
+def test_military_is_not_exempt() -> None:
+    """#608's headline: military service IS employment — a branch is an employer,
+    a rank is a title. A Military record with no employer is a real, fillable gap,
+    so it must keep reaching the review queue. Do not "helpfully" add it here."""
+    assert employer_applies("Military") is True
+    assert employer_applies("  military  ") is True
+
+
+@pytest.mark.parametrize("status", EMPLOYER_NOT_APPLICABLE_STATUSES)
+def test_employer_applies_is_false_for_the_exempt(status: str) -> None:
+    assert employer_applies(status) is False
+    assert employer_applies(status.upper()) is False
+    assert employer_applies(f"  {status.lower()} ") is False
+
+
+def test_employer_applies_for_an_unset_status() -> None:
+    """A blank status is not evidence the blank employer was intentional."""
+    assert employer_applies(None) is True
+    assert employer_applies("") is True
+    assert employer_applies("Unknown") is True
+
+
+def test_employer_prompt_is_military_specific() -> None:
+    assert "branch of service" in employer_prompt("Military")
+    assert "branch of service" not in employer_prompt("Full-time")
+    assert employer_prompt(None) == "No current employer on file."
+
+
+def test_doc_documents_the_exemption() -> None:
+    """``database/dropdowns.md`` calls itself the single source of truth, and the
+    exemption is exactly the kind of quiet behaviour that has to be written down
+    for the next person deciding whether to widen it."""
+    doc = DROPDOWNS_MD.read_text(encoding="utf-8")
+    for status in EMPLOYER_NOT_APPLICABLE_STATUSES:
+        assert status in doc
+    assert "EMPLOYER_NOT_APPLICABLE_STATUSES" in doc

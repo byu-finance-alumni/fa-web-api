@@ -9,6 +9,7 @@ import datetime
 from sqlalchemy import literal, select
 from sqlalchemy.dialects import postgresql
 
+from app.core.dropdowns import EMPLOYER_NOT_APPLICABLE_STATUSES
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
@@ -27,6 +28,17 @@ def _order_sql(sort: str | None) -> str:
 def _bind_values(stmt) -> list:
     """The compiled statement's bind parameter values (the %term% LIKE patterns)."""
     return list(stmt.compile(dialect=postgresql.dialect()).params.values())
+
+
+def _flat_bind_values(stmt) -> list:
+    """``_bind_values`` with expanding IN-clause tuples/lists flattened out."""
+    flat: list = []
+    for value in _bind_values(stmt):
+        if isinstance(value, (list, tuple, set, frozenset)):
+            flat.extend(value)
+        else:
+            flat.append(value)
+    return flat
 
 
 def test_default_excludes_archived():
@@ -234,9 +246,34 @@ def test_missing_email_filter():
 
 def test_missing_employer_filter():
     sql = _sql(build_alumni_query(missing_employer=True))
-    assert "NOT (EXISTS" in sql
+    # NOT (has an employer OR an employer doesn't apply) — the whole OR is
+    # negated, not just the EXISTS (#608), so the negation wraps both arms.
+    assert "NOT ((EXISTS" in sql
     assert "current_employment" in sql
     assert "current_employer IS NOT NULL" in sql
+    assert "employment_status" in sql
+
+
+def test_missing_employer_filter_exempts_statuses_with_no_employer():
+    """#608 — Unemployed / Not in the Labor Force / Graduate Student are not
+    "missing" an employer; there is nothing for anyone to go and find. The
+    comparison is lower(trim(coalesce(...))) so import casing drift can't leak
+    someone back into the review queue."""
+    sql = _sql(build_alumni_query(missing_employer=True)).lower()
+    assert "lower(trim(coalesce(alumni.employment_status" in sql
+    bound = _flat_bind_values(build_alumni_query(missing_employer=True))
+    for status in EMPLOYER_NOT_APPLICABLE_STATUSES:
+        assert status.lower() in bound
+
+
+def test_missing_employer_filter_still_counts_military():
+    """#608 — military service IS employment (a branch is an employer), so a
+    Military record with no employer stays a real, fillable gap. Exempting it
+    would hide every service member from the one worklist that gets their branch
+    recorded."""
+    bound = _flat_bind_values(build_alumni_query(missing_employer=True))
+    assert "military" not in bound
+    assert "Military" not in EMPLOYER_NOT_APPLICABLE_STATUSES
 
 
 def test_duplicate_filter():

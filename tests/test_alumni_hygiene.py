@@ -8,6 +8,9 @@ real DATABASE_URL — CI has none), mirroring tests/test_dashboard_drawers.py.
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
+from app.core.dropdowns import EMPLOYER_NOT_APPLICABLE_STATUSES
 from app.schemas.alumni import AlumniCreateFull, AlumniUpdateFull
 from app.services import hygiene
 
@@ -290,6 +293,93 @@ def test_recommended_warnings_none_when_present():
         }
     )
     assert warnings == []
+
+
+# --- missing employer vs employment status (#608) ----------------------------
+
+
+def _employer_codes(employment_status):
+    """Warning codes for an otherwise-complete record with no employer."""
+    warnings = hygiene.recommended_warnings(
+        {
+            "contact": {"work_email": "a@b.com"},
+            "career": {},
+            "graduation_year": 2018,
+            "employment_status": employment_status,
+        }
+    )
+    return {w["code"] for w in warnings}
+
+
+def _employer_message(employment_status):
+    warnings = hygiene.recommended_warnings(
+        {
+            "contact": {"work_email": "a@b.com"},
+            "career": {},
+            "graduation_year": 2018,
+            "employment_status": employment_status,
+        }
+    )
+    return next(w["message"] for w in warnings if w["code"] == "missing_employer")
+
+
+@pytest.mark.parametrize("status", EMPLOYER_NOT_APPLICABLE_STATUSES)
+def test_missing_employer_suppressed_when_no_employer_can_exist(status):
+    """#608 — for these statuses a blank employer IS the complete answer, so
+    flagging it is a false alarm that trains people to ignore the whole list."""
+    assert "missing_employer" not in _employer_codes(status)
+
+
+@pytest.mark.parametrize(
+    "status", ["unemployed", "  Not In The Labor Force  ", "GRADUATE STUDENT"]
+)
+def test_missing_employer_exemption_is_case_and_whitespace_insensitive(status):
+    """employment_status has no write validation, so prod holds casing drift
+    from imports — the exemption must not depend on exact casing."""
+    assert "missing_employer" not in _employer_codes(status)
+
+
+@pytest.mark.parametrize(
+    "status", ["Military", "Full-time", "Part-time", "Self-Employed", "Unknown"]
+)
+def test_missing_employer_still_flagged_for_the_rest(status):
+    """Deliberately NOT exempt. Military most of all: a branch of service is an
+    employer and a rank is a title (#608), so the gap is real and fillable —
+    exempting it would hide every service member from the review queue."""
+    assert "missing_employer" in _employer_codes(status)
+
+
+def test_missing_employer_not_exempt_when_status_is_blank():
+    """A blank status tells us nothing about whether the blank employer was
+    intentional, so it stays flagged."""
+    assert "missing_employer" in _employer_codes(None)
+    assert "missing_employer" in _employer_codes("")
+
+
+def test_military_missing_employer_message_says_what_to_record():
+    """#608's actual fix for Military: same flag, actionable wording."""
+    message = _employer_message("Military")
+    assert "branch of service" in message
+    assert message != _employer_message("Full-time")
+
+
+def test_non_military_missing_employer_message_is_unchanged():
+    assert _employer_message("Full-time") == "No current employer on file."
+
+
+def test_missing_employer_never_fires_when_an_employer_is_on_file():
+    """The exemption only ever REMOVES a warning — a Military alum who does have
+    an employer is not warned either way."""
+    for status in ("Military", "Unemployed", None):
+        warnings = hygiene.recommended_warnings(
+            {
+                "contact": {"work_email": "a@b.com"},
+                "career": {"current_employer": "U.S. Air Force"},
+                "graduation_year": 2018,
+                "employment_status": status,
+            }
+        )
+        assert warnings == []
 
 
 # --- Duplicate detection -----------------------------------------------------

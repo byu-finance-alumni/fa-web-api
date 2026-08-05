@@ -46,6 +46,7 @@ Options:
 - FP&A
 - Investment Banking
 - Law *(secondary only)*
+- Military
 - Private Banking
 - Private Credit
 - Private Equity
@@ -110,6 +111,33 @@ It is a **valid primary industry** (selectable and filterable, NOT in
 `Graduate Student` it gets **no** separate dashboard indicator. It is pinned in
 the dropdown just above `Graduate Student` (`sort_order` 97).
 
+### Military (#608)
+
+`Military` was added 2026-08-04 because a service member had **no industry that
+fit** and had to be recorded as `Other` or `Unknown` — which is what pushed them
+out of the dashboard's industry breakdown entirely. (Nothing ever *blocked* a
+Military alumnus from having an employer and title; that part of #608 was a data
+gap, not a bug.)
+
+It is a **valid primary industry** and is **not** a dashboard wheel slice — it is
+not one of Tanya's 15 finance industries, so it is in `_NON_WHEEL_INDUSTRIES`. It
+gets the **`Graduate Student` treatment, not the `Unknown` treatment**: its own
+counted bar at the bottom of the industry breakdown, split out of the `Other`
+fold, linking to the alumni list filtered to `current_industry = "Military"`.
+Folding it into `Other` would have recreated the very disappearance the option
+exists to fix; merging it into the `Unknown` data-gap bar would be wrong because
+`Military` is a real answer, not a recorded non-answer.
+
+Unlike the three pinned tail options it sits in the **alphabetical body**, between
+`Law` and `Private Banking` (`sort_order` 11) — it is an ordinary answer to "what
+do you do", and people scan for it under M. Adding it therefore shifted
+`Private Banking`..`Wealth Management` from 11..19 to 12..20, which is why
+`migrations/2026-08-04_add_military_industry.sql` re-upserts the whole body.
+
+`Military` the **industry** is independent of `Military` the **employment status**
+below. The two are entered separately and neither is derived from the other; the
+migration deliberately does no backfill between them.
+
 ---
 
 ## Employment Status
@@ -160,6 +188,34 @@ the survey exists to clear. The survey renders from
 frontend) = this list minus the placeholders, and it displays a *stored*
 `Unknown` as blank (#572) so the alum is prompted for a real answer without the
 untouched value being overwritten.
+
+### Statuses where a blank employer is complete data (#608)
+
+`EMPLOYER_NOT_APPLICABLE_STATUSES` in `app/core/dropdowns.py` — the three statuses
+for which the **"missing employer" hygiene flag is suppressed**, because there is
+nothing for a human to go and find:
+
+- Unemployed
+- Not in the Labor Force
+- Graduate Student
+
+One constant drives all three surfaces (the per-record create/edit warning, the
+dashboard + Data-quality counts, and the `?missing_employer=1` drill-down and its
+export) so they always describe the same population. Matching is
+case-insensitive on the trimmed value, because the column has no write validation
+and casing drifts through imports.
+
+**`Military` is deliberately NOT exempt.** Military service *is* employment — a
+branch is an employer, a rank is a title — so a Military record with no employer
+is a real, fillable gap and must keep appearing in the review queue; exempting it
+would permanently hide every service member from the one worklist that would get
+their branch recorded. What #608 changed for them is the **wording**: the warning
+now says to record the branch of service as the employer instead of the bare "No
+current employer on file" (`employer_prompt()`).
+
+Also not exempt: `Self-Employed` (their own company is the employer),
+`Full-time` / `Part-time`, and `Unknown` (we do not know the status, so we cannot
+claim the blank employer is intentional — that *is* the gap).
 
 ---
 

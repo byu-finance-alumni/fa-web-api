@@ -17,7 +17,11 @@ import re
 from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import DESIGNATION_NEGATIVES, WHEEL_INDUSTRIES
+from app.core.dropdowns import (
+    DESIGNATION_NEGATIVES,
+    EMPLOYER_NOT_APPLICABLE_BY_LOWER,
+    WHEEL_INDUSTRIES,
+)
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Interaction, Survey
@@ -43,9 +47,9 @@ SURVEY_CADENCE = datetime.timedelta(days=365 * 2)
 #   * ``other``   — has a primary industry, but it isn't one of the 14 wheel
 #                   industries (literal "Other", a non-wheel finance value like
 #                   Law/Corporate Banking, or any non-canonical value) — EXCLUDING
-#                   the two values the dashboard breaks out into their own buckets:
-#                   "Graduate Student" (#294, own bar) and "Unknown" (#295, merged
-#                   into the Unknown bar).
+#                   the three values the dashboard breaks out into their own
+#                   buckets: "Graduate Student" (#294, own bar), "Military" (#608,
+#                   own bar) and "Unknown" (#295, merged into the Unknown bar).
 # Lower-cased for a case-insensitive DB comparison (industries are stored as
 # free-text varchars, so casing can drift on import).
 _FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
@@ -56,9 +60,44 @@ _FINANCE_INDUSTRIES_LOWER: frozenset[str] = frozenset(
 # (exact ``industry=Graduate Student`` / ``industry_group=unknown``) own them.
 _GRADUATE_STUDENT_LOWER = "graduate student"
 _EXPLICIT_UNKNOWN_LOWER = "unknown"
+# "Military" (#608) is the third such value: non-wheel, but broken out of the
+# "Other" fold into its own dashboard bar, so ``industry_group=other`` must
+# exclude it and the exact ``industry=Military`` drill-down owns it.
+_MILITARY_LOWER = "military"
 _OTHER_EXCLUDED_LOWER: frozenset[str] = frozenset(
-    {_GRADUATE_STUDENT_LOWER, _EXPLICIT_UNKNOWN_LOWER}
+    {_GRADUATE_STUDENT_LOWER, _EXPLICIT_UNKNOWN_LOWER, _MILITARY_LOWER}
 )
+
+
+# --- missing employer (#608) --------------------------------------------------
+
+
+def has_employer_or_not_applicable():
+    """Correlated predicate: an employer is on file, OR none is expected.
+
+    THE shared definition of "not missing an employer", used by the alumni-list /
+    export ``missing_employer`` filter AND (imported) by the dashboard summary +
+    Data-quality counts, so the KPI, the drill-down list and the CSV export can
+    never describe different populations — the parity bug class this codebase
+    keeps hitting.
+
+    ``employment_status`` is a free-text varchar with no write validation, so the
+    status comparison is on the trimmed, lower-cased value. A NULL status is NOT
+    exempt (``coalesce`` to ''), because a blank status tells us nothing about
+    whether the blank employer was intentional.
+    """
+    has_employer = (
+        select(CurrentEmployment.current_employment_id)
+        .where(
+            CurrentEmployment.alumni_id == Alumni.alumni_id,
+            CurrentEmployment.current_employer.is_not(None),
+        )
+        .exists()
+    )
+    not_applicable = func.lower(
+        func.trim(func.coalesce(Alumni.employment_status, ""))
+    ).in_(sorted(EMPLOYER_NOT_APPLICABLE_BY_LOWER))
+    return or_(has_employer, not_applicable)
 
 
 # Free-text ``q`` tokenization (#281). Names are stored atomized (first_name
@@ -341,7 +380,11 @@ def build_alumni_query(
     The missing-data filters mirror the dashboard's KPI logic exactly so the
     "Review" deep-links land on the same population the dashboard counted:
       * ``missing_email``    — no contact-info row with a personal/work email
-      * ``missing_employer`` — no current-employment row naming an employer
+      * ``missing_employer`` — no current-employment row naming an employer, AND
+        an employer is applicable: alumni whose ``employment_status`` is one of
+        ``EMPLOYER_NOT_APPLICABLE_STATUSES`` (Unemployed / Not in the Labor
+        Force / Graduate Student) are NOT missing one (#608). Military IS still
+        counted — a branch of service is an employer.
       * ``missing_phone``    — no contact-info row with a phone number
       * ``duplicate``        — the alumnus appears on either side of a
         ``duplicate_candidates`` pair
@@ -474,8 +517,8 @@ def build_alumni_query(
     elif industry_group == "other":
         # Has a primary industry, but it isn't one of the canonical finance
         # industries AND isn't one of the values the dashboard breaks out into
-        # their own bars ("Graduate Student", "Unknown") — so this drill-down
-        # matches the dashboard "Other" bar exactly.
+        # their own bars ("Graduate Student", "Military", "Unknown") — so this
+        # drill-down matches the dashboard "Other" bar exactly.
         conditions.append(
             select(CurrentEmployment.current_employment_id)
             .where(
@@ -828,15 +871,7 @@ def build_alumni_query(
         )
         conditions.append(~has_email)
     if missing_employer:
-        has_employer = (
-            select(CurrentEmployment.current_employment_id)
-            .where(
-                CurrentEmployment.alumni_id == Alumni.alumni_id,
-                CurrentEmployment.current_employer.is_not(None),
-            )
-            .exists()
-        )
-        conditions.append(~has_employer)
+        conditions.append(~has_employer_or_not_applicable())
     if missing_phone:
         has_phone = (
             select(AlumniContactInfo.contact_info_id)

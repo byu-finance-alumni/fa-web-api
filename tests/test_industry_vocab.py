@@ -190,6 +190,49 @@ def test_industries_are_alphabetical_ignoring_case_other_aside() -> None:
     assert body == sorted(body, key=str.casefold)
 
 
+# --- Military (#608) ---------------------------------------------------------
+
+
+def test_military_is_an_industry() -> None:
+    """#608 — a service member had no industry that fit and had to be recorded
+    as Other/Unknown, which is what dropped them out of the dashboard breakdown."""
+    assert "Military" in INDUSTRIES
+
+
+def test_military_sits_in_the_alphabetical_body_not_the_pinned_tail() -> None:
+    """Unlike "Graduate Student"/"Unknown"/"Other", Military is an ordinary
+    answer to "what do you do" — people scan for it under M, so it goes between
+    "Law" and "Private Banking" rather than being pinned to the bottom."""
+    i = INDUSTRIES.index("Military")
+    assert INDUSTRIES[i - 1] == "Law"
+    assert INDUSTRIES[i + 1] == "Private Banking"
+    assert i < len(INDUSTRIES) - 3
+
+
+def test_military_is_selectable_as_a_primary_industry() -> None:
+    """The whole point: it must be pickable as an alumnus's CURRENT industry."""
+    assert "Military" in PRIMARY_INDUSTRIES
+    assert "Military" in SECONDARY_INDUSTRIES
+    assert validate_industry("military") == "Military"
+
+
+def test_military_is_not_a_wheel_industry() -> None:
+    """It isn't one of Tanya's 15 finance industries, so it gets no wheel slice
+    — the Graduate Student treatment, not a new finance bar."""
+    assert "Military" not in WHEEL_INDUSTRIES
+
+
+def test_military_body_insert_renumbered_the_rest_of_the_body() -> None:
+    """Inserting into the alphabetical body shifts every later sort_order, so
+    the migration had to re-upsert the whole body. If someone "fixes" it into a
+    single-row append later, the seeded order silently stops matching the tuple
+    and this catches it."""
+    terms = _seeded_industry_terms()
+    assert terms["Military"] == INDUSTRIES.index("Military") == 11
+    assert terms["Private Banking"] == 12
+    assert terms["Wealth Management"] == 20
+
+
 def test_financial_services_sits_between_equity_research_and_fpa() -> None:
     """Tanya's literal ask (#282): "move Financial Services into alphabetical
     order". Case-insensitively "financial services" < "fp&a"; a case-SENSITIVE

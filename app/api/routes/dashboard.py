@@ -25,6 +25,7 @@ from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
+from app.repositories.alumni import has_employer_or_not_applicable
 from app.schemas.auth import UserContext
 from app.schemas.dashboard import (
     ActivityFeed,
@@ -132,15 +133,14 @@ def _has_phone_exists():
 
 
 def _has_employer_exists():
-    """Correlated EXISTS: the alumnus has a current employer on file."""
-    return (
-        select(CurrentEmployment.current_employment_id)
-        .where(
-            CurrentEmployment.alumni_id == Alumni.alumni_id,
-            CurrentEmployment.current_employer.is_not(None),
-        )
-        .exists()
-    )
+    """An employer is on file, OR the alumnus's status means none is expected.
+
+    Imported wholesale from the repository (#608) so this KPI, the Data-quality
+    tile and the ``/alumni?missing_employer=1`` drill-down it deep-links to are
+    the SAME predicate — a count that doesn't match its own list is the recurring
+    bug class here. Named for what it feeds (the negation is "missing employer").
+    """
+    return has_employer_or_not_applicable()
 
 
 def _contacted_since_exists(cutoff: datetime.datetime):
@@ -452,6 +452,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     industry_counts = {name: 0 for name in _FINANCE_INDUSTRIES}
     other_count = 0
     graduate_student_count = 0
+    military_count = 0
     unknown_explicit = 0
     known_total = 0
     for value, n in industry_rows:
@@ -462,6 +463,13 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             # Graduate Student (#294) is its own dashboard bar, split out of the
             # "Other" catch-all so it can be counted and drilled into separately.
             graduate_student_count += n
+            continue
+        if lowered == "military":
+            # Military (#608) gets the same treatment as Graduate Student: its own
+            # bar, split out of "Other". The whole reason the industry was added is
+            # that service members were disappearing into the catch-all, so leaving
+            # them in it would defeat the change.
+            military_count += n
             continue
         if lowered == "unknown":
             # Explicit "Unknown" (#295) is merged INTO the "Unknown" data-gap bar
@@ -528,6 +536,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             "other": other_count,
             "unknown": unknown_count,
             "graduate_student": graduate_student_count,
+            "military": military_count,
         },
     }
 

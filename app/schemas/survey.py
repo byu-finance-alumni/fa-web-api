@@ -387,3 +387,94 @@ class SurveySendConfigUpdateRequest(BaseModel):
     enabled: bool
     daily_limit: int = Field(ge=0)
     monthly_limit: int = Field(ge=0)
+
+
+# ----------------------------------------------- per-alumnus campaign reset ----
+#
+# The engineer's replacement for hand-running SQL to re-survey ONE person (#395).
+# Two shapes: what their survey state is right now (`SurveyAlumniState`) and what
+# a reset actually removed (`SurveyResetResult`). Everything here is scoped to a
+# single alumni_id — there is deliberately no cohort- or year-wide variant.
+
+
+class SurveyAlumniSend(BaseModel):
+    """One survey email this alumnus was actually sent (`survey_send_log`)."""
+
+    graduation_year: int
+    cycle_seq: int
+    # 0 = initial, 1 = 1-week reminder, 2 = 2-week reminder.
+    stage: int
+    stage_label: str
+    sent_at: datetime.datetime
+    # True when this row belongs to the cohort's CURRENT campaign — the only
+    # rows that can block a re-send. An old cycle's rows are inert history, so
+    # showing "we emailed them" without this would make every long-standing
+    # alumnus look blocked.
+    current_cycle: bool
+
+
+class SurveyAlumniResponse(BaseModel):
+    """One submission this alumnus made (`survey_responses`), any status."""
+
+    survey_response_id: int
+    submitted_at: datetime.datetime
+    # 'pending' (awaiting review), 'applied' (written to the record), or
+    # 'rejected' (thrown away by staff).
+    status: str
+    # How many fields the submission carried, and whether a photo came with it —
+    # a plain measure of what a reset would destroy.
+    field_count: int
+    has_photo: bool
+    # True when this reply falls inside the 365-day re-survey window AND counts
+    # as a reply (`survey_email.RESPONDED_STATUSES` — `rejected` does not), i.e.
+    # it is what is currently holding the alumnus out of a send.
+    blocks_resend: bool
+
+
+class SurveyAlumniState(BaseModel):
+    """An alumnus's complete survey state, for the engineer to read BEFORE
+    deciding whether a reset is warranted (#395).
+
+    The point of this shape is that a reset is USUALLY THE WRONG MOVE: someone
+    can look blocked simply because they legitimately answered three months ago,
+    and deleting that answer to re-ask them destroys a real reply. So the state
+    is reported as facts (what went out, what came back, when, with what status)
+    plus `blocked_reasons` in plain words, rather than a single yes/no.
+    """
+
+    alumni_id: int
+    name: str
+    graduation_year: int | None = None
+    email: str | None = None
+    archived: bool = False
+    # The cohort's campaign, when the year has one — status/start date/cycle, so
+    # the engineer can tell a live campaign from finished history.
+    schedule_status: str | None = None
+    schedule_start_date: datetime.date | None = None
+    schedule_cycle_seq: int | None = None
+    sends: list[SurveyAlumniSend]
+    responses: list[SurveyAlumniResponse]
+    # Why another survey email would NOT reach this person today, in plain
+    # words — empty when nothing is holding them back, in which case a reset is
+    # pure data loss and the UI says so.
+    blocked_reasons: list[str]
+
+
+class SurveyResetResult(BaseModel):
+    """What a per-alumnus reset actually deleted (#395).
+
+    Counts, not booleans, because the audit trail records these and "we removed
+    3 emails and 1 reply" is the only useful answer to "what did that button
+    do?". A reset that found nothing succeeds and reports zeros."""
+
+    alumni_id: int
+    name: str
+    # Rows removed from `survey_send_log` — what unblocks a repeat send inside
+    # the current cycle.
+    sends_deleted: int
+    # Rows removed from `survey_responses` (EVERY status, including `rejected`)
+    # — what clears the 365-day re-survey window.
+    responses_deleted: int
+    # Staged survey photos removed from the headshots bucket alongside their
+    # rows, so a deleted response never leaves an orphaned image behind.
+    staged_photos_deleted: int

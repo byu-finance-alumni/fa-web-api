@@ -7,6 +7,7 @@ import uuid
 import pytest
 
 from app.core.errors import NotFoundError
+from app.models.audit import AuditLog
 from app.models.survey_response import SurveyResponse
 from app.services import supabase_storage
 from app.services import survey_responses as sr
@@ -139,12 +140,121 @@ def test_current_and_after_formatting():
     obj = types.SimpleNamespace(piff_donor=True, employer="Acme")
     bf = _Field("program.piff_donor", "PIFF", "engagement", "piff_donor", "bool")
     assert _current(bf, obj) == "Yes"
-    assert _current(bf, None) == ""
     assert _after(bf, "yes") == "Yes"
     assert _after(bf, "No") == "No"
     tf = _Field("k", "Employer", "employment", "employer", "text")
     assert _current(tf, obj) == "Acme"
+    assert _current(tf, None) == ""
     assert _after(tf, " Beta ") == "Beta"
+
+
+def test_missing_side_row_reads_as_no_not_blank():
+    # An alum with NO alumni_program_engagement row holds none of the yes/no
+    # flags — the columns are NOT NULL / default-false, so "no row" means "No",
+    # not "unknown". Reading it as "" made an honest "No" answer show up in the
+    # review queue as a bogus change ("" -> "No"). Text stays blank-for-blank.
+    bf = sr._FIELD_BY_KEY["program.mentor_willing"]
+    assert _current(bf, None) == "No"
+    assert _after(bf, "No") == "No"
+    cfa = sr._FIELD_BY_KEY["program.cfa_designation"]
+    assert _current(cfa, None) == "No"
+    assert _current(sr._FIELD_BY_KEY["profile.linkedin_url"], None) == ""
+
+
+def test_every_engagement_flag_the_survey_asks_is_whitelisted():
+    # The survey's "Ways to get involved" screen. Each must map to its own bool
+    # column on alumni_program_engagement — a key the apply whitelist doesn't
+    # know is dropped, so a YES the alum submitted would never reach the record.
+    for column in (
+        "mentor_willing",
+        "women_in_finance_mentor_willing",
+        "guest_speaker_willing",
+        "help_at_event_willing",
+        "nettrek_host_willing",
+        "finance_conference_willing",
+        "company_event_sponsor_willing",
+        "case_competition_host_willing",
+        "piff_donor",
+    ):
+        field = sr._FIELD_BY_KEY[f"program.{column}"]
+        assert (field.group, field.column, field.kind) == ("engagement", column, "bool")
+
+
+def test_coerce_bool_round_trips_json_true_and_false():
+    # The survey posts the strings "Yes"/"No", but the payload column is JSON and
+    # a client (or a future form) may put a real JSON boolean there. BOTH must
+    # survive: a `true` that landed as False would silently look like a correct
+    # "not willing", with nothing anywhere saying an answer was lost.
+    bf = sr._FIELD_BY_KEY["program.mentor_willing"]
+    for truthy in (True, "Yes", "yes", "YES", "true", "True", "1"):
+        assert _coerce(bf, truthy) is True, truthy
+    for falsy in (False, "No", "no", "false", "False", "0", "", None):
+        assert _coerce(bf, falsy) is False, falsy
+    assert _after(bf, True) == "Yes"
+    assert _after(bf, False) == "No"
+
+
+def test_apply_writes_engagement_flags_and_creates_a_missing_row(monkeypatch):
+    # End to end through apply for the bug Jake hit: YES to "willing to mentor"
+    # must land as True on the engagement row, a NO must land as False, and an
+    # alum with no engagement row at all must get one created rather than have
+    # the answer dropped.
+    resp = _fake_resp(
+        payload={
+            "program.mentor_willing": "Yes",
+            "program.guest_speaker_willing": "No",
+            "program.piff_donor": "Yes",
+        }
+    )
+    alum = types.SimpleNamespace(alumni_id=5, net_id="jdoe5")
+
+    async def fake_get_pending(_s, _rid):
+        return resp
+
+    async def fake_side(_s, _ids):
+        return ({}, {}, {})  # no engagement row on file
+
+    monkeypatch.setattr(sr, "_get_pending", fake_get_pending)
+    monkeypatch.setattr(sr, "_load_side_rows", fake_side)
+    session = _Session(alum)
+    asyncio.run(sr.apply_response(session, 1, actor_user_id=9))
+    eng = next(
+        o for o in session.added if isinstance(o, sr.AlumniProgramEngagement)
+    )
+    assert eng.alumni_id == 5
+    assert eng.mentor_willing is True
+    assert eng.guest_speaker_willing is False
+    assert eng.piff_donor is True
+    assert resp.status == "applied"
+
+
+def test_apply_reports_keys_it_could_not_write(monkeypatch, caplog):
+    # A payload key missing from the whitelist writes NOTHING, yet the response
+    # still flips to "applied". That used to happen in total silence, so a rename
+    # on either side of the wire would lose alumni answers with no trace. It must
+    # now WARN with the offending keys and record the counts on the audit row.
+    resp = _fake_resp(
+        payload={"program.mentor_willing": "Yes", "program.mentorWilling": "Yes"}
+    )
+    alum = types.SimpleNamespace(alumni_id=5, net_id="jdoe5")
+    eng = types.SimpleNamespace(alumni_id=5, mentor_willing=False)
+
+    async def fake_get_pending(_s, _rid):
+        return resp
+
+    async def fake_side(_s, _ids):
+        return ({}, {}, {5: eng})
+
+    monkeypatch.setattr(sr, "_get_pending", fake_get_pending)
+    monkeypatch.setattr(sr, "_load_side_rows", fake_side)
+    session = _Session(alum)
+    with caplog.at_level("WARNING"):
+        asyncio.run(sr.apply_response(session, 1, actor_user_id=9))
+    assert eng.mentor_willing is True
+    assert "program.mentorWilling" in caplog.text
+    audit = next(o for o in session.added if isinstance(o, AuditLog))
+    assert "written=1" in audit.new_value
+    assert "dropped=1" in audit.new_value
 
 
 def test_submit_invalid_token_raises():

@@ -55,6 +55,7 @@ from app.schemas.survey import (
     SurveyScheduleBulkRequest,
     SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
+    SurveyScheduleDeleteResult,
     SurveyScheduleItem,
     SurveySchedulePauseAllResult,
     SurveyScheduleRunSummary,
@@ -483,11 +484,50 @@ async def cancel_survey_schedule(
     user: RequireSurveysManage,
     session: SessionDep,
 ) -> SurveyScheduleItem:
-    """Cancel a graduation year's schedule — no further sends."""
-    item = await survey_schedule.cancel_schedule(session, grad_year)
+    """Cancel a graduation year's schedule — no further sends.
+
+    Terminal, and non-destructive: the row stays with its `cycle_seq`, next to
+    the send log it explains. This is what a campaign that has already emailed
+    people gets instead of `DELETE` below (#398). Audited."""
+    item = await survey_schedule.cancel_schedule(
+        session, grad_year, actor_user_id=user.user_id
+    )
     if item is None:
         raise NotFoundError("No schedule exists for that graduation year.")
     return item
+
+
+@router.delete("/schedules/{grad_year}", response_model=SurveyScheduleDeleteResult)
+async def delete_survey_schedule(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireEngineer,
+    session: SessionDep,
+) -> SurveyScheduleDeleteResult:
+    """Remove a survey campaign — the schedule row, and nothing else (#398).
+
+    For the campaign scheduled against the wrong year, or created by mistake:
+    pausing hid it, but the row stayed forever. This removes it, and with it any
+    future send (the cron only ever selects rows that exist).
+
+    DELETES NO HISTORY. `survey_send_log` and `survey_responses` are not touched
+    here or anywhere in this path — a "delete campaign" that took the alumni's
+    submitted answers with it is precisely what Jake ruled out on #395 the same
+    day.
+
+    409 when the campaign has EVER sent an email. That is not squeamishness:
+    `survey_schedule` is the only holder of the year's `cycle_seq`, so deleting
+    it would leave the send-log rows looking like the current cycle's, and the
+    next campaign for that year would find everyone already emailed and send to
+    nobody (#357). Cancel is the honest verb for those, and the error says so.
+
+    Engineer-gated like the other maintenance controls (pause-all / cancel-all /
+    per-alumnus reset) rather than `surveys.manage`, which is assignable."""
+    result = await survey_schedule.delete_schedule(
+        session, grad_year, actor_user_id=user.user_id
+    )
+    if result is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return result
 
 
 @router.post("/schedules/cancel-all", response_model=SurveyScheduleCancelAllResult)
@@ -525,13 +565,13 @@ async def survey_alumnus_state(
 
     Read-only, and the REQUIRED first half of the reset below — the engineer has
     to be able to see that someone looks "blocked" only because they legitimately
-    replied three months ago, in which case deleting that reply is the wrong
-    move. `blocked_reasons` says so in plain words; empty means a reset would
-    unblock nothing and only destroy history.
+    replied three months ago, in which case re-asking them may not be wanted.
+    `blocked_reasons` says so in plain words; empty means a reset would change
+    nothing at all.
 
     Engineer-gated (`RequireEngineer` = the non-assignable `engineer`
-    capability), matching its destructive twin: the read exists to inform that
-    one decision, so widening it would only invite the reset to be run blind.
+    capability), matching its twin below: the read exists to inform that one
+    decision, so widening it would only invite the reset to be run blind.
     """
     return await survey_reset.get_state(session, alumni_id)
 
@@ -542,25 +582,25 @@ async def survey_reset_alumnus(
     user: RequireEngineer,
     session: SessionDep,
 ) -> SurveyResetResult:
-    """Clear ONE alumnus's survey campaign state so they can be surveyed again
-    (#395) — the UI replacement for hand-running DELETE statements.
+    """Make ONE alumnus surveyable again (#395) — the UI replacement for
+    hand-running DELETE statements, which now deletes nothing itself.
 
-    IRREVERSIBLE AND DESTRUCTIVE. It permanently deletes that person's submitted
-    survey answers, including a `pending` one nobody has reviewed yet, along with
-    the record of the emails they were sent. Nothing is applied to their profile
-    on the way out and there is no undo. Callers must show
-    `GET /survey/alumni/{alumni_id}/state` first.
+    DESTROYS NOTHING (Jake, 2026-08-05). It records a reset in
+    `survey_reset_log`; their submitted answers, the record of the emails sent to
+    them, and any staged survey photo all stay in the database and on their
+    profile. A `pending` answer stays pending and stays in the review queue.
+    Eligibility queries stop counting what predates the reset — that is the
+    entire effect. Callers must show `GET /survey/alumni/{alumni_id}/state`
+    first, because a reset that unblocks nothing is simply noise.
 
     Gated on `RequireEngineer` — the `engineer` capability, which is the one
     capability the permission editor cannot grant to another role. Deliberately
-    NOT `surveys.manage`: that capability IS assignable, so gating on it would
-    let an engineer hand permanent destruction of alumni submissions to any role
-    that merely needs to review responses. Same reasoning as the pause-all /
-    cancel-all switches, which are engineer-gated for being maintenance actions.
+    NOT `surveys.manage`: that capability IS assignable, and this button decides
+    who receives a real email, so it stays with the maintenance controls
+    (pause-all / cancel-all) rather than with response review.
 
     Scoped to exactly one alumnus. There is no bulk or cohort variant; the annual
-    cohort re-run is `POST /schedules/{grad_year}/new-cycle`, which deletes
-    nothing.
+    cohort re-run is `POST /schedules/{grad_year}/new-cycle`.
     """
     return await survey_reset.reset_alumnus(
         session, alumni_id, actor_user_id=user.user_id

@@ -200,7 +200,16 @@ async def probe_object(bucket: str, path: str) -> tuple[str | None, int | None]:
 
 
 async def delete_object(bucket: str, path: str) -> None:
-    """Delete an object. A missing object (404) is treated as success."""
+    """Delete an object. An object that is already gone is treated as success.
+
+    Deleting something that no longer exists is the outcome the caller wanted,
+    so it must never raise. Supabase Storage is inconsistent about how it says
+    "not found" — a 404 for some keys, but a 400 whose body carries a
+    ``not_found`` / "Object not found" marker for others — so matching only on
+    404 turned an already-deleted file into a hard failure. That is exactly what
+    blocked an engineer resetting a survey campaign for an alumnus whose staged
+    photo had already been promoted onto their profile.
+    """
     base, key = _base_and_key()
     url = f"{base}/object/{bucket}/{path}"
     try:
@@ -208,7 +217,21 @@ async def delete_object(bucket: str, path: str) -> None:
             response = await client.delete(url, headers=_headers(key))
     except httpx.HTTPError as exc:
         raise ServiceError("Could not reach the file storage service to delete.") from exc
-    if response.status_code == 404:
+    if response.status_code == 404 or _is_missing_object(response):
         return
     if not response.is_success:
         raise ServiceError("The file storage service rejected the delete.")
+
+
+def _is_missing_object(response: httpx.Response) -> bool:
+    """Whether a non-2xx delete response means "it wasn't there anyway"."""
+    if response.is_success or response.status_code not in (400, 404):
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    marker = " ".join(
+        str(body.get(field, "")) for field in ("error", "message", "statusCode")
+    ).lower()
+    return "not_found" in marker or "not found" in marker

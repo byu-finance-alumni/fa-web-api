@@ -30,6 +30,7 @@ from app.models.login_failure import LoginFailure
 from app.models.maintenance import MaintenanceMode
 from app.models.note import Note
 from app.models.role_capability import RoleCapability
+from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
@@ -67,6 +68,7 @@ __all__ = [
     "RoleCapability",
     "StatusLabel",
     "Survey",
+    "SurveyResetLog",
     "SurveyResponse",
     "SurveySchedule",
     "SurveySendConfig",

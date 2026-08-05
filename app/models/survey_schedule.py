@@ -109,6 +109,7 @@ class SurveySendLog(Base):
             "alumni_id",
             "stage",
             "cycle_seq",
+            "reset_seq",
             name="uq_survey_send_log_year_alumni_stage",
         ),
     )
@@ -127,6 +128,22 @@ class SurveySendLog(Base):
     )
     # 0 = initial, 1 = 1-week reminder, 2 = 2-week reminder.
     stage: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # Which reset generation this email belongs to (#395, 2026-08-05). 0 = the
+    # alumnus had never been reset when it went out, which is every row that
+    # existed before that change.
+    #
+    # It is in the unique key above because an engineer reset must let the SAME
+    # (year, alumni, stage, cycle) be emailed again WITHOUT deleting the row that
+    # recorded the first one. Ignoring the old row in the reads is not enough —
+    # the constraint refuses the insert, `_claim_batch`'s ON CONFLICT DO NOTHING
+    # swallows it, and the recipient is silently never emailed while the console
+    # still counts them as eligible.
+    #
+    # Written once, at claim time, from the alumnus's current reset count; never
+    # updated afterwards, so this table stays append-only.
+    reset_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     sent_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

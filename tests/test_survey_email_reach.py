@@ -109,6 +109,21 @@ def db():
                 " submitted_at TIMESTAMP NOT NULL)"
             )
         )
+        # An engineer reset is recorded here, and every eligibility predicate
+        # consults it (#395). Empty in these tests: with no resets, replies and
+        # sends count exactly as they always did.
+        conn.execute(
+            text(
+                "CREATE TABLE survey_reset_log ("
+                " survey_reset_id INTEGER PRIMARY KEY,"
+                " alumni_id INTEGER NOT NULL,"
+                " reset_seq INTEGER NOT NULL,"
+                " reset_at TIMESTAMP NOT NULL,"
+                " reset_by_user_id INTEGER,"
+                " sends_superseded INTEGER NOT NULL DEFAULT 0,"
+                " responses_superseded INTEGER NOT NULL DEFAULT 0)"
+            )
+        )
         conn.commit()
         yield conn
     engine.dispose()

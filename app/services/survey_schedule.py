@@ -74,6 +74,7 @@ from app.schemas.survey import (
     SurveyNonResponder,
     SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
+    SurveyScheduleDeleteResult,
     SurveyScheduleItem,
     SurveySchedulePauseAllResult,
     SurveyScheduleRunItem,
@@ -150,7 +151,13 @@ async def _sent_counts_by_stage(
     A year with log rows but no schedule row (a manual send for an unscheduled
     year) has no current cycle to report against, so it is absent here and its
     counters read 0 — the same as before this change, since the console only
-    renders rows that HAVE a schedule."""
+    renders rows that HAVE a schedule.
+
+    DELIBERATELY not filtered by `send_not_superseded` (#395). This is a count of
+    emails that left the building, not of people currently blocked: an alum who
+    was reset and re-emailed really did receive two, and hiding the first would
+    under-report what the campaign sent. The same reasoning keeps
+    `survey_email.get_send_usage` — the Resend budget meter — unfiltered."""
     stmt = (
         select(
             SurveySendLog.graduation_year,
@@ -217,6 +224,10 @@ def _cycle_non_responders():
             SurveyResponse.alumni_id == SurveySendLog.alumni_id,
             SurveyResponse.submitted_at >= survey_email._resurvey_cutoff(),
             SurveyResponse.status.in_(survey_email.RESPONDED_STATUSES),
+            # A reply an engineer reset has superseded no longer counts as a
+            # reply anywhere (#395) — including here, or the call sheet would
+            # disagree with the send about who still owes us an answer.
+            survey_email.response_not_superseded(),
         )
         .exists()
     )
@@ -233,6 +244,10 @@ def _cycle_non_responders():
             (SurveySchedule.graduation_year == SurveySendLog.graduation_year)
             & (SurveySchedule.cycle_seq == SurveySendLog.cycle_seq),
         )
+        # Pre-reset sends do not count toward the three stages either (#395).
+        # Someone reset mid-campaign is owed the whole campaign again, so they
+        # are not a finished-and-silent follow-up case until it has run.
+        .where(survey_email.send_not_superseded())
         .where(~replied)
         .group_by(SurveySendLog.graduation_year, SurveySendLog.alumni_id)
         .having(func.count(func.distinct(SurveySendLog.stage)) == len(_ALL_STAGES))
@@ -359,11 +374,29 @@ async def _creator_names(
     return names
 
 
+async def _all_time_send_counts(session: AsyncSession) -> dict[int, int]:
+    """Emails ever sent for each graduation year, ACROSS EVERY CYCLE (#398).
+
+    Distinct from :func:`_sent_counts_by_stage`, which is current-cycle only.
+    This is the number that decides whether a campaign can be DELETED or only
+    CANCELLED: once a year has any send-log row, its schedule row is the only
+    thing holding the cycle counter that keeps those rows scoped to a past
+    campaign, so removing it would make them look like the current cycle's and
+    the next campaign for that year would find everyone already emailed (#357,
+    exactly). Superseded rows are counted too — a reset does not un-send an
+    email."""
+    stmt = select(SurveySendLog.graduation_year, func.count()).group_by(
+        SurveySendLog.graduation_year
+    )
+    return {year: int(n) for year, n in (await session.execute(stmt)).all()}
+
+
 def _to_item(
     sched: SurveySchedule,
     counts: dict[tuple[int, int], int],
     creators: dict[int, str],
     non_responders: dict[int, int] | None = None,
+    all_time_sent: dict[int, int] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     created_by_id = getattr(sched, "created_by_user_id", None)
@@ -381,6 +414,7 @@ def _to_item(
         sent_reminder_1=counts.get((year, STAGE_REMINDER_1), 0),
         sent_reminder_2=counts.get((year, STAGE_REMINDER_2), 0),
         non_responders=(non_responders or {}).get(year, 0),
+        emails_sent_all_time=(all_time_sent or {}).get(year, 0),
     )
 
 
@@ -401,8 +435,11 @@ async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
     )
     counts = await _sent_counts_by_stage(session)
     non_responders = await _non_responder_counts(session)
+    all_time = await _all_time_send_counts(session)
     creators = await _creator_names(session, schedules)
-    return [_to_item(s, counts, creators, non_responders) for s in schedules]
+    return [
+        _to_item(s, counts, creators, non_responders, all_time) for s in schedules
+    ]
 
 
 async def get_schedule(
@@ -420,8 +457,9 @@ async def get_schedule(
         return None
     counts = await _sent_counts_by_stage(session)
     non_responders = await _non_responder_counts(session)
+    all_time = await _all_time_send_counts(session)
     creators = await _creator_names(session, [sched])
-    return _to_item(sched, counts, creators, non_responders)
+    return _to_item(sched, counts, creators, non_responders, all_time)
 
 
 async def _upsert_schedule(
@@ -501,7 +539,13 @@ async def preview_new_cycle(
     previous cycle, BEFORE committing. ``previously_emailed`` is the number this
     cycle would reach who are in the CURRENT cycle's send log — i.e. the people
     who would get a second email — which is the number that makes the blast size
-    real rather than abstract."""
+    real rather than abstract.
+
+    ``previously_emailed`` counts EVERY send-log row in the current cycle,
+    including ones an engineer reset has superseded (#395): the question it
+    answers is "who has already had an email from us this cycle", and a reset
+    person had one. Only `eligible` is a blocking question, and it comes from
+    `_load_recipients`, which applies the reset rules."""
     sched = (
         await session.execute(
             select(SurveySchedule).where(
@@ -851,9 +895,17 @@ async def pause_all_schedules(
 
 
 async def cancel_schedule(
-    session: AsyncSession, graduation_year: int
+    session: AsyncSession, graduation_year: int, *, actor_user_id: int | None = None
 ) -> SurveyScheduleItem | None:
-    """Cancel a schedule (no further sends). Returns None if there is none."""
+    """Cancel a schedule (no further sends). Returns None if there is none.
+
+    Terminal and non-destructive: the row stays, keeping its ``cycle_seq`` and
+    its place beside the send log, so the year's history still reads as "cycle N
+    ran, and here is what it sent". Cancelling is what a campaign that HAS
+    emailed people gets instead of :func:`delete_schedule` (#398).
+
+    Audited, matching pause/resume and the two blanket switches — stopping a
+    cohort's campaign is an intervention someone will later want explained."""
     existing = (
         await session.execute(
             select(SurveySchedule).where(
@@ -863,9 +915,131 @@ async def cancel_schedule(
     ).scalar_one_or_none()
     if existing is None:
         return None
+    previous = existing.status
     existing.status = STATUS_CANCELLED
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="cancel_survey_schedule",
+            entity_type="survey_campaign",
+            entity_id=graduation_year,
+            field_name="status",
+            old_value=previous,
+            new_value=STATUS_CANCELLED,
+        )
+    )
     await session.commit()
     return await get_schedule(session, graduation_year)
+
+
+# ------------------------------------------------------ delete a campaign ------
+#
+# #398, Jake 2026-08-05: "make it so in the surveys you can delete the survey
+# campaigns next to the resume button." A campaign scheduled for the wrong year
+# or created by mistake was stuck there forever — pausing hid it, the row stayed.
+#
+# DELETING A CAMPAIGN MEANS THE SCHEDULE ROW, AND ONLY THAT. `survey_send_log`
+# (what we emailed) and `survey_responses` (what alumni told us) are never
+# touched, here or anywhere else — the same rule the per-alumnus reset was
+# rewritten around on the same day.
+#
+# Which makes "delete" the wrong verb for a campaign that has already emailed
+# people, and not just cosmetically. `survey_schedule` is the ONLY holder of a
+# year's `cycle_seq`. Drop the row for a year with send-log rows in cycle 2 and
+# the next campaign for that year starts at cycle 1 again, colliding with cycle
+# 1's log rows: every alum reads as already emailed, `select_stage_targets`
+# returns nothing at every stage, and the campaign "completes" having sent to
+# nobody. That is #357 verbatim — the bug this codebase has already paid for
+# once.
+#
+# So the rule is the honest one the issue asks for:
+#
+#   * never emailed  -> DELETE. Nothing exists that the row is the key to.
+#   * ever emailed   -> CANCEL. The row stays, terminally stopped, next to the
+#                       history it explains.
+#
+# Both stop the cron for the same reason from its point of view: `_load_schedules_due`
+# selects `scheduled`/`active` rows, so a deleted row is not there to select and
+# a cancelled one is not runnable. A mid-flight campaign with reminders still due
+# genuinely stops either way.
+
+
+async def delete_schedule(
+    session: AsyncSession, graduation_year: int, *, actor_user_id: int | None
+) -> SurveyScheduleDeleteResult | None:
+    """Delete a graduation year's campaign row (#398).
+
+    Returns ``None`` when the year has no schedule (the route 404s). Raises
+    :class:`ConflictError` — a 409 — when the campaign has EVER sent an email,
+    because deleting it then would take the cycle counter with it (see the note
+    above); the console offers cancel instead, and the message says so.
+
+    Removes the ``survey_schedule`` row and nothing else. Any survey responses
+    for that year stay in the database and on the alumni's profiles; the count is
+    reported back so the confirmation can state it rather than imply otherwise.
+    """
+    sched = (
+        await session.execute(
+            select(SurveySchedule).where(
+                SurveySchedule.graduation_year == graduation_year
+            )
+        )
+    ).scalar_one_or_none()
+    if sched is None:
+        return None
+
+    emails_sent = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(SurveySendLog)
+            .where(SurveySendLog.graduation_year == graduation_year)
+        )
+        or 0
+    )
+    if emails_sent:
+        raise ConflictError(
+            f"This campaign has already emailed {emails_sent} "
+            f"{'alum' if emails_sent == 1 else 'alumni'}, so it cannot be "
+            "deleted — the record of those emails is kept, and removing the "
+            "campaign would make the next one for this year skip everybody. "
+            "Cancel it instead: it stops immediately and stays visible as "
+            "history."
+        )
+
+    responses_kept = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(SurveyResponse)
+            .where(SurveyResponse.graduation_year == graduation_year)
+        )
+        or 0
+    )
+    previous_status = sched.status
+    cycle_seq = getattr(sched, "cycle_seq", 1)
+    await session.delete(sched)
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="delete_survey_schedule",
+            entity_type="survey_campaign",
+            entity_id=graduation_year,
+            old_value=(
+                f"status={previous_status} cycle={cycle_seq} "
+                f"start_date={sched.start_date.isoformat()}"
+            ),
+            # Spelled out because the obvious reading of "deleted a campaign" is
+            # that the emails and answers went with it. They did not.
+            new_value=(
+                f"deleted (emails_sent=0, responses_kept={responses_kept})"
+            ),
+        )
+    )
+    await session.commit()
+    return SurveyScheduleDeleteResult(
+        graduation_year=graduation_year,
+        previous_status=previous_status,
+        responses_kept=responses_kept,
+    )
 
 
 async def cancel_all_schedules(

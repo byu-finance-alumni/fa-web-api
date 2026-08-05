@@ -62,6 +62,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
+from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.repositories.alumni import build_alumni_query, has_status_label_exists
@@ -94,6 +95,88 @@ _RESURVEY_INTERVAL_DAYS = 365
 # (:func:`_load_recipients`) and the console's responded tally
 # (:func:`list_graduation_years`) — they must never drift.
 RESPONDED_STATUSES: tuple[str, ...] = ("pending", "applied")
+
+
+# --------------------------------------------------- engineer reset (#395) ----
+#
+# A per-alumnus reset makes ONE person surveyable again. It used to do that by
+# DELETING their responses and send-log rows; it now records an event in
+# `survey_reset_log` and DELETES NOTHING (Jake, 2026-08-05: "when you reset the
+# campaign the responses should not be reset, they should still be in the db").
+#
+# The two predicates below are how that stays true. EVERY query that asks "has
+# this person already replied?" or "have we already emailed them?" must apply the
+# matching one, or the console and the sender end up with different populations —
+# the standing bug class in this area. The full list of callers is in
+# `services/survey_reset.py`.
+#
+# They are asymmetric, on purpose:
+#
+# * responses are compared by TIME, because the requirement is that those rows
+#   are not written to at all — there is no column on them to compare;
+# * send-log rows are compared by `reset_seq`, which they had to grow anyway so
+#   the UNIQUE (year, alumni, stage, cycle, reset_seq) would admit the re-send.
+#   Exact integer identity, no clock involved.
+
+
+def response_not_superseded():
+    """Correlated NOT EXISTS: no reset has happened since this response.
+
+    Compares `survey_responses.submitted_at` against the alum's reset times, so
+    the response row itself is never touched. A response submitted AFTER the
+    reset counts normally again — answering post-reset re-blocks them, which is
+    the point.
+
+    Clock note: `reset_at` is stamped by the API and `submitted_at` by Postgres.
+    A skew of a second could leave a response submitted a moment before a reset
+    still counting as a reply, i.e. the alum stays blocked and the engineer sees
+    it and resets again — the safe direction to be wrong in.
+    """
+    return ~(
+        select(SurveyResetLog.survey_reset_id)
+        .where(
+            SurveyResetLog.alumni_id == SurveyResponse.alumni_id,
+            SurveyResetLog.reset_at >= SurveyResponse.submitted_at,
+        )
+        .exists()
+    )
+
+
+def send_not_superseded():
+    """Correlated NOT EXISTS: this delivered email predates no later reset.
+
+    A send-log row records the alum's reset count at the moment it was claimed,
+    so "superseded" is simply "a reset with a higher sequence exists" — no
+    timestamps, and it agrees with the unique key by construction.
+    """
+    return ~(
+        select(SurveyResetLog.survey_reset_id)
+        .where(
+            SurveyResetLog.alumni_id == SurveySendLog.alumni_id,
+            SurveyResetLog.reset_seq > SurveySendLog.reset_seq,
+        )
+        .exists()
+    )
+
+
+async def reset_seq_for(session: AsyncSession, alumni_ids: list[int]) -> dict[int, int]:
+    """How many times each of these alumni has been reset (absent = never).
+
+    The value a new `survey_send_log` row must carry. Bulk, because it is
+    resolved for a whole cohort inside `_load_recipients` and must not become
+    one round trip per recipient.
+    """
+    if not alumni_ids:
+        return {}
+    stmt = (
+        select(SurveyResetLog.alumni_id, func.max(SurveyResetLog.reset_seq))
+        .where(SurveyResetLog.alumni_id.in_(alumni_ids))
+        .group_by(SurveyResetLog.alumni_id)
+    )
+    return {
+        alumni_id: int(seq or 0)
+        for alumni_id, seq in (await session.execute(stmt)).all()
+    }
 
 # --------------------------------------------------------------- send stages --
 #
@@ -196,6 +279,11 @@ async def logged_alumni_ids(
         SurveySendLog.graduation_year == graduation_year,
         SurveySendLog.stage == stage,
         SurveySendLog.cycle_seq == cycle_seq,
+        # An engineer reset makes the rows that predate it inert history (#395):
+        # they still record a real email, but they no longer hold the person out
+        # of this stage. Without this the reset would unblock the 365-day
+        # response window and nothing else, and the alum would stay unsendable.
+        send_not_superseded(),
     )
     return set((await session.execute(stmt)).scalars().all())
 
@@ -437,6 +525,10 @@ class Recipient:
     # preview and the audit trail so staff can see when a campaign leaned on work
     # addresses, which is a data-quality signal worth acting on.
     email_source: str = email_reach.SOURCE_PERSONAL
+    # How many times an engineer has reset this alumnus (#395). Carried on the
+    # recipient because it is part of the send-log unique key, so the claim needs
+    # it per person; 0 for everyone who has never been reset.
+    reset_seq: int = 0
 
 
 def _on_file_rows(r: Recipient) -> list[tuple[str, str]]:
@@ -674,6 +766,11 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
             SurveyResponse.graduation_year.is_not(None),
             SurveyResponse.submitted_at >= _resurvey_cutoff(),
             SurveyResponse.status.in_(RESPONDED_STATUSES),
+            # A reset alum is surveyable again, so they are not "responded" for
+            # this campaign — the same rule `_replied_recently_exists` applies to
+            # the send. The reply itself is still in the table and still on their
+            # profile; it just stopped counting toward this year's tally (#395).
+            response_not_superseded(),
         )
         .group_by(SurveyResponse.graduation_year)
     )
@@ -774,13 +871,19 @@ def _suppressed_label_exists():
 def _replied_recently_exists():
     """Correlated EXISTS: replied within the 365-day re-survey window. A
     ``rejected`` response does not count (:data:`RESPONDED_STATUSES`) — staff
-    threw it away, so the alum is surveyable again."""
+    threw it away, so the alum is surveyable again.
+
+    Nor does a reply an engineer reset has since superseded (#395): the row
+    stays in the database and on the alum's profile, but it no longer silences
+    them. That is the whole of what a reset now does to this table — it writes
+    nothing to it."""
     return (
         select(SurveyResponse.survey_response_id)
         .where(
             SurveyResponse.alumni_id == Alumni.alumni_id,
             SurveyResponse.submitted_at >= _resurvey_cutoff(),
             SurveyResponse.status.in_(RESPONDED_STATUSES),
+            response_not_superseded(),
         )
         .exists()
     )
@@ -1089,6 +1192,9 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
         .scalars()
         .all()
     }
+    # One bulk read, like the side tables — the claim needs each person's reset
+    # count to write a send-log row that does not collide with the pre-reset one.
+    resets = await reset_seq_for(session, ids)
 
     recipients: list[Recipient] = []
     for a in alumni:
@@ -1120,6 +1226,7 @@ async def _load_recipients(session: AsyncSession, graduation_year: int) -> list[
                 email=email,
                 on_file=_build_on_file(a, contact, job),
                 email_source=source or email_reach.SOURCE_PERSONAL,
+                reset_seq=resets.get(a.alumni_id, 0),
             )
         )
     return recipients
@@ -1434,6 +1541,13 @@ async def _claim_batch(
     claim-then-send can at worst skip someone. For an irreversible side effect,
     "possibly missed" is the correct way to fail — a missed alum can be found and
     re-sent deliberately, a duplicate cannot be recalled.
+
+    ``reset_seq`` comes from the recipient (#395) and is what lets a reset alum
+    be claimed again for a (year, stage, cycle) they already have a row for,
+    WITHOUT that row being deleted. It is read when the cohort is loaded, so a
+    reset landing mid-send leaves this insert conflicting with the pre-reset row
+    and the recipient simply drops out of this batch — "possibly missed" again,
+    and the next run picks them up with the new sequence.
     """
     stmt = (
         pg_insert(SurveySendLog)
@@ -1444,6 +1558,7 @@ async def _claim_batch(
                     "alumni_id": r.alumni_id,
                     "stage": stage,
                     "cycle_seq": cycle_seq,
+                    "reset_seq": r.reset_seq,
                 }
                 for r in batch
             ]
@@ -1477,17 +1592,29 @@ async def _release_claim(
     throttled claim in cycle 2 would silently delete the cycle-1 row recording an
     email that really was delivered last year — destroying send history and
     making that alum re-sendable in the earlier cycle's accounting.
+
+    ``reset_seq`` is in the same guarantee for the same reason (#395): after an
+    engineer reset the alum has TWO rows for one (year, stage, cycle), and a
+    release that did not name the generation would delete the pre-reset one —
+    erasing the very history the reset was rewritten to preserve. Recipients are
+    grouped by their sequence so each DELETE names exactly the row that was just
+    inserted.
     """
     if not batch:
         return
-    await session.execute(
-        delete(SurveySendLog).where(
-            SurveySendLog.graduation_year == graduation_year,
-            SurveySendLog.stage == stage,
-            SurveySendLog.cycle_seq == cycle_seq,
-            SurveySendLog.alumni_id.in_([r.alumni_id for r in batch]),
+    by_seq: dict[int, list[int]] = {}
+    for r in batch:
+        by_seq.setdefault(r.reset_seq, []).append(r.alumni_id)
+    for reset_seq, alumni_ids in by_seq.items():
+        await session.execute(
+            delete(SurveySendLog).where(
+                SurveySendLog.graduation_year == graduation_year,
+                SurveySendLog.stage == stage,
+                SurveySendLog.cycle_seq == cycle_seq,
+                SurveySendLog.reset_seq == reset_seq,
+                SurveySendLog.alumni_id.in_(alumni_ids),
+            )
         )
-    )
     await session.commit()
 
 

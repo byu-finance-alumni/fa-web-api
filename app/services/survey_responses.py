@@ -17,6 +17,7 @@ legacy `surveys` table (see `models.crm.Survey`) — one fact, one home.
 from __future__ import annotations
 
 import datetime
+import logging
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -37,6 +38,8 @@ from app.schemas.survey import (
 )
 from app.services import supabase_storage
 from app.services.survey_email import LINK_DEAD_MESSAGE, verify_survey_token
+
+log = logging.getLogger(__name__)
 
 # A staged survey photo lives in the SAME private bucket as real headshots, but
 # under a `survey-pending/` prefix so it can NEVER overwrite an alum's actual
@@ -248,9 +251,15 @@ def _current(field: _Field, obj: object | None) -> str:
     designation column is a held/not-held fact to the alum, so its marker string
     reads as 'Yes' too — the reviewer's diff should say what changed, not which
     literal we store."""
-    if obj is None:
+    raw = getattr(obj, field.column, None) if obj is not None else None
+    # A MISSING side row is not "unknown" for a yes/no question: these columns are
+    # NOT NULL with a false/NULL default, so an alum with no engagement row simply
+    # holds none of them. Reading that as "" made every such alum's honest "No"
+    # show up in the review queue as a change ("" -> "No") the reviewer then
+    # "applied" for nothing. Text fields keep returning "" — a blank column and a
+    # blank answer really are the same thing there.
+    if obj is None and field.kind not in ("bool", "designation"):
         return ""
-    raw = getattr(obj, field.column, None)
     if field.kind == "designation":
         # Presence is NOT the question: a column imported as the literal "No" is
         # a stored (truthy) value that must still read as "No" here, or the
@@ -502,10 +511,20 @@ async def apply_response(
         )
         await supabase_storage.delete_object(_HEADSHOT_BUCKET, resp.staged_photo_path)
 
+    # An apply that writes NOTHING used to report success: a payload key missing
+    # from `_FIELDS` was skipped silently, no log, no error, and the response
+    # still flipped to "applied". Any future rename on either side of the wire
+    # would therefore lose alumni answers invisibly, so count what was written
+    # and what was dropped, warn on the drops, and put both in the audit row.
+    # Field KEYS only ever appear in the log — never a submitted value.
+    written = 0
+    dropped: list[str] = []
     for key, raw in (resp.payload or {}).items():
         field = _FIELD_BY_KEY.get(key)
         if field is None:
+            dropped.append(key)
             continue
+        written += 1
         value = _coerce(field, raw)
         if field.group == "alumni":
             setattr(alum, field.column, value)
@@ -525,6 +544,16 @@ async def apply_response(
                 session.add(eng)
             setattr(eng, field.column, value)
 
+    if dropped:
+        log.warning(
+            "Survey response %s: %d submitted field key(s) are not in the apply "
+            "whitelist and wrote NOTHING to alumni %s: %s",
+            response_id,
+            len(dropped),
+            alum.alumni_id,
+            ", ".join(sorted(dropped)),
+        )
+
     resp.status = "applied"
     resp.reviewed_by_user_id = actor_user_id
     resp.reviewed_at = datetime.datetime.now(datetime.UTC)
@@ -534,7 +563,10 @@ async def apply_response(
             action_type="apply_survey_response",
             entity_type="alumni",
             entity_id=alum.alumni_id,
-            new_value=f"survey_response={response_id} fields={len(resp.payload or {})}",
+            new_value=(
+                f"survey_response={response_id} fields={len(resp.payload or {})} "
+                f"written={written} dropped={len(dropped)}"
+            ),
         )
     )
     await session.commit()

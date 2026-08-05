@@ -292,8 +292,14 @@ def test_every_send_is_recorded_in_the_send_log(call_site, fake_settings, monkey
         (_YEAR, 3, 0, 1),
     ]
     # The audit row is still written for the trail (it is just no longer the
-    # ledger — see get_send_usage).
-    assert [a.action_type for a in audits(session)] == ["send_survey"]
+    # ledger — see get_send_usage). The manual path writes a second one, for the
+    # campaign the send leaves behind so the reminders can fire (#405); the cron
+    # path is already running from a campaign and creates nothing.
+    assert [a.action_type for a in audits(session)] == (
+        ["send_survey", "create_survey_schedule"]
+        if call_site == "manual"
+        else ["send_survey"]
+    )
 
 
 def test_manual_send_then_cron_does_not_re_email_the_cohort(

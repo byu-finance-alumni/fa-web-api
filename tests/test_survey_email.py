@@ -198,7 +198,16 @@ def test_send_stops_and_reports_retry_after_on_429(fake_settings, monkeypatch):
     # The audit row is still written — and, unlike before, so is every claim,
     # each committed before its own send rather than all at the end.
     assert session.committed >= 1
-    assert len(_audits(session)) == 1
+    # Two audit rows now: the send, and the campaign this throttled PARTIAL send
+    # left behind (#405). 100 alumni really were emailed, so the reminders they
+    # are owed need a campaign to fire from — and the 150 the 429 stopped are
+    # picked up by the same campaign's stage 0 on the next cron run, because
+    # `select_stage_targets` drains the initial before it looks at a reminder.
+    assert [a.action_type for a in _audits(session)] == [
+        "send_survey",
+        "create_survey_schedule",
+    ]
+    assert result.campaign_created is True
 
 
 # ------------------------------------------------------ sendable email -------

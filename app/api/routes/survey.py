@@ -47,6 +47,7 @@ from app.schemas.survey import (
     SurveyNewCyclePreview,
     SurveyNewCycleRequest,
     SurveyNonResponder,
+    SurveyRecipientBreakdown,
     SurveyRespondInfo,
     SurveyResponseItem,
     SurveyScheduleBulkRequest,
@@ -60,6 +61,7 @@ from app.schemas.survey import (
     SurveySendResult,
     SurveySubmitRequest,
     SurveySubmitResult,
+    SurveyUnreachableAlum,
     SurveyUsage,
 )
 from app.services import survey_email, survey_responses, survey_schedule
@@ -228,6 +230,63 @@ async def send_survey_campaign(
         dry_run=dry_run,
         limit=limit,
     )
+
+
+@router.get(
+    "/campaigns/{grad_year}/recipients",
+    response_model=SurveyRecipientBreakdown,
+)
+async def survey_recipient_breakdown(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireSurveysManage,
+    session: SessionDep,
+) -> SurveyRecipientBreakdown:
+    """Who this year's survey would reach, and who it would not (#392).
+
+    The console's send confirmation reads THIS rather than doing its own
+    arithmetic on the year picker's totals. That arithmetic
+    (``total_alumni - responded``) ignored suppression, unreachable alumni and
+    the shared-address dedupe, so the button promised a number the send could not
+    deliver — the parity bug this codebase keeps re-growing.
+
+    The same function backs `SurveySendResult.breakdown`, so the figure shown
+    before a send and the figure explaining it afterwards cannot disagree.
+
+    Read-only, sends nothing, takes no send lock — safe to poll while the daily
+    cron is mid-run. Gated like the rest of the console.
+    """
+    return await survey_email.recipient_breakdown(session, grad_year)
+
+
+@router.get(
+    "/campaigns/{grad_year}/unreachable",
+    response_model=list[SurveyUnreachableAlum],
+)
+async def list_survey_unreachable(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireSurveysManage,
+    session: SessionDep,
+) -> list[SurveyUnreachableAlum]:
+    """The alumni this year's survey CANNOT email, by name (#392).
+
+    ``SurveyRecipientBreakdown.unreachable`` is this set as a count; this is the
+    worklist behind it, so "we can't reach 20 of them" becomes something staff
+    can act on. Each row says WHY and shows whatever is in the two email columns,
+    because a typo'd work address is fixable on sight while a wholly missing one
+    has to be chased.
+
+    Campaign-scoped, NOT schedule-scoped: a year with no schedule still has a
+    contact-data gap worth seeing, so this never 404s — an empty list means
+    everyone is reachable.
+
+    Contains no suppressed alumni. Deceased / Do Not Contact are excluded from
+    the campaign by decision, not by a gap, and must never be presented as people
+    to chase for an address.
+
+    Read-only and gated like the rest of the console (it returns alumni contact
+    details).
+    """
+    return await survey_email.list_unreachable(session, grad_year)
 
 
 # --------------------------------------------------------------- scheduler ----

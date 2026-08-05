@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.api.dependencies.auth import RequireReportsAdvanced, RequireViewAccess
+from app.core import email_reach
 from app.core.database import get_session
 from app.core.dropdowns import WHEEL_INDUSTRIES
 from app.models.alumni import Alumni
@@ -106,14 +107,23 @@ def _full_name(
 
 
 def _has_email_exists():
-    """Correlated EXISTS: the alumnus has a personal or work email on file."""
+    """Correlated EXISTS: the alumnus has a personal or work email ON FILE.
+
+    A DATA-QUALITY question, deliberately NOT the survey's deliverability one:
+    ``email_reach.reachable_email_sql`` additionally rejects malformed and
+    placeholder addresses, so the survey's "unreachable" count is always >= this
+    KPI. The two are reported separately on purpose — "we hold no address" and
+    "the address we hold won't send" are different problems with different fixes.
+
+    Now rejects blank/whitespace values too: ``IS NOT NULL`` counted an email
+    column imported as ``''`` as an address on file, understating the gap (#392).
+    """
     return (
         select(AlumniContactInfo.contact_info_id)
         .where(
             AlumniContactInfo.alumni_id == Alumni.alumni_id,
-            or_(
-                AlumniContactInfo.personal_email.is_not(None),
-                AlumniContactInfo.work_email.is_not(None),
+            email_reach.has_email_value_sql(
+                AlumniContactInfo.personal_email, AlumniContactInfo.work_email
             ),
         )
         .exists()

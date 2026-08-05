@@ -74,6 +74,12 @@ class GraduationYearCount(BaseModel):
     # reply: staff threw that submission away, nothing reached the record, so the
     # alum stays surveyable and still counts as a non-responder.
     responded: int = 0
+    # Alumni this year's survey WANTS to email and cannot: no usable personal or
+    # work address (#392). Reported next to the year in the picker so a cohort
+    # with a contact-data gap is visible before a campaign is scheduled rather
+    # than after it quietly under-delivers. Excludes suppressed alumni — see
+    # `SurveyRecipientBreakdown`.
+    unreachable: int = 0
 
 
 class SurveySendSample(BaseModel):
@@ -81,6 +87,75 @@ class SurveySendSample(BaseModel):
 
     email: str
     link: str
+    # Which column the address came from — "personal" or "work" (#392). A sample
+    # full of work addresses is a visible cue that the cohort's personal-email
+    # coverage is poor.
+    email_source: str = "personal"
+
+
+class SurveyRecipientBreakdown(BaseModel):
+    """Who a year's survey reaches, and who it does not — the console's one
+    account of a cohort (#392).
+
+    The buckets PARTITION the year's alumni (is_alumni, not archived)::
+
+        cohort_total = suppressed + already_responded + unreachable + eligible
+        recipients   = eligible - duplicate_emails
+
+    Every consumer reads these same numbers — the year picker, the send
+    confirmation, and the send result — because they are produced by the same
+    queries the send itself runs. Deriving a count separately from the send is
+    the standing bug in this area: the console reports a figure, a different
+    number goes out, and nobody can tell which was wrong.
+
+    `suppressed` and `unreachable` are SEPARATE and must stay that way in the UI.
+    Deceased / Do Not Contact is a decision to honour; no usable address is a gap
+    to close. Summing them into one "not emailed" total would either hide real
+    gaps or put Do Not Contact alumni on a chase list.
+    """
+
+    graduation_year: int
+    # Everyone in the year, before any survey rule is applied.
+    cohort_total: int
+    # Deceased or Do Not Contact — deliberately never emailed. NOT unreachable.
+    suppressed: int
+    # Replied within the 365-day re-survey window, so not due again yet.
+    already_responded: int
+    # No usable personal OR work address. The gap; see the drill-down endpoint.
+    unreachable: int
+    # Passed every rule and has an address — before the shared-address dedupe.
+    eligible: int
+    # Of those, dropped for sharing an address with another recipient (spouses,
+    # reused addresses). Each carries a live edit token, so only one is emailed.
+    duplicate_emails: int
+    # What a send would actually email: eligible - duplicate_emails.
+    recipients: int
+    # Of `recipients`, how many are reached at their WORK address because no
+    # usable personal one exists — the population this change unblocked.
+    work_email_fallback: int
+
+
+class SurveyUnreachableAlum(BaseModel):
+    """One alumnus this campaign cannot email (#392).
+
+    The count made actionable, mirroring `SurveyNonResponder`: staff need names
+    and the offending values, not a number. The reason separates "we have never
+    had an address" from "the address we hold is unusable" — the second is often
+    a typo fixable straight from this list.
+
+    Never contains a suppressed (Deceased / Do Not Contact) alumnus.
+    """
+
+    alumni_id: int
+    name: str
+    # Machine-readable: "no_email" | "unusable_email".
+    reason: str
+    # Human-readable form of `reason`, so the UI need not duplicate the mapping.
+    reason_label: str
+    # Whatever IS on file, so a bad address can be corrected on sight. Both None
+    # when the reason is "no_email".
+    personal_email: str | None = None
+    work_email: str | None = None
 
 
 class SurveySendResult(BaseModel):
@@ -103,6 +178,16 @@ class SurveySendResult(BaseModel):
     # Resend's, discovered from its response — never a value we configure.
     retry_after_seconds: int | None = None
     sample: list[SurveySendSample]
+    # True when every permitted stage has already been delivered to everyone
+    # owed it — i.e. `sent=0` because there is nothing left to send, not because
+    # anything is wrong. Without this the console could only guess at a zero, and
+    # it guessed WRONG: it blamed "they need a personal email on file" for every
+    # zero-send, including cohorts that had simply all replied already (#392).
+    stage_complete: bool = False
+    # The full account of the cohort, so the console can state the REAL reason a
+    # send was small or empty. Same numbers as the standalone breakdown endpoint
+    # — one function produces both.
+    breakdown: SurveyRecipientBreakdown | None = None
 
 
 class SurveyUsage(BaseModel):

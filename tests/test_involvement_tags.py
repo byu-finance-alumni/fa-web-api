@@ -121,6 +121,12 @@ def _remove(session, name: str) -> list[str]:
 def test_all_nine_ways_to_get_involved_are_tags():
     # The nine booleans the survey asks about. Before #629 only five of them
     # rendered anywhere on the profile; every one must now be a real tag.
+    #
+    # Plus the two "has already hired one of our students" facts. They are not
+    # willingness, which is why #629 left them out -- but the survey asks them,
+    # and once the "Ways to get involved" panel was removed (Jake, 2026-08-05)
+    # an untagged flag renders ONLY in the editor-only Tags tab. That is the
+    # invisibility #629 existed to end, so they are tags too.
     assert set(ENGAGEMENT_FLAG_TAGS.values()) == {
         "mentor_willing",
         "women_in_finance_mentor_willing",
@@ -131,6 +137,8 @@ def test_all_nine_ways_to_get_involved_are_tags():
         "company_event_sponsor_willing",
         "case_competition_host_willing",
         "piff_donor",
+        "hired_finance_intern",
+        "hired_finance_full_time",
     }
     # Each maps to a column that actually exists on the model — a typo here would
     # otherwise surface as a tag that silently never matches anyone.

@@ -46,9 +46,15 @@ from app.services.geo_regions import CityKey, Region, lookup_region
 
 # Radius (miles) applied to a "near"/"around" phrase with no explicit number.
 DEFAULT_RADIUS_MILES = 50.0
-# Radius (miles) applied to a bare "City, State" — tighter, since naming a single
-# city reads as "this city and its immediate metro", not a wide region.
-BARE_CITY_RADIUS_MILES = 25.0
+# Radius (miles) applied to a bare "City, State".
+#
+# Jake, 2026-08-04: "near" means 50 miles. Both generic fallbacks are therefore
+# 50 — a bare city no longer searches a tighter ring than a "near <city>" phrase,
+# which was surprising in practice. Named metros keep their OWN radius
+# (``Region.radius_miles`` in geo_regions: Greater Seattle 40, Boston 35, Bay
+# Area 45, ...) — those are deliberate and are NOT flattened by this — and an
+# explicit "within N miles of <place>" still overrides everything.
+BARE_CITY_RADIUS_MILES = 50.0
 
 # Mean earth radius in miles (matches app.services.geography._EARTH_MI).
 _EARTH_MI = 3958.8

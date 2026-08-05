@@ -137,7 +137,16 @@ async def list_alumni(
     session: SessionDep,
     q: Annotated[
         str | None,
-        Query(description="Search names and external ids (case-insensitive)."),
+        Query(
+            description=(
+                "Free-text search over names, external ids, designations, "
+                "current employer / title / city / state / country / industry "
+                "and past employers. Tolerant of case, accents, punctuation, "
+                "spacing ('newyork' finds New York) and misspellings "
+                "('goldman schs' finds Goldman Sachs). Filler words are ignored; "
+                "'at <x>' narrows to employers and 'in <x>' to places/industries."
+            )
+        ),
     ] = None,
     net_id: Annotated[
         str | None,
@@ -385,6 +394,7 @@ async def list_alumni(
     ] = None,
     sort: Annotated[
         Literal[
+            "relevance",
             "name",
             "grad_desc",
             "grad_asc",
@@ -394,14 +404,17 @@ async def list_alumni(
             "employer",
             "gender",
             "updated",
-        ],
+        ]
+        | None,
         Query(
             description=(
-                "Sort order: name | grad_desc | grad_asc | industry | city | "
-                "state | employer | gender | updated."
+                "Sort order: relevance | name | grad_desc | grad_asc | industry | "
+                "city | state | employer | gender | updated. Omitted means "
+                "relevance when a free-text 'q' is given (best match first) and "
+                "name otherwise."
             )
         ),
-    ] = "name",
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> AlumniPage:

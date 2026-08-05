@@ -5,6 +5,7 @@ clauses are asserted — no database needed.
 """
 
 import datetime
+import re
 
 from sqlalchemy import literal, select
 from sqlalchemy.dialects import postgresql
@@ -41,6 +42,22 @@ def _flat_bind_values(stmt) -> list:
     return flat
 
 
+def _row_term_groups(sql: str, column: str) -> int:
+    """How many free-text TERMS are matched against an alumni-row ``column``.
+
+    The alumni-row legs of ``q`` are emitted as one ``alumni_id IN (SELECT ...)``
+    subquery per term (see repositories/alumni_search._alumni_row_in), each with
+    its own alias, so counting the distinct aliases counts the terms.
+    """
+    return len(
+        set(re.findall(rf"alumni_search_norm\((alumni_\d+)\.{column}\)", sql))
+    )
+
+
+def _searches_row_column(sql: str, column: str) -> bool:
+    return bool(re.search(rf"alumni_search_norm\(alumni_\d+\.{column}\)", sql))
+
+
 def test_default_excludes_archived():
     sql = _sql(build_alumni_query())
     assert "WHERE" in sql
@@ -61,20 +78,50 @@ def test_include_archived_and_all_kinds_has_no_where():
     assert "WHERE" not in sql
 
 
-def test_single_token_q_searches_eight_columns_with_ilike():
-    # Per-token columns (6: first, middle, last, preferred, birth_name,
-    # other_designations #404) + the single-token-only byu_id + net_id. A plain
-    # name query adds no designation EXISTS.
+def test_single_token_q_searches_the_name_and_id_columns():
+    # Per-token alumni-row columns (6: first, middle, last, preferred, birth_name
+    # #216, other_designations #404) + the single-token-only byu_id + net_id.
+    # Since #620 the comparison is on the NORMALIZED form (alumni_search_norm)
+    # rather than a raw ILIKE, and the alumni-row legs are wrapped in an id-set
+    # subquery so they stay index-usable -- but the same eight columns are what a
+    # one-word query reaches on the alumni row.
     sql = _sql(build_alumni_query(q="smith", is_alumni=None))
-    assert sql.count("ILIKE") == 8
-    assert "other_designations ILIKE" in sql
+    for column in (
+        "first_name",
+        "middle_name",
+        "last_name",
+        "preferred_first_name",
+        "birth_name",
+        "other_designations",
+        "byu_id",
+        "net_id",
+    ):
+        assert _searches_row_column(sql, column)
+    # A plain name query adds no designation EXISTS.
     assert "alumni_program_engagement" not in sql
+
+
+def test_q_also_searches_the_employment_record():
+    # THE bug Jake hit: "?q=Goldman Sachs" returned 0 while
+    # "?employer=Goldman Sachs" returned 15, because q only looked at names.
+    sql = _sql(build_alumni_query(q="Goldman Sachs"))
+    for column in (
+        "current_employer",
+        "current_title",
+        "current_city",
+        "current_state",
+        "current_country",
+        "current_industry",
+        "current_industry_secondary",
+    ):
+        assert f"alumni_search_norm(current_employment.{column})" in sql
+    assert "alumni_search_norm(employment_history.employer_name)" in sql
 
 
 def test_q_matches_birth_name():
     # Maiden / birth name is part of the free-text name search (#216).
     sql = _sql(build_alumni_query(q="smith"))
-    assert "birth_name ILIKE" in sql
+    assert _searches_row_column(sql, "birth_name")
 
 
 # --- #281 multi-token full-name search ---------------------------------------
@@ -86,9 +133,6 @@ def test_q_matches_birth_name():
 def test_q_full_name_ands_tokens_each_oring_the_searchable_columns():
     stmt = build_alumni_query(q="Kyle Marsh", is_alumni=None)
     sql = _sql(stmt)
-    # One OR group of the 6 per-token columns per token — the atomic external
-    # ids are the only single-token-only branches.
-    assert sql.count("ILIKE") == 12
     for column in (
         "first_name",
         "middle_name",
@@ -97,65 +141,72 @@ def test_q_full_name_ands_tokens_each_oring_the_searchable_columns():
         "birth_name",
         "other_designations",
     ):
-        assert sql.count(f"alumni.{column} ILIKE") == 2
-    assert "byu_id ILIKE" not in sql
-    assert "net_id ILIKE" not in sql
+        # One OR group per token, plus one for the joined phrase (#620).
+        assert _row_term_groups(sql, column) == 3
+    # The atomic external ids stay out of a multi-token query (#281).
+    assert not _searches_row_column(sql, "byu_id")
+    assert not _searches_row_column(sql, "net_id")
     # A name query still adds no engagement join.
     assert "alumni_program_engagement" not in sql
-    # Each token is matched on its own (not the raw "Kyle Marsh" string).
-    values = _bind_values(stmt)
-    assert "%Kyle%" in values
-    assert "%Marsh%" in values
+    # Each token is matched on its own, plus the spacing-insensitive phrase.
+    values = _flat_bind_values(stmt)
+    assert "%kyle%" in values
+    assert "%marsh%" in values
+    assert "%kylemarsh%" in values
     assert "%Kyle Marsh%" not in values
 
 
 def test_q_full_name_is_order_and_separator_independent():
-    # "Marsh, Kyle" splits on the comma and yields the same predicate set as
-    # "Kyle Marsh" (order-independent: tokens are ANDed, fields ORed).
-    assert sorted(_bind_values(build_alumni_query(q="Marsh, Kyle"))) == sorted(
-        _bind_values(build_alumni_query(q="Kyle Marsh"))
-    )
+    # "Marsh, Kyle" splits on the comma and yields the same per-token predicates
+    # as "Kyle Marsh" (order-independent: tokens are ANDed, fields ORed). The
+    # joined phrase differs by construction -- that is what makes "newyork" work.
+    marsh_first = set(_flat_bind_values(build_alumni_query(q="Marsh, Kyle")))
+    kyle_first = set(_flat_bind_values(build_alumni_query(q="Kyle Marsh")))
+    for token in ("%kyle%", "%marsh%", "kyle%", "marsh%", "kyle", "marsh"):
+        assert (token in marsh_first) == (token in kyle_first)
 
 
 def test_q_single_surname_still_matches_the_name_columns():
     # The case that already worked must keep working, unchanged.
     stmt = build_alumni_query(q="Marsh", is_alumni=None)
-    assert "last_name ILIKE" in _sql(stmt)
-    assert "%Marsh%" in _bind_values(stmt)
+    assert _searches_row_column(_sql(stmt), "last_name")
+    assert "%marsh%" in _flat_bind_values(stmt)
 
 
 def test_q_token_matches_middle_name():
     # Alumni who go by a middle name: the second token may land on middle_name.
     sql = _sql(build_alumni_query(q="Kyle Robert Marsh"))
-    assert sql.count("alumni.middle_name ILIKE") == 3
+    # Three tokens + the joined phrase.
+    assert _row_term_groups(sql, "middle_name") == 4
 
 
 def test_q_token_matches_maiden_name():
     # Married-name change: "Jane Smith" must hit an alumna whose birth_name is
     # Smith, so EVERY token also searches birth_name (#216 + #281).
     sql = _sql(build_alumni_query(q="Jane Smith"))
-    assert sql.count("alumni.birth_name ILIKE") == 2
+    assert _row_term_groups(sql, "birth_name") == 3
 
 
 def test_single_token_q_still_matches_byu_id():
     # An id lookup is a one-token query and keeps its byu_id / net_id branches.
     stmt = build_alumni_query(q="123456789", is_alumni=None)
     sql = _sql(stmt)
-    assert "byu_id ILIKE" in sql
-    assert "net_id ILIKE" in sql
-    assert "%123456789%" in _bind_values(stmt)
+    assert _searches_row_column(sql, "byu_id")
+    assert _searches_row_column(sql, "net_id")
+    assert "%123456789%" in _flat_bind_values(stmt)
 
 
 def test_q_token_count_is_capped():
-    # A pasted paragraph can't fan out into an unbounded AND chain of
-    # leading-wildcard ILIKEs — tokens are capped at 5 (6 columns each).
-    sql = _sql(build_alumni_query(q="a b c d e f g h i j"))
-    assert sql.count("ILIKE") == 30
+    # A pasted paragraph can't fan out into an unbounded AND chain of trigram
+    # lookups. Single letters are not filler, so this exercises the raw cap.
+    values = _flat_bind_values(build_alumni_query(q="q w e r t y u i o p"))
+    assert "%q%" in values
+    assert "%p%" not in values
 
 
 def test_q_whitespace_only_adds_no_search_predicate():
     sql = _sql(build_alumni_query(q="   ", is_alumni=None))
-    assert "ILIKE" not in sql
+    assert "alumni_search_norm" not in sql
 
 
 def test_last_name_field_also_matches_birth_name():
@@ -229,7 +280,7 @@ def test_deceased_filter():
 
 def test_filters_combine():
     sql = _sql(build_alumni_query(q="lee", graduation_year=2019, deceased=False))
-    assert "ILIKE" in sql
+    assert "alumni_search_norm" in sql
     assert "graduation_year =" in sql
     assert "deceased IS false" in sql
     assert "archived IS false" in sql
@@ -628,7 +679,7 @@ def test_designations_combine_with_other_filters_via_and():
 
 def test_q_matches_other_designations_column():
     sql = _sql(build_alumni_query(q="Series7"))
-    assert "other_designations ILIKE" in sql
+    assert _searches_row_column(sql, "other_designations")
 
 
 def test_multi_token_q_still_matches_a_spaced_designation():
@@ -638,10 +689,13 @@ def test_multi_token_q_still_matches_a_spaced_designation():
     # single-token queries would break the search Tanya's designations rely on.
     stmt = build_alumni_query(q="Series 7", is_alumni=None)
     sql = _sql(stmt)
-    assert sql.count("alumni.other_designations ILIKE") == 2
-    values = _bind_values(stmt)
-    assert "%Series%" in values
+    # Two tokens + the joined phrase (#620), so "series7" typed without the
+    # space now matches the same cell too.
+    assert _row_term_groups(sql, "other_designations") == 3
+    values = _flat_bind_values(stmt)
+    assert "%series%" in values
     assert "%7%" in values
+    assert "%series7%" in values
 
 
 def test_q_naming_a_certification_adds_holder_exists():
@@ -681,11 +735,12 @@ def test_cert_token_adds_holder_exists_ored_into_its_own_token_group():
     # The group then ANDs with the 'Marsh' group.
     sql = _sql(build_alumni_query(q="CFA Marsh", is_alumni=None))
     assert "cfa_designation IS NOT NULL" in sql
-    # Exactly one holder-EXISTS: only the cert token contributes one.
-    assert sql.count("EXISTS (SELECT") == 1
+    # Exactly one holder-EXISTS: only the cert token contributes one. The
+    # joined phrase "cfamarsh" is not a certification token, so it adds none.
+    assert sql.count("cfa_designation IS NOT NULL") == 1
     assert "cpa_designation" not in sql
     # Both tokens still search the name columns; 'Marsh' can hit last_name.
-    assert sql.count("alumni.last_name ILIKE") == 2
+    assert _row_term_groups(sql, "last_name") == 3
 
 
 def test_plain_q_adds_no_designation_holder_join():

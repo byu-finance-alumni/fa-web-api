@@ -17,9 +17,10 @@ Owns the rules that aren't just data access:
 import contextlib
 import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -84,6 +85,44 @@ async def _distinct_values(
         await session.execute(_distinct_query(column, desc=desc, scope=scope))
     ).all()
     return [r[0] for r in rows]
+
+
+async def _tag_filter_options(session: AsyncSession, tag_scope) -> list[str]:
+    """The tag facet's options, drawn from BOTH tag stores (#629).
+
+    Ordinary tags come from ``alumni_tags`` as before. The nine "ways to get
+    involved" come from their ``alumni_program_engagement`` boolean instead,
+    and only when at least one visible alumnus actually has the flag set — the
+    same #184 rule the other facets follow, so the panel never offers an option
+    that returns zero rows.
+
+    Leftover ``alumni_tags`` rows for one of the nine are filtered out so the
+    name is offered once, backed by the flag, rather than twice.
+    """
+    names = {
+        name
+        for name in await _distinct_values(session, Tag.tag_name, scope=tag_scope)
+        if engagement_flag_for_tag(name) is None
+    }
+    # One aggregate row: "is this flag set on at least one visible alumnus?" for
+    # all nine at once, rather than nine separate round trips.
+    held = (
+        await session.execute(
+            select(
+                *[
+                    func.bool_or(getattr(AlumniProgramEngagement, column))
+                    for column in ENGAGEMENT_FLAG_TAGS.values()
+                ]
+            ).where(_visible_alumni_exists(AlumniProgramEngagement.alumni_id))
+        )
+    ).all()
+    if held:
+        names.update(
+            tag_name
+            for tag_name, is_held in zip(ENGAGEMENT_FLAG_TAGS, held[0], strict=False)
+            if is_held
+        )
+    return sorted(names)
 
 
 async def filter_options(session: AsyncSession) -> dict:
@@ -170,7 +209,7 @@ async def filter_options(session: AsyncSession) -> dict:
         "states": await _distinct_values(
             session, CurrentEmployment.current_state, scope=employment_scope
         ),
-        "tags": await _distinct_values(session, Tag.tag_name, scope=tag_scope),
+        "tags": await _tag_filter_options(session, tag_scope),
         "status_labels": await _distinct_values(
             session, StatusLabel.status_label_name, scope=status_scope
         ),

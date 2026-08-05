@@ -10,7 +10,7 @@ import re
 from sqlalchemy import literal, select
 from sqlalchemy.dialects import postgresql
 
-from app.core.dropdowns import EMPLOYER_NOT_APPLICABLE_STATUSES
+from app.core.dropdowns import EMPLOYER_NOT_APPLICABLE_STATUSES, ENGAGEMENT_FLAG_TAGS
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
@@ -449,14 +449,60 @@ def test_city_filter():
 
 
 def test_tag_filter():
-    sql = _sql(build_alumni_query(tag="Speaker"))
+    sql = _sql(build_alumni_query(tag="Highly Engaged"))
     # EXISTS over the alumni_tags join to the tags lookup, matched case-insensitively
-    # on the tag label — generic, accepts any tag value.
+    # on the tag label — generic, accepts any ordinary tag value.
     assert "EXISTS" in sql
     assert "NOT (EXISTS" not in sql
     assert "alumni_tags" in sql
     assert "tags" in sql
     assert "tag_name ILIKE" in sql
+
+
+def test_involvement_tag_filter_reads_the_engagement_flag():
+    # #629: the nine "ways to get involved" are backed by their engagement
+    # boolean, NOT by an alumni_tags row. Before this, `tag=Mentor` matched
+    # alumni_tags while the `mentor_willing` filter matched the flag, so the two
+    # controls returned different half-populated lists of mentors. One name now
+    # resolves to one predicate.
+    sql = _sql(build_alumni_query(tag="Mentor"))
+    assert "alumni_program_engagement.mentor_willing IS true" in sql
+    assert "alumni_tags" not in sql
+
+    sql = _sql(build_alumni_query(tag="Speaker"))
+    assert "alumni_program_engagement.guest_speaker_willing IS true" in sql
+
+    # All nine resolve, including the four that previously rendered nowhere.
+    for tag_name, column in ENGAGEMENT_FLAG_TAGS.items():
+        sql = _sql(build_alumni_query(tag=tag_name))
+        assert f"alumni_program_engagement.{column} IS true" in sql, tag_name
+
+
+def test_involvement_tag_matches_the_same_people_as_its_boolean_filter():
+    # The anti-fork guarantee: filtering by the tag and filtering by the
+    # dedicated boolean must compile to the same predicate, so "find me mentors"
+    # cannot depend on which control the user reached for.
+    assert "alumni_program_engagement.mentor_willing IS true" in _sql(
+        build_alumni_query(tag="Mentor")
+    )
+    assert "alumni_program_engagement.mentor_willing IS true" in _sql(
+        build_alumni_query(mentor_willing=True)
+    )
+
+
+def test_tag_filter_is_case_insensitive_for_involvement_tags():
+    # A deep link may carry any casing; it must resolve like the UI's value.
+    sql = _sql(build_alumni_query(tag="mentor"))
+    assert "alumni_program_engagement.mentor_willing IS true" in sql
+
+
+def test_mixed_tag_filter_ors_both_stores():
+    # A multi-select spanning both kinds keeps OR-within-the-facet semantics
+    # rather than silently dropping one half.
+    sql = _sql(build_alumni_query(tag=["Mentor", "Highly Engaged"]))
+    assert "alumni_tags" in sql
+    assert "alumni_program_engagement.mentor_willing IS true" in sql
+    assert " OR " in sql
 
 
 def test_city_and_tag_compose_with_archived_default():

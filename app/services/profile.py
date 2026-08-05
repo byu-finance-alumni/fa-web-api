@@ -34,6 +34,7 @@ from app.models.engagement import (
     FinanceSocietyLeadership,
 )
 from app.models.event import Event, EventAttendance
+from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
@@ -165,6 +166,12 @@ _RESPONSE_STATUS_LABELS = {
     "rejected": "Completed - not applied",
 }
 
+def _as_utc(value: datetime.datetime) -> datetime.datetime:
+    """Aware-UTC view of a timestamp, so a naive one from the DB driver cannot
+    make a comparison raise instead of answering."""
+    return value.replace(tzinfo=datetime.UTC) if value.tzinfo is None else value
+
+
 _SEND_STAGE_LABELS = {
     0: "Survey sent",
     1: "1-week reminder sent",
@@ -190,6 +197,13 @@ async def _derive_survey_history(
 
     Returns rows in the SAME ``SurveyRead`` shape the legacy table produced, so
     the profile tab renders them with no change.
+
+    An engineer reset (#395) deletes none of this — it only stops those rows
+    counting toward eligibility — so everything still renders. Responses that
+    predate the alum's latest reset are labelled as belonging to a previous
+    survey cycle, because "you answered this in a cycle we have since re-opened"
+    is a real difference to whoever is reading the tab, and an unlabelled second
+    answer to "the same" survey looks like a duplicate.
     """
     responses = list(
         (
@@ -211,6 +225,14 @@ async def _derive_survey_history(
     )
     if not responses and not sends:
         return []
+
+    # The alum's latest engineer reset, if any (#395). Everything submitted at or
+    # before it belongs to a superseded cycle.
+    last_reset_at = await session.scalar(
+        select(func.max(SurveyResetLog.reset_at)).where(
+            SurveyResetLog.alumni_id == alumni_id
+        )
+    )
 
     # The cohort campaign's deadline, when there is one to tie rows to.
     campaign_start: datetime.date | None = None
@@ -235,6 +257,11 @@ async def _derive_survey_history(
         notes = f"{field_count} field{'' if field_count == 1 else 's'} submitted"
         if r.staged_photo_path:
             notes += " + photo"
+        if last_reset_at is not None and _as_utc(last_reset_at) >= _as_utc(submitted):
+            # Kept and shown — it IS something they submitted — but named as the
+            # earlier cycle so it does not read as a stale duplicate of the
+            # answer to the campaign now running.
+            notes += " (previous survey cycle)"
         rows.append(
             SurveyRead(
                 survey_id=-r.survey_response_id,

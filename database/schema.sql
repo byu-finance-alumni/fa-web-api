@@ -661,13 +661,44 @@ CREATE TABLE survey_send_log (
     alumni_id           bigint NOT NULL,
     stage               smallint NOT NULL,
     cycle_seq           int NOT NULL DEFAULT 1,
+    -- Which engineer-reset generation this email belongs to (#395). 0 = the
+    -- alumnus had never been reset when it went out. It is in the unique key
+    -- because a reset must let the same (year, alumni, stage, cycle) be emailed
+    -- again WITHOUT deleting the row recording the first one — ignoring the old
+    -- row in the reads is not enough, the constraint itself refuses the insert
+    -- and the claim's ON CONFLICT DO NOTHING would silently skip the recipient.
+    -- See migrations/2026-08-05_survey_reset_log.sql.
+    reset_seq           int NOT NULL DEFAULT 0,
     sent_at             timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_survey_send_log_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT ck_survey_send_log_cycle_seq CHECK (cycle_seq >= 1),
-    CONSTRAINT uq_survey_send_log_year_alumni_stage UNIQUE (graduation_year, alumni_id, stage, cycle_seq)
+    CONSTRAINT ck_survey_send_log_reset_seq CHECK (reset_seq >= 0),
+    CONSTRAINT uq_survey_send_log_year_alumni_stage UNIQUE (graduation_year, alumni_id, stage, cycle_seq, reset_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_survey_send_log_year_stage ON survey_send_log (graduation_year, stage);
 CREATE INDEX IF NOT EXISTS ix_survey_send_log_year_cycle_stage ON survey_send_log (graduation_year, cycle_seq, stage);
+
+-- Per-alumnus survey campaign resets (#395). A reset makes ONE person surveyable
+-- again and DELETES NOTHING: their responses and send-log rows stay exactly as
+-- they are, and every eligibility query ignores what predates the latest reset
+-- here. `reset_seq` is a per-alumnus counter starting at 1; it is also the value
+-- their next survey email's `survey_send_log.reset_seq` carries, which is what
+-- keeps the unique key above from refusing the re-send. See
+-- migrations/2026-08-05_survey_reset_log.sql.
+CREATE TABLE survey_reset_log (
+    survey_reset_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id            bigint NOT NULL,
+    reset_seq            int NOT NULL,
+    reset_at             timestamptz NOT NULL DEFAULT now(),
+    reset_by_user_id     bigint,
+    sends_superseded     int NOT NULL DEFAULT 0,
+    responses_superseded int NOT NULL DEFAULT 0,
+    CONSTRAINT fk_survey_reset_log_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_survey_reset_log_user FOREIGN KEY (reset_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT ck_survey_reset_log_seq CHECK (reset_seq >= 1),
+    CONSTRAINT uq_survey_reset_log_alumni_seq UNIQUE (alumni_id, reset_seq)
+);
+CREATE INDEX IF NOT EXISTS ix_survey_reset_log_alumni_at ON survey_reset_log (alumni_id, reset_at DESC);
 
 -- Survey send cap (#542 follow-up). Single-row config (id pinned to 1) the
 -- scheduler paces against: when `enabled`, sends at most `daily_limit`/day and

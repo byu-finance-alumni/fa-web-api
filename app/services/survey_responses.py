@@ -510,6 +510,11 @@ async def apply_response(
             _HEADSHOT_BUCKET, _headshot_key(alum), data, content_type
         )
         await supabase_storage.delete_object(_HEADSHOT_BUCKET, resp.staged_photo_path)
+        # Clear the pointer with the object. Leaving it set left the row naming a
+        # key that no longer exists, so every later reader — the review queue's
+        # signed-URL preview, the engineer survey-state screen, the profile's
+        # "+ photo" note — was working from a path that resolves to nothing.
+        resp.staged_photo_path = None
 
     # An apply that writes NOTHING used to report success: a payload key missing
     # from `_FIELDS` was skipped silently, no log, no error, and the response
@@ -577,9 +582,12 @@ async def reject_response(
 ) -> None:
     """Mark a staged response rejected — nothing is written to the record."""
     resp = await _get_pending(session, response_id)
-    # Discard any staged photo so rejected uploads don't linger in storage.
+    # Discard any staged photo so rejected uploads don't linger in storage, and
+    # clear the pointer with it — a row naming a deleted key is a path every
+    # later reader (preview URLs, the engineer state screen) tries to resolve.
     if resp.staged_photo_path:
         await supabase_storage.delete_object(_HEADSHOT_BUCKET, resp.staged_photo_path)
+        resp.staged_photo_path = None
     resp.status = "rejected"
     resp.reviewed_by_user_id = actor_user_id
     resp.reviewed_at = datetime.datetime.now(datetime.UTC)

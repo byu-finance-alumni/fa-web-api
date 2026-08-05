@@ -10,6 +10,7 @@ schedule), so these lock in the mapping without needing Postgres.
 import asyncio
 import datetime
 
+from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.services import profile as service
@@ -59,10 +60,14 @@ class _FakeSession:
     """Serves each query by the entity it selects from, so the service's own
     ordering/filtering is exercised without a database."""
 
-    def __init__(self, *, responses=(), sends=(), start_date=None):
+    def __init__(self, *, responses=(), sends=(), start_date=None, reset_at=None):
         self._responses = list(responses)
         self._sends = list(sends)
         self._start_date = start_date
+        # When the alum was last reset by an engineer (#395). Responses at or
+        # before it belong to a superseded cycle and are labelled as such —
+        # they are NOT removed, which is the point of the redesign.
+        self._reset_at = reset_at
 
     @staticmethod
     def _entity(stmt):
@@ -78,7 +83,10 @@ class _FakeSession:
         raise AssertionError(f"unexpected scalars() on {entity}")
 
     async def scalar(self, stmt):
-        assert self._entity(stmt) is SurveySchedule
+        entity = self._entity(stmt)
+        if entity is SurveyResetLog:
+            return self._reset_at
+        assert entity is SurveySchedule
         return self._start_date
 
 
@@ -202,3 +210,28 @@ def test_no_cohort_schedule_means_no_due_date():
     )
     assert row.survey_due_date is None
     assert row.survey_year == 2026
+
+
+def test_a_response_from_before_a_reset_is_kept_and_labelled():
+    """An engineer reset deletes nothing (#395), so the answer still renders —
+    but it belongs to a cycle that has since been re-opened, and an unlabelled
+    older answer to "the same" survey reads as a duplicate."""
+    submitted = datetime.datetime(2026, 3, 5, tzinfo=UTC)
+    rows = _derive(
+        responses=[_response(1, submitted=submitted)],
+        start_date=START,
+        reset_at=datetime.datetime(2026, 4, 1, tzinfo=UTC),
+    )
+    (row,) = rows
+    assert row.completed is True
+    assert "previous survey cycle" in row.survey_notes
+
+
+def test_a_response_after_the_reset_is_not_labelled():
+    rows = _derive(
+        responses=[_response(1, submitted=datetime.datetime(2026, 5, 5, tzinfo=UTC))],
+        start_date=START,
+        reset_at=datetime.datetime(2026, 4, 1, tzinfo=UTC),
+    )
+    (row,) = rows
+    assert "previous survey cycle" not in row.survey_notes

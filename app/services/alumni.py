@@ -396,7 +396,9 @@ async def create_alumni(
     # Data-hygiene pass: clean the payload and persist the CLEANED values (the
     # UI's /preview is not trusted — defense-in-depth). Exact duplicates block.
     cleaned, _changes = hygiene.clean_alumni_payload(payload, jsonable=False)
-    blockers, _warnings = await hygiene.detect_duplicates(session, cleaned)
+    # A create payload is complete by definition, so `cleaned` alone is already
+    # the effective record here — no overlay needed (contrast `update_alumni`).
+    blockers, warnings = await hygiene.detect_duplicates(session, cleaned)
     if blockers:
         raise ConflictError(blockers[0]["message"])
 
@@ -474,6 +476,9 @@ async def create_alumni(
 
     await session.commit()
     await session.refresh(alumnus)
+    # Same contract as `update_alumni` — soft duplicate warnings ride back on the
+    # created record so the caller can show them (#627).
+    alumnus.duplicate_warnings = warnings
     return alumnus
 
 
@@ -600,8 +605,18 @@ async def update_alumni(
     cleaned, _changes = hygiene.clean_alumni_payload(
         payload, jsonable=False, stored_state=stored_state
     )
-    blockers, _warnings = await hygiene.detect_duplicates(
-        session, cleaned, exclude_alumni_id=alumni_id
+    #
+    # Duplicate detection runs against the EFFECTIVE record — the stored row with
+    # this patch overlaid — not the patch alone (#627). `cleaned` is
+    # exclude_unset, so the focused edit forms that submit just the name fields
+    # carry no graduation year, and the fuzzy first+last+grad-year check needs all
+    # three: passing `cleaned` here meant a rename into an exact collision found
+    # nothing to warn about. `effective_identity` is query-free — every field it
+    # reads is already on the loaded row.
+    blockers, warnings = await hygiene.detect_duplicates(
+        session,
+        hygiene.effective_identity(alumnus, cleaned),
+        exclude_alumni_id=alumni_id,
     )
     if blockers:
         raise ConflictError(blockers[0]["message"])
@@ -720,6 +735,12 @@ async def update_alumni(
             _audit(session, actor_user_id, "update", alumni_id)
         await session.commit()
         await session.refresh(alumnus)
+    # Hand the soft duplicate warnings back to the caller (#627). Fuzzy matches
+    # never block — two alumni really can share a name and a graduation year, and
+    # a marriage rename into a genuine collision is sometimes correct — but the
+    # person doing the rename has to be TOLD. Set after `refresh`, which reloads
+    # mapped columns only and would otherwise be an easy place to lose this.
+    alumnus.duplicate_warnings = warnings
     return alumnus
 
 

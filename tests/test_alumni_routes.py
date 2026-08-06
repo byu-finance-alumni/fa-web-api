@@ -452,16 +452,19 @@ def test_create_persists_preferred_contact_method():
 def test_update_preview_excludes_self_from_dup_detection():
     # Updating alum 5's byu_id to a value: the only DB row with that id is alum
     # 5 itself, which the query excludes -> no blocker. get_alumni returns the
-    # record; detect byu_id scalar returns None (self excluded); then effective
-    # loads contact + career rows.
+    # record; effective loads contact + career rows; detect byu_id scalar returns
+    # None (self excluded).
     existing = _alum(alumni_id=5, graduation_year=2018)
     contact_row = SimpleNamespace(personal_email="jane@x.com", work_email=None)
     career_row = SimpleNamespace(current_employer="Goldman")
-    # get() -> existing; scalars: active byu_id dup lookup (None, self
-    # excluded), archived byu_id ghost lookup (None), then effective loads
-    # contact then career.
+    # get() -> existing; scalars, in call order: effective loads contact then
+    # career, THEN the active byu_id dup lookup (None, self excluded) and the
+    # archived byu_id ghost lookup (None). The effective record is built FIRST
+    # because duplicate detection now runs against it rather than against the
+    # partial payload (#627) — a rename that omits the graduation year has to be
+    # measured against the year the record actually holds.
     session = _FakeSession(
-        scalars=[None, None, contact_row, career_row], get_result=existing
+        scalars=[contact_row, career_row, None, None], get_result=existing
     )
     with _full_access_client(session) as c:
         resp = c.post(

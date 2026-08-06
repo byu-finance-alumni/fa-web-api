@@ -70,6 +70,7 @@ from app.schemas.alumni import (
     AlumniPage,
     AlumniRead,
     AlumniUpdateFull,
+    AlumniWriteResult,
     HeadshotUrls,
     minimize_alumni_read,
 )
@@ -2153,22 +2154,30 @@ async def preview_update_alumni(
     return result
 
 
-@router.post("", response_model=AlumniRead, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=AlumniWriteResult, status_code=status.HTTP_201_CREATED)
 async def create_alumni(
     payload: AlumniCreateFull, user: RequireAlumniCreate, session: SessionDep
-) -> AlumniRead:
+) -> AlumniWriteResult:
+    """Create an alumnus. Returns the saved record plus any soft duplicate
+    warnings (``duplicate_warnings``) the write raised — see #627. Exact
+    ``byu_id`` / ``net_id`` collisions still 409 instead."""
     return await service.create_alumni(
         session, _drop_manual_updated_date(payload), actor_user_id=user.user_id
     )
 
 
-@router.patch("/{alumni_id}", response_model=AlumniRead)
+@router.patch("/{alumni_id}", response_model=AlumniWriteResult)
 async def update_alumni(
     alumni_id: IdPath,
     payload: AlumniUpdateFull,
     user: RequireAlumniEdit,
     session: SessionDep,
-) -> AlumniRead:
+) -> AlumniWriteResult:
+    """Update an alumnus. Returns the saved record plus any soft duplicate
+    warnings (``duplicate_warnings``) — the rename case in #627: the checks run
+    against the stored row with this patch overlaid, so a partial edit that only
+    sends the name fields is still measured against the record's real graduation
+    year. Warnings never block; exact ID collisions still 409."""
     return await service.update_alumni(
         session, alumni_id, _drop_manual_updated_date(payload), actor_user_id=user.user_id
     )

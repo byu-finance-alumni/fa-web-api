@@ -137,6 +137,8 @@ async def filter_options(session: AsyncSession) -> dict:
     # its association table) references the alumni row via ``alumni_id``.
     employment_scope = [_visible_alumni_exists(CurrentEmployment.alumni_id)]
     history_scope = [_visible_alumni_exists(EmploymentHistory.alumni_id)]
+    education_scope = [_visible_alumni_exists(EducationHistory.alumni_id)]
+    contact_scope = [_visible_alumni_exists(AlumniContactInfo.alumni_id)]
     leadership_scope = [_visible_alumni_exists(FinanceSocietyLeadership.alumni_id)]
     survey_scope = [_visible_alumni_exists(Survey.alumni_id)]
     # graduation_year lives on the alumni row itself, so the guard is a plain
@@ -208,6 +210,28 @@ async def filter_options(session: AsyncSession) -> dict:
         ),
         "states": await _distinct_values(
             session, CurrentEmployment.current_state, scope=employment_scope
+        ),
+        # Country comes off the same employment record as city/state above.
+        "countries": await _distinct_values(
+            session, CurrentEmployment.current_country, scope=employment_scope
+        ),
+        # Region is the DERIVED grouping (#283) and is stored on the contact row,
+        # so its options must be read there — that is the column the filter
+        # matches, and re-deriving it here would let the two drift apart.
+        "regions": await _distinct_values(
+            session, AlumniContactInfo.region, scope=contact_scope
+        ),
+        "past_titles": await _distinct_values(
+            session, EmploymentHistory.employment_title, scope=history_scope
+        ),
+        "universities": await _distinct_values(
+            session, EducationHistory.university, scope=education_scope
+        ),
+        "degrees": await _distinct_values(
+            session, EducationHistory.degree, scope=education_scope
+        ),
+        "majors": await _distinct_values(
+            session, EducationHistory.major, scope=education_scope
         ),
         "tags": await _tag_filter_options(session, tag_scope),
         "status_labels": await _distinct_values(

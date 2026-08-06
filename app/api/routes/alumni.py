@@ -252,6 +252,54 @@ async def list_alumni(
         list[str] | None,
         Query(description="Current state(s) — repeatable, exact match."),
     ] = None,
+    country: Annotated[
+        list[str] | None,
+        Query(description="Current work country/countries — repeatable, exact match."),
+    ] = None,
+    region: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "US region(s) derived from the work state (#283) — repeatable, "
+                "exact match. Same stored value the geography map shades by."
+            )
+        ),
+    ] = None,
+    past_title: Annotated[
+        list[str] | None,
+        Query(
+            description="Prior job title(s) from employment history — repeatable."
+        ),
+    ] = None,
+    university: Annotated[
+        list[str] | None,
+        Query(description="University/universities from education history — repeatable."),
+    ] = None,
+    degree: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Degree(s) from education history — repeatable, exact match. "
+                "Distinct from 'graduate_degree', which only asks whether the "
+                "alumnus holds one at all."
+            )
+        ),
+    ] = None,
+    major: Annotated[
+        list[str] | None,
+        Query(description="Major(s) from education history — repeatable, exact match."),
+    ] = None,
+    worked_in_year: Annotated[
+        int | None,
+        Query(
+            ge=1900,
+            le=2200,
+            description=(
+                "Held any role covering this calendar year. A history row with "
+                "no end year counts as still running."
+            ),
+        ),
+    ] = None,
     tag: Annotated[
         list[str] | None,
         Query(description="Engagement tag(s) — repeatable, exact match."),
@@ -485,6 +533,13 @@ async def list_alumni(
         employment_status=employment_status,
         city=city,
         state=state,
+        country=country,
+        region=region,
+        past_title=past_title,
+        university=university,
+        degree=degree,
+        major=major,
+        worked_in_year=worked_in_year,
         tag=tag,
         status_label=status_label,
         leadership_role=leadership_role,
@@ -545,6 +600,13 @@ async def list_alumni(
             ),
             "city": "|".join(city) if city else None,
             "state": "|".join(state) if state else None,
+            "country": "|".join(country) if country else None,
+            "region": "|".join(region) if region else None,
+            "past_title": "|".join(past_title) if past_title else None,
+            "university": "|".join(university) if university else None,
+            "degree": "|".join(degree) if degree else None,
+            "major": "|".join(major) if major else None,
+            "worked_in_year": worked_in_year,
             "tag": "|".join(tag) if tag else None,
             "status_label": "|".join(status_label) if status_label else None,
             "leadership_role": "|".join(leadership_role) if leadership_role else None,

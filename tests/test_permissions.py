@@ -2,8 +2,7 @@
 the engineer permission matrix endpoint, and the toggle endpoint's guards.
 
 Pure-unit tests for ``effective_capabilities`` plus offline route tests that
-override the auth + config dependencies (no database), mirroring
-tests/test_dashboard_presets.py.
+override the auth + config dependencies (no database).
 """
 
 import asyncio

@@ -22,7 +22,6 @@ from app.api.routes import (
     audit,
     auth,
     dashboard,
-    dashboard_presets,
     donations,
     engineer,
     events,
@@ -173,8 +172,6 @@ app.include_router(maintenance.router)
 app.include_router(auth.router)
 app.include_router(alumni.router)
 app.include_router(dashboard.router)
-app.include_router(dashboard_presets.router)
-app.include_router(dashboard_presets.admin_router)
 app.include_router(admin.router)
 app.include_router(engineer.router)
 app.include_router(engineer.admin_router)

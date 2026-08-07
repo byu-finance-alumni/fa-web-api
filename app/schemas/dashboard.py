@@ -73,8 +73,15 @@ class DashboardSummary(BaseModel):
     # #606: active alumni whose ``updated_at`` falls in the CURRENT CALENDAR
     # month (1st 00:00 UTC through now) — not the rolling 30-day window the
     # contacted/attended KPIs use. Counts any write to the record, including
-    # bulk imports.
+    # bulk imports (deliberate — the tile measures data freshness).
     alumni_edited_this_month: int
+    # #645: the same count over the CURRENT CALENDAR YEAR to date (1 Jan 00:00
+    # UTC through now) — a running year total shown under the month figure on
+    # the same tile. Year-to-date, NOT a rolling 12 months, so it drops to near
+    # zero each January by design. Both fields count DISTINCT ALUMNI RECORDS
+    # (one row per alumnus in ``alumni``), never individual changes, so the year
+    # value is always >= ``alumni_edited_this_month``.
+    alumni_edited_this_year: int
     not_contacted_6mo: int
     not_contacted_12mo: int
     not_contacted_24mo: int

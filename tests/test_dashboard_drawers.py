@@ -410,10 +410,10 @@ def test_summary_includes_this_month_kpis(client):
     # not_contacted_6mo, not_contacted_12mo, not_contacted_24mo,
     # upcoming_follow_ups, duplicate_count, attended_event_this_month,
     # upcoming_events, events_this_month, guest_speakers_this_month,
-    # piff_donors, willing_mentors, alumni_edited_this_month. The three
-    # execute() calls (cohort / top_employers / by_state) fall back to the
-    # empty rows list.
-    scalars = [100, 5, 2, 12, 9, 8, 60, 30, 10, 4, 3, 6, 7, 11, 2, 1, 0, 23]
+    # piff_donors, willing_mentors, alumni_edited_this_month,
+    # alumni_edited_this_year. The three execute() calls (cohort /
+    # top_employers / by_state) fall back to the empty rows list.
+    scalars = [100, 5, 2, 12, 9, 8, 60, 30, 10, 4, 3, 6, 7, 11, 2, 1, 0, 23, 91]
     app.dependency_overrides[get_session] = _with_session(
         _FakeSession([], scalars=scalars)
     )
@@ -423,8 +423,10 @@ def test_summary_includes_this_month_kpis(client):
     body = response.json()
     assert body["events_this_month"] == 11
     assert body["guest_speakers_this_month"] == 2
-    # #606: the alumni-edited tile reads the LAST scalar in handler order.
+    # #606/#645: the alumni-edited tile reads the LAST TWO scalars in handler
+    # order — month first, then the year-to-date running total under it.
     assert body["alumni_edited_this_month"] == 23
+    assert body["alumni_edited_this_year"] == 91
 
 
 # --- #606: "alumni edited this month" KPI ------------------------------------
@@ -476,6 +478,194 @@ def test_summary_alumni_edited_month_boundary_is_first_of_month_utc(client):
     )
     assert bound.tzinfo is not None
     assert bound.utcoffset() == datetime.timedelta(0)
+
+
+# --- #645: "alumni edited this year" KPI (calendar year to date) -------------
+
+
+def _freeze_dashboard_clock(monkeypatch, when: datetime.datetime) -> None:
+    """Pin the dashboard module's clock to ``when`` (a tz-aware UTC datetime).
+
+    Every window bound on /dashboard/summary is derived from
+    ``datetime.datetime.now(datetime.UTC)``, so month/year boundaries otherwise
+    depend on the day the suite happens to run — and "a previous month, same
+    year" is unrepresentable in January. We swap the module's ``datetime``
+    global for a shim that proxies the stdlib module and only overrides
+    ``now()``; date/time/timedelta/UTC pass straight through, so
+    ``combine``/``_months_before`` behave exactly as in production.
+    """
+    from app.api.routes import dashboard
+
+    class _FrozenDatetime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: D102 - test shim
+            return when if tz is None else when.astimezone(tz)
+
+    monkeypatch.setattr(
+        dashboard,
+        "datetime",
+        SimpleNamespace(
+            datetime=_FrozenDatetime,
+            date=datetime.date,
+            time=datetime.time,
+            timedelta=datetime.timedelta,
+            UTC=datetime.UTC,
+        ),
+    )
+
+
+def _updated_at_bound(stmt) -> datetime.datetime:
+    """The single datetime bound bound into an alumni-edited COUNT statement."""
+    from sqlalchemy.dialects import postgresql
+
+    params = stmt.compile(dialect=postgresql.dialect()).params
+    bounds = [v for v in params.values() if isinstance(v, datetime.datetime)]
+    assert len(bounds) == 1
+    return bounds[0]
+
+
+def _edited_bounds(session) -> tuple[datetime.datetime, datetime.datetime]:
+    """(month_bound, year_bound) — scalars #18 and #19 (indexes 17 and 18) in
+    handler order; the year count is appended directly after the month count."""
+    return (
+        _updated_at_bound(session.scalar_args[17]),
+        _updated_at_bound(session.scalar_args[18]),
+    )
+
+
+def _summary_session(client, monkeypatch=None, when=None):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    if monkeypatch is not None and when is not None:
+        _freeze_dashboard_clock(monkeypatch, when)
+    session = _FakeSession([], scalars=[0] * 19)
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    return session, response
+
+
+def test_summary_edited_previous_month_counts_for_year_not_month(
+    client, monkeypatch
+):
+    # #645: an alumnus edited EARLIER THIS YEAR but in a previous month belongs
+    # to the year running total and must NOT appear in the month figure — the
+    # tile stacks "this month" over "this year" and they'd contradict each other
+    # otherwise. Clock frozen to August so "a previous month, same year" exists
+    # (in January there is no such month, which is exactly why we freeze).
+    session, _ = _summary_session(
+        client,
+        monkeypatch,
+        datetime.datetime(2026, 8, 6, 12, 0, tzinfo=datetime.UTC),
+    )
+    month_bound, year_bound = _edited_bounds(session)
+
+    edited_in_march = datetime.datetime(2026, 3, 14, 9, 0, tzinfo=datetime.UTC)
+    assert edited_in_march >= year_bound  # counted by the year KPI
+    assert edited_in_march < month_bound  # excluded from the month KPI
+
+
+def test_summary_alumni_edited_year_boundary_is_jan_1_utc(client, monkeypatch):
+    # The year window is CALENDAR YEAR TO DATE: 1 January 00:00 UTC through now.
+    # It is NOT a rolling 12 months, so 31 December of the prior year is out and
+    # the count legitimately collapses to near zero every 1 January.
+    session, _ = _summary_session(
+        client,
+        monkeypatch,
+        datetime.datetime(2026, 8, 6, 12, 0, tzinfo=datetime.UTC),
+    )
+    _, year_bound = _edited_bounds(session)
+
+    assert year_bound == datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+    # UTC-anchored like every other date filter in the app.
+    assert year_bound.tzinfo is not None
+    assert year_bound.utcoffset() == datetime.timedelta(0)
+    # A rolling-12-month window would have swept this in; year-to-date must not.
+    assert (
+        datetime.datetime(2025, 12, 31, 23, 59, tzinfo=datetime.UTC) < year_bound
+    )
+
+
+def test_summary_alumni_edited_year_boundary_tracks_live_clock(client):
+    # Same assertion against the real server clock (no freeze), so the bound can
+    # never drift away from 1 Jan of the CURRENT year.
+    session, _ = _summary_session(client)
+    _, year_bound = _edited_bounds(session)
+    today = datetime.datetime.now(datetime.UTC).date()
+    assert year_bound == datetime.datetime.combine(
+        today.replace(month=1, day=1), datetime.time.min, tzinfo=datetime.UTC
+    )
+
+
+def test_summary_alumni_edited_year_is_always_at_least_the_month(
+    client, monkeypatch
+):
+    # The year count is a strict SUPERSET of the month count. That is guaranteed
+    # structurally rather than by arithmetic: both counts run the SAME query over
+    # the SAME population and differ only in the updated_at lower bound, and the
+    # year bound is never later than the month bound. Assert both halves.
+    session, _ = _summary_session(
+        client,
+        monkeypatch,
+        datetime.datetime(2026, 8, 6, 12, 0, tzinfo=datetime.UTC),
+    )
+    month_bound, year_bound = _edited_bounds(session)
+    assert year_bound <= month_bound
+
+    month_sql = _compiled(session.scalar_args[17])
+    year_sql = _compiled(session.scalar_args[18])
+    # Identical SQL (same table, same `active` predicate, same >= comparison) —
+    # only the bound parameter's value differs.
+    assert month_sql == year_sql
+    assert "alumni.updated_at >=" in year_sql
+    assert "archived" in year_sql
+    assert "is_alumni" in year_sql
+
+    # And in January, when the two bounds coincide, the counts are equal — the
+    # expected "drops to near zero each January" behaviour, not a bug.
+    session_jan, _ = _summary_session(
+        client,
+        monkeypatch,
+        datetime.datetime(2026, 1, 9, 12, 0, tzinfo=datetime.UTC),
+    )
+    jan_month_bound, jan_year_bound = _edited_bounds(session_jan)
+    assert jan_year_bound == jan_month_bound == datetime.datetime(
+        2026, 1, 1, tzinfo=datetime.UTC
+    )
+
+
+def test_summary_alumni_edited_year_counts_records_not_changes(client):
+    # THE key requirement: ten edits to one alumnus is ONE record. This holds by
+    # construction — the KPI counts rows in the `alumni` table (one row per
+    # alumnus) filtered on updated_at, so repeated writes only move that one
+    # row's timestamp. Guard the shape so nobody rebuilds it on audit_logs,
+    # which stores one row per changed FIELD and also carries
+    # action_type='search'/'preview' rows (double inflation).
+    session, _ = _summary_session(client)
+    for index in (17, 18):
+        sql = _compiled(session.scalar_args[index])
+        assert "count(*)" in sql
+        assert "FROM alumni" in sql
+        assert "audit_logs" not in sql
+        assert "action_type" not in sql
+        assert "JOIN" not in sql
+        # Aggregate only — never fetch rows and count in Python (8,000+ alumni).
+        assert "LIMIT" not in sql
+
+
+def test_summary_alumni_edited_year_in_response_body(client):
+    # The exact field name the frontend tile reads, alongside the month figure.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    scalars = [0] * 17 + [23, 91]
+    app.dependency_overrides[get_session] = _with_session(
+        _FakeSession([], scalars=scalars)
+    )
+
+    response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["alumni_edited_this_month"] == 23
+    assert body["alumni_edited_this_year"] == 91
+    assert body["alumni_edited_this_year"] >= body["alumni_edited_this_month"]
 
 
 def test_summary_industry_breakdown_separates_other_and_unknown(client):
@@ -708,8 +898,8 @@ def test_summary_response_validates_against_model(client):
     from app.schemas.dashboard import DashboardSummary
 
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    # 18 scalar KPIs; the three distribution queries fall back to empty rows.
-    session = _FakeSession([], scalars=[0] * 18)
+    # 19 scalar KPIs; the three distribution queries fall back to empty rows.
+    session = _FakeSession([], scalars=[0] * 19)
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/summary")

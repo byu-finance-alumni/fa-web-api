@@ -254,6 +254,52 @@ Military. The staff **create** and **profile-edit** forms close that gap by
 
 ---
 
+## Marital Status
+
+Used by: `alumni.marital_status`.
+
+> **This list is machine-checked.** `tests/test_marital_status_vocab.py` parses
+> the bullets below and fails CI if they drift from `app/core/dropdowns.py`
+> `MARITAL_STATUSES`. Change both together — order included.
+
+Free text until #647. Like Employment Status this is **not** a `vocabulary_terms`
+category — there is no `/vocabulary/marital_status` endpoint and no seed
+migration; the list lives in code on both sides. These four are a product
+decision (Jake, #647), not a set an admin should be able to extend at runtime,
+and making the list runtime-mutable would mean an admin edit could start silently
+rejecting alumni survey answers.
+
+Options:
+- Single
+- Married
+- Divorced
+- Widowed
+
+### Constrained on the survey write, not on the column
+
+The column is a plain `varchar(50)` and there is no `validate_marital_status()`,
+for the same reason there is no `validate_employment_status()`: prod holds
+off-list legacy values from the free-text intake sheet (`Separated`, casing
+drift), and an allow-list on the column would make those records 422 the moment
+someone edited an unrelated field.
+
+The four are enforced in exactly one place — the **survey**, whose submit
+endpoint is public (token-gated), so anyone holding a link can POST arbitrary
+text at it. `app/services/survey_responses.py` gives the field the `choice` kind,
+which behaves like `designation`: the server decides what may be written, not the
+payload. An off-list answer is **ignored**, not stored and not written as `NULL`
+— blanking it would destroy the very legacy value this rule exists to protect.
+A blank submission is likewise ignored (`blankable=False`), because an alum whose
+stored status is off-list sees a dropdown with no matching option.
+
+An off-list stored value stays fully **readable**: the confirm page receives it
+verbatim, the review queue's before/after diff shows it verbatim, and staff can
+still edit it. The importer is unchanged and stays lenient (see
+`_MARITAL_BLANK_TOKENS` in `app/services/import_csv.py`, which blanks
+`Undeclared` / `N/A` / `None` / `Unknown` on import).
+
+---
+
 ## Mentor Industries
 
 Used by: `alumni_mentor_industries.industry` (multi-select — one row per industry).

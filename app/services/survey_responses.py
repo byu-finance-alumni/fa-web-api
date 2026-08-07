@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import holds_designation
+from app.core.dropdowns import MARITAL_STATUSES, holds_designation
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -36,7 +36,7 @@ from app.schemas.survey import (
     SurveyResponseItem,
     SurveySubmitResult,
 )
-from app.services import supabase_storage
+from app.services import hygiene, supabase_storage
 from app.services.survey_email import LINK_DEAD_MESSAGE, verify_survey_token
 
 log = logging.getLogger(__name__)
@@ -79,10 +79,26 @@ class _Field:
     label: str
     group: str  # alumni | contact | employment | engagement
     column: str
-    kind: str  # text | int | bool | date | designation
+    kind: str  # text | int | bool | date | designation | choice
     # `designation` only: the canonical string written to the column when the alum
     # ticks the box. Lives HERE, server-side, never in the payload — see `_coerce`.
     marker: str | None = None
+    # `choice` only: the exact values that may be written. Anything else the alum
+    # (or anyone holding a survey link) submits is IGNORED — see `_coerce`.
+    options: tuple[str, ...] | None = None
+    # False when a blank submission is NOT an instruction to clear the column.
+    # Defaults True, which is the long-standing `text` behaviour (blank -> NULL).
+    # Turned off for the identity columns the confirm page pre-fills: an empty box
+    # there means the field was cleared or never rendered, not that the alumnus has
+    # no surname. See the name block in `_FIELDS`.
+    blankable: bool = True
+
+
+# What `_coerce` returns for a value the server refuses to write. DISTINCT from
+# `None`, which is a real instruction ("store NULL"). The apply path skips the
+# column entirely on this, so an off-list or disallowed-blank answer leaves what
+# is on file exactly as it was rather than overwriting it.
+_IGNORE = object()
 
 
 # The whitelist of fields an alum may submit + where each writes. Order matches
@@ -174,8 +190,69 @@ _FIELDS: tuple[_Field, ...] = (
         "profile.other_designations", "Other designations", "alumni", "other_designations", "text"
     ),
     # Personal & family (alumni table). Columns already exist — no migration.
+    #
+    # NAME BLOCK (#646). The four name columns on `alumni`, at the head of the
+    # personal group so the confirm page reads as one "Name" question rather than
+    # four fields scattered through the form. Until #646 an alum could not correct
+    # their own name at all — a marriage rename had to go to staff.
+    #
+    # "Middle or Maiden name" is the LABEL on purpose, and it is a product call,
+    # not a guess: staff have been entering maiden names in `middle_name` for
+    # years, so the label is being changed to match the data rather than the data
+    # migrated to match a label.
+    #
+    # `alumni.birth_name` STAYS IN THE SCHEMA AND STAYS UNUSED. It is the column
+    # you would expect a maiden name to live in, which is exactly why this note is
+    # here — the next person to read this will go looking for it. It is not
+    # surveyed, not written, not repurposed and not dropped: the real maiden names
+    # are in `middle_name`, and pointing the survey at `birth_name` instead would
+    # split one fact across two columns and leave every existing record's maiden
+    # name invisible to it.
+    #
+    # `blankable=False` on all four: `survey_email.get_respondent` pre-fills every
+    # name box, so a blank one means the box was cleared or never rendered — never
+    # "this alumnus has no first name". Anything holding a survey link can POST to
+    # this whitelist, and NULLing an identity column that search, the duplicate
+    # check and every export key off is not an edit a public form should be able to
+    # stage. Staff can still clear a name from the profile editor.
+    _Field("profile.first_name", "First name", "alumni", "first_name", "text", blankable=False),
+    _Field(
+        "profile.middle_name",
+        "Middle or Maiden name",
+        "alumni",
+        "middle_name",
+        "text",
+        blankable=False,
+    ),
+    _Field("profile.last_name", "Last name", "alumni", "last_name", "text", blankable=False),
+    _Field(
+        "profile.preferred_first_name",
+        "Preferred first name",
+        "alumni",
+        "preferred_first_name",
+        "text",
+        blankable=False,
+    ),
     _Field("profile.gender", "Gender", "alumni", "gender", "text"),
-    _Field("profile.marital_status", "Marital status", "alumni", "marital_status", "text"),
+    # Marital status became a fixed four-option choice in #647. It was free text
+    # here (and the column still is a plain varchar(50) — see
+    # `core.dropdowns.MARITAL_STATUSES` for why the constraint is not on the
+    # column), so the `choice` kind is what stops a public submit from putting
+    # arbitrary text into it while leaving every off-list value already on file
+    # readable, displayable and untouched.
+    _Field(
+        "profile.marital_status",
+        "Marital status",
+        "alumni",
+        "marital_status",
+        "choice",
+        options=MARITAL_STATUSES,
+        # A blank is not an answer here either: an alumnus whose stored status is
+        # off-list ("Separated") sees a dropdown with no matching option, and if
+        # leaving it alone wiped the column the survey would destroy exactly the
+        # legacy value #647 requires be preserved.
+        blankable=False,
+    ),
     _Field("profile.birth_date", "Birthday", "alumni", "birth_date", "date"),
     _Field("profile.citizenship", "Citizenship", "alumni", "citizenship", "text"),
     _Field("profile.home_country", "Home country", "alumni", "home_country", "text"),
@@ -239,6 +316,12 @@ _FIELDS: tuple[_Field, ...] = (
 )
 _FIELD_BY_KEY = {f.key: f for f in _FIELDS}
 
+# The `alumni` columns the fuzzy duplicate check keys off (with graduation_year,
+# which the survey cannot write). Named here so the apply path and
+# `hygiene.detect_duplicates` cannot drift about which columns make a rename a
+# rename — middle/preferred names are not part of the dedup identity.
+_DEDUP_NAME_COLUMNS = frozenset({"first_name", "last_name"})
+
 _TRUE = frozenset({"yes", "true", "1"})
 
 
@@ -267,6 +350,11 @@ def _current(field: _Field, obj: object | None) -> str:
         return "Yes" if holds_designation(raw) else "No"
     if field.kind == "bool":
         return "Yes" if raw else "No"
+    # `choice` deliberately falls through to the verbatim stored text: a value
+    # that is no longer (or never was) one of the options — "Separated" in
+    # marital_status — must still READ back exactly as stored, here and on the
+    # confirm page. The option list constrains what can be WRITTEN, never what can
+    # be displayed (#647).
     return _text(raw)
 
 
@@ -275,11 +363,41 @@ def _after(field: _Field, raw: object) -> str:
     value = _text(raw)
     if field.kind in ("bool", "designation"):
         return "Yes" if value.lower() in _TRUE else "No"
+    if field.kind == "choice":
+        # Show the CANONICAL option, not what was typed, so the reviewer's "after"
+        # is the string that will actually be stored. Nothing off-list ever reaches
+        # here — `_coerce` returns `_IGNORE` for those and both the submit and the
+        # diff drop the field before this is called — but resolving it again here
+        # keeps the displayed value and the written value derived from one rule.
+        return _choice(field, raw) or ""
     return value
 
 
+def _choice(field: _Field, raw: object) -> str | None:
+    """The canonical option matching *raw*, or ``None`` when it isn't one.
+
+    Case-insensitive and whitespace-trimmed: the alum's browser sends whatever the
+    form put in the option's value attribute, and a stored value being re-submitted
+    unchanged can carry the casing drift already on the record.
+    """
+    value = _text(raw)
+    if not value:
+        return None
+    folded = value.lower()
+    for option in field.options or ():
+        if option.lower() == folded:
+            return option
+    return None
+
+
 def _coerce(field: _Field, raw: object):
-    """The submitted value coerced to the column's Python type for writing."""
+    """The submitted value coerced to the column's Python type for writing.
+
+    Returns the module-level `_IGNORE` sentinel when the server refuses to write
+    the value at all (an off-list `choice`, or a blank on a non-`blankable`
+    field). Callers must check for it BEFORE writing — `None` means "store NULL"
+    and is a different instruction.
+    """
     value = _text(raw)
     if field.kind == "bool":
         return value.lower() in _TRUE
@@ -288,6 +406,17 @@ def _coerce(field: _Field, raw: object):
         # from the field definition, so a public submit can never write anything
         # other than the canonical marker (or NULL) into a filtered column.
         return field.marker if value.lower() in _TRUE else None
+    if not value and not field.blankable:
+        # A blank on a field that cannot be blanked is not an instruction, it's a
+        # missing answer — leave what's on file alone.
+        return _IGNORE
+    if field.kind == "choice":
+        # Same principle as `designation`: the server decides what may be written,
+        # not the payload. Anything holding a survey link can POST to this
+        # whitelist, so an unrecognized answer is ignored outright rather than
+        # stored as free text (which is what this field used to be) or written as
+        # NULL (which would destroy a legitimate off-list value already on file).
+        return _choice(field, raw) or _IGNORE
     if field.kind == "int":
         try:
             return int(value) if value else None
@@ -323,7 +452,19 @@ async def submit_response(
     if alum is None or alum.archived:
         raise NotFoundError(LINK_DEAD_MESSAGE)
 
-    payload = {k: _text(v) for k, v in (fields or {}).items() if k in _FIELD_BY_KEY}
+    # Recognized keys only — and, for the kinds where the server decides what may
+    # be written, only values it would actually write. Staging an answer the apply
+    # path is going to ignore would put a change in the review queue that silently
+    # does nothing when a reviewer approves it, which is the same class of bug as
+    # the dropped-key warning in `apply_response`. Rejecting it here is also what
+    # makes the four marital-status options a real constraint rather than a UI
+    # convention: the endpoint is public (token-gated), so anyone with a link can
+    # POST arbitrary text at this whitelist.
+    payload = {
+        k: _text(v)
+        for k, v in (fields or {}).items()
+        if k in _FIELD_BY_KEY and _coerce(_FIELD_BY_KEY[k], v) is not _IGNORE
+    }
     if not payload and not has_photo:
         return SurveySubmitResult(staged=False, change_count=0)
 
@@ -438,6 +579,12 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
             field = _FIELD_BY_KEY.get(key)
             if field is None:
                 continue
+            # A value the apply path will not write is not a change. `submit_response`
+            # already drops these, so in practice this only catches rows staged
+            # BEFORE the field gained its constraint (#647) — those must not sit in
+            # the queue advertising an edit that approving them wouldn't make.
+            if _coerce(field, raw) is _IGNORE:
+                continue
             before = _current(field, by_group.get(field.group))
             after = _after(field, raw)
             if before == after:
@@ -485,8 +632,16 @@ async def _get_pending(session: AsyncSession, response_id: int) -> SurveyRespons
 
 async def apply_response(
     session: AsyncSession, response_id: int, actor_user_id: int | None
-) -> None:
-    """Write the staged changes to the alum's record and mark applied."""
+) -> list[dict]:
+    """Write the staged changes to the alum's record and mark applied.
+
+    Returns the soft duplicate warnings a NAME change raised (#646/#627) — an
+    empty list for every other apply. They never block: the response is already
+    applied and committed by the time they are returned, exactly as on the staff
+    rename path, because two alumni genuinely can share a name and a graduation
+    year and a marriage rename into a real collision is sometimes correct. The
+    point is that the person who approved it is told.
+    """
     resp = await _get_pending(session, response_id)
     alum = (
         await session.execute(select(Alumni).where(Alumni.alumni_id == resp.alumni_id))
@@ -524,14 +679,28 @@ async def apply_response(
     # Field KEYS only ever appear in the log — never a submitted value.
     written = 0
     dropped: list[str] = []
+    # Values the server refused to write (an off-list `choice`, a blank on a
+    # non-blankable name). Counted apart from `dropped`, which means "we don't know
+    # this key at all": an ignored value is a KNOWN field whose answer we declined,
+    # and the column keeps whatever it already held.
+    ignored: list[str] = []
+    # True when this apply moves first_name or last_name — the only two columns the
+    # fuzzy duplicate check keys off (with graduation_year). Nothing else the survey
+    # can write affects it, so the extra query below runs on renames only.
+    name_changed = False
     for key, raw in (resp.payload or {}).items():
         field = _FIELD_BY_KEY.get(key)
         if field is None:
             dropped.append(key)
             continue
-        written += 1
         value = _coerce(field, raw)
+        if value is _IGNORE:
+            ignored.append(key)
+            continue
+        written += 1
         if field.group == "alumni":
+            if field.column in _DEDUP_NAME_COLUMNS and getattr(alum, field.column) != value:
+                name_changed = True
             setattr(alum, field.column, value)
         elif field.group == "contact":
             if contact is None:
@@ -558,6 +727,40 @@ async def apply_response(
             alum.alumni_id,
             ", ".join(sorted(dropped)),
         )
+    if ignored:
+        log.info(
+            "Survey response %s: %d submitted value(s) were not writable and left "
+            "alumni %s unchanged: %s",
+            response_id,
+            len(ignored),
+            alum.alumni_id,
+            ", ".join(sorted(ignored)),
+        )
+
+    # A rename can collide with an existing alumnus, and until now the survey was
+    # the one write path where that happened in total silence — #627 fixed the
+    # staff create/edit path and the survey did not exist on it. Same check, same
+    # rule, reached by handing `detect_duplicates` the identity this apply
+    # produces (the values are already on `alum` in memory).
+    #
+    # ONLY first/last/graduation_year are passed, and the `blockers` half is
+    # deliberately discarded rather than raised. The survey cannot write byu_id or
+    # net_id — they aren't in `_FIELDS` — so the exact-collision branches have
+    # nothing to fire on that this apply caused; passing the stored ids anyway
+    # would let a pre-existing data problem surface here as if this approval had
+    # created it, and could turn an unrelated archived-ghost warning into noise on
+    # every name change.
+    duplicate_warnings: list[dict] = []
+    if name_changed:
+        _blockers, duplicate_warnings = await hygiene.detect_duplicates(
+            session,
+            {
+                "first_name": alum.first_name,
+                "last_name": alum.last_name,
+                "graduation_year": alum.graduation_year,
+            },
+            exclude_alumni_id=alum.alumni_id,
+        )
 
     resp.status = "applied"
     resp.reviewed_by_user_id = actor_user_id
@@ -570,11 +773,13 @@ async def apply_response(
             entity_id=alum.alumni_id,
             new_value=(
                 f"survey_response={response_id} fields={len(resp.payload or {})} "
-                f"written={written} dropped={len(dropped)}"
+                f"written={written} dropped={len(dropped)} ignored={len(ignored)}"
+                + (f" duplicate_warnings={len(duplicate_warnings)}" if name_changed else "")
             ),
         )
     )
     await session.commit()
+    return duplicate_warnings
 
 
 async def reject_response(

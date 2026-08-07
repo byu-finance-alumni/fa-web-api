@@ -330,6 +330,10 @@ def _respondent_alum():
         alumni_id=7,
         archived=False,
         first_name="Jordan",
+        # All four name columns are pre-filled onto the confirm page since #646 —
+        # the survey can change them now, and a name box that arrives blank must
+        # mean "cleared", not "we never sent one".
+        middle_name=None,
         last_name="Avery",
         preferred_first_name=None,
         employment_status="Employed",
@@ -346,6 +350,37 @@ def _respondent_alum():
         citizenship=None,
         home_country=None,
     )
+
+
+def test_get_respondent_prefills_the_whole_name_block(fake_settings, monkeypatch):
+    """#646 — the survey can change an alum's name, and the name fields refuse to
+    write a blank (`survey_responses._Field.blankable`). That rule only holds
+    because the boxes arrive PRE-FILLED: without these four an alum with a perfectly
+    good name on file would be shown four empty inputs."""
+    monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)
+    alum = _respondent_alum()
+    alum.middle_name = "Whitaker"
+    alum.preferred_first_name = "Jordy"
+    session = _RespondentSession([alum, None, None, None])
+    info = asyncio.run(survey_email.get_respondent(session, "tok"))
+    assert info.fields["profile.first_name"] == "Jordan"
+    assert info.fields["profile.middle_name"] == "Whitaker"
+    assert info.fields["profile.last_name"] == "Avery"
+    assert info.fields["profile.preferred_first_name"] == "Jordy"
+
+
+def test_get_respondent_sends_an_off_list_marital_status_verbatim(
+    fake_settings, monkeypatch
+):
+    """#647 — the four options constrain what the survey may WRITE, never what it
+    may show. A legacy "Separated" has to reach the alum unaltered; the frontend
+    re-adds it to the dropdown the way the staff employment-status dropdown does."""
+    monkeypatch.setattr(survey_email, "verify_survey_token", lambda _t: 7)
+    alum = _respondent_alum()
+    alum.marital_status = "Separated"
+    session = _RespondentSession([alum, None, None, None])
+    info = asyncio.run(survey_email.get_respondent(session, "tok"))
+    assert info.fields["profile.marital_status"] == "Separated"
 
 
 def test_get_respondent_prefills_held_designations(fake_settings, monkeypatch):

@@ -308,6 +308,46 @@ def is_military_status(employment_status: str | None) -> bool:
     return (employment_status or "").strip().lower() == MILITARY_STATUS.lower()
 
 
+# --- marital status (#647) ---------------------------------------------------
+#
+# ``alumni.marital_status``. Free text until #647; now a fixed FOUR-option choice
+# for anything the SURVEY writes. Mirror any change here in
+# ``database/dropdowns.md`` and in the frontend's ``MARITAL_STATUS_OPTIONS``
+# (fa-web-app/src/constants/dropdowns.ts); ``tests/test_marital_status_vocab.py``
+# machine-checks this tuple against the doc.
+#
+# WHY A CONSTANT AND NOT A ``vocabulary_terms`` CATEGORY. The same reason
+# :data:`EMPLOYMENT_STATUSES` is one: these four are a product decision (Jake,
+# #647), not a list an admin should be able to extend at runtime. A DB-backed
+# category would cost a seed migration and an admin screen to express a list that
+# is not expected to change, and it would make the *survey's* allow-list
+# runtime-mutable — i.e. an admin edit could start silently rejecting alumni
+# answers. The established pattern in this codebase for a small fixed list is a
+# constant here + a mirrored frontend constant + a doc the tests parse, so this
+# follows it rather than inventing a third shape.
+#
+# CONSTRAINED WHERE IT IS WRITTEN, NOT ON THE COLUMN. There is deliberately no
+# ``validate_marital_status``, for exactly the reason there is no
+# ``validate_employment_status``: the column is a plain ``varchar(50)`` that prod
+# has been filling from a free-text intake sheet for years, so it holds off-list
+# values ("Separated", "Undeclared", casing drift). An allow-list on the column
+# would make every one of those records 422 the moment someone edited an
+# unrelated field. Off-list values stay readable, displayable, exportable and
+# editable; the four are enforced only where a value arrives from an UNTRUSTED
+# source — the public survey, via the ``choice`` field kind in
+# ``app/services/survey_responses.py``, which ignores an off-list answer outright
+# rather than storing it or blanking what is on file.
+#
+# ORDER IS THE DROPDOWN ORDER: Single first (the most common answer for a recent
+# cohort), then the three that describe a marriage that has ended.
+MARITAL_STATUSES: tuple[str, ...] = (
+    "Single",
+    "Married",
+    "Divorced",
+    "Widowed",
+)
+
+
 # --- finance designations (CFA / CFP / CPA) ----------------------------------
 #
 # ``alumni_program_engagement.cfa_designation`` / ``cfp_designation`` /

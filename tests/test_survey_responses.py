@@ -534,7 +534,10 @@ def test_apply_with_photo_falls_back_to_alumni_id(monkeypatch):
 
 
 def test_apply_without_photo_writes_fields_and_skips_storage(monkeypatch):
-    resp = _fake_resp(payload={"profile.linkedin_url": "https://x"})
+    # NOTE the URL: since #418 the linkedin_url field carries the staff LinkedIn
+    # rule, so a placeholder like "https://x" is now (correctly) refused and would
+    # make this test assert nothing about the write path.
+    resp = _fake_resp(payload={"profile.linkedin_url": "https://www.linkedin.com/in/jdoe"})
     alum = types.SimpleNamespace(alumni_id=5, net_id="jdoe5", linkedin_url=None)
 
     async def fake_get_pending(_s, _rid):
@@ -554,7 +557,7 @@ def test_apply_without_photo_writes_fields_and_skips_storage(monkeypatch):
     monkeypatch.setattr(supabase_storage, "upload_object", boom)
     monkeypatch.setattr(supabase_storage, "delete_object", boom)
     asyncio.run(sr.apply_response(_Session(alum), 1, actor_user_id=9))
-    assert alum.linkedin_url == "https://x"
+    assert alum.linkedin_url == "https://www.linkedin.com/in/jdoe"
     assert touched == []  # storage never touched when no photo staged
     assert resp.status == "applied"
 
@@ -575,3 +578,204 @@ def test_reject_with_photo_removes_staged(monkeypatch):
     asyncio.run(sr.reject_response(_Session(None), 1, actor_user_id=9))
     assert calls["delete"] == ("headshots", "survey-pending/1")
     assert resp.status == "rejected"
+
+
+# ------------------------------------------- hostile public input (#418) ------
+#
+# `apply_response` writes with a raw `setattr`, so no Pydantic validator runs and
+# every rule in app/schemas/alumni.py is bypassed on this path. The survey made
+# these columns a PUBLIC write surface, so the fields whose values are trusted
+# downstream (rendered as an href, handed to the email sender) carry their rule
+# on the _Field itself and are refused exactly like an off-list `choice`.
+
+
+def test_linkedin_url_refuses_hostile_values():
+    field = sr._FIELD_BY_KEY["profile.linkedin_url"]
+    # The stored value becomes an href on staff pages, so a non-http(s) scheme is
+    # a script a signed-in reviewer runs by clicking. The before/after diff would
+    # have shown them a plausible-looking URL.
+    assert _coerce(field, "javascript:alert(document.cookie)") is sr._IGNORE
+    assert _coerce(field, "data:text/html;base64,PHNjcmlwdD4=") is sr._IGNORE
+    # Lookalike hosts: each of these READS as LinkedIn in the review queue and
+    # resolves somewhere else. The last two are the ones a host check written as
+    # a substring/`startswith` test would wave through.
+    for hostile in (
+        "https://linkedin.com.evil.example/in/jdoe",
+        "https://evil.example/linkedin.com/in/jdoe",
+        "https://linkedin.com@evil.example/in/jdoe",
+        "https://notlinkedin.com/in/jdoe",
+    ):
+        assert _coerce(field, hostile) is sr._IGNORE, hostile
+    # A real profile URL still goes through, trimmed — refusing these would just
+    # move the bug from "accepts anything" to "accepts nothing".
+    assert (
+        _coerce(field, "  https://www.linkedin.com/in/jane-doe-123  ")
+        == "https://www.linkedin.com/in/jane-doe-123"
+    )
+    assert _coerce(field, "https://linkedin.com/in/jdoe") == "https://linkedin.com/in/jdoe"
+    # A blank is still the ordinary "clear this column" instruction, NOT a
+    # rejection: the rule guards hostile values, it must not swallow a legitimate
+    # clear (linkedin_url is blankable).
+    assert _coerce(field, "") is None
+
+
+def test_linkedin_rule_is_the_staff_rule_not_a_second_copy():
+    # Guards against the rule silently disappearing (e.g. if the shared validator
+    # stopped being reachable) — the point of #418 is ONE definition, so if the
+    # staff schema accepts a URL this path must too, and vice versa.
+    from app.schemas.alumni import AlumniBase
+
+    for value in (
+        "https://www.linkedin.com/in/jdoe",
+        "javascript:alert(1)",
+        "https://linkedin.com.evil.example/in/jdoe",
+    ):
+        try:
+            AlumniBase._validate_linkedin_url(value)
+            staff_ok = True
+        except ValueError:
+            staff_ok = False
+        survey_ok = _coerce(sr._FIELD_BY_KEY["profile.linkedin_url"], value) is not sr._IGNORE
+        assert staff_ok == survey_ok, value
+
+
+def test_email_refuses_a_smuggled_second_recipient():
+    # The stored address is what `email_reach.resolve_email` hands the sender, so
+    # a separator character in the column silently copies or redirects every
+    # future mail to that alumnus — and the console still shows one address.
+    for field_key in ("contact.personal_email", "contact.work_email"):
+        field = sr._FIELD_BY_KEY[field_key]
+        for hostile in (
+            "alum@byu.edu, attacker@evil.example",
+            "alum@byu.edu;attacker@evil.example",
+            "alum@byu.edu attacker@evil.example",
+            "alum@byu.edu\nattacker@evil.example",
+            "alum@byu.edu\r\nBcc: attacker@evil.example",
+            '"Finance Alumni" <attacker@evil.example>',
+            "alum@byu.edu@evil.example",
+            "@byu.edu",
+            "alum@byu",
+            "a" * 250 + "@byu.edu",  # longer than the varchar(255) column
+        ):
+            assert _coerce(field, hostile) is sr._IGNORE, (field_key, hostile)
+        # Ordinary addresses — including the plus-addressed and hyphenated shapes
+        # real people use — still pass. This gate is about "is this ONE address",
+        # not "is this address real"; a misspelling is a data problem staff can
+        # see and fix, and rejecting it here would silently drop real alumni.
+        for ok in (
+            "jane.doe@byu.edu",
+            "jane+alumni@gmail.com",
+            "j.doe-smith@sub.domain.co.uk",
+            "  jdoe@byu.edu  ",
+        ):
+            assert _coerce(field, ok) == ok.strip(), (field_key, ok)
+        assert _coerce(field, "") is None  # clearing an address is still allowed
+
+
+def test_hostile_values_are_never_even_staged(monkeypatch):
+    # `submit_response` already drops anything `_coerce` would refuse, so a
+    # hostile value never reaches the review queue at all — a reviewer is never
+    # shown a change that approving would (or worse, would not) make.
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    result = asyncio.run(
+        sr.submit_response(
+            session,
+            "tok",
+            {
+                "profile.linkedin_url": "javascript:alert(1)",
+                "contact.personal_email": "alum@byu.edu, attacker@evil.example",
+                "contact.work_email": "jdoe@byu.edu",
+            },
+        )
+    )
+    assert result.change_count == 1
+    staged = next(o for o in session.added if isinstance(o, SurveyResponse))
+    assert staged.payload == {"contact.work_email": "jdoe@byu.edu"}
+
+
+def test_apply_leaves_the_column_alone_on_a_refused_value(monkeypatch):
+    # The refusal must NOT be "write NULL": an alum who already has a good
+    # LinkedIn URL keeps it. Counted in `ignored` (a known field whose answer we
+    # declined), never in `dropped` (a key we don't recognize), and only the KEY
+    # is logged — never the submitted value.
+    resp = _fake_resp(
+        payload={
+            "profile.linkedin_url": "javascript:alert(1)",
+            "contact.personal_email": "good@byu.edu",
+        }
+    )
+    alum = types.SimpleNamespace(
+        alumni_id=5, net_id="jdoe5", linkedin_url="https://www.linkedin.com/in/real"
+    )
+    contact = types.SimpleNamespace(alumni_id=5, personal_email=None)
+
+    async def fake_get_pending(_s, _rid):
+        return resp
+
+    async def fake_side(_s, _ids):
+        return ({5: contact}, {}, {})
+
+    monkeypatch.setattr(sr, "_get_pending", fake_get_pending)
+    monkeypatch.setattr(sr, "_load_side_rows", fake_side)
+    session = _Session(alum)
+    asyncio.run(sr.apply_response(session, 1, actor_user_id=9))
+    assert alum.linkedin_url == "https://www.linkedin.com/in/real"
+    assert contact.personal_email == "good@byu.edu"
+    audit = next(o for o in session.added if isinstance(o, AuditLog))
+    assert "written=1" in audit.new_value
+    assert "ignored=1" in audit.new_value
+    assert "dropped=0" in audit.new_value
+
+
+def test_offlist_choice_behaviour_is_not_regressed():
+    # #647 regression guard. Adding the `validate` hook must not disturb the
+    # existing `choice` contract: an off-list answer is refused (not stored, not
+    # NULLed), and a value already ON FILE that is off-list still READS back
+    # verbatim. The option list constrains what may be WRITTEN, never what may be
+    # displayed.
+    field = sr._FIELD_BY_KEY["profile.marital_status"]
+    assert _coerce(field, "Separated") is sr._IGNORE
+    assert _coerce(field, "<script>alert(1)</script>") is sr._IGNORE
+    assert _coerce(field, "married") == "Married"
+    assert _current(field, types.SimpleNamespace(marital_status="Separated")) == "Separated"
+    # A blank on this non-blankable field is still ignored, not a wipe.
+    assert _coerce(field, "") is sr._IGNORE
+
+
+# ---------------------------------------------- concurrent review (#421) ------
+
+
+def test_get_pending_locks_the_row():
+    # Without FOR UPDATE the `status == "pending"` check below is advisory only:
+    # two reviewers (or one double-click) both read "pending", both pass, and one
+    # applies the changes + promotes the photo while the other marks it rejected.
+    # The record changed and the audit says it was refused. The lock makes the
+    # second transaction block, re-read, and get the ordinary "already reviewed"
+    # error instead. Same pattern as survey_reset._load_alum.
+    from sqlalchemy.dialects import postgresql
+
+    class _Recording(_Session):
+        def __init__(self, obj):
+            super().__init__(obj)
+            self.stmts = []
+
+        async def execute(self, stmt):
+            self.stmts.append(stmt)
+            return await super().execute(stmt)
+
+    resp = _fake_resp()
+    session = _Recording(resp)
+    assert asyncio.run(sr._get_pending(session, 1)) is resp
+    sql = str(session.stmts[0].compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE" in sql
+
+
+def test_get_pending_still_rejects_an_already_reviewed_response():
+    from app.core.errors import InvalidRequestError
+
+    with pytest.raises(InvalidRequestError):
+        asyncio.run(sr._get_pending(_Session(_fake_resp(status="applied")), 1))
+    with pytest.raises(NotFoundError):
+        asyncio.run(sr._get_pending(_Session(None), 1))

@@ -168,6 +168,20 @@ def test_limit_caps_recipients(fake_settings, monkeypatch):
 def test_send_stops_and_reports_retry_after_on_429(fake_settings, monkeypatch):
     # Resend rate-limits mid-send -> we stop, report what got sent, how many
     # remain, and Resend's retry-after. The limit comes from Resend, not config.
+    #
+    # The CAP IS SWITCHED OFF here (#417), which is now the only way 250 emails
+    # can be attempted in one call: the send budget is enforced inside
+    # `send_survey_stage`, and the default 100/day would otherwise clamp this
+    # send to 100 and it would never reach the second batch. That clamp is the
+    # subject of `test_survey_send_budget.py`; what is under test here is
+    # Resend's own throttle, which is a different brake and still the real one.
+    from app.services import survey_schedule
+
+    async def no_cap(session):
+        return None
+
+    monkeypatch.setattr(survey_schedule, "_run_allowance", no_cap)
+
     async def fake_load(session, year):
         return _recipients(250)  # 3 batches: 100, 100, 50
 

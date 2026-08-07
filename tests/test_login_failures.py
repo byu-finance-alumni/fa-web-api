@@ -34,15 +34,20 @@ def _ctx(*roles: str, user_id: int = 1) -> UserContext:
 
 
 class _FailSession:
-    """Fake session covering both the throttle service (get/scalar) and the
-    best-effort login_failures insert (add/commit). ``user`` is the registered
-    user for the attempted email, or None for an unknown/probed email."""
+    """Fake session covering the throttle service (get/scalar), the best-effort
+    login_failures insert (add/commit) and the retention purge's execute/rollback
+    (#423). ``user`` is the registered user for the attempted email, or None for
+    an unknown/probed email."""
 
     def __init__(self, user=None):
         self.user = user
         self.attempts: dict = {}
         self.added: list = []
+        self.executed: list = []
         self.commits = 0
+
+    async def execute(self, stmt):
+        self.executed.append(stmt)
 
     async def scalar(self, _stmt):
         return self.user

@@ -6,6 +6,8 @@ import datetime
 
 from pydantic import BaseModel, Field
 
+from app.schemas.alumni import DuplicateWarning
+
 
 class SurveySubmitRequest(BaseModel):
     """The alum's submitted values, keyed by survey field keys (`table.column`).
@@ -50,6 +52,26 @@ class SurveyResponseItem(BaseModel):
     # Short-lived signed URL of a NEW profile photo the alum submitted with this
     # response, for the reviewer to preview. None when no photo was staged.
     photo_preview_url: str | None = None
+
+
+class SurveyApplyResult(BaseModel):
+    """What applying a staged response reports back (#646).
+
+    The apply itself is already done and committed — this is not a confirmation,
+    it is the one thing the reviewer could not have known before clicking:
+    ``duplicate_warnings`` is non-empty when the response RENAMED the alumnus into
+    a collision with a live record (same first + last name and graduation year).
+
+    Warn-and-continue, matching the staff rename path this reuses (#627): two
+    alumni genuinely can share a name and a year, and a marriage rename into a
+    real collision is sometimes correct. Empty on every apply that didn't move
+    ``first_name`` / ``last_name`` — the check isn't even run.
+
+    The endpoint used to be a bodyless 204. Consumers that ignore the body keep
+    working; the frontend's generated client needs a regen.
+    """
+
+    duplicate_warnings: list[DuplicateWarning] = []
 
 
 class SurveyRespondInfo(BaseModel):

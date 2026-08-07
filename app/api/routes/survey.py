@@ -45,6 +45,7 @@ from app.core.rate_limit import (
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyAlumniState,
+    SurveyApplyResult,
     SurveyNewCyclePreview,
     SurveyNewCycleRequest,
     SurveyNonResponder,
@@ -158,12 +159,22 @@ async def survey_pending_responses(
     return await survey_responses.list_pending(session, grad_year)
 
 
-@router.post("/responses/{response_id}/apply", status_code=204)
+@router.post("/responses/{response_id}/apply", response_model=SurveyApplyResult)
 async def survey_apply_response(
     response_id: int, user: RequireSurveysManage, session: SessionDep
-) -> None:
-    """Apply a staged response to the alum's record."""
-    await survey_responses.apply_response(session, response_id, user.user_id)
+) -> SurveyApplyResult:
+    """Apply a staged response to the alum's record.
+
+    Returns any soft duplicate warnings the apply raised (#646). A survey can now
+    change an alum's name, and a rename can collide with an existing record —
+    the same fuzzy first + last + graduation-year check the staff rename path
+    runs (#627). It NEVER blocks: the write has already happened by the time this
+    returns, exactly as on that path.
+
+    Was a bodyless 204 before #646.
+    """
+    warnings = await survey_responses.apply_response(session, response_id, user.user_id)
+    return SurveyApplyResult(duplicate_warnings=warnings)
 
 
 @router.post("/responses/{response_id}/reject", status_code=204)

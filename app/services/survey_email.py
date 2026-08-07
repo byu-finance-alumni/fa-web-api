@@ -770,7 +770,20 @@ async def get_respondent(
     put("program.cfa_designation", _held(getattr(eng, "cfa_designation", None)))
     put("program.cfp_designation", _held(getattr(eng, "cfp_designation", None)))
     put("program.cpa_designation", _held(getattr(eng, "cpa_designation", None)))
+    # Name block (#646). Pre-filling these is not a convenience — it is what makes
+    # them safe to collect: the survey's name fields refuse to write a blank
+    # (`survey_responses._Field.blankable`), so a box that arrived empty is a box
+    # the alum cleared, not a name we never had. Omitting them here would render
+    # four empty boxes over an alum who has a perfectly good name on file.
+    put("profile.first_name", alum.first_name)
+    put("profile.middle_name", alum.middle_name)
+    put("profile.last_name", alum.last_name)
+    put("profile.preferred_first_name", alum.preferred_first_name)
     put("profile.gender", alum.gender)
+    # Sent VERBATIM, including a value that is not one of the four options (#647):
+    # a stored "Separated" has to be visible to the alum, and the frontend re-adds
+    # whatever is on file to the dropdown the same way the staff employment-status
+    # dropdown does. The constraint is on the write, not the read.
     put("profile.marital_status", alum.marital_status)
     # A date column — emit as an ISO "YYYY-MM-DD" string for the survey date input.
     put("profile.birth_date", alum.birth_date)

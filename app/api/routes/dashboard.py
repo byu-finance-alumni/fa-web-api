@@ -349,29 +349,58 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         .join(Alumni, Alumni.alumni_id == AlumniProgramEngagement.alumni_id)
         .where(active, AlumniProgramEngagement.mentor_willing.is_(True))
     )
-    # Alumni records edited this CALENDAR month (#606) — replaces the
-    # events-attended tile on the dashboard KPI strip. Deliberately calendar-
-    # month scoped ("this month" = the 1st through now), NOT the rolling 30-day
-    # window the older contacted/attended KPIs use; the two windows disagree by
-    # design and the tile label says "this month" so staff can tell them apart.
+    # Alumni records edited this CALENDAR month (#606) and this CALENDAR YEAR
+    # to date (#645) — the dashboard tile stacks "this month" over "this year"
+    # as a running year total, so the two counts MUST come from the same signal
+    # and the same population or the tile contradicts itself.
+    #
+    # Both are deliberately calendar scoped ("this month" = the 1st through now;
+    # "this year" = 1 January through now), NOT the rolling 30-day / 12-month
+    # windows the older contacted/attended KPIs use; the windows disagree by
+    # design and the tile labels say "this month"/"this year" so staff can tell
+    # them apart. CONSEQUENCE, and it is CORRECT, not a bug: the year count
+    # collapses to near zero every 1 January. Do NOT "fix" that by switching to
+    # a trailing 12 months — Amy asked for a year-to-date running total.
     #
     # SIGNAL: alumni.updated_at (TimestampMixin, auto-bumped on every write).
-    # Caveat for whoever reads this number: updated_at moves on ANY write, so a
-    # bulk CSV import or an automated survey-response apply inflates it — it
-    # answers "how many records changed", not "how many a human hand-edited".
-    # An audit-trail-based "staff edits only" version was considered and
-    # explicitly declined for this issue.
+    # This COUNTS DISTINCT ALUMNI RECORDS, NOT CHANGES — ten edits to one person
+    # is one record. That property is structural, not something we enforce here:
+    # we count rows in the `alumni` table filtered on updated_at, and there is
+    # exactly one such row per alumnus. Do NOT rebuild either count on top of
+    # audit_logs to get "who changed what" — that table holds one row per
+    # changed FIELD, and it also carries action_type='search'/'preview' rows with
+    # entity_type='alumni', so a naive count there would be inflated twice over.
+    # (Section-only edits — contact, employment, education — do bump
+    # alumni.updated_at, because update_alumni touches the Alumni row whenever a
+    # section was actually written, and a no-op save doesn't move it.)
+    #
+    # Bulk imports DO count, DELIBERATELY: the tile measures DATA FRESHNESS
+    # ("how much of the record set has changed recently"), not staff effort, so a
+    # large CSV import or an automated survey-response apply legitimately
+    # dominates the month it lands in. An audit-trail-based "staff hand-edits
+    # only" version was considered and explicitly declined.
     #
     # Single aggregate COUNT with a WHERE on updated_at — never fetch rows and
     # count in Python (8,000+ alumni). Same `active` predicate as every other
-    # alumni KPI so archived / friend-of-program records can't inflate it.
+    # alumni KPI so archived / friend-of-program records can't inflate either.
+    # The year bound is 1 Jan 00:00 UTC (all date filters in this app are UTC),
+    # and since it is strictly earlier than the month bound over an otherwise
+    # identical query, the year count is always >= the month count.
     month_start_ts = datetime.datetime.combine(
         month_start, datetime.time.min, tzinfo=datetime.UTC
+    )
+    year_start_ts = datetime.datetime.combine(
+        today.replace(month=1, day=1), datetime.time.min, tzinfo=datetime.UTC
     )
     alumni_edited_this_month = await session.scalar(
         select(func.count())
         .select_from(Alumni)
         .where(active, Alumni.updated_at >= month_start_ts)
+    )
+    alumni_edited_this_year = await session.scalar(
+        select(func.count())
+        .select_from(Alumni)
+        .where(active, Alumni.updated_at >= year_start_ts)
     )
 
     cohort = (
@@ -516,6 +545,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "missing_employer": int(missing_employer or 0),
         "contacted_this_month": int(contacted_this_month or 0),
         "alumni_edited_this_month": int(alumni_edited_this_month or 0),
+        "alumni_edited_this_year": int(alumni_edited_this_year or 0),
         "not_contacted_6mo": int(not_contacted[6] or 0),
         "not_contacted_12mo": int(not_contacted[12] or 0),
         "not_contacted_24mo": int(not_contacted[24] or 0),

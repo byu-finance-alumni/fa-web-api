@@ -69,6 +69,17 @@ class AlumniExportFilters(BaseModel):
     employment_status: list[str] | None = None
     city: list[str] | None = None
     state: list[str] | None = None
+    # Work country + derived region, and the employment/education-history facets.
+    # Every one of these must exist here or an export of a view that uses it
+    # silently widens back to the whole population — the #366 failure the parity
+    # test below this schema guards against.
+    country: list[str] | None = None
+    region: list[str] | None = None
+    past_title: list[str] | None = None
+    university: list[str] | None = None
+    degree: list[str] | None = None
+    major: list[str] | None = None
+    worked_in_year: int | None = Field(default=None, ge=1900, le=2200)
     # Location proximity search (#358/#366). The plain-English phrase the list
     # view sent as ``?near=`` plus its optional ``?radius=`` override — NOT a
     # resolved city set: the export re-resolves the phrase through the very same

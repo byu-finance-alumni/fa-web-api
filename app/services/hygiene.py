@@ -789,6 +789,31 @@ _EFFECTIVE_CORE_FIELDS = (
 )
 
 
+def effective_identity(existing: Alumni, cleaned: dict) -> dict:
+    """Overlay the cleaned partial payload's CORE fields on the stored record.
+
+    Pure and query-free: everything it reads is already on the loaded ``Alumni``
+    row. This is the input :func:`detect_duplicates` needs — it consults only
+    ``byu_id`` / ``net_id`` / ``first_name`` / ``last_name`` /
+    ``graduation_year``, all of which live on the core record.
+
+    Duplicate detection on an UPDATE **must** run against this rather than the
+    partial payload (#627). ``clean_alumni_payload`` uses ``exclude_unset``, so a
+    focused edit form that submits only the name fields produces a ``cleaned``
+    with no ``graduation_year`` — and the fuzzy check needs first + last + grad
+    year all present, so it silently does nothing and a rename into an exact
+    collision saves with no warning at all. Overlaying the stored row restores
+    the legs the patch didn't resend.
+    """
+    effective: dict = {}
+    for field in _EFFECTIVE_CORE_FIELDS:
+        effective[field] = getattr(existing, field, None)
+    for field in _EFFECTIVE_CORE_FIELDS:
+        if field in cleaned:
+            effective[field] = cleaned[field]
+    return effective
+
+
 async def _load_effective(
     session: AsyncSession,
     existing: Alumni,
@@ -800,13 +825,7 @@ async def _load_effective(
     duplicate/recommended checks consult) and applies any cleaned overrides so
     the checks see the *resulting* values, not just the changed ones.
     """
-    effective: dict = {}
-    # Core: start from the stored record, override with cleaned core fields.
-    for field in _EFFECTIVE_CORE_FIELDS:
-        effective[field] = getattr(existing, field, None)
-    for field in _EFFECTIVE_CORE_FIELDS:
-        if field in cleaned:
-            effective[field] = cleaned[field]
+    effective = effective_identity(existing, cleaned)
 
     # Contact (emails) from the stored row, then overlay cleaned contact.
     contact_row = await session.scalar(
@@ -871,14 +890,20 @@ async def build_preview(
         # Create (nothing stored yet, so "supplied" is the right trigger), or an
         # update that sent no work state — nothing to derive from either way.
         cleaned, changes = clean_alumni_payload(payload)
-    blockers, dup_warnings = await detect_duplicates(
-        session, cleaned, exclude_alumni_id=exclude_alumni_id
-    )
-
     if existing is not None:
         effective = await _load_effective(session, existing, cleaned)
     else:
         effective = cleaned
+
+    # Duplicate detection runs against the EFFECTIVE record, not the partial
+    # payload (#627). This used to be passed ``cleaned``, which made the
+    # docstring's promise false for exactly the case that matters: a focused edit
+    # form sends the name fields and nothing else, ``cleaned`` therefore has no
+    # graduation year, and the fuzzy first+last+grad-year check needs all three —
+    # so a rename into a real collision previewed clean.
+    blockers, dup_warnings = await detect_duplicates(
+        session, effective, exclude_alumni_id=exclude_alumni_id
+    )
 
     warnings = recommended_warnings(effective) + dup_warnings
 

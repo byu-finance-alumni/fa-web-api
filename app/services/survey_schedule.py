@@ -62,7 +62,7 @@ import datetime
 import logging
 from collections.abc import Sequence
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import email_reach
@@ -260,6 +260,84 @@ def _cycle_non_responders():
     )
 
 
+def _qualifying_reply(status_filter: tuple[str, ...]):
+    """Correlated EXISTS: this send-log row's alumnus has replied.
+
+    The SAME definition of "replied" the sender and the follow-up list use — a
+    reply inside the re-survey window, in a status that counts, not superseded by
+    a later reset (#395). Sharing it is the point: a progress table built on a
+    looser rule would show a cohort as answered while the sender still considers
+    them owed an email.
+    """
+    return (
+        select(SurveyResponse.survey_response_id)
+        .where(
+            SurveyResponse.alumni_id == SurveySendLog.alumni_id,
+            SurveyResponse.submitted_at >= survey_email._resurvey_cutoff(),
+            SurveyResponse.status.in_(status_filter),
+            survey_email.response_not_superseded(),
+        )
+        .exists()
+    )
+
+
+def _cycle_progress():
+    """``(graduation_year, recipients, replied, awaiting_review)`` per year, for
+    the campaign each year is on RIGHT NOW.
+
+    This is the "how is it actually going" question, which the existing counts
+    could not answer between the first email and the last. ``sent_initial`` and
+    friends say what LEFT; ``non_responders`` only counts people who have had all
+    three emails, so mid-campaign it is legitimately zero no matter how many have
+    replied. Neither tells you the response rate while the campaign is running,
+    which is the whole of #543.
+
+    Counted over the send log rather than over responses, so every number shares
+    one denominator: you cannot reply to a survey you were never sent, and a
+    stray response from someone outside this cycle cannot push the rate above
+    100%.
+
+    ``awaiting_review`` is the actionable one — replies sitting in the queue
+    waiting for someone to apply or reject them.
+    """
+    replied = _qualifying_reply(survey_email.RESPONDED_STATUSES)
+    pending = _qualifying_reply(("pending",))
+    return (
+        select(
+            SurveySendLog.graduation_year,
+            func.count(func.distinct(SurveySendLog.alumni_id)).label("recipients"),
+            func.count(func.distinct(case((replied, SurveySendLog.alumni_id)))).label(
+                "replied"
+            ),
+            func.count(func.distinct(case((pending, SurveySendLog.alumni_id)))).label(
+                "awaiting_review"
+            ),
+        )
+        # The cycle scope, identical to `_cycle_non_responders`. Without this join
+        # the counts become all-time and a year on its second campaign reports
+        # last year's replies as this year's (#357).
+        .join(
+            SurveySchedule,
+            (SurveySchedule.graduation_year == SurveySendLog.graduation_year)
+            & (SurveySchedule.cycle_seq == SurveySendLog.cycle_seq),
+        )
+        .where(survey_email.send_not_superseded())
+        .group_by(SurveySendLog.graduation_year)
+    )
+
+
+async def _progress_counts(
+    session: AsyncSession,
+) -> dict[int, tuple[int, int, int]]:
+    """``{year: (recipients, replied, awaiting_review)}`` in ONE query, so the
+    console's table costs a fixed number of round trips however many years exist."""
+    rows = (await session.execute(_cycle_progress())).all()
+    return {
+        year: (int(recipients or 0), int(replied or 0), int(awaiting or 0))
+        for year, recipients, replied, awaiting in rows
+    }
+
+
 async def _non_responder_counts(session: AsyncSession) -> dict[int, int]:
     """How many alumni need manual follow-up, keyed by graduation year.
 
@@ -403,9 +481,11 @@ def _to_item(
     creators: dict[int, str],
     non_responders: dict[int, int] | None = None,
     all_time_sent: dict[int, int] | None = None,
+    progress: dict[int, tuple[int, int, int]] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     created_by_id = getattr(sched, "created_by_user_id", None)
+    recipients, replied, awaiting_review = (progress or {}).get(year, (0, 0, 0))
     return SurveyScheduleItem(
         survey_schedule_id=sched.survey_schedule_id,
         graduation_year=year,
@@ -421,6 +501,9 @@ def _to_item(
         sent_reminder_2=counts.get((year, STAGE_REMINDER_2), 0),
         non_responders=(non_responders or {}).get(year, 0),
         emails_sent_all_time=(all_time_sent or {}).get(year, 0),
+        recipients=recipients,
+        replied=replied,
+        awaiting_review=awaiting_review,
     )
 
 
@@ -442,9 +525,11 @@ async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
     counts = await _sent_counts_by_stage(session)
     non_responders = await _non_responder_counts(session)
     all_time = await _all_time_send_counts(session)
+    progress = await _progress_counts(session)
     creators = await _creator_names(session, schedules)
     return [
-        _to_item(s, counts, creators, non_responders, all_time) for s in schedules
+        _to_item(s, counts, creators, non_responders, all_time, progress)
+        for s in schedules
     ]
 
 
@@ -464,8 +549,9 @@ async def get_schedule(
     counts = await _sent_counts_by_stage(session)
     non_responders = await _non_responder_counts(session)
     all_time = await _all_time_send_counts(session)
+    progress = await _progress_counts(session)
     creators = await _creator_names(session, [sched])
-    return _to_item(sched, counts, creators, non_responders, all_time)
+    return _to_item(sched, counts, creators, non_responders, all_time, progress)
 
 
 async def _upsert_schedule(

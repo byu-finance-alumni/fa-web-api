@@ -762,6 +762,38 @@ class AlumniRead(BaseModel):
     updated_at: datetime.datetime
 
 
+class DuplicateWarning(BaseModel):
+    """One soft duplicate warning raised by a create or update (#627).
+
+    ``code`` is ``possible_duplicate`` (same first + last name and graduation
+    year as a live record) or ``duplicate_archived`` (the BYU/Net ID matches an
+    archived record). Neither blocks the write — exact ID collisions are what
+    409, and two alumni genuinely can share a name and a year.
+    """
+
+    code: str
+    message: str
+    alumni_id: int | None = None
+
+
+class AlumniWriteResult(AlumniRead):
+    """What POST /alumni and PATCH /alumni/{id} return: the saved record, plus
+    any soft duplicate warnings the write raised.
+
+    A superset of ``AlumniRead``, so every existing consumer of these two
+    responses keeps working unchanged.
+
+    This field exists because the warnings used to be computed on the write path
+    and then thrown away — only ``/preview`` surfaced them, and the focused edit
+    forms don't call preview, so renaming an alumnus into an exact name +
+    graduation-year collision saved silently (#627). Warn-and-continue rather
+    than block: a rename that genuinely collides is sometimes correct, and it
+    matches how the rest of this app treats soft warnings.
+    """
+
+    duplicate_warnings: list[DuplicateWarning] = []
+
+
 class AlumniListItem(AlumniRead):
     """List-row variant: adds the alumnus's current employer + industry (joined
     from ``current_employment``) and current city + state (from

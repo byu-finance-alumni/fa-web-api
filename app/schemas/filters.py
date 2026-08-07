@@ -26,6 +26,18 @@ class FilterOptions(BaseModel):
     employment_statuses: list[str]
     cities: list[str]
     states: list[str]
+    # Work country, from the same employment record as cities/states.
+    countries: list[str]
+    # Derived US region (#283), read from the contact row where it is stored —
+    # the same column the list filter matches, so the two can't drift.
+    regions: list[str]
+    # Employment- and education-history facets. These have stored data and a
+    # searchable phrasing in the free-text box, but had no filter behind them,
+    # so asking for them returned the whole list rather than an answer.
+    past_titles: list[str]
+    universities: list[str]
+    degrees: list[str]
+    majors: list[str]
     tags: list[str]
     status_labels: list[str]
     leadership_roles: list[str]

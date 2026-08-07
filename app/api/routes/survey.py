@@ -10,7 +10,7 @@ legacy `surveys` table — see `models.crm.Survey`.
 """
 
 import hmac
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import (
     APIRouter,
@@ -46,6 +46,7 @@ from app.schemas.survey import (
     GraduationYearCount,
     SurveyAlumniState,
     SurveyApplyResult,
+    SurveyHeldOutPage,
     SurveyNewCyclePreview,
     SurveyNewCycleRequest,
     SurveyNonResponder,
@@ -315,6 +316,56 @@ async def list_survey_unreachable(
     details).
     """
     return await survey_email.list_unreachable(session, grad_year)
+
+
+@router.get(
+    "/campaigns/{grad_year}/held-out",
+    response_model=SurveyHeldOutPage,
+)
+async def list_survey_held_out(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireEngineer,
+    session: SessionDep,
+    reason: Annotated[
+        Literal["suppressed", "already_responded", "unreachable"] | None, Query()
+    ] = None,
+    limit: Annotated[
+        int, Query(ge=1, le=survey_email.HELD_OUT_PAGE_MAX)
+    ] = survey_email.HELD_OUT_PAGE_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> SurveyHeldOutPage:
+    """WHO this year's send is holding out, and why (#658).
+
+    `SurveyRecipientBreakdown` gives the three exclusions as counts; this expands
+    them into people. It was written for one specific dead end: a campaign was
+    deleted and re-sent, the console said "1 already replied within the last
+    year", and there was no way to find out who. The behaviour was right —
+    retiring a cycle deliberately does not clear the 365-day annual window for
+    alumni who actually ANSWERED — but a "1" nobody can expand is not something
+    an operator can act on, so the cohort was searched by name until she turned
+    up.
+
+    `already_responded` rows carry `last_reply_at`, which is the fact the
+    decision turns on: a reply from three months ago is a reason to leave someone
+    alone; one that predates a retired campaign may not be. The way to act on it
+    is `GET /survey/alumni/{alumni_id}/state` and then, if warranted, `POST
+    /survey/alumni/{alumni_id}/reset` — this endpoint changes nothing itself.
+
+    `reason` narrows to one bucket; omit it for all three. `total` is always the
+    size of the FULL filtered set, so it can be checked against the matching
+    breakdown count — both come from the same predicates and are supposed to be
+    identical. Paged (default 200, max 1000) because the responded bucket grows
+    for the life of a campaign.
+
+    ENGINEER-GATED (`RequireEngineer`), matching the state/reset pair it exists to
+    inform rather than the console's assignable `surveys.manage`. It names alumni
+    who replied and when — and it is read as the first half of a decision about
+    who receives a real email, exactly like `GET /survey/alumni/{id}/state`, whose
+    gate is narrowed for that same reason.
+    """
+    return await survey_email.list_held_out(
+        session, grad_year, reason=reason, limit=limit, offset=offset
+    )
 
 
 # --------------------------------------------------------------- scheduler ----

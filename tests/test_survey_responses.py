@@ -613,6 +613,32 @@ def test_linkedin_url_refuses_hostile_values():
         == "https://www.linkedin.com/in/jane-doe-123"
     )
     assert _coerce(field, "https://linkedin.com/in/jdoe") == "https://linkedin.com/in/jdoe"
+
+
+def test_linkedin_url_refuses_the_backslash_parser_differential():
+    r"""A backslash makes Python and the BROWSER disagree about the host, and the
+    browser is the one that decides where the staff member actually goes.
+
+    Verified against both parsers on 2026-08-07:
+
+        https://evil.example\@linkedin.com/in/x
+          Python urlsplit() -> host "linkedin.com"   (the first fix PASSED this)
+          browser new URL() -> host "evil.example"   (where the click lands)
+
+    So the value read as a LinkedIn profile everywhere staff could see it, and
+    resolved to the attacker. The render-side guard cannot catch it either — by
+    every measure that guard checks it is a valid https URL.
+
+    No real linkedin.com URL contains a backslash, encoded or not.
+    """
+    field = sr._FIELD_BY_KEY["profile.linkedin_url"]
+    for hostile in (
+        "https://evil.example\\@linkedin.com/in/jdoe",
+        "https://evil.example%5C@linkedin.com/in/jdoe",
+        "https://evil.example%5c@linkedin.com/in/jdoe",
+        "https:\\\\linkedin.com/in/jdoe",
+    ):
+        assert _coerce(field, hostile) is sr._IGNORE, hostile
     # A blank is still the ordinary "clear this column" instruction, NOT a
     # rejection: the rule guards hostile values, it must not swallow a legitimate
     # clear (linkedin_url is blankable).
@@ -656,6 +682,15 @@ def test_email_refuses_a_smuggled_second_recipient():
             "@byu.edu",
             "alum@byu",
             "a" * 250 + "@byu.edu",  # longer than the varchar(255) column
+            # mailto: QUERY INJECTION (found re-reviewing the fix, 2026-08-07).
+            # The address is rendered as `href={`mailto:${email}`}`, and in a
+            # mailto: URL `?` and `&` start and separate query parameters — so
+            # these pre-fill the compose window a staff member opens by clicking
+            # "Send" with attacker-authored subject and body text, in a message
+            # they believe is their own.
+            "victim@byu.edu?subject=Urgent&body=Click%20here",
+            "victim@byu.edu?cc=attacker@evil.example",
+            "victim@byu.edu&bcc=attacker",
         ):
             assert _coerce(field, hostile) is sr._IGNORE, (field_key, hostile)
         # Ordinary addresses — including the plus-addressed and hyphenated shapes

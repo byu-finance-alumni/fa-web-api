@@ -9,106 +9,151 @@
 --
 -- HOW IT WORKS: Enabling RLS with NO policies = deny-all for the API roles
 -- (`anon`, `authenticated`). The backend is UNAFFECTED because it connects with
--- a privileged Postgres role (and the service-role key) that bypasses RLS.
+-- a privileged Postgres role (the tables' owner, which additionally carries
+-- BYPASSRLS) that is not subject to row security. Note this file deliberately
+-- does NOT set FORCE ROW LEVEL SECURITY, which is what would change that.
 --
 -- The frontend never queries these tables directly (it uses Supabase only for
 -- auth, in the separate `auth` schema), so this does not break the app.
 --
--- SAFE TO RE-RUN: ENABLE ROW LEVEL SECURITY is idempotent.
--- RE-RUN AFTER SCHEMA CHANGES: when new tables are added, add them here (or use
--- the dynamic block at the bottom) so they don't ship unprotected.
+-- SAFE TO RE-RUN: every statement below is idempotent.
+--
+-- =============================================================================
+-- ⚠️ 2026-08-07 (#424): THIS FILE NO LONGER CARRIES A HAND-MAINTAINED TABLE LIST.
+-- =============================================================================
+-- It used to enumerate ~45 tables by name, with a note asking whoever adds a
+-- table to remember to add it here too. That list had silently fallen three
+-- tables behind reality (`city_geo`, `dashboard_presets`, `schema_migrations`),
+-- and the one of those that was ALSO missing from every other source —
+-- `schema_migrations`, created ad hoc by migrate.sh's bootstrap CREATE TABLE —
+-- was the single table in the database running without RLS.
+--
+-- A list that must be remembered is the bug. The sweep below cannot miss a
+-- table, so it, not a list, is now the source of truth. The full table inventory
+-- lives in ./schema.sql, which is the file that is supposed to describe the
+-- schema; this file only enforces a property over whatever is actually there.
+--
+-- RUN THIS after any schema change. There is nothing to keep in sync.
 -- =============================================================================
 
--- Identity / access ----------------------------------------------------------
-ALTER TABLE public.users                 ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.roles                 ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.user_roles            ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.role_capabilities     ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.login_attempts        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.login_events          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.login_failures        ENABLE ROW LEVEL SECURITY;
-
--- Provenance -----------------------------------------------------------------
-ALTER TABLE public.data_sources          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.import_batches        ENABLE ROW LEVEL SECURITY;
-
--- Alumni core ----------------------------------------------------------------
-ALTER TABLE public.alumni                ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.alumni_contact_info   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.current_employment    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.education_history      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.employment_history    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.verification_log      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.alumni_engagement     ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.research_tracking     ENABLE ROW LEVEL SECURITY;
-
--- Tags & status labels -------------------------------------------------------
-ALTER TABLE public.tags                  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.alumni_tags           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.status_labels         ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.alumni_status_labels  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.vocabulary_terms      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.support_contacts      ENABLE ROW LEVEL SECURITY;
-
--- Engagement -----------------------------------------------------------------
-ALTER TABLE public.interactions          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.follow_up_tasks       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.events                ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.event_attendance      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.surveys               ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.survey_responses      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.survey_schedule       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.survey_send_log       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.survey_send_config    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.survey_reset_log      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.survey_campaign_retirement ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.maintenance_mode      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.notes                 ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.donations             ENABLE ROW LEVEL SECURITY;
-
--- Files, audit, duplicates ---------------------------------------------------
-ALTER TABLE public.attachments           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.audit_logs            ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.engineer_action_log   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.duplicate_candidates  ENABLE ROW LEVEL SECURITY;
-
--- Program engagement ---------------------------------------------------------
-ALTER TABLE public.alumni_program_engagement  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.alumni_mentor_industries   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.nettrek_hosting            ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.conference_participation   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.finance_society_leadership ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.bbq_attendance             ENABLE ROW LEVEL SECURITY;
 
 -- =============================================================================
--- VERIFY — every row should show rowsecurity = true. Anything `false` is
--- exposed through the Data API.
+-- THE SWEEP — enable RLS on every public table that does not already have it.
 -- =============================================================================
+-- Reads pg_class rather than pg_tables so it can also filter on `relkind` and on
+-- extension membership:
+--
+--   * relkind IN ('r','p') — ordinary and partitioned tables, the two kinds that
+--     accept RLS. Foreign tables ('f') do not support it. VIEWS are not covered
+--     here and are their own exposure path (a view runs as its owner unless it
+--     is declared `security_invoker`, so it can read straight past the RLS on
+--     its base tables) — there are currently NONE in `public`, and if one is
+--     ever added it needs a deliberate decision, not a sweep.
+--   * NOT relrowsecurity — skip tables already locked down, so a re-run does not
+--     take an ACCESS EXCLUSIVE lock on all ~50 tables to change nothing.
+--   * deptype <> 'e' — skip tables belonging to an extension (none today; all
+--     extensions live in `extensions`/`pg_catalog`). We do not own those, so a
+--     future `CREATE EXTENSION ... WITH SCHEMA public` would otherwise abort the
+--     whole sweep on a permission error.
+--
+-- `oid::regclass` renders an already-quoted, schema-qualified-if-needed
+-- identifier, so interpolating it with %s is safe.
+--
+-- If the SQL editor errors on the $$ delimiters, run it through psql instead.
+-- =============================================================================
+
+DO $rls$
+DECLARE
+    r record;
+    n int := 0;
+BEGIN
+    FOR r IN
+        SELECT c.oid::regclass AS tbl
+          FROM pg_class c
+          JOIN pg_namespace ns ON ns.oid = c.relnamespace
+         WHERE ns.nspname = 'public'
+           AND c.relkind IN ('r', 'p')
+           AND NOT c.relrowsecurity
+           AND NOT EXISTS (
+                 SELECT 1
+                   FROM pg_depend d
+                  WHERE d.classid = 'pg_class'::regclass
+                    AND d.objid   = c.oid
+                    AND d.deptype = 'e'
+               )
+         ORDER BY 1
+    LOOP
+        RAISE NOTICE 'Enabling RLS on %', r.tbl;
+        EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY;', r.tbl);
+        n := n + 1;
+    END LOOP;
+    RAISE NOTICE 'RLS lockdown: % table(s) changed, the rest were already on.', n;
+END
+$rls$;
+
+
+-- =============================================================================
+-- REVOKE the API roles' remaining table privileges (defense in depth).
+-- =============================================================================
+-- ⚠️ PARTIALLY IN EFFECT ALREADY — this block used to be presented as an
+-- optional extra that had not been done. Checked live on dev 2026-08-07, the
+-- data half of it HAS been applied and the rest has not:
+--
+--   * `anon` and `authenticated` hold NO SELECT / INSERT / UPDATE / DELETE on
+--     ANY table in `public`, and the schema's default privileges grant them none
+--     on new tables either. This — not RLS — is why the Data API currently
+--     returns nothing: there is no privilege for a missing policy to let
+--     through. RLS is the layer that still holds if these grants ever come back
+--     (a stray GRANT, a Supabase default change, a restore from a dump).
+--
+--   * They DO still hold TRUNCATE, REFERENCES and TRIGGER (plus MAINTAIN on
+--     PG17) on all 50 tables — Supabase's original blanket grant, never revoked.
+--     PostgREST only ever issues SELECT/INSERT/UPDATE/DELETE and RPC, so none of
+--     these is reachable through the Data API today. TRUNCATE is the one worth
+--     removing anyway: **RLS does not restrict TRUNCATE**, so it is precisely
+--     the privilege the lockdown above would NOT contain if it ever did become
+--     reachable.
+--
+-- Running this completes the revoke. It touches `anon` and `authenticated` only;
+-- `service_role` and the backend's own role keep everything, so nothing in the
+-- application is affected. Re-grant explicitly if a direct Data API path is ever
+-- wanted.
+--
+-- CAVEAT — the ALTER DEFAULT PRIVILEGES line only governs objects created by the
+-- role that runs it (i.e. `postgres`, which owns every table here). Supabase
+-- keeps its OWN default-privilege entry for `public` under `supabase_admin`, and
+-- that one still grants anon/authenticated full DML. A table created in `public`
+-- by supabase_admin (the SQL editor / dashboard runs as a different role than
+-- migrate.sh) would therefore arrive readable. The sweep above is what covers
+-- that case, which is the whole reason it is the source of truth and this block
+-- is only defense in depth.
+-- =============================================================================
+
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated;
+
+
+-- =============================================================================
+-- VERIFY — run these after the sweep.
+-- =============================================================================
+-- 1. Every public table has row security on. Should return ZERO rows.
+--
 -- SELECT tablename, rowsecurity
 -- FROM pg_tables
--- WHERE schemaname = 'public'
--- ORDER BY rowsecurity, tablename;
-
--- =============================================================================
--- OPTIONAL EXTRA HARDENING — revoke table privileges from the API roles too
--- (defense in depth). Only run this if you're certain nothing should ever read
--- these tables via the Supabase API. Re-grant if you later add a direct path.
--- =============================================================================
--- REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
--- ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated;
-
--- =============================================================================
--- DYNAMIC ALTERNATIVE — enable RLS on EVERY current public table in one shot.
--- Handy after the schema is revised (catches new tables automatically). If the
--- SQL editor errors on the $$ delimiters, just use the explicit list above.
--- =============================================================================
--- DO $rls$
--- DECLARE r record;
--- BEGIN
---   FOR r IN
---     SELECT tablename FROM pg_tables WHERE schemaname = 'public'
---   LOOP
---     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY;', r.tablename);
---   END LOOP;
--- END
--- $rls$;
+-- WHERE schemaname = 'public' AND NOT rowsecurity
+-- ORDER BY tablename;
+--
+-- 2. The API roles hold no table privileges at all. Should return ZERO rows.
+--
+-- SELECT grantee, table_name, privilege_type
+-- FROM information_schema.role_table_grants
+-- WHERE table_schema = 'public' AND grantee IN ('anon', 'authenticated')
+-- ORDER BY grantee, table_name, privilege_type;
+--
+-- 3. No views have appeared in `public` (they are not covered by the sweep —
+--    see the note above). Should return ZERO rows.
+--
+-- SELECT c.relname, c.relkind
+-- FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
+-- WHERE ns.nspname = 'public' AND c.relkind IN ('v', 'm')
+-- ORDER BY 1;

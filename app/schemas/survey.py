@@ -269,6 +269,17 @@ class SurveySendResult(BaseModel):
     # send was small or empty. Same numbers as the standalone breakdown endpoint
     # — one function produces both.
     breakdown: SurveyRecipientBreakdown | None = None
+    # How many emails the account-wide daily/monthly cap still allows AFTER this
+    # call; None when the cap is switched off. A dry run spends nothing, so for a
+    # preview this is simply what is available right now.
+    budget_remaining: int | None = None
+    # True when that cap — not the caller's own `limit` — is what truncated this
+    # send (#417). The manual send used to ignore the budget entirely, so "Send
+    # now" on a large cohort emailed the whole stage past a limit the console was
+    # displaying beside the button. Now it is clamped, and this is what lets the
+    # console say "12 of 300 sent, budget exhausted" rather than leaving an
+    # operator to read a short send as a broken one.
+    budget_limited: bool = False
 
 
 class SurveyUsage(BaseModel):

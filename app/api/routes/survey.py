@@ -9,6 +9,7 @@ Sends and responses here are what the profile's Surveys tab reports on, via
 legacy `surveys` table — see `models.crm.Survey`.
 """
 
+import contextlib
 import hmac
 from typing import Annotated, Literal
 
@@ -42,6 +43,7 @@ from app.core.rate_limit import (
     SURVEY_RESPOND_READ_LIMITER,
     SURVEY_SUBMIT_LIMITER,
 )
+from app.models.audit import AuditLog
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyAlumniState,
@@ -79,6 +81,61 @@ _GRAD_YEAR_MAX = 2100
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 router = APIRouter(prefix="/survey", tags=["survey"])
+
+
+async def _log_survey_read(
+    session: AsyncSession,
+    *,
+    actor_user_id: int | None,
+    action: str,
+    entity_type: str,
+    entity_id: int | None = None,
+    scope: str | None = None,
+) -> None:
+    """Record a disclosure-audit row for an engineer-gated survey READ (#422).
+
+    Both reads this backs name alumni and say something about them — who replied
+    and when, what was emailed to whom — so each one is a FERPA-relevant
+    disclosure and has to leave a trace. Neither did, which put them out of step
+    with the rest of the codebase: ``GET /audit`` self-logs its own read (reading
+    the log is itself audited), and ``services.alumni.log_search`` /
+    ``log_preview`` exist for exactly this reason on the alumni side.
+
+    ``scope`` records WHAT was asked for (graduation year, the reason filter,
+    paging) — never a single value out of the response. The point of the row is
+    that the read happened, by whom, over which slice; storing the names or reply
+    dates it returned would copy the very PII the row exists to account for into
+    a second table, which is what ``/audit``'s own self-log deliberately avoids.
+
+    BEST EFFORT, like ``log_search``: the read has already succeeded by the time
+    this runs, and failing the request because the bookkeeping write failed would
+    turn an audit outage into an outage of the engineer's only view of who is
+    being held out. A failure is swallowed and the session rolled back so the
+    handler still returns cleanly. No-op when the actor is unknown.
+
+    Where the row LANDS depends on the actor: these routes are ``RequireEngineer``
+    and the ``engineer`` capability is non-assignable, so in practice the actor is
+    always an engineer and the ``before_flush`` hook in ``app/models/audit.py``
+    mirrors this AuditLog into ``engineer_action_log`` and drops the audit_logs
+    row. That is the intended destination — engineer actions stay out of the
+    record-change trail but land in the append-only log the engineer cannot purge.
+    """
+    if actor_user_id is None:
+        return
+    try:
+        session.add(
+            AuditLog(
+                user_id=actor_user_id,
+                action_type=action,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                new_value=scope[:1000] if scope else None,
+            )
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - audit is best-effort
+        with contextlib.suppress(Exception):
+            await session.rollback()
 
 
 @router.get(
@@ -362,10 +419,28 @@ async def list_survey_held_out(
     who replied and when — and it is read as the first half of a decision about
     who receives a real email, exactly like `GET /survey/alumni/{id}/state`, whose
     gate is narrowed for that same reason.
+
+    AUDITED (#422): naming alumni and dating their replies is a disclosure, so
+    the read writes a `read_survey_held_out` row recording who asked and for which
+    year/bucket/page — never any of the people it returned.
     """
-    return await survey_email.list_held_out(
+    page = await survey_email.list_held_out(
         session, grad_year, reason=reason, limit=limit, offset=offset
     )
+    # Logged AFTER the read so the row only ever records a disclosure that
+    # actually happened; a request that raised disclosed nothing to account for.
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_held_out",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=(
+            f"graduation_year={grad_year}; reason={reason or 'all'}; "
+            f"limit={limit}; offset={offset}"
+        ),
+    )
+    return page
 
 
 # --------------------------------------------------------------- scheduler ----
@@ -657,8 +732,22 @@ async def survey_alumnus_state(
     Engineer-gated (`RequireEngineer` = the non-assignable `engineer`
     capability), matching its twin below: the read exists to inform that one
     decision, so widening it would only invite the reset to be run blind.
+
+    AUDITED (#422): this is a named alumnus's survey history, so the read writes a
+    `read_survey_alumni_state` row saying who looked at whose record — the reset
+    below was already audited, and the read that justifies it now is too. The row
+    carries the alumni_id and nothing the response returned.
     """
-    return await survey_reset.get_state(session, alumni_id)
+    state = await survey_reset.get_state(session, alumni_id)
+    # After the read: a 404 for an alumnus who does not exist disclosed nothing.
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_alumni_state",
+        entity_type="alumni",
+        entity_id=alumni_id,
+    )
+    return state
 
 
 @router.post("/alumni/{alumni_id}/reset", response_model=SurveyResetResult)

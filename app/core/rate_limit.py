@@ -20,6 +20,9 @@ The public survey-respond routes have no logged-in actor to key on — the signe
 token in the path is the whole credential — so they use
 ``public_token_rate_limiter(...)`` instead, which budgets by hashed token AND by
 client IP. See the "#360" block at the bottom of this module.
+
+The unauthenticated pre-login routes have neither an actor nor a token, so they
+use ``client_ip_rate_limiter(...)`` — client IP only. See the "#423" block.
 """
 
 import hashlib
@@ -379,4 +382,96 @@ SURVEY_SUBMIT_LIMITER = public_token_rate_limiter(
 # retried a few times still fits.
 SURVEY_PHOTO_LIMITER = public_token_rate_limiter(
     "survey:respond_photo", token_limit=5, ip_limit=30, window_seconds=_SURVEY_WINDOW
+)
+
+
+# --- Unauthenticated pre-login routes (#423) ---------------------------------
+#
+# `/auth/login/precheck` and `/auth/login/record` are the other pair of routes
+# with no login — they run BEFORE the user has a session, so there is neither a
+# `UserContext` nor a signed token to key on and neither limiter above applies.
+# They carried NO application-level brake at all: the code accepted that on the
+# grounds that the platform WAF rate-limits them, which cannot be verified from
+# this repo. `/auth/login/record` with `success:false` upserts a `login_attempts`
+# row keyed on the CALLER'S OWN email string and inserts a permanent
+# `login_failures` row, so un-braked it was an anonymous, unbounded row-creation
+# primitive as well as a lockout-DoS amplifier.
+#
+# KEYED ON CLIENT IP ONLY — deliberately NOT on the email:
+#
+#   * A per-email budget would be a lockout amplifier, not a brake: burning it
+#     for a victim's address is exactly the denial of service the attacker wants.
+#   * It would also break anti-enumeration. These routes are contractually
+#     identical whatever email you send (see app/services/login_lockout.py); a
+#     429 that depends on the email is a side channel that separates addresses.
+#     Keying on the IP alone keeps the response a pure function of the caller,
+#     never of the account.
+#
+# The IP comes from :func:`_client_key`, i.e. the hop the trusted edge added
+# (RIGHTMOST), never the spoofable leftmost `X-Forwarded-For` value. The `context.
+# ip_address` field in the request BODY is likewise NOT used as a key: it is
+# caller-supplied, so it could be rotated to dodge the budget or pinned to a real
+# user's address to burn theirs.
+#
+# ⚠️ TOPOLOGY CAVEAT — READ BEFORE RETUNING THESE NUMBERS.
+# Both routes are called from a Next.js SERVER ACTION (fa-web-app
+# src/app/login/actions.ts), i.e. server->server, never from the browser. The
+# address this limiter sees for legitimate traffic is therefore the FRONTEND
+# function's egress IP, not the signing-in human's — so every real login in the
+# organisation funnels onto a handful of shared keys, while an attacker hitting
+# this API directly (the cheap way to abuse it) gets keyed on their own address.
+# Consequences:
+#
+#   * The budgets are sized for the AGGREGATE legitimate funnel, not per person.
+#     They are a coarse ceiling on anonymous row creation, not a per-user brake.
+#     A genuinely per-end-user control has to live at the edge/WAF, which is the
+#     only layer that still sees the real client.
+#   * They are set far above any plausible real volume on purpose. A false 429
+#     on `/auth/login/record` would stop failures being COUNTED, i.e. it would
+#     suppress the lockout — the defence, not the attack (an attacker guessing
+#     passwords talks to Supabase directly and never calls this API). Throttling
+#     the counter too eagerly would therefore be a security regression, so the
+#     limit is set to catch only floods that are unambiguously not real traffic.
+#
+# Same in-process caveat as every limiter here (see the module docstring):
+# per-instance, best-effort, not a hard boundary.
+
+_LOGIN_WINDOW = 600.0
+
+
+def client_ip_rate_limiter(bucket: str, *, limit: int, window_seconds: float):
+    """Build a FastAPI dependency throttling an unauthenticated route by client
+    IP alone.
+
+    Used as a route-level ``dependencies=[...]`` entry rather than an injected
+    ``Annotated`` parameter: there is no actor to hand back to the endpoint.
+    Because it is a route dependency it runs BEFORE the request body is
+    validated, so it cannot see — and can never vary by — the submitted email.
+    """
+
+    async def _dependency(request: Request) -> None:
+        _check(
+            bucket, _client_key(request), limit=limit, window_seconds=window_seconds
+        )
+
+    return _dependency
+
+
+# Reading the throttle state. Read-only and the frontend FAILS OPEN on any
+# non-OK response, so a 429 here costs nothing but a skipped pre-check; the
+# loosest of the two.
+LOGIN_PRECHECK_LIMIT = 600
+# Recording an attempt. The one that WRITES: a `login_attempts` upsert plus a
+# permanent `login_failures` row per failure. 300 per ten minutes is ~0.5/s of
+# anonymous row creation from one address — orders of magnitude above the real
+# funnel (a few dozen sign-ins a day across the whole directory) and still a hard
+# ceiling where there was none. See the topology caveat above for why this is
+# deliberately not tighter.
+LOGIN_RECORD_LIMIT = 300
+
+LOGIN_PRECHECK_LIMITER = client_ip_rate_limiter(
+    "auth:login_precheck", limit=LOGIN_PRECHECK_LIMIT, window_seconds=_LOGIN_WINDOW
+)
+LOGIN_RECORD_LIMITER = client_ip_rate_limiter(
+    "auth:login_record", limit=LOGIN_RECORD_LIMIT, window_seconds=_LOGIN_WINDOW
 )

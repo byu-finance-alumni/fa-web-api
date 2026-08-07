@@ -2041,6 +2041,83 @@ async def _send_and_log(
     return sent, retry_after, error
 
 
+# ----------------------------------------------------- the account-wide budget -
+#
+# THE SEND BUDGET IS ENFORCED HERE, NOT BY THE CALLER (#417).
+#
+# `survey_schedule._run_allowance` — the configured daily/monthly limits minus
+# what `survey_send_log` says has already gone out — used to be read in exactly
+# ONE place: the cron body. The console's manual send never asked. Its `limit`
+# query param defaults to None, the console sends none, and `send_campaign`
+# passed that straight through — so pressing "Send now" on a large cohort emailed
+# the WHOLE eligible stage in a single call: past the configured cap, past
+# whatever the cron had already spent that day, into real alumni inboxes, and
+# unrecallable. The console's own daily/monthly tallies sat beside the button
+# describing a limit that only one of the two senders obeyed.
+#
+# Patching `send_campaign` would have fixed that one caller and left the same
+# shape of hole for the next one — which is the identical mistake the 2026-08-02
+# incident was made of (the manual path skipped the send-log callback, so the fix
+# was to make logging impossible to skip rather than to pass it at that call
+# site). So the gate lives where the sending lives: :func:`send_survey_stage`
+# reads the budget itself and clamps its own recipient list. A caller can LOWER
+# the ceiling with `limit`; there is no way for one to raise it.
+#
+# WHY THIS DOES NOT DOUBLE-COUNT THE CRON'S BUDGET. The cron reads the allowance
+# once per run and decrements it locally as each year sends, passing what is left
+# as `limit`. This module re-reads it, and the two agree by construction: every
+# delivered email's claim is COMMITTED before the next year is considered, so
+# `get_send_usage` has already absorbed exactly the emails the cron subtracted.
+# `min(limit, allowance)` over two equal numbers is that number — the clamp is
+# idempotent, not cumulative. Where they can differ, the re-read is the LOOSER
+# one (a claim released after a 429 un-spends budget), so `min` keeps the cron's
+# figure and the run still stops where it meant to.
+#
+# WHY NO LOCK IS TAKEN HERE. `send_lock` is a transaction-scoped advisory lock
+# held on a CONNECTION OF ITS OWN, so it is not re-entrant: taking it again
+# inside a send whose caller already holds it would come back false and every
+# real send would decline itself. The lock therefore stays at the two entry
+# points (:func:`send_campaign` and ``survey_schedule.run_due_schedules``), both
+# of which already hold it around this call — which is what keeps the
+# read-budget-then-claim sequence below safe from a second runner (#358).
+
+
+async def remaining_send_allowance(session: AsyncSession) -> int | None:
+    """Emails the account may still send right now; ``None`` = cap disabled.
+
+    Delegates to ``survey_schedule._run_allowance`` rather than re-deriving it.
+    The console's cap screen, the cron's pacing and this gate have to be ONE
+    number: a second implementation of "daily and monthly, minus usage, whichever
+    is tighter" is precisely how the meter and the sender come to disagree, and
+    this subsystem has paid for that class of split twice already.
+
+    Imported locally because ``survey_schedule`` imports this module at module
+    level — the same cycle :func:`send_campaign` works around, for the same
+    reason. Reached through the module rather than bound at import so the one
+    implementation stays the one implementation.
+    """
+    from app.services import survey_schedule
+
+    return await survey_schedule._run_allowance(session)
+
+
+def _send_ceiling(limit: int | None, allowance: int | None) -> int | None:
+    """How many recipients this send may take: the TIGHTEST stated ceiling.
+
+    ``limit`` is the caller's own (the console's explicit number, or the cron's
+    remaining run budget) and ``allowance`` is the account-wide one. ``None``
+    from either means "that side is not capping"; ``None`` from both means
+    uncapped, which is only ever true when the send cap is switched off.
+
+    Deliberately ``min`` and not "the caller wins": an explicit limit is honoured
+    when it asks for LESS than the budget and clamped when it asks for more.
+    Sending is irreversible, so the ceiling has to be the lowest thing anyone
+    said, never the most recent.
+    """
+    stated = [c for c in (limit, allowance) if c is not None]
+    return min(stated) if stated else None
+
+
 # ------------------------------------------------- the one send entry point ---
 
 
@@ -2060,6 +2137,17 @@ class SendOutcome:
     targets: list[Recipient]  # of those, not yet logged for `stage`
     prepared: list[Recipient]  # targets after the limit / send budget
     sent: int
+    # The account-wide send budget as it stood when this call started, and what
+    # is left of it now (None = the cap is switched off). Both, not one: the
+    # console needs "how much was there" to explain a send that took nothing, and
+    # "how much is left" to say what a retry would do.
+    allowance: int | None = None
+    budget_remaining: int | None = None
+    # True when the BUDGET — not the caller's own `limit` — is what truncated
+    # this send. An operator who typed a small limit must not be told the account
+    # is out of emails, and an operator who typed nothing must not be left
+    # guessing why a cohort of 300 got 12.
+    budget_limited: bool = False
     retry_after: int | None = None
     duplicate_emails: int = 0
     # The dropped-for-a-shared-address recipients themselves, so the caller can
@@ -2101,7 +2189,20 @@ async def send_survey_stage(
     one implementation.
 
     ``limit`` is the caller's own ceiling (the console's explicit limit, or the
-    scheduler's shared daily budget). Resend's 429 is still the real brake.
+    scheduler's remaining run budget). It can only ever LOWER the send: the
+    account-wide budget is read here (:func:`remaining_send_allowance`) and
+    applied whether or not a caller passed anything, so a caller that says
+    nothing — which is what the console does — is capped rather than uncapped
+    (#417). See the section notes above for why the check is here rather than in
+    the two callers, why it does not double-count the cron's budget, and why it
+    takes no lock. Resend's 429 is still the real brake.
+
+    A zero budget sends NOTHING and says so on the outcome (``budget_limited``
+    with ``allowance == 0``) rather than reporting a clean "sent 0" — the two are
+    indistinguishable to a caller otherwise, and one of them means a cohort is
+    still owed its email. ``dry_run`` is clamped by the same ceiling, on purpose:
+    a preview that promised more recipients than the real send would take is the
+    standing bug class in this area.
     """
     settings = get_settings()
     base_url = settings.survey_app_base_url
@@ -2145,9 +2246,24 @@ async def send_survey_stage(
         max_stage=max_stage,
         cycle_seq=cycle_seq,
     )
+    # THE BUDGET GATE (#417). Read after the targets are known and before a
+    # single claim is written, so what goes out is bounded by what the account
+    # may still send — for the cron, for the console, and for whatever calls this
+    # next. `eligible_alumni_query` orders by alumni_id precisely so this
+    # truncation takes a stable prefix and the remainder is picked up next run.
+    allowance = await remaining_send_allowance(session)
     prepared = [] if stage is None else targets
-    if limit is not None:
-        prepared = prepared[: max(limit, 0)]
+    ceiling = _send_ceiling(limit, allowance)
+    if ceiling is not None:
+        prepared = prepared[: max(ceiling, 0)]
+    # Whether the budget is what did the cutting. `allowance <= limit` is the
+    # test, not `len(prepared) < limit`: a caller asking for exactly the budget
+    # gets everything it asked for and is still budget-bound for the remainder.
+    budget_limited = (
+        allowance is not None
+        and len(prepared) < len(targets)
+        and (limit is None or allowance <= limit)
+    )
 
     sent = 0
     retry_after: int | None = None
@@ -2186,6 +2302,13 @@ async def send_survey_stage(
                     else ""
                 )
                 + (f" duplicate_emails={len(duplicates)}" if duplicates else "")
+                # The budget this send was measured against, on the permanent
+                # record (#417). "Why did only 12 of that cohort go out?" is
+                # answerable months later from the trail alone, and a send that
+                # was cut short by the cap is distinguishable from one that had
+                # nothing left to do.
+                + (f" allowance={allowance}" if allowance is not None else "")
+                + (" budget_limited=True" if budget_limited else "")
                 + (f" throttled_retry_after={retry_after}" if retry_after else "")
                 + (" failed=True" if error is not None else "")
             ),
@@ -2207,6 +2330,12 @@ async def send_survey_stage(
         targets=targets,
         prepared=prepared,
         sent=sent,
+        allowance=allowance,
+        # What a retry right now would have to spend. A dry run spent nothing, so
+        # this is simply the allowance — which is exactly what makes a preview
+        # able to say "a real send would email 0 of these people".
+        budget_remaining=(None if allowance is None else max(0, allowance - sent)),
+        budget_limited=budget_limited,
         retry_after=retry_after,
         duplicate_emails=len(duplicates),
         duplicates=tuple(duplicates),
@@ -2242,6 +2371,15 @@ async def send_campaign(
     reminders the cadence owes actually go out and the send is visible in the
     console. See ``survey_schedule.create_campaign_for_send`` for why that is
     automatic rather than a refusal, and why it cannot re-send the initial.
+
+    THE SEND CAP APPLIES HERE TOO (#417). It is enforced inside
+    :func:`send_survey_stage`, so this function neither reads nor passes it —
+    ``limit`` stays what the operator typed, and the budget clamps it. What this
+    function adds is the ANSWER A PERSON GETS: a real send with a spent budget is
+    a 409 rather than a silent "sent 0", for the same reason a send that cannot
+    take the lock is (the caller is waiting, and "0" reads as "the cohort had
+    nothing owed"). A truncated send returns normally, carrying the numbers the
+    console needs to say "N of M sent, budget exhausted".
     """
     # Local, because `survey_schedule` imports THIS module: the send belongs here
     # and the campaign row belongs there, and the manual send is the one caller
@@ -2283,6 +2421,25 @@ async def send_campaign(
                     "and try again — nothing was sent."
                 )
             outcome = await _send()
+            # Nothing went out and the cap is why (#417). Raised BEFORE the
+            # campaign-creation step and inside the lock, so a refused send
+            # leaves the year exactly as it found it. `outcome.targets` is what
+            # keeps this off the repair path of #405 — a year whose recipients
+            # are all already claimed has no targets, sends nothing for a reason
+            # that has nothing to do with the budget, and must still be allowed
+            # to leave its backdated campaign behind.
+            if (
+                outcome.allowance == 0
+                and outcome.stage is not None
+                and outcome.targets
+            ):
+                raise ConflictError(
+                    "The account-wide survey send budget is spent — no emails "
+                    "remain in today's or this month's limit, so nothing was "
+                    f"sent. {len(outcome.targets)} alumni are still owed this "
+                    "email; raise the limit on the Surveys console, or leave it "
+                    "and the daily scheduler will send them as budget frees up."
+                )
             if start_date is None:
                 # Inside the lock: the campaign is part of this send, and no
                 # other sender may be mid-flight for the year while it appears.
@@ -2321,6 +2478,13 @@ async def send_campaign(
         remaining=remaining,
         dry_run=dry_run,
         retry_after_seconds=outcome.retry_after,
+        # What the account may still send after this call, and whether that
+        # budget is what cut this send short (#417). Together with `sent` and
+        # `remaining` they are the whole of "12 of 300 sent, budget exhausted" —
+        # which the console could not previously say, because the manual send did
+        # not consult a budget at all.
+        budget_remaining=outcome.budget_remaining,
+        budget_limited=outcome.budget_limited,
         stage_complete=outcome.stage is None,
         campaign_created=campaign_created,
         breakdown=breakdown,

@@ -168,7 +168,16 @@ _EMAIL_MAX = 255
 #   that displays as one address deliver to another.
 #
 # Everything else stays permissive ON PURPOSE — see `_valid_email`.
-_EMAIL_DISALLOWED = frozenset(',;<>"()[]\\')
+# `?` and `&` are here for a reason that is NOT about email syntax: a stored
+# address is rendered as `href={`mailto:${email}`}` on the profile page, and in
+# a mailto: URL those two characters start and separate QUERY PARAMETERS
+# (RFC 6068). An address containing `?subject=…&body=…` therefore pre-fills the
+# compose window a staff member opens by clicking "Send" — attacker-authored
+# text, in a mail client, from a message the staff member believes they wrote.
+# `:` is excluded for the same family of reasons (scheme confusion).
+# A true second recipient is already blocked by the single-`@` rule below.
+# Found re-reviewing the #418 fix, 2026-08-07.
+_EMAIL_DISALLOWED = frozenset(',;<>"()[]\\?&:')
 
 
 def _valid_email(value: str) -> bool:

@@ -947,7 +947,14 @@ async def confirm_headshot_upload(
             session, user.user_id, alumni_id, net_id, "size", size
         )
         return _too_large_response(_HEADSHOT_MAX_BYTES)
-    elif head and (content_error := _sniffed_head_error(head, content_type)) is not None:
+    # `head is not None`, NOT truthiness: an empty object reads back as `b""`,
+    # which is a real answer and must be REJECTED (nothing is a valid JPEG/PNG/
+    # WebP). Only `None` means the probe failed, which is the documented
+    # fail-open case. Testing truthiness let a 0-byte upload skip this check
+    # entirely and be audited as a successful headshot.
+    elif head is not None and (
+        content_error := _sniffed_head_error(head, content_type)
+    ) is not None:
         # Real bytes contradict the label (or aren't an image at all): the object
         # is gone before this returns, so a rejected upload never survives as the
         # alumnus's headshot. ``field_name="content"`` matches the bulk path's
@@ -1328,9 +1335,13 @@ async def _verify_landed_headshot(key: str) -> tuple[str, str, str | None]:
     if size is not None and size > _HEADSHOT_MAX_BYTES:
         mib = _HEADSHOT_MAX_BYTES // (1024 * 1024)
         return ("invalid", f"Image exceeds the {mib} MB per-file size limit.", "size")
-    if head:
+    if head is not None:
         # Same judgement as the single confirm path, from the same function, so
         # the two can't drift apart again (#419).
+        #
+        # `is not None`, NOT truthiness — an empty object reads back as `b""`
+        # and must be rejected; only `None` (a failed probe) fails open. The
+        # truthy form skipped the check for a 0-byte upload on BOTH paths.
         content_error = _sniffed_head_error(head, content_type)
         if content_error is not None:
             return ("invalid", content_error, "content")

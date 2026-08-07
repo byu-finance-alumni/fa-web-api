@@ -1186,6 +1186,71 @@ def _single_confirm_audits(session):
     return [a.action_type for a in session.added if getattr(a, "action_type", None)]
 
 
+def test_single_confirm_rejects_an_empty_object(monkeypatch):
+    """A 0-byte object labelled ``image/jpeg`` is REJECTED, not confirmed.
+
+    Found re-reviewing the #419 fix: `probe_object_head` returned ``None`` for
+    the head both when the probe FAILED and when the object was genuinely
+    EMPTY, and the call site tested truthiness — so an empty upload skipped the
+    magic-byte check entirely and was audited as a successful headshot, in the
+    one code path whose whole job is to distrust the label. An empty file is
+    never a valid JPEG/PNG/WebP, so "we looked and there was nothing there" has
+    to fail closed; only a failed probe fails open.
+    """
+    deleted: list = []
+
+    async def _delete(bucket, path):
+        deleted.append((bucket, path))
+
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub(("image/jpeg", 0, b"")),
+    )
+    monkeypatch.setattr(alumni_routes.supabase_storage, "delete_object", _delete)
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 422
+    assert deleted == [("headshots", "jdoe12")]
+    assert _single_confirm_audits(session) == ["upload_headshot_rejected"]
+
+
+def test_single_confirm_still_fails_open_when_the_probe_fails(monkeypatch):
+    """``head=None`` means the probe itself failed, and that must still FAIL
+    OPEN — a storage hiccup must never reject a legitimate upload. This is the
+    other half of the empty-object fix: the two cases used to be
+    indistinguishable, and tightening one must not tighten this one.
+
+    Note it does not fail open blindly: it still proves the object EXISTS via a
+    signed URL, so a never-uploaded key cannot be confirmed. That is why this
+    test has to stub `create_signed_url` — without it the route correctly 422s.
+    """
+
+    async def _signed(bucket, path, *, expires_in: int = 3600):
+        return "https://storage.example/signed"
+
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub((None, None, None)),
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "create_signed_url", _signed
+    )
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 204
+    assert _single_confirm_audits(session) == ["upload_headshot"]
+
+
 def test_single_confirm_sniffs_real_bytes_and_purges_a_liar(monkeypatch):
     """A non-image body labelled ``image/jpeg`` is REJECTED, deleted, and audited
     ``upload_headshot_rejected`` — never recorded as a verified headshot. The

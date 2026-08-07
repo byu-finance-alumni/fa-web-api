@@ -468,6 +468,28 @@ class AlumniBase(BaseModel):
             return None
         if len(value) > _LINKEDIN_MAX:
             raise ValueError(f"Must be at most {_LINKEDIN_MAX} characters.")
+        # ⚠️ PARSER DIFFERENTIAL — reject backslashes BEFORE parsing.
+        #
+        # This host check decides whether a link is safe to render, but the
+        # thing that ultimately follows the link is a BROWSER, and Python and
+        # browsers do not agree on what the host is. Python's `urlsplit` is
+        # RFC 3986 and treats `\` as an ordinary character; the WHATWG URL
+        # Standard every browser implements treats it as a `/`. So:
+        #
+        #     https://evil.example\@linkedin.com/in/x
+        #       urlsplit()  -> host "linkedin.com"   (would PASS)
+        #       new URL()   -> host "evil.example"   (where the staff member GOES)
+        #
+        # Verified against both parsers, 2026-08-07. That is a credential-harvest
+        # link that looks like the profile someone meant to open, and it passed
+        # the first version of this validator on BOTH the survey and staff paths.
+        #
+        # No legitimate linkedin.com URL contains a backslash, encoded or not, so
+        # refusing them outright closes the gap without needing a WHATWG parser
+        # on this side. Checked case-insensitively because `%5C` and `%5c` are
+        # the same byte once decoded.
+        if "\\" in value or "%5c" in value.lower():
+            raise ValueError("Must be a linkedin.com URL.")
         parts = urlsplit(value)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise ValueError("Must be an http(s) URL.")

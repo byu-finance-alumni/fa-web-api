@@ -28,7 +28,11 @@ from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.crm import Interaction, Survey
 from app.models.duplicate import DuplicateCandidate
-from app.models.employment import CurrentEmployment, EmploymentHistory
+from app.models.employment import (
+    CurrentEmployment,
+    EducationHistory,
+    EmploymentHistory,
+)
 from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
 from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
@@ -374,6 +378,26 @@ def build_alumni_query(
     employment_status: "str | list[str] | None" = None,
     city: "str | list[str] | None" = None,
     state: "str | list[str] | None" = None,
+    # Work country + region. `country` sits on the employment record alongside
+    # `city` / `state`; `region` is the derived US grouping (#283) and lives on
+    # the contact row, which is where `derive_region` writes it. Both were
+    # searchable in the free-text sentence and in the stored schema but had no
+    # query parameter at all, so a search for either returned the unfiltered
+    # list rather than nothing — the worse of the two failures.
+    country: "str | list[str] | None" = None,
+    region: "str | list[str] | None" = None,
+    # Previous job title, the employment-history twin of `past_employer`.
+    past_title: "str | list[str] | None" = None,
+    # Education facets. `graduate_degree` (further down) only answers "do they
+    # hold one at all"; these match the actual education-history rows, so
+    # "who studied Accounting" and "who has a JD" become answerable.
+    university: "str | list[str] | None" = None,
+    degree: "str | list[str] | None" = None,
+    major: "str | list[str] | None" = None,
+    # "Held any role covering this calendar year." Open-ended history rows (no
+    # end year) count as still running — see the predicate for why that is the
+    # only reading that doesn't lose current jobs.
+    worked_in_year: int | None = None,
     tag: "str | list[str] | None" = None,
     status_label: "str | list[str] | None" = None,
     # Suppression (opt-in, #survey): EXCLUDE alumni carrying any of these status
@@ -691,6 +715,93 @@ def build_alumni_query(
             .where(
                 CurrentEmployment.alumni_id == Alumni.alumni_id,
                 _ilike_any(CurrentEmployment.current_state, states),
+            )
+            .exists()
+        )
+    countries = _as_values(country)
+    if countries:
+        # Same source as city/state above: the work location on the employment
+        # record, which is the only address this system holds (#287).
+        conditions.append(
+            select(CurrentEmployment.current_employment_id)
+            .where(
+                CurrentEmployment.alumni_id == Alumni.alumni_id,
+                _ilike_any(CurrentEmployment.current_country, countries),
+            )
+            .exists()
+        )
+    regions = _as_values(region)
+    if regions:
+        # Region is DERIVED from the work state (#283) and stored on the contact
+        # row — that is where `hygiene.derive_region` writes it, so filtering the
+        # stored column is what keeps this agreeing with the map's shading rather
+        # than re-deriving the mapping in a second place.
+        conditions.append(
+            select(AlumniContactInfo.contact_info_id)
+            .where(
+                AlumniContactInfo.alumni_id == Alumni.alumni_id,
+                _ilike_any(AlumniContactInfo.region, regions),
+            )
+            .exists()
+        )
+    past_titles = _as_values(past_title)
+    if past_titles:
+        conditions.append(
+            select(EmploymentHistory.employment_history_id)
+            .where(
+                EmploymentHistory.alumni_id == Alumni.alumni_id,
+                _ilike_any(EmploymentHistory.employment_title, past_titles),
+            )
+            .exists()
+        )
+    universities = _as_values(university)
+    if universities:
+        conditions.append(
+            select(EducationHistory.education_id)
+            .where(
+                EducationHistory.alumni_id == Alumni.alumni_id,
+                _ilike_any(EducationHistory.university, universities),
+            )
+            .exists()
+        )
+    degrees = _as_values(degree)
+    if degrees:
+        conditions.append(
+            select(EducationHistory.education_id)
+            .where(
+                EducationHistory.alumni_id == Alumni.alumni_id,
+                _ilike_any(EducationHistory.degree, degrees),
+            )
+            .exists()
+        )
+    majors = _as_values(major)
+    if majors:
+        conditions.append(
+            select(EducationHistory.education_id)
+            .where(
+                EducationHistory.alumni_id == Alumni.alumni_id,
+                _ilike_any(EducationHistory.major, majors),
+            )
+            .exists()
+        )
+    if worked_in_year is not None:
+        # A history row covers the year when it started on or before it and
+        # ended on or after it. A NULL end year means "still there", so it must
+        # count as covering every year from the start onward — treating NULL as
+        # "unknown, exclude" would drop precisely the roles people still hold,
+        # which is the opposite of what anyone asking this question wants. A NULL
+        # START year is genuinely unusable (there is no year to compare), so
+        # those rows are excluded rather than guessed at.
+        conditions.append(
+            select(EmploymentHistory.employment_history_id)
+            .where(
+                EmploymentHistory.alumni_id == Alumni.alumni_id,
+                EmploymentHistory.start_year.is_not(None),
+                EmploymentHistory.start_year <= worked_in_year,
+                or_(
+                    EmploymentHistory.end_year.is_(None),
+                    EmploymentHistory.end_year >= worked_in_year,
+                ),
             )
             .exists()
         )

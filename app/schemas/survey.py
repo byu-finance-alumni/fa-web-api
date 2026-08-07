@@ -304,6 +304,26 @@ class SurveyScheduleItem(BaseModel):
     # make the next campaign for that year skip everyone (#357). The console uses
     # this to offer the honest control, and the backend enforces it either way.
     emails_sent_all_time: int = 0
+    # AT-A-GLANCE PROGRESS (#543/#497). The three counts above say what LEFT;
+    # these say whether it worked, which nothing reported while a campaign was
+    # still running. `non_responders` cannot fill that gap — it only counts
+    # people who have had all three emails, so it is legitimately 0 for the first
+    # fortnight of every campaign no matter how many have answered.
+    #
+    # All three are scoped to the year's CURRENT cycle and counted over the send
+    # log, so they share one denominator: nobody can reply to a survey they were
+    # never sent, and a stray response from outside the cycle cannot push the
+    # rate past 100%. "Replied" is the sender's own definition — a pending or
+    # applied response inside the re-survey window, not superseded by a reset —
+    # so a cohort never reads as answered while the sender still owes it email.
+    #
+    # The response RATE is deliberately not a field: it is replied/recipients,
+    # and a stored copy is one more thing that can disagree with its own inputs.
+    recipients: int = 0
+    replied: int = 0
+    # Replies sitting in the review queue — the actionable number, since these
+    # are answers nobody has applied or rejected yet.
+    awaiting_review: int = 0
 
 
 class SurveySchedulePauseAllResult(BaseModel):

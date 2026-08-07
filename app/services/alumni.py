@@ -137,6 +137,8 @@ async def filter_options(session: AsyncSession) -> dict:
     # its association table) references the alumni row via ``alumni_id``.
     employment_scope = [_visible_alumni_exists(CurrentEmployment.alumni_id)]
     history_scope = [_visible_alumni_exists(EmploymentHistory.alumni_id)]
+    education_scope = [_visible_alumni_exists(EducationHistory.alumni_id)]
+    contact_scope = [_visible_alumni_exists(AlumniContactInfo.alumni_id)]
     leadership_scope = [_visible_alumni_exists(FinanceSocietyLeadership.alumni_id)]
     survey_scope = [_visible_alumni_exists(Survey.alumni_id)]
     # graduation_year lives on the alumni row itself, so the guard is a plain
@@ -208,6 +210,28 @@ async def filter_options(session: AsyncSession) -> dict:
         ),
         "states": await _distinct_values(
             session, CurrentEmployment.current_state, scope=employment_scope
+        ),
+        # Country comes off the same employment record as city/state above.
+        "countries": await _distinct_values(
+            session, CurrentEmployment.current_country, scope=employment_scope
+        ),
+        # Region is the DERIVED grouping (#283) and is stored on the contact row,
+        # so its options must be read there — that is the column the filter
+        # matches, and re-deriving it here would let the two drift apart.
+        "regions": await _distinct_values(
+            session, AlumniContactInfo.region, scope=contact_scope
+        ),
+        "past_titles": await _distinct_values(
+            session, EmploymentHistory.employment_title, scope=history_scope
+        ),
+        "universities": await _distinct_values(
+            session, EducationHistory.university, scope=education_scope
+        ),
+        "degrees": await _distinct_values(
+            session, EducationHistory.degree, scope=education_scope
+        ),
+        "majors": await _distinct_values(
+            session, EducationHistory.major, scope=education_scope
         ),
         "tags": await _tag_filter_options(session, tag_scope),
         "status_labels": await _distinct_values(
@@ -396,7 +420,9 @@ async def create_alumni(
     # Data-hygiene pass: clean the payload and persist the CLEANED values (the
     # UI's /preview is not trusted — defense-in-depth). Exact duplicates block.
     cleaned, _changes = hygiene.clean_alumni_payload(payload, jsonable=False)
-    blockers, _warnings = await hygiene.detect_duplicates(session, cleaned)
+    # A create payload is complete by definition, so `cleaned` alone is already
+    # the effective record here — no overlay needed (contrast `update_alumni`).
+    blockers, warnings = await hygiene.detect_duplicates(session, cleaned)
     if blockers:
         raise ConflictError(blockers[0]["message"])
 
@@ -474,6 +500,9 @@ async def create_alumni(
 
     await session.commit()
     await session.refresh(alumnus)
+    # Same contract as `update_alumni` — soft duplicate warnings ride back on the
+    # created record so the caller can show them (#627).
+    alumnus.duplicate_warnings = warnings
     return alumnus
 
 
@@ -600,8 +629,18 @@ async def update_alumni(
     cleaned, _changes = hygiene.clean_alumni_payload(
         payload, jsonable=False, stored_state=stored_state
     )
-    blockers, _warnings = await hygiene.detect_duplicates(
-        session, cleaned, exclude_alumni_id=alumni_id
+    #
+    # Duplicate detection runs against the EFFECTIVE record — the stored row with
+    # this patch overlaid — not the patch alone (#627). `cleaned` is
+    # exclude_unset, so the focused edit forms that submit just the name fields
+    # carry no graduation year, and the fuzzy first+last+grad-year check needs all
+    # three: passing `cleaned` here meant a rename into an exact collision found
+    # nothing to warn about. `effective_identity` is query-free — every field it
+    # reads is already on the loaded row.
+    blockers, warnings = await hygiene.detect_duplicates(
+        session,
+        hygiene.effective_identity(alumnus, cleaned),
+        exclude_alumni_id=alumni_id,
     )
     if blockers:
         raise ConflictError(blockers[0]["message"])
@@ -720,6 +759,12 @@ async def update_alumni(
             _audit(session, actor_user_id, "update", alumni_id)
         await session.commit()
         await session.refresh(alumnus)
+    # Hand the soft duplicate warnings back to the caller (#627). Fuzzy matches
+    # never block — two alumni really can share a name and a graduation year, and
+    # a marriage rename into a genuine collision is sometimes correct — but the
+    # person doing the rename has to be TOLD. Set after `refresh`, which reloads
+    # mapped columns only and would otherwise be an easy place to lose this.
+    alumnus.duplicate_warnings = warnings
     return alumnus
 
 

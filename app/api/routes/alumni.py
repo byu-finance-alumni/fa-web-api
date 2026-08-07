@@ -70,6 +70,7 @@ from app.schemas.alumni import (
     AlumniPage,
     AlumniRead,
     AlumniUpdateFull,
+    AlumniWriteResult,
     HeadshotUrls,
     minimize_alumni_read,
 )
@@ -250,6 +251,54 @@ async def list_alumni(
     state: Annotated[
         list[str] | None,
         Query(description="Current state(s) — repeatable, exact match."),
+    ] = None,
+    country: Annotated[
+        list[str] | None,
+        Query(description="Current work country/countries — repeatable, exact match."),
+    ] = None,
+    region: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "US region(s) derived from the work state (#283) — repeatable, "
+                "exact match. Same stored value the geography map shades by."
+            )
+        ),
+    ] = None,
+    past_title: Annotated[
+        list[str] | None,
+        Query(
+            description="Prior job title(s) from employment history — repeatable."
+        ),
+    ] = None,
+    university: Annotated[
+        list[str] | None,
+        Query(description="University/universities from education history — repeatable."),
+    ] = None,
+    degree: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Degree(s) from education history — repeatable, exact match. "
+                "Distinct from 'graduate_degree', which only asks whether the "
+                "alumnus holds one at all."
+            )
+        ),
+    ] = None,
+    major: Annotated[
+        list[str] | None,
+        Query(description="Major(s) from education history — repeatable, exact match."),
+    ] = None,
+    worked_in_year: Annotated[
+        int | None,
+        Query(
+            ge=1900,
+            le=2200,
+            description=(
+                "Held any role covering this calendar year. A history row with "
+                "no end year counts as still running."
+            ),
+        ),
     ] = None,
     tag: Annotated[
         list[str] | None,
@@ -484,6 +533,13 @@ async def list_alumni(
         employment_status=employment_status,
         city=city,
         state=state,
+        country=country,
+        region=region,
+        past_title=past_title,
+        university=university,
+        degree=degree,
+        major=major,
+        worked_in_year=worked_in_year,
         tag=tag,
         status_label=status_label,
         leadership_role=leadership_role,
@@ -544,6 +600,13 @@ async def list_alumni(
             ),
             "city": "|".join(city) if city else None,
             "state": "|".join(state) if state else None,
+            "country": "|".join(country) if country else None,
+            "region": "|".join(region) if region else None,
+            "past_title": "|".join(past_title) if past_title else None,
+            "university": "|".join(university) if university else None,
+            "degree": "|".join(degree) if degree else None,
+            "major": "|".join(major) if major else None,
+            "worked_in_year": worked_in_year,
             "tag": "|".join(tag) if tag else None,
             "status_label": "|".join(status_label) if status_label else None,
             "leadership_role": "|".join(leadership_role) if leadership_role else None,
@@ -2153,22 +2216,30 @@ async def preview_update_alumni(
     return result
 
 
-@router.post("", response_model=AlumniRead, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=AlumniWriteResult, status_code=status.HTTP_201_CREATED)
 async def create_alumni(
     payload: AlumniCreateFull, user: RequireAlumniCreate, session: SessionDep
-) -> AlumniRead:
+) -> AlumniWriteResult:
+    """Create an alumnus. Returns the saved record plus any soft duplicate
+    warnings (``duplicate_warnings``) the write raised — see #627. Exact
+    ``byu_id`` / ``net_id`` collisions still 409 instead."""
     return await service.create_alumni(
         session, _drop_manual_updated_date(payload), actor_user_id=user.user_id
     )
 
 
-@router.patch("/{alumni_id}", response_model=AlumniRead)
+@router.patch("/{alumni_id}", response_model=AlumniWriteResult)
 async def update_alumni(
     alumni_id: IdPath,
     payload: AlumniUpdateFull,
     user: RequireAlumniEdit,
     session: SessionDep,
-) -> AlumniRead:
+) -> AlumniWriteResult:
+    """Update an alumnus. Returns the saved record plus any soft duplicate
+    warnings (``duplicate_warnings``) — the rename case in #627: the checks run
+    against the stored row with this patch overlaid, so a partial edit that only
+    sends the name fields is still measured against the record's real graduation
+    year. Warnings never block; exact ID collisions still 409."""
     return await service.update_alumni(
         session, alumni_id, _drop_manual_updated_date(payload), actor_user_id=user.user_id
     )

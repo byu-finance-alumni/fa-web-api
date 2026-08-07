@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from html import escape
 
 import httpx
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import and_, case, delete, func, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,6 +69,8 @@ from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.repositories.alumni import build_alumni_query, has_status_label_exists
 from app.schemas.survey import (
     GraduationYearCount,
+    SurveyHeldOutAlum,
+    SurveyHeldOutPage,
     SurveyRecipientBreakdown,
     SurveyRespondInfo,
     SurveySendResult,
@@ -931,6 +933,40 @@ def _suppressed_label_exists():
     return has_status_label_exists(SUPPRESSED_CONTACT_STATUS_LABELS)
 
 
+def _suppressed_from_send():
+    """The WHOLE suppression test: the deceased FLAG or a suppressing LABEL.
+
+    Two separate columns, set independently — an alum can carry the Deceased
+    label with the flag unset, or the reverse — so "is this person suppressed?"
+    is only ever this disjunction. It gets one definition because the NEGATION of
+    it is what scopes every other bucket (``already_responded`` and
+    ``unreachable`` both mean "…and not suppressed"), and a bucket that spelled
+    that negation out for itself could quietly disagree with the count beside it.
+
+    ``alumni.deceased`` is NOT NULL and an EXISTS never yields NULL, so ``~`` of
+    this is total: everyone falls on exactly one side of it.
+    """
+    return or_(Alumni.deceased.is_(True), _suppressed_label_exists())
+
+
+def _recent_reply_criteria():
+    """The WHERE of "this alumnus has replied this cycle", as criteria.
+
+    Factored out so the two questions asked of that population — *is there one?*
+    (:func:`_replied_recently_exists`, the send exclusion and its count) and
+    *when was it?* (:func:`_last_reply_at`, the held-out list's reply date) —
+    are answered over literally the same rows. Written out twice, the list could
+    show a date for a reply that was not the one holding the alum back, or show
+    none at all for someone the count says is blocked.
+    """
+    return (
+        SurveyResponse.alumni_id == Alumni.alumni_id,
+        SurveyResponse.submitted_at >= _resurvey_cutoff(),
+        SurveyResponse.status.in_(RESPONDED_STATUSES),
+        response_not_superseded(),
+    )
+
+
 def _replied_recently_exists():
     """Correlated EXISTS: replied within the 365-day re-survey window. A
     ``rejected`` response does not count (:data:`RESPONDED_STATUSES`) — staff
@@ -942,13 +978,30 @@ def _replied_recently_exists():
     nothing to it."""
     return (
         select(SurveyResponse.survey_response_id)
-        .where(
-            SurveyResponse.alumni_id == Alumni.alumni_id,
-            SurveyResponse.submitted_at >= _resurvey_cutoff(),
-            SurveyResponse.status.in_(RESPONDED_STATUSES),
-            response_not_superseded(),
-        )
+        .where(*_recent_reply_criteria())
         .exists()
+    )
+
+
+def _last_reply_at():
+    """Correlated scalar: WHEN this alumnus last replied in a way that holds them
+    out of a send — the same rows :func:`_replied_recently_exists` tests for,
+    aggregated instead of tested.
+
+    NULL for anyone that predicate is false for, which is what lets the held-out
+    list carry one date column across all three buckets: a suppressed or
+    unreachable alum simply has no qualifying reply, so the column is empty for
+    them without a second query or a Python branch.
+
+    ``max``, not ``min``: someone can have answered more than once inside the
+    window (a pending submission, then another after a correction), and the
+    question the engineer is deciding is how recently they were last asked
+    something they answered — the newest reply is the one that makes re-asking
+    look unreasonable."""
+    return (
+        select(func.max(SurveyResponse.submitted_at))
+        .where(*_recent_reply_criteria())
+        .scalar_subquery()
     )
 
 
@@ -965,6 +1018,202 @@ def _has_reachable_email():
             ),
         )
         .exists()
+    )
+
+
+# ------------------------------------------------------- who was held out ----
+#
+# The console reports the send's exclusions as COUNTS
+# (:class:`SurveyRecipientBreakdown`), and a count is not something anyone can
+# act on. Jake deleted a campaign, re-sent to the cohort, and was told "1 already
+# replied within the last year" — which was CORRECT (deleting a campaign retires
+# its cycle so the alumni it emailed are sendable again, but it deliberately does
+# not clear the 365-day annual window for the ones who actually answered). Right
+# and useless in the same breath: there was no way to learn who the 1 was, so the
+# cohort was searched by hand until she turned up and the per-alumnus reset could
+# be run on her (2026-08-06, #658).
+#
+# So: the same three exclusions, by name. The buckets below are the ONLY
+# definition of them — :func:`recipient_breakdown` counts these very expressions
+# and :func:`held_out_alumni_query` lists the rows they match, so a person can
+# appear in the list if and only if they were counted, and the drill-down cannot
+# quietly report a different population than the number it drills into. Deriving
+# "who replied recently?" a second way is the standing bug in this area: two
+# figures disagree and nobody can tell which one is lying.
+
+HELD_OUT_SUPPRESSED = "suppressed"
+HELD_OUT_ALREADY_RESPONDED = "already_responded"
+HELD_OUT_UNREACHABLE = "unreachable"
+
+HELD_OUT_REASON_LABELS: dict[str, str] = {
+    HELD_OUT_SUPPRESSED: "Deceased or Do Not Contact",
+    HELD_OUT_ALREADY_RESPONDED: "Already replied within the last year",
+    HELD_OUT_UNREACHABLE: "No usable email address",
+}
+
+
+def _held_out_buckets() -> dict:
+    """The three reasons a send skips someone, as mutually exclusive predicates.
+
+    Together with "eligible" they PARTITION the year's alumni, which is the
+    property :class:`SurveyRecipientBreakdown` states and its tests pin::
+
+        cohort_total = suppressed + already_responded + unreachable + eligible
+
+    Exclusivity is what makes that arithmetic true, and it is bought by scoping
+    each bucket with the negation of the ones before it — suppression first
+    (a Do Not Contact alum who also has no address is suppressed, not a gap to
+    chase), then the annual window, then reachability. That order is not
+    cosmetic: it is why a Do Not Contact name can never reach a worklist.
+
+    ``unreachable`` is the same set as :func:`unreachable_alumni_query` — same
+    cohort, same suppression, same annual window, same inverted email predicate,
+    the suppression written here as one negated disjunction rather than
+    ``build_alumni_query``'s two arguments. They are pinned equal by test rather
+    than by sharing a call, because that query returns whole ORM entities and
+    this one returns columns plus a computed reason.
+
+    Fresh expressions each call: SQLAlchemy elements are immutable, but a bucket
+    is used in several statements and building them per call keeps the
+    ``_resurvey_cutoff()`` inside them evaluated at query time rather than frozen
+    at import.
+    """
+    suppressed = _suppressed_from_send()
+    return {
+        # Deceased / Do Not Contact — never emailed, by decision.
+        HELD_OUT_SUPPRESSED: suppressed,
+        # Answered inside the 365-day window. THE bucket #658 is about: it is the
+        # one a retired campaign does not clear, and the only way out of it is
+        # `POST /survey/alumni/{id}/reset`.
+        HELD_OUT_ALREADY_RESPONDED: and_(~suppressed, _replied_recently_exists()),
+        # Wanted, due, and we have no usable address for them (#392).
+        HELD_OUT_UNREACHABLE: and_(
+            ~suppressed, ~_replied_recently_exists(), ~_has_reachable_email()
+        ),
+    }
+
+
+def held_out_alumni_query(graduation_year: int, *, reason: str | None = None):
+    """WHO this year's send is holding out, with the reason, as ONE query (#658).
+
+    Columns, not entities: the reason is computed in SQL and the reply date comes
+    from a correlated aggregate, so the whole answer arrives in a single pass over
+    the year's alumni. Loading the cohort and bucketing it in Python would be the
+    obvious alternative and is exactly what this codebase cannot afford — 8,000+
+    rows, and a second implementation of the eligibility rules to drift.
+
+    ``reason`` narrows to one bucket; ``None`` returns all three, which is the
+    same rows the breakdown's three counts add up to.
+
+    Ordered by name (then id, to break ties) so it reads as a worklist and pages
+    deterministically — an unstable sort under LIMIT/OFFSET silently repeats and
+    skips people, and this list exists to be worked through. NOT ordered by
+    reason: the UI asks for one bucket at a time, and a mixed page grouped by
+    reason would make "page 2" mean something different depending on the mix.
+    """
+    buckets = _held_out_buckets()
+    # The buckets are mutually exclusive and the WHERE below admits nothing
+    # outside their union, so falling past the first two branches IS the third —
+    # this is the same layering `_held_out_buckets` scopes them with, written
+    # once more as a projection.
+    reason_col = case(
+        (buckets[HELD_OUT_SUPPRESSED], literal(HELD_OUT_SUPPRESSED)),
+        (buckets[HELD_OUT_ALREADY_RESPONDED], literal(HELD_OUT_ALREADY_RESPONDED)),
+        else_=literal(HELD_OUT_UNREACHABLE),
+    ).label("reason")
+    wanted = buckets[reason] if reason is not None else or_(*buckets.values())
+    return (
+        select(
+            Alumni.alumni_id,
+            Alumni.first_name,
+            Alumni.preferred_first_name,
+            Alumni.last_name,
+            reason_col,
+            _last_reply_at().label("last_reply_at"),
+        )
+        .where(
+            # The same cohort the breakdown's `cohort_total` counts, so the
+            # buckets stay a partition OF something.
+            Alumni.is_alumni.is_(True),
+            Alumni.archived.is_(False),
+            Alumni.graduation_year == graduation_year,
+            wanted,
+        )
+        .order_by(Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
+    )
+
+
+# A cohort is a graduation year, so a few hundred people at most today — but the
+# `already_responded` bucket grows for the life of a campaign and an unbounded
+# list is a promise this endpoint would eventually break. The default page is
+# generous enough that the console's normal case (one bucket of one year) arrives
+# whole, and `total` always describes the FULL set, so a UI that never pages
+# still shows an honest number next to a partial list.
+HELD_OUT_PAGE_DEFAULT = 200
+HELD_OUT_PAGE_MAX = 1000
+
+
+async def list_held_out(
+    session: AsyncSession,
+    graduation_year: int,
+    *,
+    reason: str | None = None,
+    limit: int = HELD_OUT_PAGE_DEFAULT,
+    offset: int = 0,
+) -> SurveyHeldOutPage:
+    """The held-out count made actionable — names, reasons, and reply dates (#658).
+
+    Two statements, both aggregate/SQL-level: one COUNT over the filtered set (so
+    `total` is the whole set regardless of paging, and is comparable to the
+    matching :class:`SurveyRecipientBreakdown` field) and one paged SELECT. The
+    count reuses :func:`held_out_alumni_query`'s own WHERE — it is that query with
+    its columns swapped for a count — so the total can never describe a different
+    population than the rows.
+
+    Read-only. Nothing here changes who is sendable; the only control that does
+    is the per-alumnus reset, and this exists so the engineer can decide whether
+    to run it on a real person rather than on a number.
+    """
+    filtered = held_out_alumni_query(graduation_year, reason=reason)
+    total = int(
+        await session.scalar(
+            select(func.count()).select_from(
+                # Columns dropped before counting: the reason CASE and the
+                # correlated reply-date aggregate are per-row work a COUNT has no
+                # use for. The WHERE — the part that decides WHO is counted — is
+                # the query's own, untouched.
+                filtered.order_by(None)
+                .with_only_columns(Alumni.alumni_id)
+                .subquery()
+            )
+        )
+        or 0
+    )
+    rows = (await session.execute(filtered.limit(limit).offset(offset))).all()
+    items = [
+        SurveyHeldOutAlum(
+            alumni_id=row.alumni_id,
+            # Preferred name first, matching `list_unreachable` and the rest of
+            # the console — staff look these people up by what they're called.
+            name=" ".join(
+                p
+                for p in (row.preferred_first_name or row.first_name, row.last_name)
+                if p
+            ).strip()
+            or f"Alum #{row.alumni_id}",
+            reason=row.reason,
+            reason_label=HELD_OUT_REASON_LABELS[row.reason],
+            last_reply_at=row.last_reply_at,
+        )
+        for row in rows
+    ]
+    return SurveyHeldOutPage(
+        graduation_year=graduation_year,
+        reason=reason,
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=items,
     )
 
 
@@ -1150,7 +1399,7 @@ async def recipient_breakdown(
                 Alumni.is_alumni.is_(True),
                 Alumni.archived.is_(False),
                 Alumni.graduation_year == graduation_year,
-                or_(Alumni.deceased.is_(True), _suppressed_label_exists()),
+                _held_out_buckets()[HELD_OUT_SUPPRESSED],
             )
         )
         or 0
@@ -1163,9 +1412,7 @@ async def recipient_breakdown(
                 Alumni.is_alumni.is_(True),
                 Alumni.archived.is_(False),
                 Alumni.graduation_year == graduation_year,
-                Alumni.deceased.is_(False),
-                ~_suppressed_label_exists(),
-                _replied_recently_exists(),
+                _held_out_buckets()[HELD_OUT_ALREADY_RESPONDED],
             )
         )
         or 0

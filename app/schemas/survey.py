@@ -180,6 +180,57 @@ class SurveyUnreachableAlum(BaseModel):
     work_email: str | None = None
 
 
+class SurveyHeldOutAlum(BaseModel):
+    """One alumnus this year's send is holding out, and why (#658).
+
+    `SurveyRecipientBreakdown` reports the exclusions as three counts. A count is
+    not actionable: a cancelled-then-re-sent campaign told staff "1 already
+    replied within the last year" and there was no way to find out who, so the
+    cohort had to be searched by hand until she turned up. This is that same
+    number with a name on it.
+
+    `alumni_id` is here because it is what the engineer's next call needs — the
+    state/reset pair (`GET|POST /survey/alumni/{alumni_id}/...`) is keyed on it,
+    and that reset is the only thing that makes a recent responder sendable again.
+    """
+
+    alumni_id: int
+    name: str
+    # Which bucket of the breakdown they fell into — "suppressed" |
+    # "already_responded" | "unreachable". Machine-readable; the same three
+    # strings the endpoint's `reason` filter accepts.
+    reason: str
+    # Human-readable form of `reason`, so the UI need not duplicate the mapping.
+    reason_label: str
+    # WHEN they replied — set only for `already_responded`, None for the other
+    # two buckets. This is the fact the re-send decision actually turns on: an
+    # answer from three months ago is a reason to leave them alone, one from a
+    # retired campaign an hour before the cohort was re-sent is not. Without it
+    # the row would say someone is blocked and leave the operator no better able
+    # to judge whether unblocking them is reasonable.
+    last_reply_at: datetime.datetime | None = None
+
+
+class SurveyHeldOutPage(BaseModel):
+    """A page of the held-out list, plus the size of the whole set (#658).
+
+    `total` is the count BEFORE paging, and it is the number the console can
+    check its own breakdown against: both come from the same predicates, so
+    `total` for `reason="already_responded"` is
+    `SurveyRecipientBreakdown.already_responded` by construction. If they ever
+    differ, something has re-derived one of them and that is the bug.
+    """
+
+    graduation_year: int
+    # Which bucket was asked for, echoed back; None = all three.
+    reason: str | None = None
+    # Rows matching `reason` for this year, ignoring `limit` / `offset`.
+    total: int
+    limit: int
+    offset: int
+    items: list[SurveyHeldOutAlum]
+
+
 class SurveySendResult(BaseModel):
     """Summary returned by the send endpoint.
 

@@ -100,6 +100,13 @@ class AlumniUpdateSummary(BaseModel):
     unmatched: int
     with_changes: int
     errors: int
+    #: How many rows carry ``overwrites_manual_edit`` (#420) — i.e. would change
+    #: a field on a record hand-edited within the last
+    #: ``import_csv.MANUAL_EDIT_WARNING_WINDOW_DAYS`` days. Counted here so the
+    #: UI can lead with "3 of 2,000 rows overwrite a recent edit" without walking
+    #: every row. Defaults to 0 because the header-error early return in the
+    #: route builds a summary of zeroes by hand.
+    overwrites_manual_edit: int = 0
 
 
 class AlumniUpdateFieldChange(BaseModel):
@@ -110,6 +117,32 @@ class AlumniUpdateFieldChange(BaseModel):
     section: str = "core"
     old: Any = None
     new: Any = None
+
+
+class AlumniUpdateManualEditWarning(BaseModel):
+    """Set on a preview row that would overwrite a RECENT manual edit (#420).
+
+    A staffer's hand correction stamps ``alumni.manually_edited_at``; a cohort
+    file built from an older export would silently revert it, looking like any
+    other field change in the preview. This surfaces those rows so the operator
+    can check them specifically. It is a WARNING ONLY — the commit still applies
+    the row unchanged, there is no block, skip, or per-row override.
+
+    ``edited_by`` follows the profile's "Profile updated by ..." display rule
+    rather than a second mechanism of its own, and ``edited_by_source`` says
+    which rule produced it:
+      * ``user``    — the app user behind ``profile_updated_by_user_id``, shown
+        as "First Last" (or their email when the name columns are empty);
+      * ``sheet``   — no linked user, so the intake sheet's free-text
+        "Profile Updated By" name;
+      * ``unknown`` — neither is recorded (an older row, or an edit that came
+        from an import). ``edited_by`` is null; say we don't know, don't guess.
+    """
+
+    #: ISO-8601 timestamp of the manual edit this row would overwrite.
+    manually_edited_at: str
+    edited_by: str | None = None
+    edited_by_source: str = "unknown"
 
 
 class AlumniUpdateRowReport(BaseModel):
@@ -128,6 +161,10 @@ class AlumniUpdateRowReport(BaseModel):
     changes: list[AlumniUpdateFieldChange] = []
     error: str | None = None
     message: str | None = None
+    #: Present only on a row that would CHANGE a field on a recently hand-edited
+    #: record (#420); null everywhere else, including a matched row whose values
+    #: all already agree (it overwrites nothing).
+    overwrites_manual_edit: AlumniUpdateManualEditWarning | None = None
 
 
 class AlumniUpdatePreview(BaseModel):

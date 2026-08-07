@@ -159,7 +159,14 @@ async def probe_object_head(
     recognise (JPEG 3, PNG 8, WebP 12).
 
     Returns ``(None, None, None)`` if the object is missing or unreadable so
-    callers FAIL OPEN — a probe hiccup must never reject a legitimate upload."""
+    callers FAIL OPEN — a probe hiccup must never reject a legitimate upload.
+
+    ⚠️ ``head`` is ``None`` ONLY when the probe itself failed. A successful read
+    of a genuinely EMPTY object returns ``b""``, not ``None``, and callers must
+    therefore test ``head is not None`` rather than truthiness. Conflating the
+    two let a 0-byte upload skip the magic-byte check entirely and be confirmed
+    as a valid headshot — the exact control this function exists to feed
+    (found re-reviewing the #419 fix, 2026-08-07)."""
     base, key = _base_and_key()
     url = f"{base}/object/{bucket}/{path}"
     headers = _headers(key)
@@ -187,7 +194,10 @@ async def probe_object_head(
             size = None
     # A server that ignored the Range header returns 200 with the WHOLE object;
     # trim so callers only ever see the head they asked for.
-    head = response.content[:head_bytes] if response.content else None
+    # Always bytes on a successful read — `b""` for an empty object, which is a
+    # real answer ("we looked, there is nothing there"), not a failure. Every
+    # early return above is the failure case and yields None explicitly.
+    head = response.content[:head_bytes]
     return (content_type or None, size, head)
 
 

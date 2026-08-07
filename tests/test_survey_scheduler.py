@@ -31,6 +31,13 @@ class _Settings:
     survey_from_name = "BYU Finance Alumni"
     survey_app_base_url = "https://finance.alumni.byu.edu"
     resend_api_key = "re_test_key"
+    # The usage-meter baseline. Needed since the send budget is read inside
+    # `send_survey_stage` rather than only by the cron (#417): a manual send —
+    # including a dry run — now reaches `get_send_usage`, which reads these. The
+    # other survey suites' settings stubs already carried them.
+    survey_usage_baseline_at = None
+    survey_usage_baseline_today = 0
+    survey_usage_baseline_month = 0
 
 
 @pytest.fixture

@@ -49,6 +49,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment, EducationHistory
 from app.models.engagement import AlumniProgramEngagement
+from app.models.user import User
 from app.repositories.alumni import build_alumni_query
 from app.schemas.alumni import (
     AlumniCreateFull,
@@ -1497,6 +1498,9 @@ def _reject_reason(evaluated: dict) -> str:
 #     mapped payload only carries the cells the user filled in — a PARTIAL update).
 #   * unmatched rows are REPORTED, never created (no inserts in update mode).
 #   * preview (dry-run diff) then commit, mirroring the create-mode split.
+#   * a row that would change a field on a RECENTLY hand-edited record is FLAGGED
+#     in the preview (#420) — see ``_manual_edit_warning``. Warning only: the
+#     commit still applies it.
 #
 # Each matched row is applied through ``alumni_service.update_alumni`` so update
 # semantics + provenance stamping + per-field audit match a single-record edit.
@@ -1527,6 +1531,23 @@ _UPDATE_SECTION_MODELS: dict[str, type] = {
     "education": EducationHistory,
     "engagement": AlumniProgramEngagement,
 }
+
+# How recently an alumnus must have been hand-edited (``manually_edited_at``) for
+# an update-import row that changes one of their fields to be flagged in the
+# preview (#420).
+#
+# 30 days is a JUDGEMENT CALL, not a rule the data implies — it is roughly "still
+# fresh enough that whoever made the edit would be surprised to see it reverted,
+# and old enough that the exported spreadsheet in front of the operator plausibly
+# predates it". Change this one number and the flags, the count, and the tests
+# move with it.
+#
+# Why a WINDOW and not "most recent wins": we cannot tell which version is newer.
+# The record knows when it was last hand-edited; the uploaded sheet carries no
+# date at all, so "most recent" would always resolve to "the import" — which is
+# exactly the silent-clobber behaviour this warns about. Stamping the export with
+# its generation date is the real fix, and is not built.
+MANUAL_EDIT_WARNING_WINDOW_DAYS = 30
 
 
 def _to_jsonable(value: object) -> object:
@@ -1698,6 +1719,86 @@ async def _diff_against_current(
     return changes
 
 
+def _manual_edit_warning(alumnus: Alumni) -> dict | None:
+    """Flag a row that is about to overwrite a RECENT manual edit (#420), or None.
+
+    ``alumni_service`` stamps ``manually_edited_at`` on every client edit so that
+    "manual edits win" over a later import — but the bulk update import never
+    read the column, so a colleague's cohort file built from a week-old export
+    silently reverted a hand correction, indistinguishable in the preview from
+    any other field change.
+
+    This does NOT block or skip anything: Jake's call (2026-08-07) is WARN, DO
+    NOT BLOCK. The commit still applies every matched row exactly as before; the
+    preview just points at the handful of rows worth double-checking first.
+
+    Returns None when the record was never hand-edited, or was hand-edited
+    longer ago than :data:`MANUAL_EDIT_WARNING_WINDOW_DAYS`. Otherwise a dict of:
+      * ``manually_edited_at`` — ISO-8601 timestamp of that hand edit;
+      * ``edited_by`` — who made it, or None when we genuinely do not know;
+      * ``edited_by_source`` — how ``edited_by`` was derived (see below);
+      * ``_editor_user_id`` — PRIVATE, popped by :func:`evaluate_update` once it
+        has resolved the app user in one batched query (never serialized).
+
+    ``edited_by`` mirrors the profile's "Profile updated by ..." hover rather
+    than inventing a second rule: the app user behind
+    ``profile_updated_by_user_id`` first (resolved by the caller), falling back
+    to the intake sheet's free-text ``profile_updated_by`` name. Older rows and
+    import-sourced edits have neither, and those report ``edited_by: None`` /
+    ``edited_by_source: "unknown"`` — say we don't know rather than guess.
+    """
+    edited = alumnus.manually_edited_at
+    if edited is None:
+        return None
+    # The column is timestamptz, so a loaded value normally carries a tzinfo. A
+    # naive one (a legacy value, or a hand-built object in a test) would raise on
+    # the comparison below, so read it as the UTC the column stores instead of
+    # losing the warning to a TypeError.
+    if edited.tzinfo is None:
+        edited = edited.replace(tzinfo=datetime.UTC)
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+        days=MANUAL_EDIT_WARNING_WINDOW_DAYS
+    )
+    if edited < cutoff:
+        return None
+    sheet_name = alumnus.profile_updated_by or None
+    return {
+        "manually_edited_at": edited.isoformat(),
+        "edited_by": sheet_name,
+        "edited_by_source": "sheet" if sheet_name else "unknown",
+        "_editor_user_id": alumnus.profile_updated_by_user_id,
+    }
+
+
+async def _resolve_editor_names(
+    session: AsyncSession, user_ids: set[int]
+) -> dict[int, str]:
+    """Resolve ``users.user_id`` -> display name for the whole preview in ONE query.
+
+    The batched twin of ``profile._actor_name`` (what the profile's "Profile
+    updated by ..." hover calls), using the SAME name rule — "First Last",
+    falling back to the email when the name columns are empty. Batched because
+    the preview walks up to ``MAX_IMPORT_ROWS`` (2000) rows against an 8,000+ row
+    table: a per-row ``session.get(User, ...)`` would be a textbook N+1 on a path
+    that is already heavy. Ids with no surviving user row are simply absent from
+    the result (the FK is ON DELETE SET NULL, but a row can still be mid-flight),
+    and the caller then reports the editor as unknown.
+    """
+    if not user_ids:
+        return {}
+    result = await session.execute(
+        select(User.user_id, User.first_name, User.last_name, User.email).where(
+            User.user_id.in_(user_ids)
+        )
+    )
+    names: dict[int, str] = {}
+    for user_id, first, last, email in result.all():
+        name = " ".join(part for part in (first, last) if part).strip()
+        if name or email:
+            names[user_id] = name or email
+    return names
+
+
 async def _evaluate_update_row(
     session: AsyncSession, row: dict, existing: dict
 ) -> dict:
@@ -1710,6 +1811,9 @@ async def _evaluate_update_row(
         "changes": [],
         "error": None,
         "message": None,
+        # Set only for a row that CHANGES something on a recently hand-edited
+        # record (#420); every other outcome leaves it None.
+        "overwrites_manual_edit": None,
     }
 
     # A mapping-stage coercion error (bad date/number/industry) rejects the row.
@@ -1744,6 +1848,13 @@ async def _evaluate_update_row(
     changes = await _diff_against_current(session, alumnus, cleaned)
     base["changes"] = changes
     base["status"] = "update" if changes else "no_changes"
+    # Only a row that actually CHANGES a field can clobber a hand edit; a
+    # re-uploaded, identical row overwrites nothing, so it is never flagged no
+    # matter how recently the record was edited. ``alumnus`` is already loaded
+    # here, so the flag costs no extra query — only the editor NAME does, and
+    # ``evaluate_update`` batches that for the whole file.
+    if changes:
+        base["overwrites_manual_edit"] = _manual_edit_warning(alumnus)
     return base
 
 
@@ -1753,11 +1864,23 @@ async def evaluate_update(session: AsyncSession, rows: list[dict]) -> dict:
     For each row: resolve the match (BYU -> Net, active only); for matched rows
     validate the non-blank cells against ``AlumniUpdateFull`` and compute a
     per-field diff against the CURRENT stored values. Reports summary counts plus
-    per-row detail. NO writes."""
+    per-row detail. NO writes.
+
+    Changed rows landing on a recently hand-edited record additionally carry
+    ``overwrites_manual_edit`` (#420), and ``summary.overwrites_manual_edit``
+    counts them so the UI can lead with "3 of 2,000 rows overwrite a recent
+    edit" without walking every row. Informational only — nothing here changes
+    what a commit writes."""
     existing = await _load_existing_index(session)
 
     out_rows: list[dict] = []
     matched = unmatched = with_changes = errors = 0
+    overwrites_manual_edit = 0
+    # (warning dict, editor user id) for each flagged row, so every editor NAME
+    # can be resolved in a single query after the loop instead of one per row.
+    # The warning dicts are the same objects already in ``out_rows``, so filling
+    # them in below updates the report in place.
+    pending_editors: list[tuple[dict, int]] = []
     for row in rows:
         report = await _evaluate_update_row(session, row, existing)
         out_rows.append(report)
@@ -1770,6 +1893,27 @@ async def evaluate_update(session: AsyncSession, rows: list[dict]) -> dict:
             with_changes += 1
         elif status == "error":
             errors += 1
+        warning = report["overwrites_manual_edit"]
+        if warning is not None:
+            overwrites_manual_edit += 1
+            # Private carrier key: strip it here so it can never reach a client.
+            editor_user_id = warning.pop("_editor_user_id")
+            if editor_user_id is not None:
+                pending_editors.append((warning, editor_user_id))
+
+    # ONE query for the whole file, and none at all when nothing was flagged.
+    if pending_editors:
+        editor_names = await _resolve_editor_names(
+            session, {user_id for _warning, user_id in pending_editors}
+        )
+        for warning, editor_user_id in pending_editors:
+            name = editor_names.get(editor_user_id)
+            # The app user wins over the sheet's free-text name, exactly as the
+            # profile hover prefers it; an unresolvable id leaves whatever
+            # fallback ``_manual_edit_warning`` already put there.
+            if name:
+                warning["edited_by"] = name
+                warning["edited_by_source"] = "user"
 
     return {
         "columns_ok": True,
@@ -1780,6 +1924,7 @@ async def evaluate_update(session: AsyncSession, rows: list[dict]) -> dict:
             "unmatched": unmatched,
             "with_changes": with_changes,
             "errors": errors,
+            "overwrites_manual_edit": overwrites_manual_edit,
         },
         "rows": out_rows,
     }

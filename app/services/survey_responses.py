@@ -9,6 +9,16 @@ review each in the console (`list_pending`, with a before/after diff) and apply
 Every field an alum can submit is in `_FIELDS` (key -> table/column/kind), which
 is the ONLY thing that gets written — nothing else in the payload is applied.
 
+READ THIS BEFORE ADDING A FIELD. `apply_response` writes with a raw `setattr`,
+so NOTHING in `app/schemas/alumni.py` runs on this path — every field validator
+the staff create/edit endpoints rely on is bypassed here. The survey made these
+columns a PUBLIC write surface (anyone holding a link can POST at the
+whitelist), and staff review is not a substitute for validation: a reviewer sees
+a plausible before/after diff, not a `javascript:` href or a second recipient
+hidden in an email. A field whose value is trusted downstream — rendered as a
+link, handed to the sender, grouped in a dashboard, filtered on — must carry its
+rule HERE, as a `choice`, a `designation`, or a `_Field.validate` predicate.
+
 These rows ARE the survey history the profile's Surveys tab shows: it derives
 from them in `profile._derive_survey_history`. Do NOT also insert into the
 legacy `surveys` table (see `models.crm.Survey`) — one fact, one home.
@@ -18,6 +28,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -31,6 +42,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.survey_response import SurveyResponse
+from app.schemas.alumni import AlumniBase
 from app.schemas.survey import (
     SurveyChange,
     SurveyResponseItem,
@@ -92,6 +104,18 @@ class _Field:
     # there means the field was cleared or never rendered, not that the alumnus has
     # no surname. See the name block in `_FIELDS`.
     blankable: bool = True
+    # `text` only: a predicate the SUBMITTED value must satisfy before the server
+    # will write it. Returning False is treated exactly like an off-list `choice`
+    # — `_coerce` yields `_IGNORE` and the column keeps whatever it already held.
+    #
+    # This exists because `apply_response` writes with a raw `setattr`, which runs
+    # NO Pydantic validator: everything `app/schemas/alumni.py` enforces on the
+    # staff create/edit path is bypassed on this one. That was tolerable while the
+    # only writers were staff; the survey turned these columns into a PUBLIC write
+    # surface (anything holding a link can POST at the whitelist), so a field whose
+    # value is trusted downstream needs its rule restated HERE, on the path the
+    # public actually writes through. See `_valid_linkedin_url` / `_valid_email`.
+    validate: Callable[[str], bool] | None = None
 
 
 # What `_coerce` returns for a value the server refuses to write. DISTINCT from
@@ -99,6 +123,95 @@ class _Field:
 # column entirely on this, so an off-list or disallowed-blank answer leaves what
 # is on file exactly as it was rather than overwriting it.
 _IGNORE = object()
+
+
+# --------------------------------------------------- public-write field rules --
+
+
+def _valid_linkedin_url(value: str) -> bool:
+    """The STAFF LinkedIn rule, reused verbatim: http(s) scheme, a linkedin.com
+    host (or subdomain), within the column's 500 characters.
+
+    Deliberately delegates to `AlumniBase._validate_linkedin_url` rather than
+    restating the checks. Two copies of "what is a LinkedIn URL" would drift, and
+    the drift would be invisible until someone noticed the public path accepting
+    what the staff path rejects — which is the whole bug this fixes.
+
+    Why it matters that this is enforced at all: the stored value is rendered as
+    an `href` on staff pages, so `javascript:...` becomes a script a signed-in
+    reviewer runs by clicking, and `https://linkedin.com.evil.example/in/jdoe`
+    becomes a credential-harvest link that LOOKS like the profile they meant to
+    open. The reviewer's before/after diff shows a plausible URL either way — a
+    human eyeballing the queue is not a control that catches this.
+    """
+    try:
+        AlumniBase._validate_linkedin_url(value)
+    except ValueError:
+        return False
+    return True
+
+
+# Mirrors alumni_contact_info.personal_email / work_email (varchar(255)), so a
+# submission we accept is one the column can actually hold.
+_EMAIL_MAX = 255
+
+# Characters that must never appear in a stored address. This is a SHAPE gate,
+# not a deliverability gate:
+#
+# * whitespace (including CR/LF/TAB) and commas/semicolons are RECIPIENT-LIST and
+#   header separators. The stored value is what `email_reach.resolve_email` hands
+#   the sender as the `to` address, so `alum@byu.edu, attacker@evil.example` is a
+#   silent BCC of every future survey mail, reminder and notification to a third
+#   party — and it renders in the console as one ordinary-looking address.
+# * angle brackets, quotes and backslashes are the RFC 5322 display-name
+#   machinery (`"Finance Alumni" <attacker@evil.example>`), which lets a value
+#   that displays as one address deliver to another.
+#
+# Everything else stays permissive ON PURPOSE — see `_valid_email`.
+# `?` and `&` are here for a reason that is NOT about email syntax: a stored
+# address is rendered as `href={`mailto:${email}`}` on the profile page, and in
+# a mailto: URL those two characters start and separate QUERY PARAMETERS
+# (RFC 6068). An address containing `?subject=…&body=…` therefore pre-fills the
+# compose window a staff member opens by clicking "Send" — attacker-authored
+# text, in a mail client, from a message the staff member believes they wrote.
+# `:` is excluded for the same family of reasons (scheme confusion).
+# A true second recipient is already blocked by the single-`@` rule below.
+# Found re-reviewing the #418 fix, 2026-08-07.
+_EMAIL_DISALLOWED = frozenset(',;<>"()[]\\?&:')
+
+
+def _valid_email(value: str) -> bool:
+    """A minimal SHAPE gate for an address submitted through the public survey.
+
+    Note what this deliberately does NOT do: it does not call
+    `email_reach.is_sendable_email`. That function's permissiveness is a
+    documented decision (see its docstring) — being stricter there was silently
+    dropping real alumni, and it also rejects the reserved domains that dev's
+    entire seed dataset uses. Reusing it as the survey's write gate would make
+    the survey un-testable on dev and would re-introduce the exact failure that
+    module exists to remove. The staff/import gate stays exactly as it is; this
+    rule only governs what a stranger with a survey link may PUT in the column.
+
+    So the bar here is "is this one address, and only one" rather than "is this
+    address real": exactly one `@`, a non-empty local part and a domain with a
+    dot, nothing longer than the column, and none of `_EMAIL_DISALLOWED`. A
+    misspelled-but-well-formed address still gets through and is still a data
+    problem staff can see and fix — which is correct. A second recipient smuggled
+    into the field does not.
+    """
+    if len(value) > _EMAIL_MAX:
+        return False
+    if any(ch.isspace() or ch in _EMAIL_DISALLOWED or ord(ch) < 0x20 for ch in value):
+        return False
+    local, sep, domain = value.partition("@")
+    if not sep or "@" in domain:
+        return False
+    return (
+        bool(local)
+        and "." in domain
+        and not domain.startswith(".")
+        and not domain.endswith(".")
+    )
 
 
 # The whitelist of fields an alum may submit + where each writes. Order matches
@@ -130,10 +243,41 @@ _FIELDS: tuple[_Field, ...] = (
     # sheet and staff all call this column the personal email, and the survey
     # calling it something else made "it says I have no personal email" hard to
     # reconcile with a form that plainly showed one. One name everywhere.
-    _Field("contact.personal_email", "Personal email", "contact", "personal_email", "text"),
-    _Field("contact.work_email", "Work email", "contact", "work_email", "text"),
+    #
+    # Both email columns carry `_valid_email` (#418). They are the ONLY fields on
+    # this whitelist whose stored value is later handed to an outbound sender, so
+    # an unvalidated one is not merely bad data — a second address smuggled in
+    # here silently redirects or copies every future mail we send that alumnus.
+    _Field(
+        "contact.personal_email",
+        "Personal email",
+        "contact",
+        "personal_email",
+        "text",
+        validate=_valid_email,
+    ),
+    _Field(
+        "contact.work_email",
+        "Work email",
+        "contact",
+        "work_email",
+        "text",
+        validate=_valid_email,
+    ),
     _Field("contact.phone", "Phone", "contact", "phone", "text"),
-    _Field("profile.linkedin_url", "LinkedIn", "alumni", "linkedin_url", "text"),
+    # `_validate_linkedin_url` on the staff schemas never ran on this path (#418):
+    # `apply_response` writes with `setattr`, so no Pydantic validator fires. The
+    # column renders as an `href` on staff pages, which makes an unvalidated
+    # public write a link a signed-in reviewer clicks. Same rule, restated where
+    # the public writes. See `_valid_linkedin_url`.
+    _Field(
+        "profile.linkedin_url",
+        "LinkedIn",
+        "alumni",
+        "linkedin_url",
+        "text",
+        validate=_valid_linkedin_url,
+    ),
     _Field("profile.graduate_degree", "Graduate program", "alumni", "graduate_degree", "text"),
     _Field("profile.graduate_school", "Graduate school", "alumni", "graduate_school", "text"),
     _Field(
@@ -394,9 +538,9 @@ def _coerce(field: _Field, raw: object):
     """The submitted value coerced to the column's Python type for writing.
 
     Returns the module-level `_IGNORE` sentinel when the server refuses to write
-    the value at all (an off-list `choice`, or a blank on a non-`blankable`
-    field). Callers must check for it BEFORE writing — `None` means "store NULL"
-    and is a different instruction.
+    the value at all (an off-list `choice`, a blank on a non-`blankable` field, or
+    a `text` value its `validate` rule rejects). Callers must check for it BEFORE
+    writing — `None` means "store NULL" and is a different instruction.
     """
     value = _text(raw)
     if field.kind == "bool":
@@ -428,6 +572,21 @@ def _coerce(field: _Field, raw: object):
             return datetime.date.fromisoformat(value) if value else None
         except ValueError:
             return None
+    # `text` is the only kind whose stored value comes VERBATIM from the payload
+    # (`bool`, `designation` and `choice` all resolve to something the server
+    # chose; `int`/`date` are parsed into typed values), so it is the only kind a
+    # `validate` rule can meaningfully guard — and the only one that needs it.
+    #
+    # A blank skips the rule on purpose: it is not a hostile value, it is the
+    # "clear this column" instruction, already gated by `blankable` above. Running
+    # an email or URL rule against "" would turn every legitimate clear into a
+    # silently-ignored answer.
+    if value and field.validate is not None and not field.validate(value):
+        # Same disposition as an off-list `choice`, and for the same reason: the
+        # server decides what may be written, and refusing is safer than either
+        # storing the value or NULLing a column that may hold a good one. The
+        # caller counts this in `ignored` and logs the KEY, never the value.
+        return _IGNORE
     return value or None
 
 
@@ -618,9 +777,35 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
 
 
 async def _get_pending(session: AsyncSession, response_id: int) -> SurveyResponse:
+    """The response, locked, if and only if it is still pending (#421).
+
+    `FOR UPDATE` is what makes the status check above mean anything. Without it
+    two reviewers — or one double-click, or a retried request — both read
+    `status == 'pending'`, both pass, and then both proceed: one writes the
+    staged fields to the alum's record and promotes their photo while the other
+    marks the response REJECTED. The record has changed and the audit trail says
+    it was refused, which is the worst of both outcomes because nothing looks
+    wrong afterwards. `apply_response` also promotes a staged photo and then
+    DELETES the staged object, so the loser of the race can additionally 500 on a
+    key that no longer exists.
+
+    Taking the lock here rather than re-checking the status just before commit is
+    deliberate, and is the same pattern (and the same reasoning) as
+    `survey_reset._load_alum`: under READ COMMITTED the second transaction blocks
+    on the lock until the first commits, then re-reads the row it was waiting for
+    and sees `applied`/`rejected` — so it raises the ordinary "already reviewed"
+    error instead of doing half the work. The lock is row-level and scoped to the
+    single response, so it never blocks review of anybody else's.
+
+    This only holds because the lock and the commit share one transaction: both
+    `apply_response` and `reject_response` call this at the top and commit at the
+    end of the SAME session. Do not move the read out of that transaction.
+    """
     resp = (
         await session.execute(
-            select(SurveyResponse).where(SurveyResponse.survey_response_id == response_id)
+            select(SurveyResponse)
+            .where(SurveyResponse.survey_response_id == response_id)
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if resp is None:

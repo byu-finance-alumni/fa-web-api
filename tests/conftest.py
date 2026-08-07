@@ -14,6 +14,7 @@ directly in tests/test_permissions.py.
 import pytest
 
 from app.api.dependencies.auth import get_permission_config
+from app.core import rate_limit
 from app.core.capabilities import DEFAULT_GRANTS
 from app.main import app
 
@@ -23,3 +24,18 @@ def _default_permission_config():
     app.dependency_overrides[get_permission_config] = lambda: dict(DEFAULT_GRANTS)
     yield
     app.dependency_overrides.pop(get_permission_config, None)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limit_windows():
+    """Start every test with empty rate-limit counters.
+
+    ``app/core/rate_limit.py`` keeps its fixed-window state in a module-level
+    dict, so without this the budget a test spends leaks into every later test in
+    the session. That matters most for the unauthenticated limiters (#423): they
+    key on the CLIENT IP, and every TestClient request in the whole suite shares
+    the same one, so the login routes' budgets would otherwise be consumed
+    collectively and a test could fail depending only on what ran before it.
+    """
+    rate_limit.reset()
+    yield

@@ -23,6 +23,7 @@ history depends on retained records.
 """
 
 import asyncio
+import contextlib
 import datetime
 import posixpath
 from typing import Annotated, Literal
@@ -769,6 +770,59 @@ def _image_content_error(data: bytes, expected_mime: str) -> str | None:
     return None
 
 
+def _sniffed_head_error(head: bytes, content_type: str | None) -> str | None:
+    """Judge the leading bytes of an object that landed via a DIRECT PUT, given
+    whatever ``Content-Type`` storage reports for it. Returns an error message, or
+    None when the bytes check out.
+
+    Shared by BOTH direct-upload confirm paths — the single
+    :func:`confirm_headshot_upload` and the bulk :func:`_verify_landed_headshot` —
+    because they had already drifted apart once (#419): the bulk path sniffed and
+    the single path trusted the declared type, which is the uploader's own label.
+    One function means a future change to what "a real image" means cannot land on
+    only one of them.
+
+    A missing content type is not itself a rejection: storage occasionally reports
+    none, and the bytes alone still answer the question that matters — is this a
+    JPEG/PNG/WebP at all."""
+    if content_type is not None:
+        return _image_content_error(head, content_type)
+    if _sniff_image_mime(head) is None:
+        return "File content is not a JPEG, PNG, or WebP image."
+    return None
+
+
+async def _purge_rejected_headshot(
+    session: AsyncSession,
+    actor_user_id: int | None,
+    alumni_id: int,
+    key: str,
+    rejected_field: str,
+    value: object,
+) -> None:
+    """Delete a non-conforming object from the headshots bucket and audit the
+    rejection, committing that audit row.
+
+    The delete is what stops a rejected upload from continuing to serve as the
+    alumnus's headshot, and the ``upload_headshot_rejected`` row is the terminal
+    half of the trail opened by ``upload_headshot_started`` at mint time — so the
+    "started" row can never be mistaken for a completed, conforming upload. A
+    storage failure on the delete must not swallow the audit: a stuck object is a
+    storage problem, not a reason to record the upload as accepted (the bulk path
+    reasons the same way)."""
+    with contextlib.suppress(ServiceError):
+        await supabase_storage.delete_object(_HEADSHOT_BUCKET, key)
+    service._audit(
+        session,
+        actor_user_id,
+        "upload_headshot_rejected",
+        alumni_id,
+        field_name=rejected_field,
+        new_value=value,
+    )
+    await session.commit()
+
+
 async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
     """Return the alumnus's net_id (the headshot object key), or raise 404/400."""
     alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
@@ -859,41 +913,56 @@ async def confirm_headshot_upload(
     ``upload_headshot_started`` row).
 
     Defense-in-depth: the bucket's own allow-list/size-limit is the primary guard
-    on the direct PUT, but we re-check the object's type + size here and delete
-    anything outside the contract, so a bucket misconfig can't silently let a bad
-    file through. The probe FAILS OPEN — if it can't read the object we fall back
-    to a plain existence check rather than reject a legitimate upload."""
+    on the direct PUT, but we re-check the object's type + size here AND sniff its
+    real leading bytes, deleting anything outside the contract, so a bucket
+    misconfig can't silently let a bad file through. The probe FAILS OPEN — if it
+    can't read the object we fall back to a plain existence check rather than
+    reject a legitimate upload.
+
+    The byte sniff is the load-bearing half (#419). Nothing about the object here
+    was chosen by us: the browser PUT it straight to storage and picked its own
+    ``Content-Type``, exactly like the multipart header on the single-request
+    upload above. This path used to check only that declared type, so anyone with
+    the photo capability could mint a legitimate signed URL, skip the cropper, PUT
+    arbitrary bytes labelled ``image/jpeg`` and have them audited
+    ``upload_headshot`` and served back as a verified headshot. The bulk-import
+    sibling (:func:`_verify_landed_headshot`) always sniffed; this one had drifted,
+    and the two now do the same thing for the same reason."""
     net_id = await _alumnus_net_id(session, alumni_id)
-    content_type, size = await supabase_storage.probe_object(_HEADSHOT_BUCKET, net_id)
-    if content_type is None and size is None:
-        # Couldn't read metadata — confirm the object at least exists so a
+    content_type, size, head = await supabase_storage.probe_object_head(
+        _HEADSHOT_BUCKET, net_id
+    )
+    if content_type is None and size is None and head is None:
+        # Couldn't read the object at all — confirm it at least exists so a
         # never-uploaded key can't be "confirmed", then record completion.
         if await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id) is None:
             raise InvalidRequestError("No uploaded image was found to confirm.")
     elif content_type is not None and content_type not in _HEADSHOT_MIME_TYPES:
-        await supabase_storage.delete_object(_HEADSHOT_BUCKET, net_id)
-        service._audit(
-            session,
-            user.user_id,
-            "upload_headshot_rejected",
-            alumni_id,
-            field_name="content_type",
-            new_value=content_type,
+        await _purge_rejected_headshot(
+            session, user.user_id, alumni_id, net_id, "content_type", content_type
         )
-        await session.commit()
         raise InvalidRequestError("Headshot must be a JPEG, PNG, or WebP image.")
     elif size is not None and size > _HEADSHOT_MAX_BYTES:
-        await supabase_storage.delete_object(_HEADSHOT_BUCKET, net_id)
-        service._audit(
-            session,
-            user.user_id,
-            "upload_headshot_rejected",
-            alumni_id,
-            field_name="size",
-            new_value=size,
+        await _purge_rejected_headshot(
+            session, user.user_id, alumni_id, net_id, "size", size
         )
-        await session.commit()
         return _too_large_response(_HEADSHOT_MAX_BYTES)
+    # `head is not None`, NOT truthiness: an empty object reads back as `b""`,
+    # which is a real answer and must be REJECTED (nothing is a valid JPEG/PNG/
+    # WebP). Only `None` means the probe failed, which is the documented
+    # fail-open case. Testing truthiness let a 0-byte upload skip this check
+    # entirely and be audited as a successful headshot.
+    elif head is not None and (
+        content_error := _sniffed_head_error(head, content_type)
+    ) is not None:
+        # Real bytes contradict the label (or aren't an image at all): the object
+        # is gone before this returns, so a rejected upload never survives as the
+        # alumnus's headshot. ``field_name="content"`` matches the bulk path's
+        # rejected_field so both show up the same way in the audit trail.
+        await _purge_rejected_headshot(
+            session, user.user_id, alumni_id, net_id, "content", content_type or net_id
+        )
+        raise InvalidRequestError(content_error)
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
     await session.commit()
     return Response(status_code=204)
@@ -1266,15 +1335,14 @@ async def _verify_landed_headshot(key: str) -> tuple[str, str, str | None]:
     if size is not None and size > _HEADSHOT_MAX_BYTES:
         mib = _HEADSHOT_MAX_BYTES // (1024 * 1024)
         return ("invalid", f"Image exceeds the {mib} MB per-file size limit.", "size")
-    if head:
-        if content_type is not None:
-            content_error = _image_content_error(head, content_type)
-        else:
-            content_error = (
-                None
-                if _sniff_image_mime(head) is not None
-                else "File content is not a JPEG, PNG, or WebP image."
-            )
+    if head is not None:
+        # Same judgement as the single confirm path, from the same function, so
+        # the two can't drift apart again (#419).
+        #
+        # `is not None`, NOT truthiness — an empty object reads back as `b""`
+        # and must be rejected; only `None` (a failed probe) fails open. The
+        # truthy form skipped the check for a 0-byte upload on BOTH paths.
+        content_error = _sniffed_head_error(head, content_type)
         if content_error is not None:
             return ("invalid", content_error, "content")
     return ("matched", "Headshot uploaded.", None)

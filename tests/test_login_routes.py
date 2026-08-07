@@ -34,13 +34,16 @@ def _ctx(*roles: str, user_id: int = 1) -> UserContext:
 class _ThrottleSession:
     """Fake session that records attempts in-memory for the throttle routes.
 
-    Exposes only what app/services/login_lockout.py touches. ``user`` is the
-    seeded registered user (or None for an unknown email).
+    Exposes what app/services/login_lockout.py touches, plus the ``execute`` /
+    ``rollback`` pair the retention purge uses (#423) so that purge is a clean
+    no-op here instead of a swallowed AttributeError. ``user`` is the seeded
+    registered user (or None for an unknown email).
     """
 
     def __init__(self, user=None):
         self.user = user
         self.attempts: dict = {}
+        self.executed: list = []
         self.commits = 0
 
     async def scalar(self, _stmt):
@@ -63,8 +66,14 @@ class _ThrottleSession:
         if isinstance(obj, LoginAttempt):
             self.attempts.pop(obj.email_lc, None)
 
+    async def execute(self, stmt):
+        self.executed.append(stmt)
+
     async def commit(self):
         self.commits += 1
+
+    async def rollback(self):
+        pass
 
 
 @pytest.fixture

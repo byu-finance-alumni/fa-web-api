@@ -10,9 +10,29 @@
 --   * source_id references are provenance pointers and are nullable
 --   * alumni_id / user_id ownership references are NOT NULL where the row
 --     cannot exist without its parent
+--
+-- ROW-LEVEL SECURITY IS NOT DECLARED HERE. Every table in `public` must run with
+-- deny-all RLS; that is applied by ./rls_lockdown.sql, which sweeps whatever is
+-- actually in the database rather than reading this file. Keeping the two apart
+-- means a table missing from this snapshot still gets locked down (#424).
 -- =============================================================================
 
 BEGIN;
+
+-- -----------------------------------------------------------------------------
+-- Migration bookkeeping
+-- -----------------------------------------------------------------------------
+
+-- Created by ./migrate.sh's own bootstrap statement before it
+-- applies anything, NOT by this file or by any migration — it has to exist
+-- before the first migration can be recorded. Documented here anyway (#424):
+-- being invisible to every schema file is exactly how it ended up as the one
+-- table in the database running without RLS. One row per applied migration
+-- filename; no data, no FKs, never read by the application.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename   text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
 
 -- -----------------------------------------------------------------------------
 -- Identity & access control
@@ -975,10 +995,45 @@ CREATE TABLE bbq_attendance (
 );
 
 -- -----------------------------------------------------------------------------
+-- Reference data & application config
+-- -----------------------------------------------------------------------------
+
+-- City -> lat/lng crosswalk backing the map radius/proximity search and the
+-- county rollups (#151). Non-sensitive public US Census reference data, seeded
+-- from the frontend crosswalk. Keys are normalized: city_norm = lower(trim(city)),
+-- state = upper 2-letter. See migrations/2026-06-25_city_geo_crosswalk.sql and
+-- 2026-06-26_city_geo_county_fips.sql.
+CREATE TABLE city_geo (
+    city_norm   text NOT NULL,
+    state       char(2) NOT NULL,
+    lat         double precision NOT NULL,
+    lng         double precision NOT NULL,
+    -- 5-digit county FIPS, so /geography/counties can aggregate nationwide.
+    county_fips char(5),
+    PRIMARY KEY (city_norm, state)
+);
+
+-- Engineer / super-admin-curated dashboard quick-filter presets: a label plus a
+-- relative in-app deep link into a pre-filtered list. No active flag — admins
+-- add, reorder and remove rows directly. See
+-- migrations/2026-06-26_dashboard_presets.sql.
+CREATE TABLE dashboard_presets (
+    dashboard_preset_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    label               varchar(200) NOT NULL,
+    href                varchar(500) NOT NULL,
+    sort_order          integer NOT NULL DEFAULT 0,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
+
+-- -----------------------------------------------------------------------------
 -- Indexes on foreign keys / common lookups
 -- -----------------------------------------------------------------------------
 
 CREATE INDEX idx_user_roles_user_id              ON user_roles (user_id);
+-- Retention purge on the rolling failed-login counter filters on this (#423);
+-- see migrations/2026-08-07_schema_migrations_rls_and_login_retention.sql.
+CREATE INDEX idx_login_attempts_last_failed_at   ON login_attempts (last_failed_at);
 CREATE INDEX idx_user_roles_role_id              ON user_roles (role_id);
 CREATE INDEX ix_role_capabilities_role_id        ON role_capabilities (role_id);
 CREATE INDEX idx_import_batches_user_id          ON import_batches (imported_by_user_id);
@@ -1042,6 +1097,11 @@ CREATE INDEX idx_notes_interaction_id                 ON notes (interaction_id);
 CREATE INDEX idx_notes_event_id                       ON notes (event_id);
 CREATE INDEX idx_donations_alumni_id                  ON donations (alumni_id);
 CREATE INDEX idx_donations_year                       ON donations (donation_year);
+
+-- city_geo lookups: by state for the map's per-state work, by county FIPS for
+-- the county rollups.
+CREATE INDEX idx_city_geo_state                       ON city_geo (state);
+CREATE INDEX idx_city_geo_county                      ON city_geo (county_fips);
 
 -- Conference-attendee matching (#612). Expression indexes matching the
 -- normalized exact-equality legs the matcher emits; see

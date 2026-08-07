@@ -39,6 +39,12 @@ due, never how to send or how to record it. That split is deliberate: the manual
 send used to call the raw sender directly without recording anything, which is
 what produced the unscheduled second send of 2026-08-02.
 
+The account-wide send cap (:func:`_run_allowance`) lives here because the config
+row and the console's cap screen do, but it is ENFORCED down in
+:func:`survey_email.send_survey_stage` (#417) — reading it only in the cron body,
+as this module used to, left the manual send able to email a whole cohort past a
+limit the console was showing beside the button.
+
 A campaign is normally created from the console, but a MANUAL send to a year that
 has none creates one too (:func:`create_campaign_for_send`, #405) — otherwise the
 send delivers the initial email and the cron, which only iterates schedule rows,
@@ -1460,12 +1466,21 @@ async def update_send_config(
 
 
 async def _run_allowance(session: AsyncSession) -> int | None:
-    """How many emails this cron run may send under the configured cap, or
-    ``None`` for unlimited (cap disabled).
+    """How many emails may still be sent under the configured cap, or ``None``
+    for unlimited (cap disabled).
 
     The cap is account-wide: the daily and monthly budgets minus what Resend has
-    already sent today / this month (the same usage tally the console shows). The
-    run may send up to whichever budget is tighter."""
+    already sent today / this month (the same usage tally the console shows). A
+    send may go up to whichever budget is tighter.
+
+    NOT the cron's private number, despite living here (#417). It is read by the
+    cron once per run to pace ALL years against one budget, and again inside
+    :func:`survey_email.send_survey_stage`, which is where it is actually
+    ENFORCED — so the console's manual send is bounded by it too. It used to be
+    called from `_run_due_schedules_locked` alone, which is exactly why "Send
+    now" could email an entire cohort straight past a limit the console was
+    displaying beside the button. Reached through this module's attribute rather
+    than copied, so the meter, the pacing and the gate stay one number."""
     config = await get_send_config(session)
     if not config.enabled:
         return None
@@ -1623,6 +1638,15 @@ async def _run_due_schedules_locked(
         # targets this run, then stop — the rest resumes on the next cron. This
         # comes AFTER the completion decision on purpose: a year starved of
         # budget still owes emails and must never be completed.
+        #
+        # `send_survey_stage` now re-reads the same budget and clamps to the
+        # tighter of the two (#417), which does NOT double-count: every delivered
+        # email is claimed and committed before the next year is considered, so
+        # the re-read has already absorbed exactly what was subtracted from
+        # `allowance` here. This local running total stays because it is what
+        # PACES one run across several years — the earliest campaign drains
+        # first — and because it is the one figure that stays correct after a 429
+        # releases a claim (the re-read would then read looser; `min` keeps this).
         if allowance is not None and allowance <= 0:
             break
 

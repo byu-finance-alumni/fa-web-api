@@ -19,23 +19,98 @@
 -- SAFE TO RE-RUN: every statement below is idempotent.
 --
 -- =============================================================================
--- ⚠️ 2026-08-07 (#424): THIS FILE NO LONGER CARRIES A HAND-MAINTAINED TABLE LIST.
+-- ⚠️ 2026-08-07 (#424): THIS FILE NOW HAS TWO LAYERS — A LIST AND A SWEEP.
 -- =============================================================================
 -- It used to enumerate ~45 tables by name, with a note asking whoever adds a
 -- table to remember to add it here too. That list had silently fallen three
 -- tables behind reality (`city_geo`, `dashboard_presets`, `schema_migrations`),
 -- and the one of those that was ALSO missing from every other source —
--- `schema_migrations`, created ad hoc by migrate.sh's bootstrap CREATE TABLE —
+-- `schema_migrations`, created ad hoc by migrate.sh's own bootstrap statement —
 -- was the single table in the database running without RLS.
 --
--- A list that must be remembered is the bug. The sweep below cannot miss a
--- table, so it, not a list, is now the source of truth. The full table inventory
--- lives in ./schema.sql, which is the file that is supposed to describe the
--- schema; this file only enforces a property over whatever is actually there.
+-- A list that must be remembered is the bug — so the SWEEP below is now the
+-- operational source of truth, and it cannot miss a table.
 --
--- RUN THIS after any schema change. There is nothing to keep in sync.
+-- ⚠️ BUT THE EXPLICIT LIST STAYS, AND MUST. Deleting it broke CI (2026-08-07):
+-- `scripts/ferpa_check.py` proves the invariant by matching every
+-- `CREATE TABLE` in ./schema.sql against an `ENABLE ROW LEVEL SECURITY` target
+-- in THIS file. A `DO` block is opaque to that check, so with only the sweep
+-- present the guard went blind and reported all 51 tables as unprotected.
+--
+-- The two do different jobs and neither replaces the other:
+--
+--   * The LIST is the declarative, statically-checkable claim. It is what
+--     catches a table added to schema.sql and never locked down — at review
+--     time, before it ships.
+--   * The SWEEP catches what the list structurally cannot: a table that exists
+--     in the database but in no schema file. That is precisely how
+--     `schema_migrations` hid.
+--
+-- Keep both in sync with reality. If you add a table, add it to the list; the
+-- sweep is the backstop for when someone doesn't.
 -- =============================================================================
 
+
+
+-- =============================================================================
+-- THE EXPLICIT LIST — every table declared in ./schema.sql.
+-- =============================================================================
+-- Statically checked by scripts/ferpa_check.py, which fails CI if a table in
+-- schema.sql has no line here. That check is why this list exists: it catches
+-- an unprotected new table at review time. Idempotent — ENABLE ROW LEVEL
+-- SECURITY is a no-op when it is already on.
+-- =============================================================================
+
+ALTER TABLE schema_migrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE login_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE login_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE login_failures ENABLE ROW LEVEL SECURITY;
+ALTER TABLE roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE role_capabilities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE data_sources ENABLE ROW LEVEL SECURITY;
+ALTER TABLE import_batches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alumni ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alumni_contact_info ENABLE ROW LEVEL SECURITY;
+ALTER TABLE current_employment ENABLE ROW LEVEL SECURITY;
+ALTER TABLE education_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE employment_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE verification_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alumni_engagement ENABLE ROW LEVEL SECURITY;
+ALTER TABLE research_tracking ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alumni_tags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE status_labels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alumni_status_labels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vocabulary_terms ENABLE ROW LEVEL SECURITY;
+ALTER TABLE support_contacts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE interactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE follow_up_tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE event_attendance ENABLE ROW LEVEL SECURITY;
+ALTER TABLE donations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE surveys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE survey_responses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE survey_schedule ENABLE ROW LEVEL SECURITY;
+ALTER TABLE survey_send_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE survey_reset_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE survey_campaign_retirement ENABLE ROW LEVEL SECURITY;
+ALTER TABLE survey_send_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE maintenance_mode ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attachments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE engineer_action_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE duplicate_candidates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alumni_program_engagement ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alumni_mentor_industries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE nettrek_hosting ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conference_participation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finance_society_leadership ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bbq_attendance ENABLE ROW LEVEL SECURITY;
+ALTER TABLE city_geo ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dashboard_presets ENABLE ROW LEVEL SECURITY;
 
 -- =============================================================================
 -- THE SWEEP — enable RLS on every public table that does not already have it.

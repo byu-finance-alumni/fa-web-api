@@ -23,7 +23,7 @@ BEGIN;
 -- Migration bookkeeping
 -- -----------------------------------------------------------------------------
 
--- Created by ./migrate.sh's bootstrap `CREATE TABLE IF NOT EXISTS` before it
+-- Created by ./migrate.sh's own bootstrap statement before it
 -- applies anything, NOT by this file or by any migration — it has to exist
 -- before the first migration can be recorded. Documented here anyway (#424):
 -- being invisible to every schema file is exactly how it ended up as the one

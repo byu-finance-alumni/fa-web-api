@@ -17,7 +17,14 @@ whitelist), and staff review is not a substitute for validation: a reviewer sees
 a plausible before/after diff, not a `javascript:` href or a second recipient
 hidden in an email. A field whose value is trusted downstream — rendered as a
 link, handed to the sender, grouped in a dashboard, filtered on — must carry its
-rule HERE, as a `choice`, a `designation`, or a `_Field.validate` predicate.
+rule HERE, as a `choice`, a `designation`, a `_Field.max_length` or a
+`_Field.validate` predicate.
+
+Reuse the staff rule, never restate it. Every predicate below delegates to the
+matching validator in `app/schemas/alumni.py` (or is built from the same
+constants), because two copies of "what is a valid name / year / birthday" drift,
+and the drift is invisible until someone notices the public path accepting what
+the staff path rejects — which is the whole bug this file keeps re-fixing.
 
 These rows ARE the survey history the profile's Surveys tab shows: it derives
 from them in `profile._derive_survey_history`. Do NOT also insert into the
@@ -34,7 +41,12 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import MARITAL_STATUSES, holds_designation
+from app.core.dropdowns import (
+    INDUSTRIES,
+    MARITAL_STATUSES,
+    SURVEY_EMPLOYMENT_STATUSES,
+    holds_designation,
+)
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -42,7 +54,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.survey_response import SurveyResponse
-from app.schemas.alumni import AlumniBase
+from app.schemas.alumni import _NAME_DISALLOWED, AlumniBase, _has_control_chars
 from app.schemas.survey import (
     SurveyChange,
     SurveyResponseItem,
@@ -98,6 +110,22 @@ class _Field:
     # `choice` only: the exact values that may be written. Anything else the alum
     # (or anyone holding a survey link) submits is IGNORED — see `_coerce`.
     options: tuple[str, ...] | None = None
+    # `text` only: the column's own width, from database/schema.sql. A longer
+    # submission is refused (`_IGNORE`) rather than truncated — see `_coerce`.
+    #
+    # This is a SEPARATE rule from `validate`, not part of it, because the two
+    # answer different questions: `validate` asks "is this value's SHAPE
+    # acceptable", this asks "does the column physically hold it". Bundling the
+    # length into each predicate would mean one cap per rule rather than one cap
+    # per column, and `_valid_free_text` guards columns from varchar(20) to
+    # varchar(255).
+    #
+    # Without it a public submit could stage a value no column can hold. For most
+    # of these the apply is simply a 500 (Postgres 22001) — bad, but loud. The one
+    # that is quietly expensive is `other_designations`: an unbounded `text`
+    # column carrying a trigram GIN index, so a multi-megabyte answer is accepted,
+    # stored, and bloats an index every alumni search reads.
+    max_length: int | None = None
     # False when a blank submission is NOT an instruction to clear the column.
     # Defaults True, which is the long-standing `text` behaviour (blank -> NULL).
     # Turned off for the identity columns the confirm page pre-fills: an empty box
@@ -214,31 +242,274 @@ def _valid_email(value: str) -> bool:
     )
 
 
+def _valid_name(value: str) -> bool:
+    """The STAFF name rule, reused verbatim on the six name columns (#426).
+
+    Deliberately delegates to `AlumniBase._validate_name` for the same reason
+    `_valid_linkedin_url` delegates: two copies of "what may appear in a name"
+    would drift, and the drift would be invisible until someone noticed the
+    public path accepting what the staff path rejects.
+
+    What it blocks: `;=<>|` (meaningful to a SQL parser, meaningless in a name),
+    control characters, a LEADING `=`/`+`/`-`/`@` (CSV formula injection), a
+    digits-only value, and anything past the column's 100 characters.
+
+    Deliberately PERMISSIVE about real names — verified against the staff rule,
+    2026-08-08: O'Brien-Smith, St. John, Anne-Marie, 'Alohilani and N'Diaye (both
+    curly-apostrophe spellings), accented Latin and non-Latin scripts all pass. A
+    deny-list is used precisely so a surname we have never seen is accepted by
+    default; refusing one is far worse than storing an odd one.
+
+    Applied here rather than left to the reviewer because a control character in
+    an identity column is invisible in a before/after diff, and these are the
+    columns search, the duplicate check and every export key off.
+    """
+    try:
+        AlumniBase._validate_name(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _free_text_ok(value: str, leads: str) -> bool:
+    """The CHARACTER half of the staff name rule, for the free-text columns.
+
+    Built from the same two things `AlumniBase._validate_name` is built from —
+    `_NAME_DISALLOWED` and `_has_control_chars`, imported, not re-typed — so
+    "which characters are disallowed" still has exactly one definition. What it
+    deliberately does NOT carry are that rule's two NAME-SHAPE checks, because
+    neither is true of these columns:
+
+    * the 100-character cap — these run from varchar(20) (`zip`) to varchar(255)
+      (`current_employer`), so the width belongs on `_Field.max_length`, per
+      column, not baked into a shared predicate;
+    * the digits-only rejection — a ZIP code and a phone number ARE digits only.
+
+    *leads* is the set of first characters that turn the cell into a live formula
+    on CSV export. `=` is in `_NAME_DISALLOWED` already, so callers pass the
+    remainder.
+    """
+    if _has_control_chars(value):
+        return False
+    if value[0] in leads:
+        return False
+    return not (_NAME_DISALLOWED & set(value))
+
+
+def _valid_free_text(value: str) -> bool:
+    """The free-text rule for employer, title, city/state/country/zip, gender,
+    citizenship, home country and the graduate fields (#426).
+
+    Same disposition as everything else on this path: a value that fails is
+    IGNORED, never rejected back at the alum and never written as NULL. That
+    matters more here than for the emails — this is data pollution, mitigated at
+    the far end (the CSV export neutralises formula leads, React escapes on
+    render), so the cost of a false positive (silently dropping a real answer)
+    is higher than the cost of a false negative.
+    """
+    return _free_text_ok(value, "+-@")
+
+
+def _valid_phone(value: str) -> bool:
+    """`_valid_free_text` with ONE exception: a leading `+`.
+
+    `+1 801-555-0100` is how an international number is written, and it is the
+    single most likely legitimate value in this whole whitelist to start with a
+    formula lead. Blocking it would silently discard exactly the numbers hardest
+    to re-collect. The staff path applies no character rule to `phone` at all
+    (`ContactCreate.phone` carries only a length), so this is still strictly
+    tighter than what staff can write, and a leading `+` is neutralised by the
+    CSV export like any other lead.
+    """
+    return _free_text_ok(value, "-@")
+
+
+def _valid_survey_text(value: str) -> bool:
+    """The staff `_validate_survey_text` rule — reject control characters — for
+    `other_designations`.
+
+    Narrower than `_valid_free_text` on purpose: this column legitimately holds
+    punctuation-heavy free text ("Series 7, Series 63; CFP Level 1"), so applying
+    the name character set here would be STRICTER than the staff path, which is
+    the mirror-image of the bug this issue is about. Control characters are the
+    part staff already refuse.
+    """
+    return not _has_control_chars(value)
+
+
 # The whitelist of fields an alum may submit + where each writes. Order matches
 # the confirm page. Anything not here is ignored on submit AND on apply.
 _FIELDS: tuple[_Field, ...] = (
-    _Field("employment.current_industry", "Industry", "employment", "current_industry", "text"),
-    _Field("profile.employment_status", "Employment status", "alumni", "employment_status", "text"),
-    _Field("employment.current_employer", "Company", "employment", "current_employer", "text"),
-    _Field("employment.current_title", "Title", "employment", "current_title", "text"),
+    # CONTROLLED VOCABULARIES (#426). Both were free text here while the staff
+    # path constrained them, which is the same shape of bug as marital status in
+    # #647: a public submit could mint a phantom bucket that then appears in the
+    # dashboard breakdown, the filter and `search_terms` as though it were one of
+    # ours. `choice` is the fix for both, and it already does the two things that
+    # make it safe to apply to columns prod has been filling from a free-text
+    # intake sheet for years — an off-list answer is IGNORED rather than stored or
+    # NULLed, and an off-list value already ON FILE still reads back verbatim.
+    #
+    # The lists are the canonical ones, imported, never restated: `INDUSTRIES` is
+    # what `validate_industry` enforces on the staff path, and
+    # `SURVEY_EMPLOYMENT_STATUSES` exists in `core/dropdowns.py` specifically for
+    # this field (the canonical eight minus "Unknown", which is meaningless as a
+    # self-description) and was, until now, imported by nothing.
+    #
+    # Checked against the frontend on 2026-08-08, because a mismatch here would
+    # silently ignore every legitimate answer — far worse than the free text it
+    # replaces. The survey's own dropdowns are static, not vocabulary-backed, so
+    # they cannot drift at runtime:
+    #   * employment status — `SURVEY_EMPLOYMENT_STATUS_OPTIONS` is the same seven
+    #     strings in the same order, both derived the same way from the canonical
+    #     eight. Exact match.
+    #   * industry — the survey offers `PRIMARY_INDUSTRY_OPTIONS` minus "Other"
+    #     (19 strings); all 19 are in `INDUSTRIES` exactly. The five it does not
+    #     offer (the four primary-excluded, plus "Other") stay WRITABLE here on
+    #     purpose: they are legitimate stored values, and `choice` re-canonicalises
+    #     casing, so an alum re-submitting one already on file is not refused.
+    #
+    # KNOWN GAP, needs a frontend change (Jake): the survey's industry control has
+    # an "Other" option that reveals a FREE-TEXT box. Whatever is typed there is
+    # now off-list and therefore ignored, silently. The frontend fix is to make
+    # that option submit the literal "Other" — which IS in `INDUSTRIES` — rather
+    # than a typed string. Until then an alum choosing Other loses that answer.
+    _Field(
+        "employment.current_industry",
+        "Industry",
+        "employment",
+        "current_industry",
+        "choice",
+        options=INDUSTRIES,
+        # Same reason as marital status: an alum whose stored industry is off-list
+        # sees a control with no matching option, and if leaving it alone wiped
+        # the column the survey would destroy the very legacy value `choice` is
+        # here to preserve.
+        blankable=False,
+    ),
+    _Field(
+        "profile.employment_status",
+        "Employment status",
+        "alumni",
+        "employment_status",
+        "choice",
+        options=SURVEY_EMPLOYMENT_STATUSES,
+        blankable=False,
+    ),
+    _Field(
+        "employment.current_employer",
+        "Company",
+        "employment",
+        "current_employer",
+        "text",
+        max_length=255,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "employment.current_title",
+        "Title",
+        "employment",
+        "current_title",
+        "text",
+        max_length=255,
+        validate=_valid_free_text,
+    ),
+    # Secondary industry stays FREE TEXT, unlike the primary above. It is free
+    # text on the staff path too (`EmploymentCreate` bounds its length and runs no
+    # `validate_industry` on it), and that consistency is deliberate — this is the
+    # blank where "Education" or "Non-profit" goes. It still gets the character
+    # rule and the column width.
     _Field(
         "employment.current_industry_secondary",
         "Secondary industry",
         "employment",
         "current_industry_secondary",
         "text",
+        max_length=255,
+        validate=_valid_free_text,
     ),
-    _Field("employment.current_city", "Employment city", "employment", "current_city", "text"),
-    _Field("employment.current_state", "Employment state", "employment", "current_state", "text"),
     _Field(
-        "employment.current_country", "Employment country", "employment", "current_country", "text"
+        "employment.current_city",
+        "Employment city",
+        "employment",
+        "current_city",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
     ),
-    _Field("employment.current_zip", "Company ZIP", "employment", "current_zip", "text"),
-    _Field("contact.city", "Residence city", "contact", "city", "text"),
-    _Field("contact.state", "Residence state", "contact", "state", "text"),
-    _Field("contact.country", "Residence country", "contact", "country", "text"),
-    _Field("profile.spouse_first_name", "Spouse first name", "alumni", "spouse_first_name", "text"),
-    _Field("profile.spouse_last_name", "Spouse last name", "alumni", "spouse_last_name", "text"),
+    _Field(
+        "employment.current_state",
+        "Employment state",
+        "employment",
+        "current_state",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "employment.current_country",
+        "Employment country",
+        "employment",
+        "current_country",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "employment.current_zip",
+        "Company ZIP",
+        "employment",
+        "current_zip",
+        "text",
+        max_length=20,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "contact.city",
+        "Residence city",
+        "contact",
+        "city",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "contact.state",
+        "Residence state",
+        "contact",
+        "state",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "contact.country",
+        "Residence country",
+        "contact",
+        "country",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
+    # Spouse names carry the same rule as the alum's own four below: they are
+    # names, and `_validate_name` is the staff rule for them.
+    _Field(
+        "profile.spouse_first_name",
+        "Spouse first name",
+        "alumni",
+        "spouse_first_name",
+        "text",
+        max_length=100,
+        validate=_valid_name,
+    ),
+    _Field(
+        "profile.spouse_last_name",
+        "Spouse last name",
+        "alumni",
+        "spouse_last_name",
+        "text",
+        max_length=100,
+        validate=_valid_name,
+    ),
     # "Personal email", not "Permanent email" (#392): the profile UI, the intake
     # sheet and staff all call this column the personal email, and the survey
     # calling it something else made "it says I have no personal email" hard to
@@ -254,6 +525,7 @@ _FIELDS: tuple[_Field, ...] = (
         "contact",
         "personal_email",
         "text",
+        max_length=255,
         validate=_valid_email,
     ),
     _Field(
@@ -262,9 +534,18 @@ _FIELDS: tuple[_Field, ...] = (
         "contact",
         "work_email",
         "text",
+        max_length=255,
         validate=_valid_email,
     ),
-    _Field("contact.phone", "Phone", "contact", "phone", "text"),
+    _Field(
+        "contact.phone",
+        "Phone",
+        "contact",
+        "phone",
+        "text",
+        max_length=50,
+        validate=_valid_phone,
+    ),
     # `_validate_linkedin_url` on the staff schemas never ran on this path (#418):
     # `apply_response` writes with `setattr`, so no Pydantic validator fires. The
     # column renders as an `href` on staff pages, which makes an unvalidated
@@ -276,10 +557,35 @@ _FIELDS: tuple[_Field, ...] = (
         "alumni",
         "linkedin_url",
         "text",
+        max_length=500,
         validate=_valid_linkedin_url,
     ),
-    _Field("profile.graduate_degree", "Graduate program", "alumni", "graduate_degree", "text"),
-    _Field("profile.graduate_school", "Graduate school", "alumni", "graduate_school", "text"),
+    _Field(
+        "profile.graduate_degree",
+        "Graduate program",
+        "alumni",
+        "graduate_degree",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "profile.graduate_school",
+        "Graduate school",
+        "alumni",
+        "graduate_school",
+        "text",
+        max_length=255,
+        validate=_valid_free_text,
+    ),
+    # THE ONLY `int` field on the whitelist, and the one that poisoned the review
+    # queue (#426). `_coerce` did a bare `int()`, so `"9" * 20` became a 20-digit
+    # Python integer that sailed through submit and staged fine — and then failed
+    # at APPLY, where Postgres raises 22003 on an `int` column. The transaction
+    # rolls back, the response never leaves `pending`, and a reviewer who clicks
+    # Approve gets a 500 every time, forever. Anyone holding a survey link could
+    # do it, repeatedly. The year range in `_coerce`'s `int` branch is what stops
+    # it; see the note there for why it is on the KIND, not on the field.
     _Field(
         "profile.graduate_graduation_year",
         "Projected graduation year",
@@ -330,8 +636,22 @@ _FIELDS: tuple[_Field, ...] = (
     ),
     # Everything else the alum holds stays free text (the survey collects it in
     # three "Other" blanks and joins them with ", ").
+    #
+    # The cap matters more here than anywhere else on the whitelist and is the
+    # reason `max_length` exists (#426): this is the one column that is `text`
+    # rather than a varchar, so the DATABASE imposes no ceiling, and it carries a
+    # trigram GIN index that every alumni search reads. A multi-megabyte answer
+    # was previously accepted, stored and indexed. 10000 mirrors the staff cap
+    # (`_OTHER_DESIGNATIONS_MAX` in schemas/alumni.py), which is already generous
+    # for "Series 7, Series 63".
     _Field(
-        "profile.other_designations", "Other designations", "alumni", "other_designations", "text"
+        "profile.other_designations",
+        "Other designations",
+        "alumni",
+        "other_designations",
+        "text",
+        max_length=10000,
+        validate=_valid_survey_text,
     ),
     # Personal & family (alumni table). Columns already exist — no migration.
     #
@@ -359,25 +679,64 @@ _FIELDS: tuple[_Field, ...] = (
     # this whitelist, and NULLing an identity column that search, the duplicate
     # check and every export key off is not an edit a public form should be able to
     # stage. Staff can still clear a name from the profile editor.
-    _Field("profile.first_name", "First name", "alumni", "first_name", "text", blankable=False),
+    #
+    # `validate=_valid_name` on all four (#426): until now the ONE rule the staff
+    # create/edit path applies to a name — no control characters, no `;=<>|`, no
+    # leading formula character — did not run on the only path the public can
+    # reach, so `=HYPERLINK("http://evil","click")` wrote cleanly into
+    # `first_name`. Same rule, restated where the public writes.
+    _Field(
+        "profile.first_name",
+        "First name",
+        "alumni",
+        "first_name",
+        "text",
+        max_length=100,
+        validate=_valid_name,
+        blankable=False,
+    ),
     _Field(
         "profile.middle_name",
         "Middle or Maiden name",
         "alumni",
         "middle_name",
         "text",
+        max_length=100,
+        validate=_valid_name,
         blankable=False,
     ),
-    _Field("profile.last_name", "Last name", "alumni", "last_name", "text", blankable=False),
+    _Field(
+        "profile.last_name",
+        "Last name",
+        "alumni",
+        "last_name",
+        "text",
+        max_length=100,
+        validate=_valid_name,
+        blankable=False,
+    ),
     _Field(
         "profile.preferred_first_name",
         "Preferred first name",
         "alumni",
         "preferred_first_name",
         "text",
+        max_length=100,
+        validate=_valid_name,
         blankable=False,
     ),
-    _Field("profile.gender", "Gender", "alumni", "gender", "text"),
+    # Gender is NOT a name — `_valid_free_text`, not `_valid_name`, because the
+    # staff path runs only a length check on it and a digits-only rejection has no
+    # meaning here.
+    _Field(
+        "profile.gender",
+        "Gender",
+        "alumni",
+        "gender",
+        "text",
+        max_length=30,
+        validate=_valid_free_text,
+    ),
     # Marital status became a fixed four-option choice in #647. It was free text
     # here (and the column still is a plain varchar(50) — see
     # `core.dropdowns.MARITAL_STATUSES` for why the constraint is not on the
@@ -397,9 +756,28 @@ _FIELDS: tuple[_Field, ...] = (
         # legacy value #647 requires be preserved.
         blankable=False,
     ),
+    # Bounds live on the `date` KIND, not here — see `_coerce`. Until #426 the
+    # survey accepted 0001-01-01 and 9999-12-31 while staff were held to
+    # 1900-and-not-future.
     _Field("profile.birth_date", "Birthday", "alumni", "birth_date", "date"),
-    _Field("profile.citizenship", "Citizenship", "alumni", "citizenship", "text"),
-    _Field("profile.home_country", "Home country", "alumni", "home_country", "text"),
+    _Field(
+        "profile.citizenship",
+        "Citizenship",
+        "alumni",
+        "citizenship",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
+    _Field(
+        "profile.home_country",
+        "Home country",
+        "alumni",
+        "home_country",
+        "text",
+        max_length=100,
+        validate=_valid_free_text,
+    ),
     _Field(
         "program.mentor_willing",
         "Willing to mentor students",
@@ -467,6 +845,34 @@ _FIELD_BY_KEY = {f.key: f for f in _FIELDS}
 _DEDUP_NAME_COLUMNS = frozenset({"first_name", "last_name"})
 
 _TRUE = frozenset({"yes", "true", "1"})
+
+# How much of an UNRECOGNIZED payload key reaches the log, and how many of them.
+# See `_log_safe_keys`.
+_LOG_KEY_MAX = 60
+_LOG_KEYS_MAX = 20
+
+
+def _log_safe_keys(keys: list[str]) -> str:
+    """Unrecognized payload keys, rendered so they cannot forge log lines (#426).
+
+    The nearby comment in `apply_response` — "field KEYS only ever appear in the
+    log, never a submitted value" — is true of the whitelist keys and misses the
+    case this handles: a key that is NOT on the whitelist is itself submitted
+    text, chosen by whoever POSTed, and it was being joined into a `log.warning`
+    verbatim. A newline in one forges a second, entirely attacker-authored log
+    line, which is how a real entry gets buried or an investigation misled.
+
+    `repr` is what fixes it — it escapes CR, LF, TAB and every other control
+    character and quotes the result, so a key can no longer break out of its own
+    line. Truncating and capping the count handles the other half: the payload is
+    staged JSON with no key-count limit, so a submission carrying thousands of
+    junk keys would otherwise write a single enormous log record.
+    """
+    shown = sorted(keys)[:_LOG_KEYS_MAX]
+    rendered = ", ".join(repr(k[:_LOG_KEY_MAX]) for k in shown)
+    if len(keys) > _LOG_KEYS_MAX:
+        rendered += f", ... ({len(keys) - _LOG_KEYS_MAX} more)"
+    return rendered
 
 
 def _text(value: object) -> str:
@@ -538,9 +944,15 @@ def _coerce(field: _Field, raw: object):
     """The submitted value coerced to the column's Python type for writing.
 
     Returns the module-level `_IGNORE` sentinel when the server refuses to write
-    the value at all (an off-list `choice`, a blank on a non-`blankable` field, or
-    a `text` value its `validate` rule rejects). Callers must check for it BEFORE
-    writing — `None` means "store NULL" and is a different instruction.
+    the value at all: an off-list `choice`, a blank on a non-`blankable` field, a
+    `text` value longer than its column or rejected by its `validate` rule, an
+    out-of-range year, or an out-of-range birthday. Callers must check for it
+    BEFORE writing — `None` means "store NULL" and is a different instruction.
+
+    Every refusal above is the SAME disposition on purpose: the column keeps what
+    it already held. Refusing is safe here in a way that rejecting is not, because
+    the alum is never told — so the rules are written to err towards accepting an
+    odd-looking real answer rather than dropping one.
     """
     value = _text(raw)
     if field.kind == "bool":
@@ -562,25 +974,83 @@ def _coerce(field: _Field, raw: object):
         # NULL (which would destroy a legitimate off-list value already on file).
         return _choice(field, raw) or _IGNORE
     if field.kind == "int":
-        try:
-            return int(value) if value else None
-        except ValueError:
+        # QUEUE POISONING (#426). This was a bare `int()`, which happily builds a
+        # 20-digit Python integer out of `"9" * 20`. Nothing here rejected it,
+        # nothing at submit rejected it, and the reviewer's diff showed an
+        # ordinary-looking number — but the column is a Postgres `int`, so the
+        # write raised 22003, the transaction rolled back, and the response was
+        # stuck `pending` FOREVER: every future Approve on it 500s. Anyone holding
+        # a survey link could do that, repeatedly, to any number of responses.
+        #
+        # The range is the STAFF rule (`AlumniBase._validate_year`, 1900 .. this
+        # year + 10) reached the same way `_valid_linkedin_url` reaches its own —
+        # one definition of "a plausible year", not two. It happens to also be far
+        # inside int4, so the crash cannot recur.
+        #
+        # It is on the KIND rather than on the field because `graduate_graduation_year`
+        # is the only `int` on the whitelist and a YEAR is the only thing this kind
+        # has ever meant. If a non-year integer is ever added, give it its own kind
+        # instead of widening this — a range that fits both is a range that fits
+        # neither.
+        #
+        # Disposition: `_IGNORE`, exactly like an off-list `choice`. NOT `None`,
+        # which would mean "store NULL" and would let a bad answer wipe a good year
+        # off the record. This also unwedges any response already staged with a
+        # poisoned value: `_coerce` runs off the STORED payload at apply time, so
+        # the field is now skipped and the response applies (or rejects) normally
+        # instead of failing on every attempt.
+        if not value:
             return None
+        try:
+            number = int(value)
+        except ValueError:
+            # Not a number at all ("abc"), or so many digits that CPython refuses
+            # to parse it. Long-standing behaviour, unchanged.
+            return None
+        try:
+            AlumniBase._validate_year(number)
+        except ValueError:
+            return _IGNORE
+        return number
     if field.kind == "date":
         # Expect an ISO "YYYY-MM-DD" string (the survey's <input type="date">).
+        if not value:
+            return None
         try:
-            return datetime.date.fromisoformat(value) if value else None
+            parsed = datetime.date.fromisoformat(value)
         except ValueError:
             return None
+        # Bounds, added #426: the survey took 0001-01-01 and 9999-12-31 while the
+        # staff path enforced 1900-and-not-future. `birth_date` is the only `date`
+        # field on the whitelist and the staff rule for it is
+        # `AlumniBase._validate_birth_date`, reused here rather than restated. A
+        # future-dated or year-0001 birthday is not a typo we should keep: it
+        # lands in age/cohort reporting and in exports. Ignored, not NULLed — the
+        # column may already hold a good date.
+        #
+        # If a non-birthday date field is ever added, it needs its OWN kind; these
+        # bounds are not general to dates.
+        try:
+            AlumniBase._validate_birth_date(parsed)
+        except ValueError:
+            return _IGNORE
+        return parsed
     # `text` is the only kind whose stored value comes VERBATIM from the payload
     # (`bool`, `designation` and `choice` all resolve to something the server
     # chose; `int`/`date` are parsed into typed values), so it is the only kind a
     # `validate` rule can meaningfully guard — and the only one that needs it.
     #
-    # A blank skips the rule on purpose: it is not a hostile value, it is the
-    # "clear this column" instruction, already gated by `blankable` above. Running
-    # an email or URL rule against "" would turn every legitimate clear into a
-    # silently-ignored answer.
+    # A blank skips the rules below on purpose: it is not a hostile value, it is
+    # the "clear this column" instruction, already gated by `blankable` above.
+    # Running an email or URL rule against "" would turn every legitimate clear
+    # into a silently-ignored answer.
+    #
+    # The width check comes FIRST, and is separate from `validate`, because it is
+    # about the column rather than the value's shape — see `_Field.max_length`.
+    # Refused rather than truncated: a silently shortened employer name is a wrong
+    # answer presented as a right one, and half a value is not what the alum said.
+    if value and field.max_length is not None and len(value) > field.max_length:
+        return _IGNORE
     if value and field.validate is not None and not field.validate(value):
         # Same disposition as an off-list `choice`, and for the same reason: the
         # server decides what may be written, and refusing is safer than either
@@ -861,7 +1331,10 @@ async def apply_response(
     # still flipped to "applied". Any future rename on either side of the wire
     # would therefore lose alumni answers invisibly, so count what was written
     # and what was dropped, warn on the drops, and put both in the audit row.
-    # Field KEYS only ever appear in the log — never a submitted value.
+    # Field KEYS only ever appear in the log — never a submitted value. Note that
+    # an UNRECOGNIZED key is itself submitter-chosen text, so `dropped` goes
+    # through `_log_safe_keys` before it reaches the log (#426); `ignored` holds
+    # whitelist keys, which are ours.
     written = 0
     dropped: list[str] = []
     # Values the server refused to write (an off-list `choice`, a blank on a
@@ -910,7 +1383,7 @@ async def apply_response(
             response_id,
             len(dropped),
             alum.alumni_id,
-            ", ".join(sorted(dropped)),
+            _log_safe_keys(dropped),
         )
     if ignored:
         log.info(

@@ -159,19 +159,29 @@ async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondI
 #
 # This body is FIELD TEXT ONLY — a new profile photo travels as a separate
 # multipart POST to `/respond/{token}/photo`, and `has_photo` here is just a
-# flag — so nothing legitimate in it is large. 4 KiB per answer is eight times
-# the widest survey-writable column (LinkedIn's varchar(500)) and orders of
-# magnitude beyond any name, city or job title; 64 KiB for the whole payload is
-# many times over a submission that filled in all ~40 fields. They are ABUSE
-# GUARDS, not data rules: the per-field lengths that mirror the real column
-# widths belong with the field table in `services.survey_responses`, and must
-# stay well below these.
+# flag — so nothing legitimate in it is large. They are ABUSE GUARDS, not data
+# rules: the per-field lengths that mirror the real column widths live with the
+# field table in `services.survey_responses`.
+#
+# THE TOTAL is the guard that matters — it is what bounds how much an abuser can
+# persist per submission, and it is the one tuned against abuse rather than
+# against any column.
+#
+# THE PER-FIELD CAP EXISTS ONLY TO STOP ONE ANSWER EATING THE WHOLE BUDGET, so
+# it must sit ABOVE the widest column, never below it. It was originally 4 KiB,
+# chosen as eight times LinkedIn's varchar(500) — which silently made
+# `other_designations` (max_length=10000, the one `text` column here) impossible
+# to fill: the byte cap fired first and that field's own limit became dead code.
+# 40 KiB is 10000 characters at UTF-8's four-bytes-per-character worst case, so
+# the declared column limit is now always the thing an honest respondent meets.
+# `test_survey_submit_limits` asserts that relationship against the real field
+# table, so tightening this or widening a column cannot quietly re-break it.
 #
 # Both sit far under Vercel's ~4.5 MB edge body cap ON PURPOSE. A request above
 # that ceiling never reaches this function — the platform rejects it and the
 # browser reports it as a CORS error, which tells the alum nothing. Capping well
 # underneath is what makes our own message the one they actually see.
-_SUBMIT_MAX_FIELD_BYTES = 4 * 1024
+_SUBMIT_MAX_FIELD_BYTES = 40 * 1024
 _SUBMIT_MAX_TOTAL_BYTES = 64 * 1024
 
 

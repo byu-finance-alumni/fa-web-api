@@ -172,3 +172,34 @@ def test_our_cap_fires_well_before_vercels_opaque_one():
     # calls it a CORS error. A cap at or above that ceiling would be dead code.
     assert _SUBMIT_MAX_TOTAL_BYTES * 50 < _VERCEL_BODY_CAP_BYTES
     assert _SUBMIT_MAX_FIELD_BYTES < _SUBMIT_MAX_TOTAL_BYTES
+
+
+# ---------------------------------------------- the two caps must agree ------
+
+
+def test_the_route_cap_never_preempts_a_declared_column_limit():
+    """The abuse guard here must sit ABOVE every column's own `max_length`.
+
+    These two limits were written independently — the byte cap in this route,
+    the per-column character caps with the field table — and they disagreed:
+    a 4 KiB byte cap fired before `other_designations` (10000 characters) could
+    ever be filled, so that column's declared limit was unreachable dead code
+    and a long-but-legitimate answer got a 413 instead of the real rule.
+
+    Asserted against the REAL field table rather than a copied number, so
+    widening a column or tightening this cap fails here instead of silently
+    re-introducing the same mismatch.
+    """
+    from app.services.survey_responses import _FIELDS
+
+    declared = [f.max_length for f in _FIELDS if f.max_length is not None]
+    assert declared, "the field table declares no max_length at all — check the import"
+
+    # Four bytes is UTF-8's worst case per character, so a field filled to its
+    # declared limit with astral-plane text still has to fit under the byte cap.
+    worst_case_bytes = max(declared) * 4
+    assert worst_case_bytes <= _SUBMIT_MAX_FIELD_BYTES, (
+        f"the widest column allows {max(declared)} characters "
+        f"({worst_case_bytes} bytes worst case) but the route rejects anything "
+        f"over {_SUBMIT_MAX_FIELD_BYTES} bytes — the column limit is unreachable"
+    )

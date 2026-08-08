@@ -54,7 +54,12 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.survey_response import SurveyResponse
-from app.schemas.alumni import _NAME_DISALLOWED, AlumniBase, _has_control_chars
+from app.schemas.alumni import (
+    _NAME_DISALLOWED,
+    AlumniBase,
+    _has_control_chars,
+    _has_invisible_chars_strict,
+)
 from app.schemas.survey import (
     SurveyChange,
     SurveyResponseItem,
@@ -230,6 +235,16 @@ def _valid_email(value: str) -> bool:
     if len(value) > _EMAIL_MAX:
         return False
     if any(ch.isspace() or ch in _EMAIL_DISALLOWED or ord(ch) < 0x20 for ch in value):
+        return False
+    # The whitespace test above does NOT cover zero-width characters — Python's
+    # `str.isspace()` is False for U+200B, and its ordinal is far above 0x20, so
+    # all three of the checks on the line above miss it (found 2026-08-08,
+    # re-reviewing the #418 fix). An address carrying one looks identical to a
+    # clean one everywhere a human reads it, while being a different string to
+    # every exact-match suppression and dedup check — and it will bounce at the
+    # provider. No invisible character is ever legitimate in an address, so this
+    # uses the STRICT set, joiners included, unlike the name rule.
+    if _has_invisible_chars_strict(value):
         return False
     local, sep, domain = value.partition("@")
     if not sep or "@" in domain:

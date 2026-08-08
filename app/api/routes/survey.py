@@ -24,7 +24,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import RequireEngineer, RequireSurveysManage
@@ -153,6 +153,64 @@ async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondI
     return info
 
 
+# Size caps for the public submit payload (#426). `submit_response` stages the
+# payload as JSON, so without these anyone holding a survey link can persist a
+# multi-megabyte row.
+#
+# This body is FIELD TEXT ONLY — a new profile photo travels as a separate
+# multipart POST to `/respond/{token}/photo`, and `has_photo` here is just a
+# flag — so nothing legitimate in it is large. 4 KiB per answer is eight times
+# the widest survey-writable column (LinkedIn's varchar(500)) and orders of
+# magnitude beyond any name, city or job title; 64 KiB for the whole payload is
+# many times over a submission that filled in all ~40 fields. They are ABUSE
+# GUARDS, not data rules: the per-field lengths that mirror the real column
+# widths belong with the field table in `services.survey_responses`, and must
+# stay well below these.
+#
+# Both sit far under Vercel's ~4.5 MB edge body cap ON PURPOSE. A request above
+# that ceiling never reaches this function — the platform rejects it and the
+# browser reports it as a CORS error, which tells the alum nothing. Capping well
+# underneath is what makes our own message the one they actually see.
+_SUBMIT_MAX_FIELD_BYTES = 4 * 1024
+_SUBMIT_MAX_TOTAL_BYTES = 64 * 1024
+
+
+def _oversized_submission(fields: dict[str, str]) -> JSONResponse | None:
+    """A 413 for an over-cap submission, or ``None`` when it is within both caps.
+
+    Sized in UTF-8 bytes over keys AND values, because that is what gets stored;
+    counting characters would let a payload of astral-plane text be four times
+    the size it declares. Unknown keys count too — the whitelist is applied
+    downstream, and ten thousand junk keys is the same abuse as one huge value.
+
+    The message never echoes any part of the payload back (the keys are
+    submitter-chosen strings), and refusing here means nothing is staged.
+    """
+    total = 0
+    for key, value in fields.items():
+        size = len(key.encode()) + len(value.encode())
+        if size > _SUBMIT_MAX_FIELD_BYTES:
+            return _submission_too_large_response(
+                "One of your answers is too long to save. "
+                "Please shorten it and submit again."
+            )
+        total += size
+    if total > _SUBMIT_MAX_TOTAL_BYTES:
+        return _submission_too_large_response(
+            "Your submission is too large to save. "
+            "Please shorten your answers and submit again."
+        )
+    return None
+
+
+def _submission_too_large_response(message: str) -> JSONResponse:
+    """413 in the project error envelope, matching the upload caps' shape."""
+    return JSONResponse(
+        status_code=413,  # Content Too Large
+        content={"error": {"code": "payload_too_large", "message": message}},
+    )
+
+
 @router.post(
     "/respond/{token}",
     response_model=SurveySubmitResult,
@@ -160,9 +218,15 @@ async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondI
 )
 async def survey_submit(
     token: str, body: SurveySubmitRequest, session: SessionDep
-) -> SurveySubmitResult:
+) -> SurveySubmitResult | JSONResponse:
     """PUBLIC (token-gated): stage the alum's submitted changes for admin review.
-    Nothing is applied to the record here."""
+    Nothing is applied to the record here.
+
+    An over-cap payload is a 413 and stages nothing — see `_oversized_submission`.
+    """
+    too_large = _oversized_submission(body.fields)
+    if too_large is not None:
+        return too_large
     return await survey_responses.submit_response(
         session, token, body.fields, body.has_photo
     )

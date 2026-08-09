@@ -193,6 +193,12 @@ async def _sweep_one(key: str, summary: HeadshotSweepSummary) -> None:
         # Undecodable. SKIP — never delete. See the module docstring: on the
         # write paths rejecting is right, but this file is already somebody's
         # headshot and we have no grounds to destroy it.
+        #
+        # This also catches the 50-megapixel guard, so a bulk-imported photo
+        # from a camera bigger than any phone stays oversized and is re-tried
+        # (one wasted download) every night. It shows up as a stable non-zero
+        # `skipped_unreadable` in the log, which is the signal to look at it by
+        # hand rather than to raise the guard.
         summary.skipped_unreadable += 1
         log.warning("headshot sweep: %s could not be decoded, left untouched", key)
         return

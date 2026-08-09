@@ -31,8 +31,8 @@ from app.api.dependencies.auth import RequireEngineer, RequireSurveysManage
 from app.api.routes.alumni import (
     _HEADSHOT_MAX_BYTES,
     _HEADSHOT_MIME_TYPES,
-    _image_content_error,
     _read_capped,
+    _sniff_image_mime,
     _too_large_response,
 )
 from app.core.config import get_settings
@@ -72,6 +72,7 @@ from app.schemas.survey import (
     SurveyUsage,
 )
 from app.services import survey_email, survey_reset, survey_responses, survey_schedule
+from app.services.images import normalise_headshot
 
 # The test cohort lives in grad year 1900 (below the normal 1950 floor), so allow
 # it explicitly here.
@@ -256,24 +257,57 @@ async def survey_submit_photo(
     """PUBLIC (token-gated): attach a NEW profile photo to a just-staged response.
 
     A separate step from the JSON field-submit so the field submit is unaffected.
-    The signed token gates it (no login); the same JPEG/PNG/WebP + size validation
-    as the headshot upload runs here before the image is staged for admin review.
+    The signed token gates it (no login).
+
+    ⚠️ THIS IS THE ONLY GENUINELY UNTRUSTED UPLOADER IN THE SYSTEM — a stranger
+    holding a mailed link, with no account and no staff review before the bytes
+    land. So the image is NORMALISED here (decoded and re-encoded as our own
+    JPEG) rather than merely inspected, and what reaches the bucket is our
+    output. `apply_response` normalises again when it promotes the photo onto the
+    real profile; that repetition is deliberate — see the comment there.
+
     The photo only becomes the alum's headshot if an admin applies the response."""
     content_type = (photo.content_type or "").split(";")[0].strip().lower()
     if content_type not in _HEADSHOT_MIME_TYPES:
         raise InvalidRequestError("Photo must be a JPEG, PNG, or WebP image.")
+    # ⚠️ THE CAP MATTERS MORE NOW, NOT LESS. Everything past this line DECODES the
+    # bytes, so this is what bounds how much attacker-chosen input a single
+    # request can hand to Pillow. It must stay ahead of the normalise call.
     data = await _read_capped(photo, _HEADSHOT_MAX_BYTES)
     if data is None:
         return _too_large_response(_HEADSHOT_MAX_BYTES)
+    # `normalise_headshot` would reject an empty body too, but "the uploaded image
+    # is empty" tells a survey respondent which of their two problems they have —
+    # a browser that submitted an empty file part is a different fix from a photo
+    # we could not read.
     if not data:
         raise InvalidRequestError("The uploaded image is empty.")
-    # The Content-Type is just a client label; verify the real bytes match before
-    # anything reaches storage.
-    content_error = _image_content_error(data, content_type)
-    if content_error is not None:
-        raise InvalidRequestError(content_error)
+    # A cheap magic-byte gate kept BEFORE the decode, for one reason only: it
+    # bounds which Pillow decoder hostile bytes can reach to the three formats we
+    # actually accept, instead of every plugin Pillow ships.
+    #
+    # What is deliberately GONE is the old declared-type-vs-sniffed-type
+    # comparison. That check existed because we used to store the uploader's own
+    # bytes under the uploader's own label, so the two had to agree. We now store
+    # OUR JPEG under `image/jpeg` whatever arrived, so the comparison guards
+    # nothing — while still refusing a real photo whose browser mislabelled it,
+    # which is a live failure mode (iOS HEIC-to-JPEG conversion, a .png that is
+    # really a JPEG). The decode below is a strictly stronger test than either
+    # sniff: the prefix sniff PASSES a JPEG with an HTML payload appended, which
+    # is the whole reason `services/images.py` exists.
+    if _sniff_image_mime(data) is None:
+        raise InvalidRequestError("File content is not a JPEG, PNG, or WebP image.")
+    # Re-encode BEFORE staging so hostile bytes never reach the bucket at all,
+    # rather than sitting in it until a reviewer approves them. `InvalidRequestError`
+    # maps to 422 with a client-safe message (see `main.invalid_request_handler`),
+    # and `images.py` is careful that the message never echoes the uploaded bytes.
+    data = normalise_headshot(data)
+    # ⚠️ The recorded type must be the type we actually WROTE. `normalise_headshot`
+    # always emits JPEG, so passing the uploader's declared type here would label a
+    # PNG upload `image/png` while the stored object is a JPEG — and that label is
+    # what the bucket serves the preview and the promoted headshot with.
     await survey_responses.stage_photo(
-        session, token, survey_response_id, data, content_type
+        session, token, survey_response_id, data, "image/jpeg"
     )
     return Response(status_code=204)
 
@@ -303,10 +337,18 @@ async def survey_apply_response(
     runs (#627). It NEVER blocks: the write has already happened by the time this
     returns, exactly as on that path.
 
+    `photo_dropped` says a staged photo could not be decoded and was discarded
+    while the field changes went through. The UI MUST show it: otherwise the
+    reviewer approves a submission that plainly carried a photo and never learns
+    the profile still has the old one.
+
     Was a bodyless 204 before #646.
     """
-    warnings = await survey_responses.apply_response(session, response_id, user.user_id)
-    return SurveyApplyResult(duplicate_warnings=warnings)
+    outcome = await survey_responses.apply_response(session, response_id, user.user_id)
+    return SurveyApplyResult(
+        duplicate_warnings=outcome.duplicate_warnings,
+        photo_dropped=outcome.photo_dropped,
+    )
 
 
 @router.post("/responses/{response_id}/reject", status_code=204)

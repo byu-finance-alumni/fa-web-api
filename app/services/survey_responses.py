@@ -33,6 +33,7 @@ legacy `surveys` table (see `models.crm.Survey`) — one fact, one home.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import logging
 from collections.abc import Callable
@@ -47,7 +48,7 @@ from app.core.dropdowns import (
     SURVEY_EMPLOYMENT_STATUSES,
     holds_designation,
 )
-from app.core.errors import InvalidRequestError, NotFoundError
+from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -66,6 +67,7 @@ from app.schemas.survey import (
     SurveySubmitResult,
 )
 from app.services import hygiene, supabase_storage
+from app.services.images import normalise_headshot
 from app.services.survey_email import LINK_DEAD_MESSAGE, verify_survey_token
 
 log = logging.getLogger(__name__)
@@ -91,15 +93,17 @@ def _headshot_key(alum: Alumni) -> str:
     return net_id or str(alum.alumni_id)
 
 
-def _sniff_image_content_type(data: bytes) -> str:
-    """Best-effort image MIME from magic bytes for re-uploading a staged photo as
-    a headshot. Mirrors the headshot route's sniff; defaults to JPEG (the staged
-    bytes were already validated as JPEG/PNG/WebP at upload time)."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/jpeg"
+# Every photo this module writes is the output of `normalise_headshot`, which
+# always encodes JPEG. The stored content type is therefore a CONSTANT, not
+# something to derive from the bytes.
+#
+# This replaces a `_sniff_image_content_type` helper that read as a check and was
+# not one: it tested the PNG and WebP magic, never the JPEG magic, and returned
+# "image/jpeg" for everything else — including a text file. It could not reject
+# anything, so an unreadable object was promoted onto an alum's profile labelled
+# as a JPEG. Re-encoding answers both halves at once: the bytes are known good
+# because we produced them, and their type is known because we chose it.
+_PROMOTED_CONTENT_TYPE = "image/jpeg"
 
 
 @dataclass(frozen=True)
@@ -1300,17 +1304,37 @@ async def _get_pending(session: AsyncSession, response_id: int) -> SurveyRespons
     return resp
 
 
+@dataclass(frozen=True)
+class ApplyOutcome:
+    """What an apply has to tell the reviewer AFTER the fact.
+
+    Both members describe something the reviewer could not have known before
+    clicking, and NEITHER blocks: the write is already committed by the time this
+    is returned. Anything that should stop an apply has to stop it before the
+    commit, not be reported here.
+    """
+
+    # Non-empty when the response RENAMED the alumnus into a collision with a live
+    # record (same first + last name and graduation year) — see #646/#627.
+    duplicate_warnings: list[dict]
+    # True when a photo WAS staged but could not be decoded, so the field changes
+    # were applied and the photo was discarded. The reviewer must be shown this:
+    # they approved a submission that visibly carried a photo, and their profile
+    # still shows the old one.
+    photo_dropped: bool
+
+
 async def apply_response(
     session: AsyncSession, response_id: int, actor_user_id: int | None
-) -> list[dict]:
+) -> ApplyOutcome:
     """Write the staged changes to the alum's record and mark applied.
 
-    Returns the soft duplicate warnings a NAME change raised (#646/#627) — an
-    empty list for every other apply. They never block: the response is already
-    applied and committed by the time they are returned, exactly as on the staff
-    rename path, because two alumni genuinely can share a name and a graduation
-    year and a marriage rename into a real collision is sometimes correct. The
-    point is that the person who approved it is told.
+    Returns an `ApplyOutcome`: the soft duplicate warnings a NAME change raised
+    (#646/#627), and whether a staged photo had to be dropped. Neither blocks: the
+    response is already applied and committed by the time they are returned,
+    exactly as on the staff rename path, because two alumni genuinely can share a
+    name and a graduation year and a marriage rename into a real collision is
+    sometimes correct. The point is that the person who approved it is told.
     """
     resp = await _get_pending(session, response_id)
     alum = (
@@ -1324,21 +1348,75 @@ async def apply_response(
     eng = engs.get(resp.alumni_id)
 
     # Promote a staged photo (if any) into the alum's real headshot: download the
-    # staged copy, re-upload it under the headshot key (net_id, or alumni_id when
-    # no net_id), then remove the staged copy so the pending prefix stays clean.
+    # staged copy, re-encode it, upload OUR bytes under the headshot key (net_id,
+    # or alumni_id when no net_id), then remove the staged copy so the pending
+    # prefix stays clean.
+    had_photo = bool(resp.staged_photo_path)
+    photo_dropped = False
     if resp.staged_photo_path:
         data = await supabase_storage.download_object(
             _HEADSHOT_BUCKET, resp.staged_photo_path
         )
-        content_type = _sniff_image_content_type(data)
-        await supabase_storage.upload_object(
-            _HEADSHOT_BUCKET, _headshot_key(alum), data, content_type
-        )
-        await supabase_storage.delete_object(_HEADSHOT_BUCKET, resp.staged_photo_path)
-        # Clear the pointer with the object. Leaving it set left the row naming a
-        # key that no longer exists, so every later reader — the review queue's
-        # signed-URL preview, the engineer survey-state screen, the profile's
-        # "+ photo" note — was working from a path that resolves to nothing.
+        # ⚠️ THE AUTHORITATIVE GATE — and the reason normalising at the public
+        # upload route is not enough on its own. This is the only code path that
+        # can put bytes onto a real profile, and objects staged BEFORE the route
+        # started normalising are still sitting in the bucket right now, waiting
+        # for a reviewer to click Apply. Re-encoding here means an alum's headshot
+        # is always our own JPEG, whatever was staged and whenever it was staged.
+        # It is cheap (one decode per approval) and it is the last chance.
+        try:
+            data = normalise_headshot(data)
+        except InvalidRequestError:
+            # ⚠️ AN UNREADABLE PHOTO MUST NOT WEDGE THE WHOLE APPROVAL.
+            #
+            # The reviewer is approving a submission that usually also carries
+            # perfectly good field changes. Raising here would leave the response
+            # `pending` FOREVER: every retry downloads the same undecodable object
+            # and fails the same way, so the only escape would be to REJECT it and
+            # throw the alum's answers away. That is exactly the "one bad value
+            # makes a response permanently un-approvable" bug this codebase has
+            # already had once, and re-introducing it in the name of security
+            # would be worse than the hostile photo it was meant to stop.
+            #
+            # So: apply the fields, discard the photo, and leave the alum's
+            # EXISTING headshot alone — a photo we cannot read is not a reason to
+            # replace a good one with nothing. The reviewer is told via the
+            # returned `photo_dropped` and the audit row, so nobody walks away
+            # believing a new photo was attached when it was not.
+            #
+            # Only `InvalidRequestError` is caught, and only around the decode: a
+            # `ServiceError` from storage means the object could not be FETCHED,
+            # which is a transient outage that should fail the apply so it can be
+            # retried — not a reason to silently bin a real photo.
+            photo_dropped = True
+
+        if photo_dropped:
+            log.warning(
+                "Survey response %s: the staged photo for alumni %s could not be "
+                "decoded and was DISCARDED; the field changes were still applied "
+                "and the existing headshot is unchanged.",
+                response_id,
+                alum.alumni_id,
+            )
+            # Cleanup only — the object is unreadable and must not linger, but a
+            # storage failure while deleting it must not take the apply down with
+            # it, or the response is un-approvable again by another route.
+            with contextlib.suppress(ServiceError):
+                await supabase_storage.delete_object(
+                    _HEADSHOT_BUCKET, resp.staged_photo_path
+                )
+        else:
+            await supabase_storage.upload_object(
+                _HEADSHOT_BUCKET, _headshot_key(alum), data, _PROMOTED_CONTENT_TYPE
+            )
+            await supabase_storage.delete_object(
+                _HEADSHOT_BUCKET, resp.staged_photo_path
+            )
+        # Clear the pointer with the object — on BOTH paths. Leaving it set left
+        # the row naming a key that no longer exists, so every later reader — the
+        # review queue's signed-URL preview, the engineer survey-state screen, the
+        # profile's "+ photo" note — was working from a path that resolves to
+        # nothing.
         resp.staged_photo_path = None
 
     # An apply that writes NOTHING used to report success: a payload key missing
@@ -1448,11 +1526,17 @@ async def apply_response(
                 f"survey_response={response_id} fields={len(resp.payload or {})} "
                 f"written={written} dropped={len(dropped)} ignored={len(ignored)}"
                 + (f" duplicate_warnings={len(duplicate_warnings)}" if name_changed else "")
+                # The audit row is the record that outlives the reviewer's screen:
+                # a dropped photo has to be visible here even if nobody was
+                # watching the response body when it happened.
+                + (f" photo={'dropped' if photo_dropped else 'applied'}" if had_photo else "")
             ),
         )
     )
     await session.commit()
-    return duplicate_warnings
+    return ApplyOutcome(
+        duplicate_warnings=duplicate_warnings, photo_dropped=photo_dropped
+    )
 
 
 async def reject_response(

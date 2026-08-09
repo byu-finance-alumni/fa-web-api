@@ -1,11 +1,13 @@
 """Tests for the survey response review queue (no real DB / network)."""
 
 import asyncio
+import datetime
 import types
 import uuid
 
 import pytest
 
+from app.core.dropdowns import INDUSTRIES, SURVEY_EMPLOYMENT_STATUSES
 from app.core.errors import NotFoundError
 from app.models.audit import AuditLog
 from app.models.survey_response import SurveyResponse
@@ -814,3 +816,675 @@ def test_get_pending_still_rejects_an_already_reviewed_response():
         asyncio.run(sr._get_pending(_Session(_fake_resp(status="applied")), 1))
     with pytest.raises(NotFoundError):
         asyncio.run(sr._get_pending(_Session(None), 1))
+
+
+# ============================ the rest of the writable-field audit (#426) =====
+#
+# Same root cause as #418 above, worked through the whole of `_FIELDS` rather
+# than the two fields that were already known: `apply_response` writes with a raw
+# `setattr`, so nothing in app/schemas/alumni.py runs on the one path the public
+# can reach. Every rule written when "only staff can reach this" was true had to
+# be restated here.
+
+
+def _apply(session, resp, monkeypatch, side_rows=({}, {}, {})):
+    """Run `apply_response` with `_get_pending` / `_load_side_rows` stubbed."""
+
+    async def fake_get_pending(_s, _rid):
+        return resp
+
+    async def fake_side(_s, _ids):
+        return side_rows
+
+    monkeypatch.setattr(sr, "_get_pending", fake_get_pending)
+    monkeypatch.setattr(sr, "_load_side_rows", fake_side)
+    return asyncio.run(sr.apply_response(session, 1, actor_user_id=9))
+
+
+# --------------------------------------------- 1. queue poisoning (the year) --
+
+
+def test_an_absurd_year_is_ignored_rather_than_staged_as_a_time_bomb():
+    """THE bug this issue was opened for. `_coerce` did a bare `int()`, so a
+    20-digit year became a 20-digit Python integer: fine at submit, fine in the
+    reviewer's diff, and then Postgres 22003 at APPLY on an int4 column. The
+    transaction rolls back, the response never leaves `pending`, and every future
+    Approve on it 500s - a review queue anyone with a survey link can jam."""
+    field = sr._FIELD_BY_KEY["profile.graduate_graduation_year"]
+    for poison in ("9" * 20, "-" + "9" * 20, str(2**63), str(2**31), "99999"):
+        assert _coerce(field, poison) is sr._IGNORE, poison
+    # Ordinary answers are untouched - the fix must not stop alumni answering.
+    assert _coerce(field, "2027") == 2027
+    assert _coerce(field, " 1998 ") == 1998
+    # Long-standing behaviour for a blank / non-numeric value is deliberately
+    # unchanged: a blank is still "clear the column", and "abc" still parses to
+    # nothing. Neither can wedge anything.
+    assert _coerce(field, "") is None
+    assert _coerce(field, "abc") is None
+
+
+def test_the_year_range_is_the_staff_range_not_a_second_copy():
+    """One definition of "a plausible year". If the staff schema accepts a year
+    this path must too, and vice versa - the #418 lesson applied to #426."""
+    from app.schemas.alumni import AlumniBase
+
+    field = sr._FIELD_BY_KEY["profile.graduate_graduation_year"]
+    this_year = datetime.date.today().year
+    for year in (1899, 1900, 1901, 2020, this_year + 10, this_year + 11, 10**20):
+        try:
+            AlumniBase._validate_year(year)
+            staff_ok = True
+        except ValueError:
+            staff_ok = False
+        survey_ok = _coerce(field, str(year)) is not sr._IGNORE
+        assert staff_ok == survey_ok, year
+
+
+def test_the_year_is_the_only_int_field_that_could_overflow():
+    """Nothing else on the whitelist is an `int`, so the range on the kind covers
+    every field that can reach an integer column. A new `int` field would show up
+    here and needs the same thought (see the note in `_coerce`)."""
+    int_fields = [f.key for f in sr._FIELDS if f.kind == "int"]
+    assert int_fields == ["profile.graduate_graduation_year"]
+
+
+def test_a_poisoned_year_never_reaches_the_review_queue(monkeypatch):
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    result = asyncio.run(
+        sr.submit_response(
+            session,
+            "tok",
+            {
+                "profile.graduate_graduation_year": "9" * 20,
+                "profile.graduate_school": "BYU",
+            },
+        )
+    )
+    assert result.change_count == 1
+    staged = next(o for o in session.added if isinstance(o, SurveyResponse))
+    assert staged.payload == {"profile.graduate_school": "BYU"}
+
+
+def test_a_response_already_wedged_by_a_poisoned_year_can_now_be_applied(monkeypatch):
+    """The half of the fix that matters for anything already in the queue.
+    Blocking new poison still leaves a jammed response jammed, and `_coerce` runs
+    off the STORED payload at apply time - so a row staged before this change is
+    now skipped like any other refused value and the response completes instead of
+    500-ing on every attempt. The good year on file is kept, not NULLed."""
+    resp = _fake_resp(
+        payload={
+            "profile.graduate_graduation_year": "9" * 20,
+            "profile.graduate_school": "BYU Marriott",
+        }
+    )
+    alum = types.SimpleNamespace(
+        alumni_id=5,
+        net_id="jdoe5",
+        graduate_graduation_year=2026,
+        graduate_school=None,
+    )
+    session = _Session(alum)
+    _apply(session, resp, monkeypatch)
+
+    assert alum.graduate_graduation_year == 2026  # untouched, not overwritten
+    assert alum.graduate_school == "BYU Marriott"  # the rest of the answer lands
+    assert resp.status == "applied"  # no longer stuck pending
+    audit = next(o for o in session.added if isinstance(o, AuditLog))
+    assert "written=1" in audit.new_value
+    assert "ignored=1" in audit.new_value
+
+
+def test_the_queue_drops_a_poisoned_year_from_the_diff(monkeypatch):
+    """A reviewer must not be shown a year change that approving would not make."""
+
+    class _Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    resp = types.SimpleNamespace(
+        survey_response_id=1,
+        alumni_id=5,
+        payload={
+            "profile.graduate_graduation_year": "9" * 20,
+            "profile.graduate_school": "BYU Marriott",
+        },
+        status="pending",
+        staged_photo_path=None,
+        submitted_at=datetime.datetime(2026, 8, 8),
+    )
+    alum = types.SimpleNamespace(
+        alumni_id=5,
+        first_name="Jane",
+        last_name="Doe",
+        preferred_first_name=None,
+        graduate_graduation_year=2026,
+        graduate_school=None,
+    )
+
+    class _ListSession:
+        queue = [[resp], [alum]]
+
+        async def execute(self, _stmt):
+            return _Rows(_ListSession.queue.pop(0))
+
+    async def fake_side(_s, _ids):
+        return ({}, {}, {})
+
+    monkeypatch.setattr(sr, "_load_side_rows", fake_side)
+    items = asyncio.run(sr.list_pending(_ListSession(), 2020))
+    keys = [c.field_key for c in items[0].changes]
+    assert "profile.graduate_graduation_year" not in keys
+    assert "profile.graduate_school" in keys
+
+
+# ------------------------------------------- 2. controlled vocabularies -------
+#
+# The frontend ALREADY renders both of these as dropdowns. The two tuples below
+# are the exact strings its controls offer, copied from
+# fa-web-app/src/components/survey/survey-screens.tsx and
+# fa-web-app/src/constants/dropdowns.ts and verified character-for-character on
+# 2026-08-08. They are pinned HERE rather than derived because a mismatch is the
+# one failure mode that would be worse than the free text this replaces: every
+# legitimate answer silently ignored, with nothing anywhere saying so. If either
+# side moves, this fails.
+
+# `SURVEY_EMPLOYMENT_STATUS_OPTIONS` - EMPLOYMENT_STATUS_OPTIONS minus the
+# "Unknown" placeholder.
+_FRONTEND_EMPLOYMENT_STATUS_OPTIONS = (
+    "Full-time",
+    "Part-time",
+    "Self-Employed",
+    "Graduate Student",
+    "Military",
+    "Not in the Labor Force",
+    "Unemployed",
+)
+
+# `INDUSTRY_CHOICES` - PRIMARY_INDUSTRY_OPTIONS (the vocabulary minus the four
+# secondary-only industries) minus "Other", which the control handles separately.
+_FRONTEND_INDUSTRY_CHOICES = (
+    "Asset Management",
+    "Commercial Banking",
+    "Consulting",
+    "Corporate Finance",
+    "Equity Research",
+    "Financial Services",
+    "FP&A",
+    "Investment Banking",
+    "Military",
+    "Private Banking",
+    "Private Credit",
+    "Private Equity",
+    "Real Estate",
+    "Sales",
+    "Valuation & Advisory",
+    "Venture Capital",
+    "Wealth Management",
+    "Unknown",
+    "Graduate Student",
+)
+
+
+def test_industry_and_employment_status_are_constrained_choices():
+    industry = sr._FIELD_BY_KEY["employment.current_industry"]
+    assert (industry.group, industry.column, industry.kind) == (
+        "employment",
+        "current_industry",
+        "choice",
+    )
+    assert industry.options == INDUSTRIES
+
+    status = sr._FIELD_BY_KEY["profile.employment_status"]
+    assert (status.group, status.column, status.kind) == (
+        "alumni",
+        "employment_status",
+        "choice",
+    )
+    assert status.options == SURVEY_EMPLOYMENT_STATUSES
+    # The list that exists specifically for this field: the canonical eight minus
+    # "Unknown", which is meaningless as a self-description.
+    assert "Unknown" not in status.options
+
+
+@pytest.mark.parametrize("value", _FRONTEND_EMPLOYMENT_STATUS_OPTIONS)
+def test_every_employment_status_the_survey_offers_is_writable(value):
+    """The load-bearing check. An option the form offers that the server ignores
+    would drop every real answer to this question, silently."""
+    assert _coerce(sr._FIELD_BY_KEY["profile.employment_status"], value) == value
+
+
+@pytest.mark.parametrize("value", _FRONTEND_INDUSTRY_CHOICES)
+def test_every_industry_the_survey_offers_is_writable(value):
+    assert _coerce(sr._FIELD_BY_KEY["employment.current_industry"], value) == value
+
+
+def test_the_backend_accepts_more_industries_than_the_survey_offers():
+    """Deliberate, and the right direction for the asymmetry: the four
+    secondary-only industries and "Other" are legitimate stored values, so an alum
+    re-submitting one already on file must not be refused. The reverse asymmetry -
+    an offered option the server rejects - is what the two tests above forbid."""
+    field = sr._FIELD_BY_KEY["employment.current_industry"]
+    for not_offered in (
+        "Law",
+        "Corporate Banking",
+        "Sales and Trading",
+        "Credit Risk",
+        "Other",
+    ):
+        assert _coerce(field, not_offered) == not_offered
+
+
+def test_an_off_list_industry_or_status_is_ignored_not_stored(monkeypatch):
+    """The reason for the change: a public submit could mint a phantom bucket that
+    then shows up in the dashboard breakdown, the filter and `search_terms` as
+    though it were one of ours."""
+    industry = sr._FIELD_BY_KEY["employment.current_industry"]
+    status = sr._FIELD_BY_KEY["profile.employment_status"]
+    for hostile in ("Crypto Rug Pulls", "<script>alert(1)</script>", "x" * 500):
+        assert _coerce(industry, hostile) is sr._IGNORE, hostile
+        assert _coerce(status, hostile) is sr._IGNORE, hostile
+    # "Unknown" is a real industry but NOT an offerable status.
+    assert _coerce(industry, "Unknown") == "Unknown"
+    assert _coerce(status, "Unknown") is sr._IGNORE
+
+    alum = types.SimpleNamespace(
+        alumni_id=5, net_id="jdoe5", employment_status="Employed"
+    )
+    job = types.SimpleNamespace(alumni_id=5, current_industry="Insurance")
+    _apply(
+        _Session(alum),
+        _fake_resp(
+            payload={
+                "profile.employment_status": "Crypto",
+                "employment.current_industry": "Crypto",
+            }
+        ),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+    assert alum.employment_status == "Employed"  # legacy value survives
+    assert job.current_industry == "Insurance"
+
+
+def test_casing_drift_resolves_and_a_blank_never_wipes_the_stored_value():
+    """`choice` already did both - this pins that converting these two fields did
+    not change it. Prod holds casing drift from a free-text intake sheet, and an
+    alum whose stored value is off-list sees a control with no matching option:
+    if leaving it alone wiped the column the survey would destroy exactly the
+    legacy data the `choice` kind exists to preserve."""
+    industry = sr._FIELD_BY_KEY["employment.current_industry"]
+    status = sr._FIELD_BY_KEY["profile.employment_status"]
+    assert _coerce(industry, "investment banking") == "Investment Banking"
+    assert _coerce(status, "  FULL-TIME  ") == "Full-time"
+    assert _coerce(industry, "") is sr._IGNORE
+    assert _coerce(status, "") is sr._IGNORE
+    # And an off-list value ON FILE still reads back verbatim in the diff.
+    assert (
+        _current(industry, types.SimpleNamespace(current_industry="Insurance"))
+        == "Insurance"
+    )
+    assert (
+        _current(status, types.SimpleNamespace(employment_status="Employed"))
+        == "Employed"
+    )
+
+
+def test_secondary_industry_stays_free_text():
+    """Free text on the staff path too (`EmploymentCreate` runs no
+    `validate_industry` on it) - the consistency is deliberate. It still carries
+    the column width and the character rule."""
+    field = sr._FIELD_BY_KEY["employment.current_industry_secondary"]
+    assert field.kind == "text"
+    assert field.options is None
+    assert _coerce(field, "Education") == "Education"
+
+
+# ------------------------------------------------------ 3. length caps --------
+#
+# Column widths read from database/schema.sql on 2026-08-08. `other_designations`
+# is the one that is not a varchar at all - an unbounded `text` column carrying a
+# trigram GIN index, so an oversize value is not merely untidy, it bloats an index
+# every alumni search reads.
+_COLUMN_WIDTHS = {
+    "profile.first_name": 100,
+    "profile.middle_name": 100,
+    "profile.last_name": 100,
+    "profile.preferred_first_name": 100,
+    "profile.spouse_first_name": 100,
+    "profile.spouse_last_name": 100,
+    "profile.gender": 30,
+    "profile.citizenship": 100,
+    "profile.home_country": 100,
+    "profile.graduate_degree": 100,
+    "profile.graduate_school": 255,
+    "profile.other_designations": 10000,  # `text` column; mirrors the staff cap
+    "profile.linkedin_url": 500,
+    "contact.personal_email": 255,
+    "contact.work_email": 255,
+    "contact.phone": 50,
+    "contact.city": 100,
+    "contact.state": 100,
+    "contact.country": 100,
+    "employment.current_employer": 255,
+    "employment.current_title": 255,
+    "employment.current_industry_secondary": 255,
+    "employment.current_city": 100,
+    "employment.current_state": 100,
+    "employment.current_country": 100,
+    "employment.current_zip": 20,
+}
+
+
+def test_every_text_field_is_bounded_by_its_real_column_width():
+    """No `text` field had a cap at all before #426, so a public submit could
+    stage a value no column can hold - a 500 at apply for the varchars, and for
+    `other_designations` a silent success that bloats the search index."""
+    for field in sr._FIELDS:
+        if field.kind != "text":
+            continue
+        assert field.max_length == _COLUMN_WIDTHS[field.key], field.key
+
+
+@pytest.mark.parametrize("key,width", sorted(_COLUMN_WIDTHS.items()))
+def test_an_over_long_value_is_ignored_rather_than_truncated(key, width):
+    """Refused, not shortened: half an employer name presented as the whole thing
+    is a wrong answer that looks like a right one. Same disposition as an off-list
+    choice, so the column keeps whatever it already held."""
+    field = sr._FIELD_BY_KEY[key]
+    assert _coerce(field, "a" * (width + 1)) is sr._IGNORE, key
+
+
+def test_a_huge_other_designations_value_cannot_reach_the_indexed_column(monkeypatch):
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    result = asyncio.run(
+        sr.submit_response(session, "tok", {"profile.other_designations": "x" * 100_000})
+    )
+    assert result.staged is False
+    assert result.change_count == 0
+    # And an ordinary answer is unaffected.
+    assert (
+        _coerce(sr._FIELD_BY_KEY["profile.other_designations"], "Series 7, Series 63")
+        == "Series 7, Series 63"
+    )
+
+
+# ------------------------------------------------------ 4. birth_date ---------
+
+
+def test_birth_date_is_bounded_the_way_staff_bound_it():
+    """The survey took 0001-01-01 and 9999-12-31 while staff were held to
+    1900-and-not-future. Same rule, reused, restated where the public writes."""
+    field = sr._FIELD_BY_KEY["profile.birth_date"]
+    today = datetime.date.today()
+    for bad in (
+        "0001-01-01",
+        "9999-12-31",
+        "1899-12-31",
+        (today + datetime.timedelta(days=1)).isoformat(),
+    ):
+        assert _coerce(field, bad) is sr._IGNORE, bad
+    assert _coerce(field, "1900-01-01") == datetime.date(1900, 1, 1)
+    assert _coerce(field, "1985-06-30") == datetime.date(1985, 6, 30)
+    assert _coerce(field, today.isoformat()) == today
+    # A blank is still the ordinary "clear this column" instruction, and an
+    # unparseable string is still nothing - neither is a rejection.
+    assert _coerce(field, "") is None
+    assert _coerce(field, "not-a-date") is None
+
+
+def test_an_out_of_range_birthday_leaves_the_stored_one_alone(monkeypatch):
+    alum = types.SimpleNamespace(
+        alumni_id=5, net_id="jdoe5", birth_date=datetime.date(1990, 3, 2)
+    )
+    _apply(
+        _Session(alum),
+        _fake_resp(payload={"profile.birth_date": "9999-12-31"}),
+        monkeypatch,
+    )
+    assert alum.birth_date == datetime.date(1990, 3, 2)
+
+
+# ------------------------------------ 5. name / free-text validation ----------
+
+
+_NAME_KEYS = (
+    "profile.first_name",
+    "profile.middle_name",
+    "profile.last_name",
+    "profile.preferred_first_name",
+    "profile.spouse_first_name",
+    "profile.spouse_last_name",
+)
+
+
+@pytest.mark.parametrize("key", _NAME_KEYS)
+def test_names_carry_the_staff_name_rule(key):
+    """A formula lead used to write cleanly into `first_name`. Mitigated at the
+    far end (the CSV export neutralises formula leads, React escapes on render),
+    so this is data pollution rather than execution - but the public could put
+    control characters into the identity columns that search, the duplicate check
+    and every export key off, and a control character is invisible in the
+    reviewer's before/after diff."""
+    field = sr._FIELD_BY_KEY[key]
+    for hostile in (
+        '=HYPERLINK("http://evil","click")',
+        "+1+1",
+        "@SUM(A1)",
+        "-2+3",
+        "Jane;DROP TABLE alumni",
+        "Jane<script>",
+        "Jane|Doe",
+        "Jane\nDoe",
+        "Jane\rDoe",
+        "Jane\x00Doe",
+    ):
+        assert _coerce(field, hostile) is sr._IGNORE, (key, hostile)
+
+
+@pytest.mark.parametrize("key", _NAME_KEYS)
+@pytest.mark.parametrize(
+    "name",
+    [
+        "O'Brien",  # straight apostrophe
+        "N\u2019Diaye",  # curly apostrophe
+        "Anne-Marie",  # hyphen
+        "St. John",  # period
+        "Jos\u00e9 \u00c1lvarez",  # accented Latin
+        "\u674e\u5c0f\u9f99",  # non-Latin script
+        "van der Berg",
+    ],
+)
+def test_real_names_still_go_through(key, name):
+    """The rule is a DENY-list precisely so a surname nobody here has seen is
+    accepted by default. Silently dropping a real alumna's surname is a worse
+    outcome than storing an odd one, and this path ignores rather than rejects -
+    she would never be told."""
+    assert _coerce(sr._FIELD_BY_KEY[key], name) == name
+
+
+def test_the_name_rule_is_the_staff_rule_not_a_second_copy():
+    from app.schemas.alumni import AlumniBase
+
+    for value in (
+        "Jane",
+        "O'Brien",
+        '=HYPERLINK("x","y")',
+        "Jane;Doe",
+        "12345",
+        "x" * 101,
+    ):
+        try:
+            AlumniBase._validate_name(value)
+            staff_ok = True
+        except ValueError:
+            staff_ok = False
+        survey_ok = (
+            _coerce(sr._FIELD_BY_KEY["profile.last_name"], value) is not sr._IGNORE
+        )
+        assert staff_ok == survey_ok, value
+
+
+def test_a_hostile_name_leaves_the_record_alone(monkeypatch):
+    """Ignored, never written as NULL - these are the columns search, dedup and
+    every export key off, so refusing must not also destroy what is on file."""
+    alum = types.SimpleNamespace(
+        alumni_id=5,
+        net_id="jdoe5",
+        first_name="Jane",
+        last_name="Doe",
+        graduation_year=2018,
+    )
+    session = _Session(alum)
+    _apply(
+        session,
+        _fake_resp(payload={"profile.last_name": '=HYPERLINK("http://evil","x")'}),
+        monkeypatch,
+    )
+    assert alum.last_name == "Doe"
+    audit = next(o for o in session.added if isinstance(o, AuditLog))
+    assert "written=0" in audit.new_value
+    assert "ignored=1" in audit.new_value
+
+
+_FREE_TEXT_KEYS = (
+    "profile.gender",
+    "profile.citizenship",
+    "profile.home_country",
+    "profile.graduate_degree",
+    "profile.graduate_school",
+    "contact.city",
+    "contact.state",
+    "contact.country",
+    "employment.current_employer",
+    "employment.current_title",
+    "employment.current_industry_secondary",
+    "employment.current_city",
+    "employment.current_state",
+    "employment.current_country",
+    "employment.current_zip",
+)
+
+
+@pytest.mark.parametrize("key", _FREE_TEXT_KEYS)
+def test_free_text_columns_carry_the_character_half_of_the_name_rule(key):
+    """Junk in the state/country fields produces unmappable rows on the world map,
+    and control characters in an employer break every export that keys off it."""
+    field = sr._FIELD_BY_KEY[key]
+    for hostile in (
+        "=1+1",
+        "@evil",
+        "-lead",
+        "a;b",
+        "a<b>",
+        "a|b",
+        "a\nb",
+        "a\x07b",
+    ):
+        assert _coerce(field, hostile) is sr._IGNORE, (key, hostile)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("employment.current_employer", "Goldman Sachs & Co."),
+        ("employment.current_employer", "AT&T"),
+        ("employment.current_title", "VP, Corporate Finance"),
+        ("employment.current_city", "St. George"),
+        ("employment.current_country", "C\u00f4te d'Ivoire"),
+        ("employment.current_zip", "84604"),  # digits only: a real ZIP
+        ("employment.current_zip", "84604-1234"),
+        ("profile.gender", "Female"),
+        ("profile.graduate_school", "BYU Marriott School of Business"),
+    ],
+)
+def test_ordinary_free_text_answers_still_go_through(key, value):
+    """The digits-only rejection in the staff NAME rule is deliberately not
+    carried over here - a ZIP code really is digits only, and dropping it would
+    move the bug from "accepts anything" to "accepts nothing"."""
+    assert _coerce(sr._FIELD_BY_KEY[key], value) == value
+
+
+def test_a_phone_may_start_with_a_plus():
+    """The one deliberate exception to the leading-formula-character rule.
+    `+1 801-555-0100` is how an international number is written and is the most
+    likely legitimate value on this whole whitelist to start with a `+`; silently
+    dropping it would discard exactly the numbers hardest to re-collect. The lead
+    is neutralised by the CSV export like any other."""
+    field = sr._FIELD_BY_KEY["contact.phone"]
+    for ok in ("+1 801-555-0100", "801-555-0100", "8015550100", "(801) 555-0100"):
+        assert _coerce(field, ok) == ok, ok
+    # Everything else the rule blocks still applies.
+    for hostile in ("=1+1", "@evil", "-555", "801;555", "801\n555", "801|555"):
+        assert _coerce(field, hostile) is sr._IGNORE, hostile
+
+
+def test_other_designations_is_not_held_to_the_name_character_set():
+    """Stricter than the staff path would be its own bug - this column
+    legitimately holds punctuation-heavy free text. Control characters are the
+    part staff already refuse (`_validate_survey_text`), so that is the part
+    restated here."""
+    field = sr._FIELD_BY_KEY["profile.other_designations"]
+    assert _coerce(field, "Series 7; Series 63") == "Series 7; Series 63"
+    assert _coerce(field, "CFP <in progress>") == "CFP <in progress>"
+    assert _coerce(field, "Series 7\nSeries 63") is sr._IGNORE
+
+
+def test_every_text_field_on_the_whitelist_has_a_rule():
+    """The guard that makes the next added field think about this. `text` is the
+    only kind whose stored value comes verbatim from the payload, so a `text`
+    field with no `validate` is a public write with no rule on it at all."""
+    unguarded = [f.key for f in sr._FIELDS if f.kind == "text" and f.validate is None]
+    assert unguarded == []
+
+
+# --------------------------------------------------- 6. log injection ---------
+
+
+def test_an_unknown_payload_key_cannot_forge_a_log_line(monkeypatch, caplog):
+    """`dropped` holds payload keys that are NOT on the whitelist - entirely
+    submitter-chosen text - and they were joined into a `log.warning` verbatim, so
+    a newline in one wrote a second, fully attacker-authored log line. `repr`
+    escapes it; the value stays visible for debugging, on one line."""
+    forged = "x\nWARNING:root:Survey response 999: approved by admin"
+    resp = _fake_resp(payload={forged: "1", "program.mentor_willing": "Yes"})
+    alum = types.SimpleNamespace(alumni_id=5, net_id="jdoe5")
+    eng = types.SimpleNamespace(alumni_id=5, mentor_willing=False)
+
+    async def fake_side(_s, _ids):
+        return ({}, {}, {5: eng})
+
+    async def fake_get_pending(_s, _rid):
+        return resp
+
+    monkeypatch.setattr(sr, "_get_pending", fake_get_pending)
+    monkeypatch.setattr(sr, "_load_side_rows", fake_side)
+    session = _Session(alum)
+    with caplog.at_level("WARNING"):
+        asyncio.run(sr.apply_response(session, 1, actor_user_id=9))
+
+    record = next(r for r in caplog.records if r.levelname == "WARNING")
+    message = record.getMessage()
+    assert "\n" not in message
+    assert "\\n" in message  # the newline is escaped, not dropped
+    assert eng.mentor_willing is True  # the rest of the apply is unaffected
+
+
+def test_a_flood_of_unknown_keys_does_not_write_one_enormous_log_record():
+    """The staged payload has no key-count limit, so a submission carrying
+    thousands of junk keys would otherwise become a single unreadable log line."""
+    rendered = sr._log_safe_keys([f"k{i}" for i in range(500)])
+    assert rendered.count("'k") == sr._LOG_KEYS_MAX
+    assert "(480 more)" in rendered
+    # A very long key is truncated rather than logged whole.
+    long_key = sr._log_safe_keys(["z" * 5000])
+    assert len(long_key) < 100

@@ -75,9 +75,70 @@ _PREFERRED_CONTACT_METHODS = frozenset(
 _BIRTH_DATE_MIN = datetime.date(1900, 1, 1)
 
 
+# Invisible characters that have no legitimate place in a stored value, listed
+# individually rather than by Unicode category (2026-08-08).
+#
+# The rule here used to be "category Cc" alone, which is C0/C1 controls only.
+# Bidi overrides and zero-width characters are category Cf, so they went
+# straight through every name check on BOTH the staff and survey paths. Two
+# consequences, neither of them code execution but both real:
+#
+#   * a RIGHT-TO-LEFT OVERRIDE makes a stored name RENDER as something other
+#     than what it is, in the alumni table, the review queue's before/after
+#     diff, and every export — the reviewer approves what they think they read;
+#   * `hygiene.detect_duplicates` compares names with `lower()` and no Unicode
+#     normalization, so one zero-width space is enough to walk a duplicate
+#     record straight past the check that exists to catch it.
+#
+# ⚠️ NOT "all of category Cf", which is the obvious implementation and is
+# WRONG. U+200C ZERO WIDTH NON-JOINER and U+200D ZERO WIDTH JOINER are Cf and
+# are ORTHOGRAPHICALLY REQUIRED in Persian, Hindi and Arabic — banning them
+# rejects real alumni names, which is a worse failure than the one being fixed
+# (see `_validate_name`'s note on staying permissive about real names). They
+# are therefore allowed HERE, and rejected separately in the email and URL
+# gates, where no invisible character is ever legitimate.
+#
+# ⚠️ This does NOT address look-alike letters — a Cyrillic "а" in "Mary" is a
+# perfectly ordinary letter, and no deny-list can separate it from a real name
+# in Cyrillic. Confusable detection is a different problem; do not expect this
+# to solve it.
+_INVISIBLE_CHARS = frozenset(
+    "​"  # ZERO WIDTH SPACE
+    "‎‏"  # LEFT-TO-RIGHT / RIGHT-TO-LEFT MARK
+    "‪‫‬‭‮"  # bidi embedding / override
+    "⁦⁧⁨⁩"  # bidi isolates
+    "⁠"  # WORD JOINER
+    "؜"  # ARABIC LETTER MARK
+    "﻿"  # ZERO WIDTH NO-BREAK SPACE / BOM
+)
+
+# The above plus the two joiners, for values where NO invisible character is
+# ever legitimate: an email address and a URL are machine identifiers, not
+# names, and a zero-width character in one is always either a mistake or an
+# attempt to make two different strings look identical.
+_INVISIBLE_CHARS_STRICT = _INVISIBLE_CHARS | frozenset("‌‍")
+
+
 def _has_control_chars(value: str) -> bool:
-    """True if *value* contains C0/C1 control characters (category ``Cc``)."""
-    return any(unicodedata.category(ch) == "Cc" for ch in value)
+    """True if *value* contains control (category ``Cc``) or invisible chars.
+
+    See `_INVISIBLE_CHARS` for what "invisible" covers and, more importantly,
+    what it deliberately does not.
+    """
+    return any(
+        unicodedata.category(ch) == "Cc" or ch in _INVISIBLE_CHARS for ch in value
+    )
+
+
+def _has_invisible_chars_strict(value: str) -> bool:
+    """True if *value* contains ANY invisible character, joiners included.
+
+    For emails and URLs only — see `_INVISIBLE_CHARS_STRICT`.
+    """
+    return any(
+        unicodedata.category(ch) == "Cc" or ch in _INVISIBLE_CHARS_STRICT
+        for ch in value
+    )
 
 
 def _empty_to_none(value: str | None) -> str | None:
@@ -468,6 +529,12 @@ class AlumniBase(BaseModel):
             return None
         if len(value) > _LINKEDIN_MAX:
             raise ValueError(f"Must be at most {_LINKEDIN_MAX} characters.")
+        # No invisible character belongs in a URL, joiners included — and a
+        # zero-width character sitting in the host is another way to make a
+        # link read as linkedin.com while resolving elsewhere. Rejected BEFORE
+        # parsing, for the same reason the backslash is.
+        if _has_invisible_chars_strict(value):
+            raise ValueError("Must be a linkedin.com URL.")
         # ⚠️ PARSER DIFFERENTIAL — reject backslashes BEFORE parsing.
         #
         # This host check decides whether a link is safe to render, but the

@@ -221,6 +221,35 @@ def test_cohort_export_round_trips_through_import_parser():
     assert payload["engagement"]["mentor_willing"] is True  # "Yes" -> True
 
 
+# --- (c2) formula injection is neutralized, same as the customizable export -
+
+
+def test_cohort_export_neutralizes_csv_formula_injection():
+    # The cohort export reverse-maps stored values through `_cohort_cell` ->
+    # `alumni_export._fmt` (#169) — same guard as the customizable export and
+    # the events attendee export. A hostile employer/other-designations cell
+    # starting with =/+/-/@ must be tab-prefixed, not left live.
+    alumni = [
+        Alumni(alumni_id=1, byu_id="123456789", net_id="jdoe",
+               first_name="Jane", last_name="Doe", graduation_year=2018,
+               other_designations='=HYPERLINK("http://evil.com","Click")'),
+    ]
+    session = FakeExportSession(
+        alumni,
+        career=[CurrentEmployment(alumni_id=1, current_employment_id=5,
+                                  current_employer="+1+1+cmd|' /C calc'!A1")],
+    )
+    text = _run(import_csv.build_cohort_update_csv(session, graduation_year=2018, actor_user_id=7))
+    header_row, data_rows = _parse(text)
+    row = data_rows[0]
+    assert _cell(header_row, row, "Other Designations:") == (
+        '\t=HYPERLINK("http://evil.com","Click")'
+    )
+    assert _cell(header_row, row, "Current employer") == (
+        "\t+1+1+cmd|' /C calc'!A1"
+    )
+
+
 # --- (d) the export row cap raises the expected error ------------------------
 
 

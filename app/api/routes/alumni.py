@@ -118,6 +118,7 @@ from app.services import (
     alumni_export,
     geo_search,
     hygiene,
+    images,
     import_csv,
     supabase_storage,
 )
@@ -694,7 +695,18 @@ _HEADSHOT_BUCKET = "headshots"
 _HEADSHOT_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 # Headshots get a larger cap than CSV imports — high-res phone photos are easily
 # several MB. Independent of ``MAX_UPLOAD_BYTES`` so it doesn't loosen imports.
+#
+# ⚠️ This value MUST NOT drift above the ``headshots`` bucket's own
+# ``file_size_limit`` (verified 20,971,520 bytes on dev, 2026-08-08). On the
+# direct-upload path it is what bounds the object BEFORE the single confirm
+# downloads it into the function's memory — see ``_normalise_stored_headshot``.
 _HEADSHOT_MAX_BYTES = 20 * 1024 * 1024  # 20 MiB
+# ``normalise_headshot`` always emits a JPEG, whatever went in, so the object we
+# write back must be LABELLED one. Storage keeps whatever Content-Type the write
+# declared, and ``_sniffed_head_error`` rejects bytes that contradict their
+# label — so re-uploading JPEG bytes under a stale ``image/png`` would make the
+# NEXT confirm purge a headshot we produced ourselves.
+_HEADSHOT_NORMALISED_MIME = "image/jpeg"
 
 # Bulk headshot import (#401, reworked in #595). Extension -> MIME: a bulk file
 # name is all we get before the bytes land, so the extension picks the MIME we
@@ -823,6 +835,104 @@ async def _purge_rejected_headshot(
     await session.commit()
 
 
+async def _normalise_stored_headshot(
+    session: AsyncSession,
+    actor_user_id: int | None,
+    alumni_id: int,
+    key: str,
+) -> None:
+    """Replace the object at *key* with OUR re-encode of it, or delete it.
+
+    This is what turns the client-side cropper from something we HOPE ran into
+    something enforced. The browser PUTs straight to storage, so until this runs
+    the bytes at an alumnus's live key are entirely the uploader's: a JPEG-
+    prefixed polyglot passes the 16-byte sniff, and a phone photo arrives with
+    its EXIF — including the GPS coordinates of wherever it was taken — intact.
+    ``images.normalise_headshot`` decodes and re-encodes, so the object we keep
+    is built from a pixel buffer rather than copied.
+
+    MEMORY — WHY THIS IS SAFE HERE AND NOT ON THE BULK PATH
+    ------------------------------------------------------
+    Unlike the browser's request, this download is server -> Supabase, so the
+    ~4.5 MB Vercel edge body cap does not apply. What bounds it instead:
+
+      * the bucket's ``file_size_limit`` (20,971,520 bytes) refuses a larger PUT,
+        and the caller re-checks ``size > _HEADSHOT_MAX_BYTES`` from the probe
+        BEFORE calling this — so at most ~20 MiB of compressed bytes are read;
+      * the DECODED buffer, which is the real cost, is capped by
+        ``images._MAX_PIXELS`` (50 Mpx) at ~150 MB, and that check runs off the
+        header while the pixels are still unread.
+
+    ~180 MB peak for one object against the function's 2 GB, shared across
+    concurrent invocations. One at a time is comfortable. ⚠️ ONE — this is
+    deliberately NOT called from ``/alumni/headshots/bulk/confirm``, which
+    verifies up to 100 objects with ``_HEADSHOT_BULK_CONCURRENCY`` (8) in
+    flight: 8 x 180 MB is most of the instance, and the batch shares it with
+    every co-tenant request. Bulk normalisation belongs to a background sweep.
+
+    ON FAILURE THE OBJECT IS DELETED
+    --------------------------------
+    By the time we get here the upload is already DURABLE at the alumnus's live
+    key — the browser wrote it, not us — so "reject" cannot just mean "return an
+    error". An object we could not read, could not decode, or could not replace
+    is an object we cannot vouch for, and leaving it would defeat the whole
+    change: it would go on serving as that alumnus's headshot with none of the
+    above done to it. So it is purged and audited ``upload_headshot_rejected``,
+    and the caller never writes the ``upload_headshot`` row.
+
+    The cost of that is a staff member occasionally re-picking a file they still
+    have on disk. It is NOT the loss of a previous good photo: the signed upload
+    URL is upsert-scoped to this exact key, so whatever was there was already
+    overwritten by the PUT this confirm is about.
+    """
+    try:
+        raw = await supabase_storage.download_object(_HEADSHOT_BUCKET, key)
+    except ServiceError as exc:
+        # ⚠️ THE PROBE ABOVE FAILS OPEN; THIS MUST NOT. The probe is
+        # defense-in-depth over the bucket's own allow-list, so a hiccup reading
+        # 16 bytes is better absorbed than turned into a false upload failure.
+        # This read is the control ITSELF — failing open here would bless
+        # un-normalised bytes as a verified headshot, which is the exact thing
+        # the sniff could not do and this exists to do. Nothing an uploader
+        # controls can steer us into this branch (it is our own link to
+        # Supabase), so fail-closed costs a retry, not a bypass.
+        await _purge_rejected_headshot(
+            session, actor_user_id, alumni_id, key, "unverified", key
+        )
+        raise ServiceError(
+            "The uploaded image could not be read back to be checked, so it was "
+            "removed. Please try uploading it again."
+        ) from exc
+
+    try:
+        normalised = images.normalise_headshot(raw)
+    except InvalidRequestError:
+        # Undecodable, a polyglot whose payload is all that follows the magic
+        # number, or past the megapixel guard. ``field_name="content"`` matches
+        # what the byte sniff records for the same verdict, so the audit trail
+        # reads the same whichever check caught it.
+        await _purge_rejected_headshot(
+            session, actor_user_id, alumni_id, key, "content", key
+        )
+        raise
+
+    try:
+        await supabase_storage.upload_object(
+            _HEADSHOT_BUCKET, key, normalised, _HEADSHOT_NORMALISED_MIME
+        )
+    except ServiceError as exc:
+        # Same disposition as a failed download, for the same reason: the
+        # ORIGINAL bytes are still sitting at the live key, and we have just
+        # established we cannot replace them.
+        await _purge_rejected_headshot(
+            session, actor_user_id, alumni_id, key, "unverified", key
+        )
+        raise ServiceError(
+            "The checked image could not be saved, so the upload was removed. "
+            "Please try uploading it again."
+        ) from exc
+
+
 async def _alumnus_net_id(session: AsyncSession, alumni_id: int) -> str:
     """Return the alumnus's net_id (the headshot object key), or raise 404/400."""
     alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
@@ -912,14 +1022,34 @@ async def confirm_headshot_upload(
     (the attribution for the attempt is already on the mint's
     ``upload_headshot_started`` row).
 
+    THE OBJECT IS RE-ENCODED, NOT JUST INSPECTED. The cheap checks below (type,
+    size, magic bytes) run first because they refuse an obviously wrong object
+    without pulling up to 20 MiB across the wire; what actually decides the
+    outcome is :func:`_normalise_stored_headshot`, which downloads the whole
+    object, decodes it, and writes OUR JPEG back over the same key. A 16-byte
+    check is a check on a PREFIX: a JPEG magic number followed by an HTML payload
+    passes it, and every byte of EXIF — GPS included — survives it. Re-encoding
+    is the only thing that removes what the prefix check cannot see, and it is
+    what makes the client-side cropper enforced rather than merely hoped for.
+
+    ⚠️ KNOWN WINDOW, stated rather than hidden: the browser PUTs to the
+    alumnus's LIVE object key, so between that PUT landing and the re-upload
+    here, the raw uploaded bytes ARE the alumnus's headshot and any view-role
+    user loading the profile would be served them. If the browser never reaches
+    confirm (closed tab, dropped connection) they stay that way — the same gap
+    the ``upload_headshot_started`` audit exists to make visible. Closing it
+    needs a staging key the confirm promotes from, which changes the mint
+    contract and the frontend; it is not this change.
+
     Defense-in-depth: the bucket's own allow-list/size-limit is the primary guard
     on the direct PUT, but we re-check the object's type + size here AND sniff its
     real leading bytes, deleting anything outside the contract, so a bucket
-    misconfig can't silently let a bad file through. The probe FAILS OPEN — if it
-    can't read the object we fall back to a plain existence check rather than
-    reject a legitimate upload.
+    misconfig can't silently let a bad file through. The PROBE fails open — a
+    hiccup reading 16 bytes falls back to a plain existence check rather than
+    rejecting a legitimate upload — but the normalisation read that follows does
+    NOT, because that one is the control and not a redundant re-check.
 
-    The byte sniff is the load-bearing half (#419). Nothing about the object here
+    The byte sniff was the load-bearing half (#419). Nothing about the object here
     was chosen by us: the browser PUT it straight to storage and picked its own
     ``Content-Type``, exactly like the multipart header on the single-request
     upload above. This path used to check only that declared type, so anyone with
@@ -927,14 +1057,21 @@ async def confirm_headshot_upload(
     arbitrary bytes labelled ``image/jpeg`` and have them audited
     ``upload_headshot`` and served back as a verified headshot. The bulk-import
     sibling (:func:`_verify_landed_headshot`) always sniffed; this one had drifted,
-    and the two now do the same thing for the same reason."""
+    and the two still share :func:`_sniffed_head_error` so they cannot drift again.
+    Bulk deliberately stops at the sniff — see ``_normalise_stored_headshot`` for
+    why 100 objects cannot be re-encoded in one invocation."""
     net_id = await _alumnus_net_id(session, alumni_id)
     content_type, size, head = await supabase_storage.probe_object_head(
         _HEADSHOT_BUCKET, net_id
     )
     if content_type is None and size is None and head is None:
         # Couldn't read the object at all — confirm it at least exists so a
-        # never-uploaded key can't be "confirmed", then record completion.
+        # never-uploaded key can't be "confirmed". We then fall THROUGH to the
+        # normalisation rather than recording completion here: the probe is
+        # skippable, the re-encode is not, and a failed probe is no evidence at
+        # all about the bytes. (Before the re-encode existed this branch WAS the
+        # end of the road, which is exactly how un-inspected bytes could be
+        # audited as a verified headshot.)
         if await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id) is None:
             raise InvalidRequestError("No uploaded image was found to confirm.")
     elif content_type is not None and content_type not in _HEADSHOT_MIME_TYPES:
@@ -963,6 +1100,10 @@ async def confirm_headshot_upload(
             session, user.user_id, alumni_id, net_id, "content", content_type or net_id
         )
         raise InvalidRequestError(content_error)
+    # Everything above only narrowed what we are willing to DOWNLOAD. This is the
+    # check: the stored object is replaced by our own re-encode of it, or it is
+    # deleted and we never reach the success audit below.
+    await _normalise_stored_headshot(session, user.user_id, alumni_id, net_id)
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
     await session.commit()
     return Response(status_code=204)

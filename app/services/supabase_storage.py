@@ -77,6 +77,49 @@ async def download_object(bucket: str, path: str) -> bytes:
     return response.content
 
 
+async def list_objects(
+    bucket: str, *, prefix: str = "", limit: int = 100, offset: int = 0
+) -> list[dict]:
+    """One page of a bucket's contents: the raw Supabase rows, name-sorted.
+
+    Each row carries ``name`` plus a ``metadata`` object with ``size``,
+    ``mimetype`` and ``eTag``. ⚠️ A row whose ``metadata`` is ``None`` is a
+    FOLDER placeholder, not a file — Supabase synthesises one per path segment
+    (``survey-pending``, say). Callers must drop those; downloading one 404s.
+
+    Paging is the caller's job: ask for successive ``offset``s until a short page
+    comes back. The listing is metadata only — no image bytes cross the wire —
+    which is what lets the sweep decide what to work on for almost nothing.
+    """
+    base, key = _base_and_key()
+    url = f"{base}/object/list/{bucket}"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                url,
+                headers=_headers(key, content_type="application/json"),
+                json={
+                    "prefix": prefix,
+                    "limit": limit,
+                    "offset": offset,
+                    # Stable order across pages. Without it the same object can
+                    # appear on two pages (or on none) while paging.
+                    "sortBy": {"column": "name", "order": "asc"},
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise ServiceError("Could not reach the file storage service to list objects.") from exc
+    if not response.is_success:
+        raise ServiceError("The file storage service rejected the listing.")
+    try:
+        rows = response.json()
+    except ValueError as exc:
+        raise ServiceError("The file storage service returned an unreadable listing.") from exc
+    if not isinstance(rows, list):
+        raise ServiceError("The file storage service returned an unreadable listing.")
+    return rows
+
+
 async def create_signed_url(
     bucket: str, path: str, *, expires_in: int = 3600
 ) -> str | None:

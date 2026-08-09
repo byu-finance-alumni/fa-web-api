@@ -29,6 +29,7 @@ from app.api.routes import (
     health,
     maintenance,
     notes,
+    storage,
     support,
     survey,
     tasks,
@@ -186,6 +187,7 @@ app.include_router(vocabulary.admin_router)
 app.include_router(support.router)
 app.include_router(support.admin_router)
 app.include_router(survey.router)
+app.include_router(storage.router)
 
 
 @app.exception_handler(MaintenanceModeError)

@@ -65,6 +65,37 @@ no wiring needed. Any request without the matching secret gets a `401`, and when
 default. Set `CRON_SECRET` on the **`dev-fa-web-api`** project to enable the dev
 cron (this feature is dev-only for now).
 
+### Headshot normalisation sweep (Vercel Cron)
+
+`vercel.json` defines a second **daily cron** that hits
+`GET /storage/cron/headshot-sweep` at `30 19 * * *` — deliberately 90 minutes
+after the survey cron, so the two never share an instance and compete for the
+same 2 GB of function memory.
+
+It walks the `headshots` bucket, downloads objects still over 400 KB, re-encodes
+them with `services/images.normalise_headshot`, and writes each result back
+**under the same key**. Nothing in the database changes and every existing
+headshot URL keeps working. Staged survey photos (`survey-pending/`) are never
+touched. See `app/services/headshot_sweep.py` for why "already normalised" is
+decided by size and what the run is bounded by.
+
+**It exists because the bulk photo import cannot normalise on the way in** — the
+browser PUTs each file straight to Supabase Storage, so those bytes never cross
+our function.
+
+Authentication is identical to the survey cron: `Authorization: Bearer
+$CRON_SECRET`, sent automatically by Vercel Cron, and default-closed when
+`CRON_SECRET` is unset. That matters more here than for the survey cron, because
+this endpoint **rewrites stored photos**.
+
+⚠️ Each run rewrites at most 25 objects and stops after 45 s, so a large backlog
+drains over successive nights rather than timing out. Re-running is always safe:
+a normalised object falls under the threshold and is never picked up again.
+⚠️ Unlike the offline `compress-headshots.py`, the cron keeps **no backup** of the
+originals — a serverless function has nowhere to put them. To drain a large
+first-time backlog with backups on disk, run that script once by hand and let the
+cron handle the trickle afterwards.
+
 ## 2A. Deploy via GitHub integration (recommended)
 
 1. Push this repo to GitHub (already at `byu-finance-alumni/fa-web-api`).

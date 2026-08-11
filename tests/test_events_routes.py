@@ -270,6 +270,44 @@ def test_attendee_export_returns_csv_and_audits(client):
     )
 
 
+def test_attendee_export_neutralizes_csv_formula_injection(client):
+    # Every free-text cell here (name, email, net_id) is attacker-reachable —
+    # first/last name and net_id come from staff-editable alumni fields, and a
+    # stored value starting with =/+/-/@ would otherwise execute as a live
+    # formula the moment a staff member opens this export in Excel (#169).
+    # Uses the exact HYPERLINK payload style a real phishing attempt would send.
+    import csv as _csv
+    import io as _io
+
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _ExportSession(
+        event=_event(),
+        rows=[
+            (
+                _export_alumnus(
+                    first_name='=HYPERLINK("http://evil.com","Click")',
+                    last_name="",
+                    net_id="+cmd|'/C calc'!A1",
+                ),
+                "-2+3+cmd|' /C calc'!A1@evil.com",
+                None,
+            ),
+        ],
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/events/7/attendees/export")
+    assert response.status_code == 200
+    rows = list(_csv.reader(_io.StringIO(response.text)))
+    assert rows[0] == ["Name", "Email", "Net ID"]
+    name_cell, email_cell, net_id_cell = rows[1]
+    # Every cell that starts with a formula-lead char is tab-prefixed; the
+    # underlying value is preserved byte-for-byte after the tab.
+    assert name_cell == '\t=HYPERLINK("http://evil.com","Click")'
+    assert email_cell == "\t-2+3+cmd|' /C calc'!A1@evil.com"
+    assert net_id_cell == "\t+cmd|'/C calc'!A1"
+
+
 # --- list filters (compiled SQL) ----------------------------------------------
 
 

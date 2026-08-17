@@ -817,9 +817,25 @@ CREATE TABLE audit_logs (
     -- 2026-06-17_audit_actor_snapshot.sql.
     actor_email  varchar(255),
     actor_name   varchar(255),
+    -- Groups the rows written by ONE save into one version (#45). Timestamps
+    -- can't: now() is transaction-start time, so a bulk CSV update (one
+    -- transaction for the whole file) gives thousands of rows the same instant.
+    -- NULL on rows written before the column existed. See migration
+    -- 2026-08-17_audit_change_set_and_source.sql.
+    change_set_id varchar(36),
+    -- Write provenance: 'manual' | 'import' (#45). Hand edits and bulk CSV
+    -- updates share one write path, so a later restore feature can't otherwise
+    -- tell a spreadsheet correction from a typed one. NULL where the writing
+    -- path carries no provenance (logins, exports, disclosure reads).
+    source       varchar(20),
     created_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_audit_logs_user_id FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
+
+-- "Every row of this change set" -- the read shape version history uses.
+-- Partial, so rows that never carry a change set stay out of the index.
+CREATE INDEX idx_audit_logs_change_set_id ON audit_logs (change_set_id)
+    WHERE change_set_id IS NOT NULL;
 
 -- Snapshot the acting user's email/name onto each audit row at write time, so a
 -- later user deletion (user_id -> NULL) never erases who performed the action.
@@ -862,6 +878,10 @@ CREATE TABLE engineer_action_log (
     field_name    varchar(255),
     old_value     text,
     new_value     text,
+    -- Mirrors audit_logs (#45): the reroute hook carries the per-save grouping
+    -- key and the write's provenance across with the row.
+    change_set_id varchar(36),
+    source        varchar(20),
     occurred_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_engineer_action_log_actor_user_id FOREIGN KEY (actor_user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );

@@ -38,6 +38,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_context import AUDIT_SOURCE_IMPORT, audit_source_scope
 from app.core.dropdowns import (
     holds_designation,
     normalize_designation,
@@ -2047,9 +2048,15 @@ async def commit_update(
                 if real_refresh is not None:
                     session.refresh = _noop_refresh  # type: ignore[method-assign]
                 try:
-                    await alumni_service.update_alumni(
-                        session, alumni_id, model, actor_user_id=actor_user_id
-                    )
+                    # Stamp every audit row this row's write produces as import
+                    # provenance (#45). A spreadsheet correction and a typed one
+                    # are otherwise indistinguishable in the trail — both arrive
+                    # through update_alumni — and a later restore feature has to
+                    # be able to tell them apart before it reverts anything.
+                    with audit_source_scope(AUDIT_SOURCE_IMPORT):
+                        await alumni_service.update_alumni(
+                            session, alumni_id, model, actor_user_id=actor_user_id
+                        )
                 finally:
                     session.commit = real_commit  # type: ignore[method-assign]
                     if real_refresh is not None:

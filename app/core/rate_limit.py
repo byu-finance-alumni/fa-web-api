@@ -383,6 +383,17 @@ SURVEY_SUBMIT_LIMITER = public_token_rate_limiter(
 SURVEY_PHOTO_LIMITER = public_token_rate_limiter(
     "survey:respond_photo", token_limit=5, ip_limit=30, window_seconds=_SURVEY_WINDOW
 )
+# Submitting opportunity links (#441). The SAME budget as the field submit, and
+# deliberately its own bucket rather than a share of that one: they are two
+# independent calls the survey page makes, so sharing a budget would mean a
+# submit-then-fix-a-typo cycle on one form silently eating the other form's
+# allowance. Each call can create up to `MAX_LINKS_PER_SUBMIT` rows in the
+# moderation queue, so this is a queue-flood surface exactly like the field
+# submit — 10 per token per ten minutes is well past any real alum and a hard
+# brake on a replayed link.
+OPPORTUNITY_LINK_SUBMIT_LIMITER = public_token_rate_limiter(
+    "survey:respond_links", token_limit=10, ip_limit=60, window_seconds=_SURVEY_WINDOW
+)
 
 
 # --- Unauthenticated pre-login routes (#423) ---------------------------------

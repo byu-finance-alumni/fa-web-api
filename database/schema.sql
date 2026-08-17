@@ -998,6 +998,54 @@ CREATE TABLE bbq_attendance (
 -- Reference data & application config
 -- -----------------------------------------------------------------------------
 
+-- Alumni-submitted internship / job opportunity links (#441). Many links per
+-- alum, each with its own structure, so this does NOT fit the survey's "one
+-- question = one column" rule and gets its own table and its own write path.
+-- Two sources with two landing states: source='survey' lands 'pending' (a
+-- PUBLIC, token-gated write) and source='staff' lands 'approved' (a staff member
+-- typing it in IS the review). Moderation is PER LINK — the survey response
+-- queue is all-or-nothing per submission and cannot express it.
+-- `url` is attacker-supplied and rendered as an href to a signed-in staff
+-- member; the column widths here are the persistence cap on a public write.
+-- See migrations/2026-08-17_opportunity_links.sql and
+-- app/services/opportunity_links.py.
+CREATE TABLE opportunity_links (
+    opportunity_link_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id            bigint NOT NULL,
+    -- True = display under the alum's own current_employment.current_employer,
+    -- resolved at read time (company_name is then NULL).
+    is_own_company       boolean NOT NULL DEFAULT false,
+    company_name         varchar(255),
+    url                  varchar(2048) NOT NULL,
+    location_city        varchar(100),
+    location_state       varchar(100),
+    role_type            varchar(20) NOT NULL,
+    application_deadline date,
+    details              text,
+    status               varchar(20) NOT NULL DEFAULT 'pending',
+    source               varchar(20) NOT NULL,
+    submitted_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at           timestamptz NOT NULL DEFAULT now(),
+    created_by_user_id   bigint,
+    reviewed_by_user_id  bigint,
+    reviewed_at          timestamptz,
+    CONSTRAINT fk_opportunity_links_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_opportunity_links_created_by FOREIGN KEY (created_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_opportunity_links_reviewer FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT ck_opportunity_links_status CHECK (status IN ('pending', 'approved', 'rejected')),
+    CONSTRAINT ck_opportunity_links_source CHECK (source IN ('survey', 'staff')),
+    CONSTRAINT ck_opportunity_links_role_type CHECK (role_type IN ('internship', 'full_time', 'both')),
+    CONSTRAINT ck_opportunity_links_company CHECK (
+        (is_own_company AND company_name IS NULL)
+        OR (NOT is_own_company AND company_name IS NOT NULL)
+    ),
+    CONSTRAINT ck_opportunity_links_details_length CHECK (details IS NULL OR char_length(details) <= 2000),
+    CONSTRAINT ck_opportunity_links_url_length CHECK (char_length(url) BETWEEN 1 AND 2048)
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_links_status_submitted ON opportunity_links (status, submitted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_opportunity_links_role_type ON opportunity_links (role_type);
+CREATE INDEX IF NOT EXISTS idx_opportunity_links_alumni_id ON opportunity_links (alumni_id);
+
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded
 -- from the frontend crosswalk. Keys are normalized: city_norm = lower(trim(city)),

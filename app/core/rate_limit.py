@@ -285,8 +285,14 @@ BulkHeadshotRateLimit = Annotated[
 # Two independent budgets per request, both required:
 #
 # * per TOKEN — the precise one. A token addresses exactly one alum's record, so
-#   this is what stops one leaked/forwarded link being replayed into a flood,
-#   whatever address it is replayed from.
+#   this is the budget that tracks the thing being abused rather than the host
+#   abusing it, and unlike the IP key it is not spoofable: reaching it at all
+#   costs a valid HMAC, so header games cannot move a caller onto a fresh key.
+#   That makes it the better-aimed of the two — NOT a ceiling. It is the same
+#   in-process counter as everything else here, so it is per warm instance and
+#   starts over at zero on a cold start; a leaked link replayed slowly enough,
+#   or across enough instances, still gets through. It brakes a naive replay
+#   flood, it does not stop a patient one.
 # * per CLIENT IP — the broad one. Catches a single host working several tokens
 #   at once. Deliberately loose, because alumni share egress addresses (one
 #   employer's network, one campus, mobile CGNAT) and blocking a real alum is a
@@ -316,8 +322,9 @@ def _client_key(request: Request) -> str:
     preferring Vercel's own header since nothing upstream of the edge can set it.
     A spoofed ``X-Forwarded-For`` then only lengthens the chain we ignore.
 
-    The per-token budget is the real control regardless — it needs a valid HMAC,
-    so no header games reach it. This is the loose second layer.
+    The per-token budget is the better-aimed control regardless — it needs a
+    valid HMAC, so no header games reach it (though it is best-effort and
+    per-instance like everything else here). This is the loose second layer.
     """
     for header in ("x-vercel-forwarded-for", "x-forwarded-for"):
         raw = request.headers.get(header)
@@ -353,8 +360,11 @@ def public_token_rate_limiter(
     """
 
     async def _dependency(request: Request, token: str) -> None:
-        # Token budget first: it is the one an attacker cannot dodge, so it is
-        # the one that should decide the outcome when both are near their cap.
+        # Token budget first: it keys on the credential rather than the address,
+        # so it is the better-aimed of the two and should decide the outcome
+        # when both are near their cap. (Better-aimed, not unavoidable — it is
+        # the same best-effort per-instance counter as every other limiter here;
+        # see the module docstring.)
         _check(
             f"{bucket}:token",
             _token_key(token),

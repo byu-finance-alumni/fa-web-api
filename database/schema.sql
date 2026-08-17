@@ -619,6 +619,14 @@ CREATE TABLE surveys (
 -- admin review (per the email's "reviewed before applied" promise). `payload` is
 -- the submitted values keyed by survey field keys (table.column). See
 -- migrations/2026-07-27_survey_responses.sql.
+-- `cycle_seq` / `stage` record WHICH campaign email this answers (#497), copied
+-- at submit time from the `survey_send_log` row for the email the alum was
+-- actually sent. Both are NULLABLE and NOT backfilled: a response that predates
+-- the stamp has no knowable cycle, and a guessed number is indistinguishable
+-- from a real one in a report. NEVER derive either from `submitted_at` — a
+-- campaign starting in late December sends its reminders in January, so a
+-- date-derived cycle splits one campaign in two (see the `survey_schedule` note
+-- below). See migrations/2026-08-17_survey_response_cycle_stamp.sql.
 CREATE TABLE survey_responses (
     survey_response_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id           bigint NOT NULL,
@@ -629,15 +637,22 @@ CREATE TABLE survey_responses (
     -- (headshots bucket, `survey-pending/<id>`), pending admin review. See
     -- migrations/2026-07-28_survey_response_photo.sql.
     staged_photo_path   varchar(255),
+    -- Which campaign asked, and which email in it the alum had most recently
+    -- been sent (0 = initial, 1 = 1-week, 2 = 2-week). NULL = unknown.
+    cycle_seq           int,
+    stage               smallint,
     submitted_at        timestamptz NOT NULL DEFAULT now(),
     reviewed_by_user_id bigint,
     reviewed_at         timestamptz,
     CONSTRAINT fk_survey_responses_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_survey_responses_reviewer FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
-    CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected'))
+    CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected')),
+    CONSTRAINT ck_survey_responses_cycle_seq CHECK (cycle_seq IS NULL OR cycle_seq >= 1),
+    CONSTRAINT ck_survey_responses_stage CHECK (stage IS NULL OR stage BETWEEN 0 AND 2)
 );
 CREATE INDEX IF NOT EXISTS idx_survey_responses_status_year ON survey_responses (status, graduation_year);
 CREATE INDEX IF NOT EXISTS idx_survey_responses_alumni_id ON survey_responses (alumni_id);
+CREATE INDEX IF NOT EXISTS ix_survey_responses_year_cycle ON survey_responses (graduation_year, cycle_seq);
 
 -- Survey send scheduler (#542). `survey_schedule` holds one row per graduation
 -- year (initial send date + campaign state); a daily Vercel cron sends the due

@@ -152,10 +152,16 @@ RESET_PASSWORD_LIMITER = rate_limiter(
 )
 CREATE_USER_LIMITER = rate_limiter("admin:create_user", limit=10, window_seconds=600)
 ASSIGN_ROLE_LIMITER = rate_limiter("admin:assign_role", limit=30, window_seconds=600)
-# Permanent user deletion is destructive and irreversible. A generous cap (bulk
-# cleanup may be legitimate) that still brakes a runaway loop / compromised
-# session from wiping the directory in one burst.
-DELETE_USER_LIMITER = rate_limiter("admin:delete_user", limit=20, window_seconds=600)
+# Permanent user deletion is destructive and irreversible, so it gets the same
+# tight budget as reset-password (#425). This used to be 20 on the theory that
+# "bulk cleanup may be legitimate" — it isn't: the user directory is a couple of
+# dozen staff accounts, so nobody ever deletes more than a handful in a sitting,
+# and 20 was simply the loosest destructive budget in the file for the most
+# irreversible call in it. Five still covers any real correction pass while
+# narrowing what a runaway loop or a compromised session can wipe in one burst.
+# Same in-process caveat as every limiter here (see the module docstring): this
+# narrows the blast radius of one warm instance, it is not a global ceiling.
+DELETE_USER_LIMITER = rate_limiter("admin:delete_user", limit=5, window_seconds=600)
 # Login recording is open to ANY authenticated user (they can only record their
 # OWN login), so it's gated by the force-change-exempt resolver rather than an
 # admin guard. No human logs in 10 times in 10 minutes; this just brakes a

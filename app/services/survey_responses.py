@@ -66,7 +66,11 @@ from app.schemas.survey import (
     SurveySubmitResult,
 )
 from app.services import hygiene, supabase_storage
-from app.services.survey_email import LINK_DEAD_MESSAGE, verify_survey_token
+from app.services.survey_email import (
+    LINK_DEAD_MESSAGE,
+    sent_cycle_and_stage,
+    verify_survey_token,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1078,6 +1082,37 @@ def _coerce(field: _Field, raw: object):
 # --------------------------------------------------------------- submit ------
 
 
+async def _sent_cycle_and_stage(
+    session: AsyncSession, alum: Alumni, alumni_id: int
+) -> tuple[int | None, int | None]:
+    """The campaign cycle + stage to stamp on a new response (#497), or
+    ``(None, None)`` if it cannot be determined.
+
+    A thin guard around :func:`survey_email.sent_cycle_and_stage`. The stamp is
+    BOOKKEEPING: the alum's answers are the thing that must survive this request,
+    and a report the console does not yet draw is not worth losing a submission
+    over. So anything this lookup can raise is caught, logged and turned into
+    NULL — which is already a first-class value here (see the model), not an
+    error state.
+
+    It runs BEFORE the row is built and before any write, so a failure cannot
+    leave a half-written response, and it asks one indexed question of a table
+    the submit path would otherwise not touch.
+    """
+    try:
+        return await sent_cycle_and_stage(session, alum.graduation_year, alumni_id)
+    except Exception:
+        # alumni_id only: never the payload, and nothing that identifies the
+        # person beyond the id the rest of this module already logs.
+        log.warning(
+            "survey submit: could not resolve campaign cycle for alumni_id=%s; "
+            "storing NULL",
+            alumni_id,
+            exc_info=True,
+        )
+        return (None, None)
+
+
 async def submit_response(
     session: AsyncSession, token: str, fields: dict[str, str], has_photo: bool = False
 ) -> SurveySubmitResult:
@@ -1112,11 +1147,16 @@ async def submit_response(
     if not payload and not has_photo:
         return SurveySubmitResult(staged=False, change_count=0)
 
+    cycle_seq, stage = await _sent_cycle_and_stage(session, alum, alumni_id)
+
     response = SurveyResponse(
         alumni_id=alumni_id,
         graduation_year=alum.graduation_year,
         payload=payload,
         status="pending",
+        # WHICH campaign asked (#497). Capture only — nothing reads it yet.
+        cycle_seq=cycle_seq,
+        stage=stage,
     )
     session.add(response)
     # Flush so the identity is assigned; capture it BEFORE commit expires the row,

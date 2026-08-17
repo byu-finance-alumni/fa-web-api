@@ -274,6 +274,15 @@ def _qualifying_reply(status_filter: tuple[str, ...]):
     a later reset (#395). Sharing it is the point: a progress table built on a
     looser rule would show a cohort as answered while the sender still considers
     them owed an email.
+
+    ``status_filter`` narrows WHICH submissions satisfy it; everything else —
+    the 365-day window and the reset rule — is fixed, so every count derived from
+    this function is scoped identically and the numbers are comparable. Passing
+    :data:`survey_email.RESPONDED_STATUSES` is the "have they replied?" question.
+    Passing a single outcome (``applied``, ``rejected``) asks a NARROWER one —
+    what became of a submission — and in the ``rejected`` case that is not a
+    reply at all. Widening ``RESPONDED_STATUSES`` to reach the rejected ones
+    would be the drift this shared helper exists to prevent.
     """
     return (
         select(SurveyResponse.survey_response_id)
@@ -288,8 +297,8 @@ def _qualifying_reply(status_filter: tuple[str, ...]):
 
 
 def _cycle_progress():
-    """``(graduation_year, recipients, replied, awaiting_review)`` per year, for
-    the campaign each year is on RIGHT NOW.
+    """``(graduation_year, recipients, replied, awaiting_review, applied,
+    rejected)`` per year, for the campaign each year is on RIGHT NOW.
 
     This is the "how is it actually going" question, which the existing counts
     could not answer between the first email and the last. ``sent_initial`` and
@@ -305,9 +314,27 @@ def _cycle_progress():
 
     ``awaiting_review`` is the actionable one — replies sitting in the queue
     waiting for someone to apply or reject them.
+
+    ``applied`` and ``rejected`` (#497) break the review outcome down: how much
+    of what came back was actually USABLE. With ``awaiting_review`` (= `pending`)
+    they cover all three ``survey_responses.status`` values, but they are NOT a
+    partition. Every column here counts DISTINCT ALUMNI — the only way any of
+    them is comparable with ``recipients`` — and one alum can have submitted
+    twice and had one applied and the other rejected, so they appear under both.
+    These are counts of people, and they do not have to sum to ``replied``.
+
+    ``rejected`` IS NOT A REPLY, and adding it to ``replied`` would be a bug, not
+    a rounding difference. Staff discarded that submission, nothing reached the
+    record, and the sender, the follow-up list and ``replied`` above all agree
+    the alum still owes us an answer (:data:`survey_email.RESPONDED_STATUSES`).
+    It is reported so staff can see the review workload and the junk rate — the
+    same alum legitimately appears under ``rejected`` and under
+    ``non_responders``.
     """
     replied = _qualifying_reply(survey_email.RESPONDED_STATUSES)
-    pending = _qualifying_reply(("pending",))
+    pending = _qualifying_reply((survey_email.STATUS_PENDING,))
+    applied = _qualifying_reply((survey_email.STATUS_APPLIED,))
+    rejected = _qualifying_reply((survey_email.STATUS_REJECTED,))
     return (
         select(
             SurveySendLog.graduation_year,
@@ -317,6 +344,12 @@ def _cycle_progress():
             ),
             func.count(func.distinct(case((pending, SurveySendLog.alumni_id)))).label(
                 "awaiting_review"
+            ),
+            func.count(func.distinct(case((applied, SurveySendLog.alumni_id)))).label(
+                "applied"
+            ),
+            func.count(func.distinct(case((rejected, SurveySendLog.alumni_id)))).label(
+                "rejected"
             ),
         )
         # The cycle scope, identical to `_cycle_non_responders`. Without this join
@@ -334,13 +367,20 @@ def _cycle_progress():
 
 async def _progress_counts(
     session: AsyncSession,
-) -> dict[int, tuple[int, int, int]]:
-    """``{year: (recipients, replied, awaiting_review)}`` in ONE query, so the
-    console's table costs a fixed number of round trips however many years exist."""
+) -> dict[int, tuple[int, int, int, int, int]]:
+    """``{year: (recipients, replied, awaiting_review, applied, rejected)}`` in
+    ONE query, so the console's table costs a fixed number of round trips however
+    many years exist."""
     rows = (await session.execute(_cycle_progress())).all()
     return {
-        year: (int(recipients or 0), int(replied or 0), int(awaiting or 0))
-        for year, recipients, replied, awaiting in rows
+        year: (
+            int(recipients or 0),
+            int(replied or 0),
+            int(awaiting or 0),
+            int(applied or 0),
+            int(rejected or 0),
+        )
+        for year, recipients, replied, awaiting, applied, rejected in rows
     }
 
 
@@ -487,11 +527,13 @@ def _to_item(
     creators: dict[int, str],
     non_responders: dict[int, int] | None = None,
     all_time_sent: dict[int, int] | None = None,
-    progress: dict[int, tuple[int, int, int]] | None = None,
+    progress: dict[int, tuple[int, int, int, int, int]] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     created_by_id = getattr(sched, "created_by_user_id", None)
-    recipients, replied, awaiting_review = (progress or {}).get(year, (0, 0, 0))
+    recipients, replied, awaiting_review, applied, rejected = (progress or {}).get(
+        year, (0, 0, 0, 0, 0)
+    )
     return SurveyScheduleItem(
         survey_schedule_id=sched.survey_schedule_id,
         graduation_year=year,
@@ -510,6 +552,8 @@ def _to_item(
         recipients=recipients,
         replied=replied,
         awaiting_review=awaiting_review,
+        applied=applied,
+        rejected=rejected,
     )
 
 

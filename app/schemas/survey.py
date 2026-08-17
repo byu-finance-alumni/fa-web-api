@@ -408,6 +408,28 @@ class SurveyScheduleItem(BaseModel):
     # Replies sitting in the review queue — the actionable number, since these
     # are answers nobody has applied or rejected yet.
     awaiting_review: int = 0
+    # REVIEW OUTCOME (#497). `awaiting_review` says how much is still queued;
+    # these two say what happened to the rest — i.e. how much of what came back
+    # was actually usable, which nothing reported anywhere. Same cycle scope,
+    # same re-survey window, same reset rule as the three counts above, so they
+    # are read against the same denominator.
+    #
+    # `applied`: staff accepted the submission and it was written to the record.
+    applied: int = 0
+    # `rejected`: staff THREW THE SUBMISSION AWAY (spam, junk, someone else's
+    # data). It is NOT a reply and is deliberately not part of `replied` —
+    # nothing reached the record, so that alum still owes us an answer and the
+    # sender will email them again. Displaying it beside `replied` needs the same
+    # care the console footer already takes with `non_responders`: the same
+    # person legitimately appears under `rejected` AND under `non_responders`,
+    # and that is not a contradiction.
+    #
+    # All five are counts of DISTINCT ALUMNI, not of submissions, so that they
+    # are comparable with `recipients`. One alum who submitted twice and had one
+    # applied and one rejected is counted in both columns — so
+    # `awaiting_review + applied + rejected` need not equal `replied`, and none
+    # of them is a partition of anything. Do not compute a rate from them.
+    rejected: int = 0
 
 
 class SurveySchedulePauseAllResult(BaseModel):

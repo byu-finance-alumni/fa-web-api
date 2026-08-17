@@ -706,11 +706,28 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     """Strip the FERPA-sensitive parts of a profile for a ``view_only`` caller.
 
     Nulls the sensitive core PII (via ``minimize_alumni_read``), redacts the
-    home MAILING ADDRESS (street lines + ZIP — city/state/region/country stay,
-    as directory-style location), strips all free-text notes (interaction /
-    survey / engagement / program-engagement notes), and omits the embedded
-    audit trail entirely. Returns a new ``ProfileRead``; the input is left
-    untouched.
+    whole RESIDENCE (street lines + ZIP + city/state/country), strips all
+    free-text notes (interaction / survey / engagement / program-engagement
+    notes), and omits the embedded audit trail entirely. Returns a new
+    ``ProfileRead``; the input is left untouched.
+
+    Residence scope (#440): city/state/country used to be kept here as
+    "directory-style location". That call was made when ``contact.*`` held the
+    EMPLOYER's address (pre-#287). It no longer does — the survey asks alumni
+    for "Residence city / state / country" and writes those answers straight
+    into these three columns, and the intake sheet has Residence city/state
+    columns feeding them too. Keeping them visible would hand view_only the
+    alum's HOME city and state, which nobody decided to grant. So they are
+    redacted with the rest of the residence.
+
+    ``region`` is deliberately KEPT. Despite living on the contact row it is not
+    a residence value: per #283 it is derived from ``career.current_state``, the
+    state the alum WORKS in (see app/services/state_regions.py), and the survey
+    never writes it. It is a catchment label, so it stays.
+
+    The WORK location is untouched — ``current_career.current_city/state/
+    country/zip`` and the employment history rows stay fully visible, because
+    that is what the outreach use-case runs on (#166).
 
     Contact reachability (#166 — INTENTIONAL PRODUCT DECISION): personal/work
     email and phone are DELIBERATELY exposed to view_only so a "Professor" can
@@ -722,16 +739,22 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     ``get_profile`` (full name only for editors), so it is intentionally left
     untouched here — a view_only caller sees who made contact by first name.
     """
-    # Redact the home mailing address (street + ZIP) for view_only; keep
-    # city/state/region/country (directory-style location). Email and phone are
-    # INTENTIONALLY left visible (#166) so view_only can contact alumni for
-    # outreach — do NOT re-add personal_email/work_email/phone here.
+    # Redact the whole residence for view_only: street lines, ZIP, and (since
+    # #440) city/state/country, which the survey now fills with a genuine HOME
+    # address. ``region`` is kept — it is derived from the WORK state (#283),
+    # not from any of these. Email and phone are INTENTIONALLY left visible
+    # (#166) so view_only can contact alumni for outreach — do NOT re-add
+    # personal_email/work_email/phone here. The employer's location on
+    # ``current_career`` is likewise untouched; outreach depends on it.
     contact = (
         profile.contact.model_copy(
             update={
                 "address_line_1": None,
                 "address_line_2": None,
                 "zip": None,
+                "city": None,
+                "state": None,
+                "country": None,
                 # best_contact holds a raw phone-or-email value straight off the
                 # intake sheet — which may be a HOME number the address redaction
                 # above is meant to withhold. The frontend never renders it at

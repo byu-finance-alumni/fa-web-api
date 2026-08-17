@@ -88,6 +88,17 @@ _RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
 # cycle" — used both to exclude them from a send and to count real replies.
 _RESURVEY_INTERVAL_DAYS = 365
 
+# The three `survey_responses.status` values (the DB CHECK constraint is the
+# authority; these name them so no query has to spell one as a bare string).
+#
+#   * `pending`  — submitted, nobody has reviewed it yet.
+#   * `applied`  — staff accepted it and it was written to the alum's record.
+#   * `rejected` — staff THREW IT AWAY (spam, junk, someone else's data).
+#     Nothing reached the record, so the alum has effectively not replied.
+STATUS_PENDING = "pending"
+STATUS_APPLIED = "applied"
+STATUS_REJECTED = "rejected"
+
 # Which `survey_responses.status` values count as "they replied this cycle".
 #
 # `rejected` is DELIBERATELY absent. A rejected response is one staff THREW AWAY
@@ -97,7 +108,13 @@ _RESURVEY_INTERVAL_DAYS = 365
 # complete. This tuple is the single definition, shared by the send exclusion
 # (:func:`_load_recipients`) and the console's responded tally
 # (:func:`list_graduation_years`) — they must never drift.
-RESPONDED_STATUSES: tuple[str, ...] = ("pending", "applied")
+#
+# Reporting that wants to BREAK a reply down by outcome (the console's
+# applied/rejected columns, `survey_schedule._cycle_progress`) uses the three
+# names above and must never widen this tuple to do it: the moment `rejected`
+# counts as a reply, the same alum reads as "replied" here and "never responded"
+# in the follow-up list.
+RESPONDED_STATUSES: tuple[str, ...] = (STATUS_PENDING, STATUS_APPLIED)
 
 
 # --------------------------------------------------- engineer reset (#395) ----

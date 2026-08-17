@@ -59,6 +59,11 @@ class EngineerActionLog(Base):
     field_name: Mapped[str | None] = mapped_column(String(255))
     old_value: Mapped[str | None] = mapped_column(Text)
     new_value: Mapped[str | None] = mapped_column(Text)
+    # Mirrors audit_logs (#45): the per-save grouping key and the write's
+    # provenance ('manual' | 'import'), carried across by the reroute hook so a
+    # suppressed engineer save reads as one change set here too.
+    change_set_id: Mapped[str | None] = mapped_column(String(36))
+    source: Mapped[str | None] = mapped_column(String(20))
     occurred_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -470,6 +470,22 @@ def test_stage_photo_uploads_and_sets_path(monkeypatch):
     assert session.committed == 1
 
 
+def _real_image(fmt="PNG", size=(60, 40)):
+    """Actual encoded image bytes.
+
+    Since promotion re-encodes, a stand-in like ``b"\\x89PNG... rest"`` is no
+    longer a photo as far as `apply_response` is concerned — it is an undecodable
+    object, which is a different test.
+    """
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", size, (10, 200, 60)).save(buf, format=fmt)
+    return buf.getvalue()
+
+
 def test_apply_with_photo_promotes_headshot(monkeypatch):
     resp = _fake_resp(staged_photo_path="survey-pending/1")
     alum = types.SimpleNamespace(alumni_id=5, net_id="jdoe5")
@@ -486,10 +502,11 @@ def test_apply_with_photo_promotes_headshot(monkeypatch):
 
     async def fake_download(bucket, path):
         calls["download"] = (bucket, path)
-        return b"\x89PNG\r\n\x1a\n rest"  # PNG magic -> content type image/png
+        return _real_image("PNG")
 
-    async def fake_upload(bucket, path, _data, content_type):
+    async def fake_upload(bucket, path, data, content_type):
         calls["upload"] = (bucket, path, content_type)
+        calls["bytes"] = data
 
     async def fake_delete(bucket, path):
         calls["delete"] = (bucket, path)
@@ -497,11 +514,16 @@ def test_apply_with_photo_promotes_headshot(monkeypatch):
     monkeypatch.setattr(supabase_storage, "download_object", fake_download)
     monkeypatch.setattr(supabase_storage, "upload_object", fake_upload)
     monkeypatch.setattr(supabase_storage, "delete_object", fake_delete)
-    asyncio.run(sr.apply_response(_Session(alum), 1, actor_user_id=9))
+    outcome = asyncio.run(sr.apply_response(_Session(alum), 1, actor_user_id=9))
     assert calls["download"] == ("headshots", "survey-pending/1")
-    assert calls["upload"] == ("headshots", "jdoe5", "image/png")
+    # A PNG went in and a JPEG comes out, because promotion re-encodes. The
+    # recorded content type has to be the type actually stored, not the type
+    # staged — labelling this "image/png" is what the old sniff did.
+    assert calls["upload"] == ("headshots", "jdoe5", "image/jpeg")
+    assert calls["bytes"].startswith(b"\xff\xd8\xff")
     assert calls["delete"] == ("headshots", "survey-pending/1")
     assert resp.status == "applied"
+    assert outcome.photo_dropped is False
 
 
 def test_apply_with_photo_falls_back_to_alumni_id(monkeypatch):
@@ -520,7 +542,7 @@ def test_apply_with_photo_falls_back_to_alumni_id(monkeypatch):
     key = {}
 
     async def fake_download(_b, _p):
-        return b"\xff\xd8\xff rest"
+        return _real_image("JPEG")
 
     async def fake_upload(_bucket, path, _data, _ct):
         key["path"] = path

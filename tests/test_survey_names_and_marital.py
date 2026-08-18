@@ -115,7 +115,11 @@ def _alum(**kw):
 
 
 def _apply(session, resp, monkeypatch, side_rows=({}, {}, {})):
-    """Run ``apply_response`` with the side-row load stubbed out."""
+    """Run ``apply_response`` with the side-row load stubbed out.
+
+    Returns just the duplicate warnings — these tests are about renames, and the
+    photo half of ``ApplyOutcome`` is covered in ``test_survey_photo_hardening``.
+    """
 
     async def fake_get_pending(_s, _rid):
         return resp
@@ -125,7 +129,7 @@ def _apply(session, resp, monkeypatch, side_rows=({}, {}, {})):
 
     monkeypatch.setattr(sr, "_get_pending", fake_get_pending)
     monkeypatch.setattr(sr, "_load_side_rows", fake_side)
-    return asyncio.run(sr.apply_response(session, 1, actor_user_id=9))
+    return asyncio.run(sr.apply_response(session, 1, actor_user_id=9)).duplicate_warnings
 
 
 # =========================================================== names (#646) =====
@@ -508,13 +512,16 @@ def test_apply_route_returns_the_duplicate_warnings(client, monkeypatch):
     )
 
     async def fake_apply(_session, _rid, _actor):
-        return [
-            {
-                "code": "possible_duplicate",
-                "message": "Possible duplicate of Jane Smith (Class of 2018).",
-                "alumni_id": 99,
-            }
-        ]
+        return sr.ApplyOutcome(
+            duplicate_warnings=[
+                {
+                    "code": "possible_duplicate",
+                    "message": "Possible duplicate of Jane Smith (Class of 2018).",
+                    "alumni_id": 99,
+                }
+            ],
+            photo_dropped=False,
+        )
 
     monkeypatch.setattr(sr, "apply_response", fake_apply)
     resp = client.post("/survey/responses/5/apply")
@@ -526,7 +533,8 @@ def test_apply_route_returns_the_duplicate_warnings(client, monkeypatch):
                 "message": "Possible duplicate of Jane Smith (Class of 2018).",
                 "alumni_id": 99,
             }
-        ]
+        ],
+        "photo_dropped": False,
     }
 
 
@@ -542,9 +550,9 @@ def test_apply_route_reports_an_empty_list_when_nothing_collided(client, monkeyp
     )
 
     async def fake_apply(_session, _rid, _actor):
-        return []
+        return sr.ApplyOutcome(duplicate_warnings=[], photo_dropped=False)
 
     monkeypatch.setattr(sr, "apply_response", fake_apply)
     resp = client.post("/survey/responses/5/apply")
     assert resp.status_code == 200
-    assert resp.json() == {"duplicate_warnings": []}
+    assert resp.json() == {"duplicate_warnings": [], "photo_dropped": False}

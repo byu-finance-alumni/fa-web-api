@@ -39,9 +39,11 @@ exception is the engineer-reroute test, which needs a REAL flush (the guard is a
 """
 
 import asyncio
+import io
 import types
 
 import pytest
+from PIL import Image
 from sqlalchemy import BigInteger, Integer, create_engine, func, select
 from sqlalchemy.orm import Session
 
@@ -536,7 +538,13 @@ def test_a_photo_only_apply_writes_the_summary_row_and_nothing_else(monkeypatch)
 
     async def fake_download(_bucket, path):
         calls.append(("download", path))
-        return b"\xff\xd8\xff\xe0jpegbytes"
+        # A REAL JPEG, not a magic number with filler behind it. The promotion
+        # path re-encodes the bytes now (it no longer trusts a 16-byte sniff), so
+        # undecodable filler would be discarded and this test would exercise the
+        # drop path instead of the promotion it means to check.
+        buffer = io.BytesIO()
+        Image.new("RGB", (64, 64), (120, 140, 160)).save(buffer, format="JPEG")
+        return buffer.getvalue()
 
     async def fake_upload(_bucket, key, _data, _ct):
         calls.append(("upload", key))

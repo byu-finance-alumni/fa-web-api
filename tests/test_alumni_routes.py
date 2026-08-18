@@ -9,16 +9,20 @@ shape are covered end to end without a real DATABASE_URL.
 """
 
 import datetime
+import io
 import uuid
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
+from PIL.TiffImagePlugin import IFDRational
 
 from app.api.dependencies.auth import get_current_db_user
 from app.api.routes import alumni as alumni_routes
 from app.core import rate_limit
 from app.core.database import get_session
+from app.core.errors import ServiceError
 from app.main import app
 from app.schemas.auth import UserContext
 
@@ -783,7 +787,6 @@ def test_bulk_upload_urls_over_per_request_cap_is_413(client):
 
 def test_bulk_upload_urls_storage_failure_reported_per_file(monkeypatch):
     """One unavailable mint fails that file only — never the whole batch."""
-    from app.core.errors import ServiceError
 
     async def _boom(bucket, path):
         raise ServiceError("nope")
@@ -1186,6 +1189,84 @@ def _single_confirm_audits(session):
     return [a.action_type for a in session.added if getattr(a, "action_type", None)]
 
 
+# --- the single confirm RE-ENCODES the object, it does not just sniff it ------
+#
+# The 16-byte sniff above is a check on a PREFIX. These fixtures are the two
+# things a prefix can't see: bytes appended after a valid image, and the EXIF a
+# phone writes (GPS included). Everything below asserts against what was
+# RE-UPLOADED, because the object landing in the bucket is the only thing that
+# ends up on the alumnus's profile — a 204 on its own proves nothing.
+
+_APPENDED_PAYLOAD = b"<html><script>alert(document.domain)</script></html>"
+_EXIF_ORIENTATION = 0x0112
+_EXIF_MAKE = 0x010F
+_EXIF_GPS_IFD = 0x8825
+
+
+def _real_jpeg(size=(400, 300)) -> bytes:
+    """A JPEG that actually DECODES — `_JPEG_BYTES` is only a magic number."""
+    buf = io.BytesIO()
+    Image.new("RGB", size, (120, 90, 200)).save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _phone_jpeg_with_gps() -> bytes:
+    """What a handset uploads: sideways pixels plus where it was taken."""
+    image = Image.new("RGB", (800, 600), (120, 90, 200))
+    exif = image.getexif()
+    exif[_EXIF_ORIENTATION] = 6  # "rotate 90 on display"
+    exif[_EXIF_MAKE] = "Pixel"
+    gps = exif.get_ifd(_EXIF_GPS_IFD)
+    gps[1] = "N"
+    gps[2] = (IFDRational(40, 1), IFDRational(14, 1), IFDRational(0, 1))
+    gps[3] = "W"
+    gps[4] = (IFDRational(111, 1), IFDRational(39, 1), IFDRational(0, 1))
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", exif=exif)
+    return buf.getvalue()
+
+
+def _download_stub(data, calls=None):
+    async def _download(bucket, path):
+        if calls is not None:
+            calls.append((bucket, path))
+        return data
+
+    return _download
+
+
+def _upload_capture(uploads):
+    async def _upload(bucket, path, data, content_type):
+        uploads.append((bucket, path, data, content_type))
+
+    return _upload
+
+
+def _normalising_confirm(monkeypatch, stored: bytes, uploads: list, deleted: list):
+    """Wire a single confirm whose object is *stored* and reads back cleanly.
+
+    The probe reports the object honestly (so the cheap checks pass) and the
+    download hands back the same bytes, which is what a real successful direct
+    PUT looks like."""
+    sniffed = alumni_routes._sniff_image_mime(stored) or "image/jpeg"
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub((sniffed, len(stored), stored[:16])),
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "download_object", _download_stub(stored)
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "upload_object", _upload_capture(uploads)
+    )
+
+    async def _delete(bucket, path):
+        deleted.append((bucket, path))
+
+    monkeypatch.setattr(alumni_routes.supabase_storage, "delete_object", _delete)
+
+
 def test_single_confirm_rejects_an_empty_object(monkeypatch):
     """A 0-byte object labelled ``image/jpeg`` is REJECTED, not confirmed.
 
@@ -1220,19 +1301,27 @@ def test_single_confirm_rejects_an_empty_object(monkeypatch):
 
 
 def test_single_confirm_still_fails_open_when_the_probe_fails(monkeypatch):
-    """``head=None`` means the probe itself failed, and that must still FAIL
-    OPEN — a storage hiccup must never reject a legitimate upload. This is the
-    other half of the empty-object fix: the two cases used to be
-    indistinguishable, and tightening one must not tighten this one.
+    """``head=None`` means the PROBE itself failed, and that must still FAIL
+    OPEN — a storage hiccup reading 16 bytes must never reject a legitimate
+    upload. This is the other half of the empty-object fix: the two cases used
+    to be indistinguishable, and tightening one must not tighten this one.
 
     Note it does not fail open blindly: it still proves the object EXISTS via a
     signed URL, so a never-uploaded key cannot be confirmed. That is why this
     test has to stub `create_signed_url` — without it the route correctly 422s.
+
+    What HAS changed is what "fail open" now means. The probe being skippable
+    does not make the re-encode skippable, so the route falls through to it and
+    the object is still normalised before the success audit is written. Failing
+    open past the probe AND past the re-encode would leave the uploader's own
+    bytes on the alumnus's profile audited as verified.
     """
 
     async def _signed(bucket, path, *, expires_in: int = 3600):
         return "https://storage.example/signed"
 
+    uploads: list = []
+    stored = _real_jpeg()
     monkeypatch.setattr(
         alumni_routes.supabase_storage,
         "probe_object_head",
@@ -1240,6 +1329,12 @@ def test_single_confirm_still_fails_open_when_the_probe_fails(monkeypatch):
     )
     monkeypatch.setattr(
         alumni_routes.supabase_storage, "create_signed_url", _signed
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "download_object", _download_stub(stored)
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "upload_object", _upload_capture(uploads)
     )
     session = _SingleConfirmSession(_alumnus("jdoe12", 5))
     try:
@@ -1249,6 +1344,52 @@ def test_single_confirm_still_fails_open_when_the_probe_fails(monkeypatch):
         app.dependency_overrides.clear()
     assert resp.status_code == 204
     assert _single_confirm_audits(session) == ["upload_headshot"]
+    # The failed probe did not buy a bypass: the object was still re-encoded.
+    assert [(u[0], u[1], u[3]) for u in uploads] == [
+        ("headshots", "jdoe12", "image/jpeg")
+    ]
+
+
+def test_single_confirm_does_not_fail_open_when_the_object_cannot_be_downloaded(
+    monkeypatch,
+):
+    """The hole the re-encode closes. A read we cannot perform is not evidence
+    that the bytes are safe, and the object is already durable at the alumnus's
+    LIVE key — so it is deleted and the upload is refused, rather than blessed
+    with an ``upload_headshot`` row it did nothing to earn.
+
+    Fail-closed here costs a staff member a retry with the file still on their
+    disk. Fail-open would cost an un-normalised object serving as someone's
+    headshot forever."""
+    deleted: list = []
+
+    async def _signed(bucket, path, *, expires_in: int = 3600):
+        return "https://storage.example/signed"
+
+    async def _download(bucket, path):
+        raise ServiceError("storage down")
+
+    async def _delete(bucket, path):
+        deleted.append((bucket, path))
+
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub((None, None, None)),
+    )
+    monkeypatch.setattr(alumni_routes.supabase_storage, "create_signed_url", _signed)
+    monkeypatch.setattr(alumni_routes.supabase_storage, "download_object", _download)
+    monkeypatch.setattr(alumni_routes.supabase_storage, "delete_object", _delete)
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 502  # ServiceError — ours, not the uploader's fault
+    assert deleted == [("headshots", "jdoe12")]
+    assert _single_confirm_audits(session) == ["upload_headshot_rejected"]
+    assert session.added[0].field_name == "unverified"
 
 
 def test_single_confirm_sniffs_real_bytes_and_purges_a_liar(monkeypatch):
@@ -1309,19 +1450,12 @@ def test_single_confirm_rejects_a_real_image_of_the_wrong_type(monkeypatch):
 
 
 def test_single_confirm_accepts_a_conforming_object(monkeypatch):
-    """The happy path is unchanged: matching bytes + type + size are audited
-    ``upload_headshot`` and nothing is deleted."""
+    """The happy path: a real photo is audited ``upload_headshot``, nothing is
+    deleted, and OUR re-encode is what ends up in the bucket."""
     deleted: list = []
-
-    async def _delete(bucket, path):
-        deleted.append(path)
-
-    monkeypatch.setattr(
-        alumni_routes.supabase_storage,
-        "probe_object_head",
-        _probe_stub(("image/jpeg", 1234, _JPEG_BYTES[:16])),
-    )
-    monkeypatch.setattr(alumni_routes.supabase_storage, "delete_object", _delete)
+    uploads: list = []
+    stored = _real_jpeg()
+    _normalising_confirm(monkeypatch, stored, uploads, deleted)
     session = _SingleConfirmSession(_alumnus("jdoe12", 5))
     try:
         with _confirm_client(session) as c:
@@ -1331,22 +1465,28 @@ def test_single_confirm_accepts_a_conforming_object(monkeypatch):
     assert resp.status_code == 204
     assert deleted == []
     assert _single_confirm_audits(session) == ["upload_headshot"]
+    bucket, path, data, content_type = uploads[0]
+    assert (bucket, path, content_type) == ("headshots", "jdoe12", "image/jpeg")
+    # Written back under the SAME key, so nothing else has to learn a new path.
+    assert Image.open(io.BytesIO(data)).format == "JPEG"
 
 
-def test_single_confirm_probe_unreadable_fails_open(monkeypatch):
-    """A probe that can't read the object falls back to an existence check rather
-    than rejecting a legitimate upload — the sniff must not turn a storage hiccup
-    into a failed upload."""
-    monkeypatch.setattr(
-        alumni_routes.supabase_storage,
-        "probe_object_head",
-        _probe_stub((None, None, None)),
-    )
+def test_single_confirm_strips_an_appended_payload_the_sniff_waves_through(
+    monkeypatch,
+):
+    """The polyglot: a valid JPEG with a payload glued on the end.
 
-    async def _signed(bucket, path, expires_in=3600):
-        return "https://storage.test/signed"
-
-    monkeypatch.setattr(alumni_routes.supabase_storage, "create_signed_url", _signed)
+    It passes every prefix check by construction — asserted here, because that
+    is the whole reason a re-encode was needed — and comes back out without the
+    payload, since the stored bytes are produced from a pixel buffer rather than
+    copied from the upload."""
+    deleted: list = []
+    uploads: list = []
+    hostile = _real_jpeg() + _APPENDED_PAYLOAD
+    # The check this replaces would have accepted it, and so does the one we
+    # still run first as a cheap pre-filter.
+    assert alumni_routes._sniffed_head_error(hostile[:16], "image/jpeg") is None
+    _normalising_confirm(monkeypatch, hostile, uploads, deleted)
     session = _SingleConfirmSession(_alumnus("jdoe12", 5))
     try:
         with _confirm_client(session) as c:
@@ -1354,7 +1494,156 @@ def test_single_confirm_probe_unreadable_fails_open(monkeypatch):
     finally:
         app.dependency_overrides.clear()
     assert resp.status_code == 204
-    assert _single_confirm_audits(session) == ["upload_headshot"]
+    stored_back = uploads[0][2]
+    assert _APPENDED_PAYLOAD not in stored_back
+    assert Image.open(io.BytesIO(stored_back)).format == "JPEG"
+
+
+def test_single_confirm_strips_exif_and_gps_and_bakes_in_the_rotation(monkeypatch):
+    """A headshot is very often taken at home, and the coordinates ride along in
+    the EXIF the direct PUT preserved. They must not survive confirm — and the
+    orientation tag must be applied to the PIXELS on the way out, or stripping
+    metadata would ship every portrait phone photo sideways."""
+    deleted: list = []
+    uploads: list = []
+    src = _phone_jpeg_with_gps()
+    assert dict(Image.open(io.BytesIO(src)).getexif().get_ifd(_EXIF_GPS_IFD)), (
+        "fixture has no GPS to strip"
+    )
+    _normalising_confirm(monkeypatch, src, uploads, deleted)
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 204
+    out = Image.open(io.BytesIO(uploads[0][2]))
+    assert dict(out.getexif()) == {}
+    assert dict(out.getexif().get_ifd(_EXIF_GPS_IFD)) == {}
+    # orientation=6 is "rotate 90", so the edges must have swapped.
+    assert out.size == (600, 800)
+
+
+def test_single_confirm_leaves_a_cropper_sized_photo_effectively_unchanged(
+    monkeypatch,
+):
+    """The normal case must be invisible. `HeadshotCropper.tsx` emits 1024px at
+    q0.9 and `normalise_headshot` matches those constants, so a photo that DID
+    go through the cropper is a near-identical second generation — same
+    dimensions, not blown up in size, and certainly not rejected."""
+    deleted: list = []
+    uploads: list = []
+    cropped = _real_jpeg(size=(1024, 1024))
+    _normalising_confirm(monkeypatch, cropped, uploads, deleted)
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 204
+    assert deleted == []
+    out = Image.open(io.BytesIO(uploads[0][2]))
+    assert out.size == (1024, 1024)  # not resized, not cropped
+    assert len(uploads[0][2]) < len(cropped) * 3
+
+
+def test_single_confirm_purges_an_undecodable_object_the_sniff_let_through(
+    monkeypatch,
+):
+    """JPEG magic bytes followed by nothing usable: the 16-byte check says yes,
+    the decode says no. The object is deleted and audited ``upload_headshot_
+    rejected`` with the same ``content`` field the sniff uses, so the trail reads
+    the same whichever check caught it."""
+    deleted: list = []
+    uploads: list = []
+    junk = b"\xff\xd8\xff\xe0" + _APPENDED_PAYLOAD
+    assert alumni_routes._sniffed_head_error(junk[:16], "image/jpeg") is None
+    _normalising_confirm(monkeypatch, junk, uploads, deleted)
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 422
+    assert deleted == [("headshots", "jdoe12")]
+    assert uploads == []  # nothing was written back over it
+    assert _single_confirm_audits(session) == ["upload_headshot_rejected"]
+    assert session.added[0].field_name == "content"
+
+
+def test_single_confirm_purges_when_the_normalised_bytes_cannot_be_stored(
+    monkeypatch,
+):
+    """If the re-upload fails, the ORIGINAL bytes are still sitting at the live
+    key and we have just proved we cannot replace them — so the object goes,
+    exactly as it would for a failed download."""
+    deleted: list = []
+    stored = _real_jpeg()
+
+    async def _upload(bucket, path, data, content_type):
+        raise ServiceError("storage down")
+
+    async def _delete(bucket, path):
+        deleted.append((bucket, path))
+
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub(("image/jpeg", len(stored), stored[:16])),
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "download_object", _download_stub(stored)
+    )
+    monkeypatch.setattr(alumni_routes.supabase_storage, "upload_object", _upload)
+    monkeypatch.setattr(alumni_routes.supabase_storage, "delete_object", _delete)
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 502
+    assert deleted == [("headshots", "jdoe12")]
+    assert _single_confirm_audits(session) == ["upload_headshot_rejected"]
+    assert session.added[0].field_name == "unverified"
+
+
+def test_single_confirm_does_not_download_an_object_that_failed_a_cheap_check(
+    monkeypatch,
+):
+    """Ordering matters for MEMORY, not just for tidiness: the type/size/sniff
+    gates run BEFORE the download so an object that is obviously wrong is never
+    pulled into the function. The size gate in particular is what keeps the
+    download bounded by the bucket's 20 MiB limit."""
+    downloads: list = []
+
+    async def _delete(bucket, path):
+        pass
+
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub(
+            ("image/jpeg", alumni_routes._HEADSHOT_MAX_BYTES + 1, _JPEG_BYTES[:16])
+        ),
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "download_object",
+        _download_stub(b"", downloads),
+    )
+    monkeypatch.setattr(alumni_routes.supabase_storage, "delete_object", _delete)
+    session = _SingleConfirmSession(_alumnus("jdoe12", 5))
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post("/alumni/5/headshot/confirm")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 413
+    assert downloads == []
 
 
 def test_single_confirm_still_rejects_a_disallowed_content_type(monkeypatch):
@@ -1406,6 +1695,54 @@ def test_single_confirm_still_rejects_an_oversized_object(monkeypatch):
     assert deleted == ["jdoe12"]
     audit = session.added[0]
     assert audit.field_name == "size"
+
+
+def test_bulk_confirm_does_not_download_or_re_encode_anything(monkeypatch):
+    """⚠️ BULK MUST NOT GROW THE SINGLE PATH'S RE-ENCODE.
+
+    ``/alumni/headshots/bulk/confirm`` verifies up to
+    ``_HEADSHOT_BULK_MAX_PER_REQUEST`` (100) objects with
+    ``_HEADSHOT_BULK_CONCURRENCY`` (8) in flight. At the bucket's 20 MiB limit,
+    downloading and decoding eight of those at once is most of the function's
+    memory, shared with every co-tenant request on the instance — so bulk stops
+    at the shared 16-byte sniff and normalisation is a background sweep's job.
+
+    This pins that: any download or upload during a bulk confirm blows up. If
+    someone later wires ``_normalise_stored_headshot`` into the bulk path this
+    fails, which is the conversation to have rather than an out-of-memory in
+    production."""
+    touched: list = []
+
+    async def _must_not_be_called(*args, **kwargs):
+        touched.append(args)
+        raise AssertionError("bulk confirm must not stream object bytes")
+
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage,
+        "probe_object_head",
+        _probe_stub(("image/png", 1234, _PNG_BYTES[:16])),
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "download_object", _must_not_be_called
+    )
+    monkeypatch.setattr(
+        alumni_routes.supabase_storage, "upload_object", _must_not_be_called
+    )
+    session = _BulkHeadshotSession([_alumnus("jdoe12", 5)])
+    try:
+        with _confirm_client(session) as c:
+            resp = c.post(
+                "/alumni/headshots/bulk/confirm",
+                json={"files": [{"filename": "jdoe12.png", "uploaded": True}]},
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    # Verdict, audit and Content-Type handling are all exactly as before.
+    assert resp.json()["items"][0]["status"] == "matched"
+    audits = [a for a in session.added if getattr(a, "action_type", None)]
+    assert [a.action_type for a in audits] == ["upload_headshot"]
+    assert touched == []
 
 
 def test_bulk_headshot_routes_are_rate_limited(client):

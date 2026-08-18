@@ -3,6 +3,10 @@
     {
       "path": "/survey/cron/run",
       "schedule": "0 18 * * *"
+    },
+    {
+      "path": "/storage/cron/headshot-sweep",
+      "schedule": "30 19 * * *"
     }
   ]
 }

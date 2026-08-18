@@ -88,6 +88,17 @@ _RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
 # cycle" — used both to exclude them from a send and to count real replies.
 _RESURVEY_INTERVAL_DAYS = 365
 
+# The three `survey_responses.status` values (the DB CHECK constraint is the
+# authority; these name them so no query has to spell one as a bare string).
+#
+#   * `pending`  — submitted, nobody has reviewed it yet.
+#   * `applied`  — staff accepted it and it was written to the alum's record.
+#   * `rejected` — staff THREW IT AWAY (spam, junk, someone else's data).
+#     Nothing reached the record, so the alum has effectively not replied.
+STATUS_PENDING = "pending"
+STATUS_APPLIED = "applied"
+STATUS_REJECTED = "rejected"
+
 # Which `survey_responses.status` values count as "they replied this cycle".
 #
 # `rejected` is DELIBERATELY absent. A rejected response is one staff THREW AWAY
@@ -97,7 +108,13 @@ _RESURVEY_INTERVAL_DAYS = 365
 # complete. This tuple is the single definition, shared by the send exclusion
 # (:func:`_load_recipients`) and the console's responded tally
 # (:func:`list_graduation_years`) — they must never drift.
-RESPONDED_STATUSES: tuple[str, ...] = ("pending", "applied")
+#
+# Reporting that wants to BREAK a reply down by outcome (the console's
+# applied/rejected columns, `survey_schedule._cycle_progress`) uses the three
+# names above and must never widen this tuple to do it: the moment `rejected`
+# counts as a reply, the same alum reads as "replied" here and "never responded"
+# in the follow-up list.
+RESPONDED_STATUSES: tuple[str, ...] = (STATUS_PENDING, STATUS_APPLIED)
 
 
 # --------------------------------------------------- engineer reset (#395) ----
@@ -316,6 +333,66 @@ async def current_cycle_seq(session: AsyncSession, graduation_year: int) -> int:
     if seq is not None:
         return seq
     return await next_cycle_seq(session, graduation_year)
+
+
+async def sent_cycle_and_stage(
+    session: AsyncSession, graduation_year: int | None, alumni_id: int
+) -> tuple[int | None, int | None]:
+    """The (cycle, stage) of the LAST survey email this alum was actually sent,
+    or ``(None, None)`` if there is no such row (#497).
+
+    This is the read `survey_responses.submit_response` stamps a response from,
+    so a reply can be attributed to the campaign that asked for it. Every count
+    in the console joins the year's CURRENT cycle, so once a year runs its second
+    campaign the first one's responses become unreportable — and unrecoverable,
+    because nothing on the row says which cycle it was.
+
+    OBSERVED, NOT INFERRED. The cycle returned is READ OFF a send-log row; it is
+    never computed from a date and never guessed from the year's current
+    schedule. That matters in the two cases where those disagree:
+
+    * A campaign that was DELETED (#398) keeps its send-log rows with their own
+      cycle number, but has no schedule row — :func:`current_cycle_seq` answers
+      one ABOVE the retired cycle for such a year, which is the cycle of the NEXT
+      campaign, not the one that sent the email being replied to.
+    * A year with no campaign at all has no rows here, so the answer is "unknown"
+      rather than the ``FIRST_CYCLE`` fallback a schedule read would invent.
+
+    "No row" is a real and expected answer — a hand-issued link, a dev token, or
+    an alum whose ``graduation_year`` changed after they were emailed. The caller
+    stores NULL for it. A wrong stamp is worse than a missing one: NULL is
+    excludable in a report, a plausible-looking wrong number is not.
+
+    The year is part of the lookup so the stored ``(graduation_year, cycle_seq)``
+    pair stays coherent — a cycle number is only meaningful against the year it
+    counts for, and pairing this year with another year's cycle would be exactly
+    the kind of wrong stamp above.
+
+    Ordering is by ``sent_at`` (newest first, id as the tie-break) purely to pick
+    the most recent ROW; the value returned is that row's stored ``cycle_seq``.
+    Rows superseded by an engineer reset (#395) are deliberately NOT filtered
+    out: they still record an email that really went out, and the newest row is
+    at the current reset generation anyway whenever one exists.
+    """
+    if graduation_year is None:
+        return (None, None)
+    row = (
+        await session.execute(
+            select(SurveySendLog.cycle_seq, SurveySendLog.stage)
+            .where(
+                SurveySendLog.graduation_year == graduation_year,
+                SurveySendLog.alumni_id == alumni_id,
+            )
+            .order_by(
+                SurveySendLog.sent_at.desc(),
+                SurveySendLog.survey_send_log_id.desc(),
+            )
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return (None, None)
+    return (row[0], row[1])
 
 
 async def logged_alumni_ids(

@@ -36,6 +36,7 @@ from app.core.capabilities import (
     ALUMNI_FULL_REPLACEMENTS,
     CAPABILITIES_BY_CODE,
     DEFAULT_GRANTS,
+    POST_SPLIT_CAPABILITIES,
     Capability,
     effective_capabilities,
     expand_legacy_grants,
@@ -302,14 +303,47 @@ def test_no_role_gained_or_lost_access():
     """Every role's post-split capabilities == its pre-split capabilities, with
     ``alumni.full`` translated into the twelve codes that replaced it and
     ``interactions.create`` added (the one deliberate widening, and a no-op in
-    practice — the interaction routes were already open to every view holder)."""
+    practice — the interaction routes were already open to every view holder).
+
+    ``POST_SPLIT_CAPABILITIES`` is subtracted first. That set is the register of
+    capabilities introduced AFTER #379 and granted to a role that predates it —
+    currently just ``links.delete``. Without the subtraction, the first such
+    capability would fail this test for a reason that has nothing to do with the
+    split, and the tempting "fix" would be to edit ``_PRE_SPLIT_GRANTS`` — which
+    is a frozen restatement of the pre-#379 world and must never move, or the
+    check stops being a check. Subtracting instead keeps the assertion meaning
+    exactly what it says: THE SPLIT moved nobody.
+    """
     for role, before in _PRE_SPLIT_GRANTS.items():
         expected = set(before)
         if "alumni.full" in expected:
             expected.discard("alumni.full")
             expected |= ALUMNI_FULL_REPLACEMENTS
         expected.add(Capability.INTERACTIONS_CREATE)
-        assert effective_capabilities(DEFAULT_GRANTS, [role]) == expected, role
+        actual = effective_capabilities(DEFAULT_GRANTS, [role])
+        assert actual - POST_SPLIT_CAPABILITIES == expected, role
+
+
+def test_the_post_split_register_cannot_hide_a_widening():
+    """The subtraction above is an escape hatch, so it needs a lock.
+
+    Left unguarded, anyone could silence ``test_no_role_gained_or_lost_access``
+    by dropping the code they just handed to a role into
+    ``POST_SPLIT_CAPABILITIES`` — including a code that existed BEFORE #379,
+    which is precisely the widening this file exists to catch. So the register is
+    only allowed to contain capabilities that did not exist pre-split: nothing
+    named in ``_PRE_SPLIT_GRANTS``, nothing `alumni.full` dissolved into, and
+    nothing retired. Everything in it must be a real, registered, assignable
+    code — not a typo that silently subtracts nothing.
+    """
+    pre_split_codes = {code for caps in _PRE_SPLIT_GRANTS.values() for code in caps}
+    assert not POST_SPLIT_CAPABILITIES & pre_split_codes
+    assert not POST_SPLIT_CAPABILITIES & ALUMNI_FULL_REPLACEMENTS
+    assert Capability.INTERACTIONS_CREATE not in POST_SPLIT_CAPABILITIES
+    assert Capability.LEGACY_ALUMNI_FULL not in POST_SPLIT_CAPABILITIES
+    for code in POST_SPLIT_CAPABILITIES:
+        assert code in CAPABILITIES_BY_CODE, code
+        assert CAPABILITIES_BY_CODE[code].assignable is True, code
 
 
 def test_the_split_is_a_partition_not_a_reshuffle():

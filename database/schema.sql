@@ -619,6 +619,14 @@ CREATE TABLE surveys (
 -- admin review (per the email's "reviewed before applied" promise). `payload` is
 -- the submitted values keyed by survey field keys (table.column). See
 -- migrations/2026-07-27_survey_responses.sql.
+-- `cycle_seq` / `stage` record WHICH campaign email this answers (#497), copied
+-- at submit time from the `survey_send_log` row for the email the alum was
+-- actually sent. Both are NULLABLE and NOT backfilled: a response that predates
+-- the stamp has no knowable cycle, and a guessed number is indistinguishable
+-- from a real one in a report. NEVER derive either from `submitted_at` — a
+-- campaign starting in late December sends its reminders in January, so a
+-- date-derived cycle splits one campaign in two (see the `survey_schedule` note
+-- below). See migrations/2026-08-17_survey_response_cycle_stamp.sql.
 CREATE TABLE survey_responses (
     survey_response_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id           bigint NOT NULL,
@@ -629,15 +637,22 @@ CREATE TABLE survey_responses (
     -- (headshots bucket, `survey-pending/<id>`), pending admin review. See
     -- migrations/2026-07-28_survey_response_photo.sql.
     staged_photo_path   varchar(255),
+    -- Which campaign asked, and which email in it the alum had most recently
+    -- been sent (0 = initial, 1 = 1-week, 2 = 2-week). NULL = unknown.
+    cycle_seq           int,
+    stage               smallint,
     submitted_at        timestamptz NOT NULL DEFAULT now(),
     reviewed_by_user_id bigint,
     reviewed_at         timestamptz,
     CONSTRAINT fk_survey_responses_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_survey_responses_reviewer FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
-    CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected'))
+    CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected')),
+    CONSTRAINT ck_survey_responses_cycle_seq CHECK (cycle_seq IS NULL OR cycle_seq >= 1),
+    CONSTRAINT ck_survey_responses_stage CHECK (stage IS NULL OR stage BETWEEN 0 AND 2)
 );
 CREATE INDEX IF NOT EXISTS idx_survey_responses_status_year ON survey_responses (status, graduation_year);
 CREATE INDEX IF NOT EXISTS idx_survey_responses_alumni_id ON survey_responses (alumni_id);
+CREATE INDEX IF NOT EXISTS ix_survey_responses_year_cycle ON survey_responses (graduation_year, cycle_seq);
 
 -- Survey send scheduler (#542). `survey_schedule` holds one row per graduation
 -- year (initial send date + campaign state); a daily Vercel cron sends the due
@@ -817,9 +832,27 @@ CREATE TABLE audit_logs (
     -- 2026-06-17_audit_actor_snapshot.sql.
     actor_email  varchar(255),
     actor_name   varchar(255),
+    -- Groups the rows written by ONE save into one version (#45). Timestamps
+    -- can't: now() is transaction-start time, so a bulk CSV update (one
+    -- transaction for the whole file) gives thousands of rows the same instant.
+    -- NULL on rows written before the column existed. See migration
+    -- 2026-08-17_audit_change_set_and_source.sql.
+    change_set_id varchar(36),
+    -- Write provenance: 'manual' | 'import' | 'survey' (#45). Hand edits and bulk
+    -- CSV updates share one write path, so a later restore feature can't
+    -- otherwise tell a spreadsheet correction from a typed one; 'survey' is a
+    -- staff approval of an alum's own submission, which is neither. NULL where
+    -- the writing path carries no provenance (logins, exports, disclosure reads).
+    -- See migration 2026-08-17_audit_source_survey.sql.
+    source       varchar(20),
     created_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_audit_logs_user_id FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
+
+-- "Every row of this change set" -- the read shape version history uses.
+-- Partial, so rows that never carry a change set stay out of the index.
+CREATE INDEX idx_audit_logs_change_set_id ON audit_logs (change_set_id)
+    WHERE change_set_id IS NOT NULL;
 
 -- Snapshot the acting user's email/name onto each audit row at write time, so a
 -- later user deletion (user_id -> NULL) never erases who performed the action.
@@ -862,6 +895,10 @@ CREATE TABLE engineer_action_log (
     field_name    varchar(255),
     old_value     text,
     new_value     text,
+    -- Mirrors audit_logs (#45): the reroute hook carries the per-save grouping
+    -- key and the write's provenance across with the row.
+    change_set_id varchar(36),
+    source        varchar(20),
     occurred_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_engineer_action_log_actor_user_id FOREIGN KEY (actor_user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
@@ -997,6 +1034,63 @@ CREATE TABLE bbq_attendance (
 -- -----------------------------------------------------------------------------
 -- Reference data & application config
 -- -----------------------------------------------------------------------------
+
+-- Alumni-submitted internship / job opportunity links (#441). Many links per
+-- alum, each with its own structure, so this does NOT fit the survey's "one
+-- question = one column" rule and gets its own table and its own write path.
+-- Two sources with two landing states: source='survey' lands 'pending' (a
+-- PUBLIC, token-gated write) and source='staff' lands 'approved' (a staff member
+-- typing it in IS the review). Moderation is PER LINK — the survey response
+-- queue is all-or-nothing per submission and cannot express it.
+-- `url` is attacker-supplied and rendered as an href to a signed-in staff
+-- member; the column widths here are the persistence cap on a public write.
+-- See migrations/2026-08-17_opportunity_links.sql and
+-- app/services/opportunity_links.py.
+CREATE TABLE opportunity_links (
+    opportunity_link_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    alumni_id            bigint NOT NULL,
+    -- True = display under the alum's own current_employment.current_employer,
+    -- resolved at read time (company_name is then NULL).
+    is_own_company       boolean NOT NULL DEFAULT false,
+    company_name         varchar(255),
+    url                  varchar(2048) NOT NULL,
+    location_city        varchar(100),
+    location_state       varchar(100),
+    -- Nullable and NEVER backfilled to 'United States' (#441 follow-up): a row
+    -- written before the field existed has a genuinely unknown country, and an
+    -- invented one is indistinguishable from a stated one forever after.
+    location_country     varchar(100),
+    role_type            varchar(20) NOT NULL,
+    -- Application-level rule, deliberately NOT a CHECK: a new deadline must not
+    -- be in the past (today IS accepted), but an EXISTING row whose deadline has
+    -- since passed stays editable. A `current_date` CHECK is not immutable and
+    -- would freeze exactly those rows. See
+    -- app/schemas/opportunity_link.validate_application_deadline.
+    application_deadline date,
+    details              text,
+    status               varchar(20) NOT NULL DEFAULT 'pending',
+    source               varchar(20) NOT NULL,
+    submitted_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at           timestamptz NOT NULL DEFAULT now(),
+    created_by_user_id   bigint,
+    reviewed_by_user_id  bigint,
+    reviewed_at          timestamptz,
+    CONSTRAINT fk_opportunity_links_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_opportunity_links_created_by FOREIGN KEY (created_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_opportunity_links_reviewer FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT ck_opportunity_links_status CHECK (status IN ('pending', 'approved', 'rejected')),
+    CONSTRAINT ck_opportunity_links_source CHECK (source IN ('survey', 'staff')),
+    CONSTRAINT ck_opportunity_links_role_type CHECK (role_type IN ('internship', 'full_time', 'both')),
+    CONSTRAINT ck_opportunity_links_company CHECK (
+        (is_own_company AND company_name IS NULL)
+        OR (NOT is_own_company AND company_name IS NOT NULL)
+    ),
+    CONSTRAINT ck_opportunity_links_details_length CHECK (details IS NULL OR char_length(details) <= 2000),
+    CONSTRAINT ck_opportunity_links_url_length CHECK (char_length(url) BETWEEN 1 AND 2048)
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_links_status_submitted ON opportunity_links (status, submitted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_opportunity_links_role_type ON opportunity_links (role_type);
+CREATE INDEX IF NOT EXISTS idx_opportunity_links_alumni_id ON opportunity_links (alumni_id);
 
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded

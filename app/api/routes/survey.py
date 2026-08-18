@@ -39,11 +39,16 @@ from app.core.config import get_settings
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.core.rate_limit import (
+    OPPORTUNITY_LINK_SUBMIT_LIMITER,
     SURVEY_PHOTO_LIMITER,
     SURVEY_RESPOND_READ_LIMITER,
     SURVEY_SUBMIT_LIMITER,
 )
 from app.models.audit import AuditLog
+from app.schemas.opportunity_link import (
+    OpportunityLinkSubmitRequest,
+    OpportunityLinkSubmitResult,
+)
 from app.schemas.survey import (
     GraduationYearCount,
     SurveyAlumniState,
@@ -71,7 +76,13 @@ from app.schemas.survey import (
     SurveyUnreachableAlum,
     SurveyUsage,
 )
-from app.services import survey_email, survey_reset, survey_responses, survey_schedule
+from app.services import (
+    opportunity_links,
+    survey_email,
+    survey_reset,
+    survey_responses,
+    survey_schedule,
+)
 
 # The test cohort lives in grad year 1900 (below the normal 1950 floor), so allow
 # it explicitly here.
@@ -240,6 +251,41 @@ async def survey_submit(
     return await survey_responses.submit_response(
         session, token, body.fields, body.has_photo
     )
+
+
+@router.post(
+    "/respond/{token}/links",
+    response_model=OpportunityLinkSubmitResult,
+    dependencies=[Depends(OPPORTUNITY_LINK_SUBMIT_LIMITER)],
+)
+async def survey_submit_opportunity_links(
+    token: str, body: OpportunityLinkSubmitRequest, session: SessionDep
+) -> OpportunityLinkSubmitResult:
+    """PUBLIC (token-gated, no login): stage the alum's internship / job links
+    for staff review (#441). Every link lands PENDING.
+
+    A SEPARATE call from `POST /respond/{token}` on purpose, not an extra key in
+    that body. The field submit is built on "one survey question maps to one
+    database column" — its payload keys are literally `table.column` — and an
+    opportunity has a url, a location, a role type, a deadline and a description
+    of its own, several per alum. It gets its own table, its own write path, and
+    its own moderation, and it does NOT enter the survey field whitelist or the
+    response review queue.
+
+    THE URL IS PUBLIC INPUT RENDERED AS AN HREF TO A SIGNED-IN STAFF MEMBER. It
+    is validated on THIS path, server-side, by the same function the staff create
+    route uses — see `app/schemas/opportunity_link.validate_opportunity_url` for
+    what scheme gating does and does not defend, and why the later human approval
+    is a governance control rather than a filter that catches phishing.
+
+    A bad field is a 422 for the whole batch, not a silently dropped value: unlike
+    the field whitelist there is no existing good value to protect here, and an
+    alum at their keyboard can fix what they are told about.
+    """
+    try:
+        return await opportunity_links.submit_links(session, token, body)
+    except ValueError as exc:
+        raise InvalidRequestError(str(exc)) from exc
 
 
 @router.post(

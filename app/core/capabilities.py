@@ -66,6 +66,7 @@ class Capability:
     DONATIONS_VIEW = "donations.view"
     USER_ADMIN = "user_admin"
     DONATIONS_MANAGE = "donations.manage"
+    LINKS_DELETE = "links.delete"
     REPORTS_ADVANCED = "reports.advanced"
     VOCAB_ADMIN = "vocab_admin"
     PROFILE_COMPLETENESS = "profile.completeness"
@@ -279,6 +280,25 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "writes aren't silently granted when user-admin is delegated (#189)."
         ),
     ),
+    # Deleting an opportunity link (#441 follow-up). Deliberately NARROWER than
+    # "Manage surveys", which keeps approve / reject / add / edit: rejecting a
+    # link takes it out of circulation and is reversible, whereas deleting is
+    # permanent and the only trace left is the audit snapshot. So the people who
+    # work the moderation queue every day are not automatically the people who
+    # can erase from it. Seeded to Super Admin (plus the engineer override) and
+    # NOT to Full Access — see the note above DEFAULT_GRANTS.
+    CapabilitySpec(
+        code=Capability.LINKS_DELETE,
+        label="Delete opportunity links",
+        description=(
+            "Permanently remove internship and job links from the Links tab — "
+            "one at a time, or several selected together. This cannot be undone: "
+            "the link is gone from the list and only a record of the deletion "
+            "remains. To take a link out of circulation reversibly, reject it "
+            "instead, which \"Manage surveys\" covers along with approving, "
+            "adding, and editing links."
+        ),
+    ),
     CapabilitySpec(
         code=Capability.REPORTS_ADVANCED,
         label="Advanced reports & lookups",
@@ -360,6 +380,35 @@ ALUMNI_FULL_REPLACEMENTS: frozenset[str] = frozenset(
 )
 
 
+# Capabilities introduced AFTER the #379 split that are granted to a role which
+# existed before it. THE REGISTER EXISTS SO THE PRESERVATION TEST STAYS HONEST.
+#
+# ``tests/test_capability_split.test_no_role_gained_or_lost_access`` pins each
+# role's effective set against ``_PRE_SPLIT_GRANTS`` with an EXACT equality, and
+# that fixture is a frozen restatement of the pre-#379 world — it must never be
+# edited, or the check quietly starts agreeing with whatever the code does today.
+# But exact equality also means the very first genuinely NEW capability granted
+# to, say, super_admin fails it, for a reason that has nothing to do with #379.
+#
+# So the answer is neither "edit the fixture" nor "don't grant the capability":
+# it is to declare the addition here. The test subtracts this set before
+# comparing, so it still asserts the real thing — that the SPLIT moved nobody —
+# while a later, deliberate widening is visible in one place instead of being
+# smuggled into a fixture that claims to describe 2026-08-04.
+#
+# Add a code here ONLY when it is brand new AND granted to a pre-existing role.
+# Anything else — re-drawing an existing capability, widening one role's share of
+# an old code — is exactly what the preservation test is meant to catch, and must
+# fail it.
+POST_SPLIT_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        # #441 follow-up: deleting an opportunity link, carved out of
+        # `surveys.manage` and given to super_admin + engineer only.
+        Capability.LINKS_DELETE,
+    }
+)
+
+
 # --- Default grants (seed + empty-table fallback) -----------------------------
 #
 # Reproduces the historical hardcoded guards. Keyed by role NAME (the stable
@@ -389,6 +438,13 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             # before it was split out (super_admin + engineer), so gating the
             # donation writes on it is behaviour-preserving on day one (#189).
             Capability.DONATIONS_MANAGE,
+            # Deleting an opportunity link is Super Admin + engineer ONLY, and is
+            # deliberately absent from full_access below (#441 follow-up). It is
+            # the first capability that is NARROWER than the `surveys.manage`
+            # capability it was carved out of, rather than equal to it — see
+            # POST_SPLIT_CAPABILITIES for why that matters to the #379
+            # preservation test.
+            Capability.LINKS_DELETE,
             Capability.PROFILE_COMPLETENESS,
         }
     ),

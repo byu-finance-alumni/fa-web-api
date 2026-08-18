@@ -48,43 +48,80 @@ _DEFAULT_OUT = (
 # Each sheet: (name, [(header, example_value), ...]). The example row mirrors the
 # fully-populated mock records so staff can see the expected format.
 
-# The finalized 64-column alumni intake set. Order + EXACT header text are the
-# contract: import_csv.EXPECTED_HEADERS is derived from these headers and header
-# validation is exact-match both ways, so any edit here must match the importer's
-# _MAPPING keys verbatim (capitalization, punctuation, the parenthetical on
-# Region, the trailing colon on "Other Designations:", the "#" on "Phone #", and
-# the em-dash in the Women-in-Finance header).
+# --- Inert placeholder columns (#448) ----------------------------------------
+#
+# The department fills this sheet by copy-pasting a whole block out of their
+# SOURCE spreadsheet, so our column ORDER mirrors theirs one-for-one (#448).
+# Two of their columns have no field in this system. Simply omitting them would
+# shift every column to their right by one, and a whole-block paste would then
+# land each value in the WRONG field — the exact failure this ordering exists to
+# prevent. So they are kept as INERT PLACEHOLDERS: they hold the position in the
+# template and nothing else.
+#
+# "Inert" is enforced, not just intended:
+#   * they are NOT keys in import_csv._MAPPING, so _map_row never reads them;
+#   * they are NOT in import_csv.EXPECTED_HEADERS, so they are neither required
+#     on upload nor counted in the pinned column total (a real column can't hide
+#     behind one);
+#   * import_csv accepts and silently discards any column whose header starts
+#     with PLACEHOLDER_PREFIX, so a template round-trip (download -> fill ->
+#     upload) does not raise "Unexpected column".
+#
+# The prefix is the contract — match on it, never on the two literal captions.
+PLACEHOLDER_PREFIX = "(not imported) "
+
+
+def is_placeholder_header(header: str) -> bool:
+    """True for a position-holding column the importer must ignore entirely."""
+    return header.startswith(PLACEHOLDER_PREFIX)
+
+
+# The finalized alumni intake set: 68 real columns + 2 inert placeholders, in
+# the SOURCE spreadsheet's column order (#448) with our one extra column
+# ("Filled out Survey", which the source lacks) appended on the right.
+# Order + EXACT header text are the contract: import_csv.EXPECTED_HEADERS is
+# derived from these headers and header validation is exact-match both ways, so
+# any edit here must match the importer's _MAPPING keys verbatim (capitalization,
+# punctuation, the parenthetical on Region, the trailing colon on "Other
+# Designations:", the "#" on "Phone #", and the em-dash in the Women-in-Finance
+# header). REORDERING is safe — import matches on header name, not position — but
+# RENAMING is not; retired spellings belong in import_csv._LEGACY_HEADER_ALIASES.
 _ALUMNI_COLUMNS: list[tuple[str, str]] = [
-    ("Filled out Survey", "2026-01-15"),
+    ("Graduation Year", "2012"),
     ("MSTID (from OneAccord)", "MST-000123"),
-    ("BYU ID (9 digits)", "001000001"),
     ("Net ID", "jdoe1"),
     ("Preferred first name", ""),
     ("First name", "James"),
     ("Middle name", ""),
     ("Last Name", "Doe"),
+    # Placeholder: the source sheet's maiden-name column. No field here
+    # (#646 settled maiden names onto middle name), so it holds the slot only.
+    ("(not imported) BIRTHNAME/Maiden", ""),
     ("Gender", "M"),
     ("Personal Email", "james.doe@example.com"),
+    ("BYU ID (9 digits)", "001000001"),
     ("Birthday (YYYY-MM-DD)", "1990-03-15"),
-    ("Graduation Semester", "Winter"),
-    ("Graduation Year", "2012"),
-    ("Class of", "2012"),
-    ("LinkedIn URL", "https://linkedin.com/in/mock-jdoe"),
     ("Finance program admitted year", "2011"),
+    ("Graduation Semester", "Winter"),
+    ("Class of", "2012"),
+    ("Phone #", "+1 (212) 555-0142"),
+    ("Marital Status", "Married"),
+    ("Spouse Name", "Ava Lee"),
+    ("Languages", "English; Spanish"),
+    ("LinkedIn URL", "https://linkedin.com/in/mock-jdoe"),
     ("Employment Status", "Employed"),
     ("Profile Updated By", "Amy Adams"),
     ("Profile Updated Date", "2026-02-01"),
     ("Finance Leadership Position", "Finance Society President"),
+    # Placeholder: the source sheet's graduate-major column. We store the
+    # graduate degree/university/year but not the major.
+    ("(not imported) Graduate Major", ""),
     ("Graduate degree", ""),
     ("Graduate university", ""),
     ("Graduate graduation year", ""),
     ("Deceased? (Yes/No)", "No"),
     ("Notes", "Investment banking track."),
     ("Citizenship", "USA"),
-    ("Marital Status", "Married"),
-    ("Languages", "English; Spanish"),
-    ("Spouse Name", "Ava Lee"),
-    ("Phone #", "+1 (212) 555-0142"),
     ("Current employer", "Goldman Sachs"),
     ("Current title", "Vice President"),
     ("Current industry (see Reference sheet)", "Investment Banking"),
@@ -92,8 +129,6 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("Work Email", "jdoe@goldmansachs.com"),
     ("Address line 1", "200 West St"),
     ("Address line 2", ""),
-    ("Residence city", "Brooklyn"),
-    ("Residence state", "NY"),
     ("Current city", "New York"),
     ("Current state", "NY"),
     (
@@ -102,6 +137,8 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ),
     ("Current country", "USA"),
     ("Current ZIP", "10282"),
+    ("Residence city", "Brooklyn"),
+    ("Residence state", "NY"),
     ("Home country", "USA"),
     ("Degree", "BS"),
     ("Major", "Finance"),
@@ -126,6 +163,7 @@ _ALUMNI_COLUMNS: list[tuple[str, str]] = [
     ("Other Designations:", "Series 7, Series 63"),
     ("Engagement notes", "Hosts NetTrek in NYC; active IB-track mentor."),
     ("Best Contact", "james.doe@example.com"),
+    ("Filled out Survey", "2026-01-15"),
 ]
 
 # "Friends of the finance program" (#294) are non-alumni contacts
@@ -163,8 +201,13 @@ _FRIEND_EXCLUDED_HEADERS: frozenset[str] = frozenset(
     }
 )
 
+# Placeholders are dropped from the friend set too: the friend template is
+# already a curated subset, so it does not line up with the source spreadsheet
+# column-for-column and a position-holding column would buy nothing there.
 _FRIEND_COLUMNS: list[tuple[str, str]] = [
-    col for col in _ALUMNI_COLUMNS if col[0] not in _FRIEND_EXCLUDED_HEADERS
+    col
+    for col in _ALUMNI_COLUMNS
+    if col[0] not in _FRIEND_EXCLUDED_HEADERS and not is_placeholder_header(col[0])
 ]
 
 
@@ -207,6 +250,12 @@ _REFERENCE_ROWS: list[list[str]] = [
     [
         "Attendance status (Event attendance sheet)",
         ", ".join(_ATTENDANCE_STATUSES),
+    ],
+    [
+        f"Columns headed '{PLACEHOLDER_PREFIX.strip()}'",
+        "Placeholders only. They exist so this sheet's columns line up with the "
+        "source spreadsheet for a straight copy-paste; anything typed in them is "
+        "IGNORED on import.",
     ],
     ["All Yes/No columns", "Enter Yes or No"],
     ["All date columns (birthday, event date)", "Format YYYY-MM-DD, e.g. 1990-03-15"],

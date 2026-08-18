@@ -1039,37 +1039,50 @@ def test_commit_import_no_importable_does_not_commit():
 # --- Template endpoint content ----------------------------------------------
 
 
-FINALIZED_ALUMNI_HEADERS = [
-    "Filled out Survey",
+# --- Pinned intake-sheet column layout (#448) --------------------------------
+#
+# ``INTAKE_TEMPLATE_HEADERS`` is what we HAND OUT: the department's SOURCE
+# spreadsheet order, column for column, with two INERT PLACEHOLDER columns
+# holding the positions of source columns this system has no field for, and our
+# one extra column ("Filled out Survey") appended on the right.
+#
+# Pinning it VERBATIM and IN ORDER is the whole point of the feature. Staff paste
+# a whole block out of the source sheet in one sweep, so a column inserted,
+# dropped or moved here shifts every value to its right into a DIFFERENT field
+# and corrupts real alumni records on import. This assertion must fail loudly and
+# immediately if anyone reorders the template later.
+INTAKE_TEMPLATE_HEADERS = [
+    "Graduation Year",
     "MSTID (from OneAccord)",
-    "BYU ID (9 digits)",
     "Net ID",
     "Preferred first name",
     "First name",
     "Middle name",
     "Last Name",
+    "(not imported) BIRTHNAME/Maiden",
     "Gender",
     "Personal Email",
+    "BYU ID (9 digits)",
     "Birthday (YYYY-MM-DD)",
-    "Graduation Semester",
-    "Graduation Year",
-    "Class of",
-    "LinkedIn URL",
     "Finance program admitted year",
+    "Graduation Semester",
+    "Class of",
+    "Phone #",
+    "Marital Status",
+    "Spouse Name",
+    "Languages",
+    "LinkedIn URL",
     "Employment Status",
     "Profile Updated By",
     "Profile Updated Date",
     "Finance Leadership Position",
+    "(not imported) Graduate Major",
     "Graduate degree",
     "Graduate university",
     "Graduate graduation year",
     "Deceased? (Yes/No)",
     "Notes",
     "Citizenship",
-    "Marital Status",
-    "Languages",
-    "Spouse Name",
-    "Phone #",
     "Current employer",
     "Current title",
     "Current industry (see Reference sheet)",
@@ -1077,13 +1090,13 @@ FINALIZED_ALUMNI_HEADERS = [
     "Work Email",
     "Address line 1",
     "Address line 2",
-    "Residence city",
-    "Residence state",
     "Current city",
     "Current state",
     "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)",
     "Current country",
     "Current ZIP",
+    "Residence city",
+    "Residence state",
     "Home country",
     "Degree",
     "Major",
@@ -1108,7 +1121,186 @@ FINALIZED_ALUMNI_HEADERS = [
     "Other Designations:",
     "Engagement notes",
     "Best Contact",
+    "Filled out Survey",
 ]
+
+# What a file must actually CARRY: the same layout with the inert placeholders
+# removed. Header validation is exact-match both ways against this list, so a
+# placeholder is never required on upload and never counted in the pinned total.
+FINALIZED_ALUMNI_HEADERS = [
+    "Graduation Year",
+    "MSTID (from OneAccord)",
+    "Net ID",
+    "Preferred first name",
+    "First name",
+    "Middle name",
+    "Last Name",
+    "Gender",
+    "Personal Email",
+    "BYU ID (9 digits)",
+    "Birthday (YYYY-MM-DD)",
+    "Finance program admitted year",
+    "Graduation Semester",
+    "Class of",
+    "Phone #",
+    "Marital Status",
+    "Spouse Name",
+    "Languages",
+    "LinkedIn URL",
+    "Employment Status",
+    "Profile Updated By",
+    "Profile Updated Date",
+    "Finance Leadership Position",
+    "Graduate degree",
+    "Graduate university",
+    "Graduate graduation year",
+    "Deceased? (Yes/No)",
+    "Notes",
+    "Citizenship",
+    "Current employer",
+    "Current title",
+    "Current industry (see Reference sheet)",
+    "Secondary industry (see Reference sheet)",
+    "Work Email",
+    "Address line 1",
+    "Address line 2",
+    "Current city",
+    "Current state",
+    "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)",
+    "Current country",
+    "Current ZIP",
+    "Residence city",
+    "Residence state",
+    "Home country",
+    "Degree",
+    "Major",
+    "Degree status",
+    "Degree year",
+    "Former Company",
+    "Former Title",
+    "Former Industry",
+    "Willing to host NetTrek (Yes/No)",
+    "Willing to attend finance conference (Yes/No)",
+    "Willing to mentor (Yes/No)",
+    "Willing to sponsor company event (Yes/No)",
+    "Willing to guest speak (Yes/No)",
+    "Willing to help at events (Yes/No)",
+    "Willing to host case competition (yes/no)",
+    "Willing to mentor — Women in Finance (Yes/No)",
+    "Hired a finance intern (Yes/No)",
+    "Hired finance full-time (Yes/No)",
+    "Willing to be a PIFF donor (Yes/No)",
+    "CFP designation (Yes/No)",
+    "CFA designation (Yes/No)",
+    "Other Designations:",
+    "Engagement notes",
+    "Best Contact",
+    "Filled out Survey",
+]
+
+# Every real header -> the (section, field, kind) it binds to, snapshotted from
+# ``_MAPPING`` as it stood BEFORE the #448 reorder. Reordering columns must not
+# rebind a single one: import resolves cells by header NAME, never by position.
+# If a header in here ever points somewhere new, imported data is silently
+# landing in a different database column than it used to.
+HEADER_TARGETS = {
+    "Filled out Survey": ("core", "survey_completed_date", "date"),
+    "MSTID (from OneAccord)": ("core", "mst_id", "str"),
+    "BYU ID (9 digits)": ("core", "byu_id", "str"),
+    "Net ID": ("core", "net_id", "str"),
+    "Preferred first name": ("core", "preferred_first_name", "str"),
+    "First name": ("core", "first_name", "str"),
+    "Middle name": ("core", "middle_name", "str"),
+    "Last Name": ("core", "last_name", "str"),
+    "Gender": ("core", "gender", "str"),
+    "Personal Email": ("contact", "personal_email", "str"),
+    "Birthday (YYYY-MM-DD)": ("core", "birth_date", "date"),
+    "Graduation Semester": ("core", "graduation_semester", "str"),
+    "Graduation Year": ("core", "graduation_year", "int"),
+    "Class of": ("core", "graduation_class", "int"),
+    "LinkedIn URL": ("core", "linkedin_url", "str"),
+    "Finance program admitted year": ("core", "finance_program_year", "int"),
+    "Employment Status": ("core", "employment_status", "str"),
+    "Profile Updated By": ("core", "profile_updated_by", "str"),
+    "Profile Updated Date": ("core", "profile_updated_date", "date"),
+    "Finance Leadership Position": ("leadership", "leadership_role", "str"),
+    "Graduate degree": ("core", "graduate_degree", "str"),
+    "Graduate university": ("core", "graduate_school", "str"),
+    "Graduate graduation year": ("core", "graduate_graduation_year", "int"),
+    "Deceased? (Yes/No)": ("core", "deceased", "bool"),
+    "Notes": ("core", "notes", "str"),
+    "Citizenship": ("core", "citizenship", "str"),
+    "Marital Status": ("core", "marital_status", "str"),
+    "Languages": ("core", "languages", "str"),
+    "Spouse Name": ("core", "spouse_first_name", "spouse_name"),
+    "Phone #": ("contact", "phone", "str"),
+    "Current employer": ("career", "current_employer", "str"),
+    "Current title": ("career", "current_title", "str"),
+    "Current industry (see Reference sheet)": ("career", "current_industry", "industry"),
+    "Secondary industry (see Reference sheet)": ("career", "current_industry_secondary", "str"),
+    "Work Email": ("contact", "work_email", "str"),
+    "Address line 1": ("contact", "address_line_1", "str"),
+    "Address line 2": ("contact", "address_line_2", "str"),
+    "Residence city": ("contact", "city", "str"),
+    "Residence state": ("contact", "state", "str"),
+    "Current city": ("career", "current_city", "str"),
+    "Current state": ("career", "current_state", "str"),
+    "Region (Northeast, Southeast, Midwest, Southwest, West, and Mountain West)": (
+        "contact", "region", "str",
+    ),
+    "Current country": ("career", "current_country", "str"),
+    "Current ZIP": ("career", "current_zip", "str"),
+    "Home country": ("core", "home_country", "str"),
+    "Degree": ("education", "degree", "str"),
+    "Major": ("education", "major", "str"),
+    "Degree status": ("education", "degree_status", "str"),
+    "Degree year": ("education", "degree_year", "int"),
+    "Former Company": ("former", "employer_name", "str"),
+    "Former Title": ("former", "employment_title", "str"),
+    "Former Industry": ("former", "employment_industry", "str"),
+    "Willing to host NetTrek (Yes/No)": ("engagement", "nettrek_host_willing", "bool"),
+    "Willing to attend finance conference (Yes/No)": (
+        "engagement", "finance_conference_willing", "bool",
+    ),
+    "Willing to mentor (Yes/No)": ("engagement", "mentor_willing", "bool"),
+    "Willing to sponsor company event (Yes/No)": (
+        "engagement", "company_event_sponsor_willing", "bool",
+    ),
+    "Willing to guest speak (Yes/No)": ("engagement", "guest_speaker_willing", "bool"),
+    "Willing to help at events (Yes/No)": ("engagement", "help_at_event_willing", "bool"),
+    "Willing to host case competition (yes/no)": (
+        "engagement", "case_competition_host_willing", "bool",
+    ),
+    "Willing to mentor — Women in Finance (Yes/No)": (
+        "engagement", "women_in_finance_mentor_willing", "bool",
+    ),
+    "Hired a finance intern (Yes/No)": ("engagement", "hired_finance_intern", "bool"),
+    "Hired finance full-time (Yes/No)": ("engagement", "hired_finance_full_time", "bool"),
+    "Willing to be a PIFF donor (Yes/No)": ("engagement", "piff_donor", "bool"),
+    "CFP designation (Yes/No)": ("engagement", "cfp_designation", "designation"),
+    "CFA designation (Yes/No)": ("engagement", "cfa_designation", "designation"),
+    "Other Designations:": ("core", "other_designations", "str"),
+    "Engagement notes": ("engagement", "engagement_notes", "str"),
+    "Best Contact": ("contact", "best_contact", "str"),
+}
+
+
+def test_template_headers_pin_the_source_spreadsheet_order():
+    # The layout we hand out, verbatim and in order. If this fails, someone
+    # reordered the intake sheet: re-derive the source spreadsheet's order before
+    # updating the pin, because a paste that was landing in the right columns is
+    # now landing one field over.
+    assert import_csv.TEMPLATE_HEADERS == INTAKE_TEMPLATE_HEADERS
+    # 68 real columns + 2 inert placeholders.
+    assert len(import_csv.TEMPLATE_HEADERS) == 70
+    assert import_csv.PLACEHOLDER_HEADERS == (
+        "(not imported) BIRTHNAME/Maiden",
+        "(not imported) Graduate Major",
+    )
+    # Jake's rule: columns the source sheet does not have go to the RIGHT of the
+    # mirrored block, so the mirrored prefix stays aligned end to end.
+    assert import_csv.TEMPLATE_HEADERS[-1] == "Filled out Survey"
+    assert "Filled out Survey" not in import_csv.TEMPLATE_HEADERS[:-1]
 
 
 def test_expected_headers_are_the_finalized_set_in_order():
@@ -1121,12 +1313,134 @@ def test_expected_headers_are_the_finalized_set_in_order():
     # import_csv._LEGACY_HEADER_ALIASES, never here. It grew to 69 with the
     # Languages column and the Residence city/state columns (which bind to the
     # actual contact address, distinct from the employer "Current city/state").
+    # #448 REORDERED it to mirror the source spreadsheet; the count is unchanged
+    # because a reorder adds and removes nothing.
     assert import_csv.EXPECTED_HEADERS == FINALIZED_ALUMNI_HEADERS
     # 69 -> 68: the two Spouse First/Last columns collapsed into one "Spouse Name"
     # column that _map_row splits into first/last on import.
     assert len(import_csv.EXPECTED_HEADERS) == 68
     # Every header is a mapping key (and vice-versa).
     assert set(import_csv._MAPPING) == set(FINALIZED_ALUMNI_HEADERS)
+    # ...and the required set is exactly the handed-out layout minus the inert
+    # placeholders, with the surviving order intact. This is the invariant the
+    # "CSV/schema sync" CI job also enforces.
+    assert [
+        header
+        for header in import_csv.TEMPLATE_HEADERS
+        if not header.startswith("(not imported) ")
+    ] == FINALIZED_ALUMNI_HEADERS
+
+
+def test_reordering_did_not_rebind_a_single_header():
+    # The #448 reorder moved columns around; it must not have changed where ANY
+    # of them writes. A diff here means imported data is landing in a different
+    # database column than it did before.
+    assert import_csv._MAPPING == HEADER_TARGETS
+
+
+def test_placeholder_columns_are_inert():
+    # A placeholder holds a source-spreadsheet position and nothing else: it is
+    # in the template, but never mapped, never required, and never part of the
+    # friend set (which carries no placeholders at all).
+    assert import_csv.PLACEHOLDER_HEADERS
+    for header in import_csv.PLACEHOLDER_HEADERS:
+        assert header in import_csv.TEMPLATE_HEADERS
+        assert header not in import_csv._MAPPING
+        assert header not in import_csv.EXPECTED_HEADERS
+        assert header not in import_csv.FRIEND_EXPECTED_HEADERS
+        assert header not in import_csv._FRIEND_MAPPING
+
+
+def _template_row(**cells: str) -> tuple[list[str], bytes]:
+    """A full-template (placeholders included) CSV with one row of named cells."""
+    headers = list(import_csv.TEMPLATE_HEADERS)
+    values = {header: "" for header in headers}
+    values.update(cells)
+    return headers, _csv_bytes([values[h] for h in headers], headers=headers)
+
+
+def test_template_with_placeholders_round_trips_and_placeholder_cells_are_dropped():
+    # Download the template -> fill it -> upload it. The placeholders must not
+    # read as "Unexpected column", and anything typed into one must be discarded
+    # rather than written to a neighbouring field.
+    headers, csv_bytes = _template_row(
+        **{
+            "First name": "Jane",
+            "Last Name": "Doe",
+            "BYU ID (9 digits)": "123456789",
+            "Graduation Year": "2018",
+            "Gender": "F",
+            "(not imported) BIRTHNAME/Maiden": "Smith",
+            "(not imported) Graduate Major": "Accounting",
+        }
+    )
+    assert "(not imported) BIRTHNAME/Maiden" in headers
+    rows, errors = import_csv.parse_and_map(csv_bytes)
+    assert errors == []
+    assert len(rows) == 1
+    payload = rows[0]["payload"]
+    # The columns either side of the maiden-name placeholder still landed where
+    # they belong — the placeholder absorbed nothing and shifted nothing.
+    assert payload["last_name"] == "Doe"
+    assert payload["gender"] == "F"
+    # Nothing anywhere in the payload carries the placeholder cells' values.
+    sections = [payload] + [v for v in payload.values() if isinstance(v, dict)]
+    for section in sections:
+        assert "Smith" not in section.values()
+        assert "Accounting" not in section.values()
+
+
+def test_build_template_csv_round_trips_through_the_strict_importer():
+    # The exact bytes the /alumni/import/template endpoint hands out must be
+    # accepted by the importer that consumes it (example row and all).
+    csv_text = import_csv.build_template_csv()
+    rows, errors = import_csv.parse_and_map(csv_text.encode("utf-8"))
+    assert errors == []
+    assert len(rows) == 1  # the single example row
+
+
+def test_placeholder_columns_are_not_reported_as_ignored_on_the_update_path():
+    # The lenient UPDATE parse echoes back unrecognized columns for the user to
+    # see. Our own placeholders are not the user's stray columns, so they must
+    # not appear in that list.
+    _, csv_bytes = _template_row(**{"Net ID": "jdoe1", "First name": "Jane"})
+    _rows, errors, ignored = import_csv.parse_and_map_partial(csv_bytes)
+    assert errors == []
+    assert ignored == []
+
+
+def test_import_resolves_cells_by_header_name_not_position():
+    # Import matches on header NAME, which is why #448 could reorder the sheet
+    # safely: a file saved from ANY earlier template order still imports and
+    # still lands in the same fields. Reversing the column order is a stronger
+    # statement of the same property than pinning one historical order.
+    headers = list(import_csv.EXPECTED_HEADERS)
+    values = {header: "" for header in headers}
+    values.update(
+        {
+            "First name": "Jane",
+            "Last Name": "Doe",
+            "BYU ID (9 digits)": "123456789",
+            "Graduation Year": "2018",
+            "Current employer": "Goldman",
+            "Residence city": "Brooklyn",
+            "Current city": "New York",
+        }
+    )
+    forward, forward_errors = import_csv.parse_and_map(
+        _csv_bytes([values[h] for h in headers], headers=headers)
+    )
+    backward_headers = list(reversed(headers))
+    backward, backward_errors = import_csv.parse_and_map(
+        _csv_bytes([values[h] for h in backward_headers], headers=backward_headers)
+    )
+    assert forward_errors == []
+    assert backward_errors == []
+    assert forward[0]["payload"] == backward[0]["payload"]
+    # And the two look-alike location pairs did NOT swap: the residence goes to
+    # the contact row, the work location to the career row (#287).
+    assert forward[0]["payload"]["contact"]["city"] == "Brooklyn"
+    assert forward[0]["payload"]["career"]["current_city"] == "New York"
 
 
 def test_template_csv_has_expected_headers():
@@ -1135,7 +1449,9 @@ def test_template_csv_has_expected_headers():
     import csv as _csv
 
     header_line = next(_csv.reader([lines[0]]))
-    assert header_line == HEADERS
+    # The handed-out CSV carries the FULL layout, placeholders included, so a
+    # whole-block paste from the source spreadsheet lines up.
+    assert header_line == import_csv.TEMPLATE_HEADERS
     # An example row is present.
     assert len(lines) >= 2
 
@@ -1265,7 +1581,11 @@ def test_route_template_download():
     assert resp.headers["content-type"].startswith("text/csv")
     assert "alumni_import_template.csv" in resp.headers["content-disposition"]
     first_line = resp.text.splitlines()[0]
-    assert first_line.startswith("Filled out Survey")
+    # #448: the sheet now opens on the source spreadsheet's first column and
+    # ships the inert placeholders that keep the two layouts aligned.
+    assert first_line.startswith("Graduation Year,")
+    assert "(not imported) BIRTHNAME/Maiden" in first_line
+    assert first_line.endswith(",Filled out Survey")
 
 
 # --- Friend (non-alumni contact) import (#294) -------------------------------
@@ -1347,8 +1667,12 @@ def test_route_friend_template_download():
     assert resp.status_code == 200
     assert "friend_import_template.csv" in resp.headers["content-disposition"]
     first_line = resp.text.splitlines()[0]
-    assert first_line.startswith("Filled out Survey")
+    # The friend set follows the same (#448-reordered) column order, minus the
+    # alumni-only identity/academic columns — so it opens on the first surviving
+    # one — and minus the placeholders, which buy nothing in a curated subset.
+    assert first_line.startswith("Preferred first name,")
     assert "BYU ID (9 digits)" not in first_line
+    assert "(not imported)" not in first_line
 
 
 def test_route_friend_import_kind_routes_and_flags_friend():

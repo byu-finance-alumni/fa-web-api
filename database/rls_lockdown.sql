@@ -111,6 +111,7 @@ ALTER TABLE finance_society_leadership ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bbq_attendance ENABLE ROW LEVEL SECURITY;
 ALTER TABLE city_geo ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dashboard_presets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE opportunity_links ENABLE ROW LEVEL SECURITY;
 
 -- =============================================================================
 -- THE SWEEP — enable RLS on every public table that does not already have it.

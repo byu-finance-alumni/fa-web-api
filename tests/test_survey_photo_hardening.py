@@ -316,8 +316,18 @@ def _promote(monkeypatch, resp, alum, staged_bytes, *, delete_raises=False):
 
 
 def _audit(session) -> str:
-    rows = [o for o in session.added if isinstance(o, AuditLog)]
-    assert len(rows) == 1
+    """The SUMMARY row's new_value -- the one carrying the photo disposition.
+
+    An apply also writes one `update` row per field that changed (#45), so this
+    filters by action_type rather than assuming the approval wrote exactly one
+    row. A photo-only apply moves no fields and so still writes just the summary.
+    """
+    rows = [
+        o
+        for o in session.added
+        if isinstance(o, AuditLog) and o.action_type == "apply_survey_response"
+    ]
+    assert len(rows) == 1, [r.action_type for r in rows]
     return rows[0].new_value
 
 

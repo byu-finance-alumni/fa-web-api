@@ -15,6 +15,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_context import audit_source, new_change_set_id
 from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
 from app.core.security import AuthorizationError
@@ -706,11 +707,28 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     """Strip the FERPA-sensitive parts of a profile for a ``view_only`` caller.
 
     Nulls the sensitive core PII (via ``minimize_alumni_read``), redacts the
-    home MAILING ADDRESS (street lines + ZIP — city/state/region/country stay,
-    as directory-style location), strips all free-text notes (interaction /
-    survey / engagement / program-engagement notes), and omits the embedded
-    audit trail entirely. Returns a new ``ProfileRead``; the input is left
-    untouched.
+    whole RESIDENCE (street lines + ZIP + city/state/country), strips all
+    free-text notes (interaction / survey / engagement / program-engagement
+    notes), and omits the embedded audit trail entirely. Returns a new
+    ``ProfileRead``; the input is left untouched.
+
+    Residence scope (#440): city/state/country used to be kept here as
+    "directory-style location". That call was made when ``contact.*`` held the
+    EMPLOYER's address (pre-#287). It no longer does — the survey asks alumni
+    for "Residence city / state / country" and writes those answers straight
+    into these three columns, and the intake sheet has Residence city/state
+    columns feeding them too. Keeping them visible would hand view_only the
+    alum's HOME city and state, which nobody decided to grant. So they are
+    redacted with the rest of the residence.
+
+    ``region`` is deliberately KEPT. Despite living on the contact row it is not
+    a residence value: per #283 it is derived from ``career.current_state``, the
+    state the alum WORKS in (see app/services/state_regions.py), and the survey
+    never writes it. It is a catchment label, so it stays.
+
+    The WORK location is untouched — ``current_career.current_city/state/
+    country/zip`` and the employment history rows stay fully visible, because
+    that is what the outreach use-case runs on (#166).
 
     Contact reachability (#166 — INTENTIONAL PRODUCT DECISION): personal/work
     email and phone are DELIBERATELY exposed to view_only so a "Professor" can
@@ -722,16 +740,22 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     ``get_profile`` (full name only for editors), so it is intentionally left
     untouched here — a view_only caller sees who made contact by first name.
     """
-    # Redact the home mailing address (street + ZIP) for view_only; keep
-    # city/state/region/country (directory-style location). Email and phone are
-    # INTENTIONALLY left visible (#166) so view_only can contact alumni for
-    # outreach — do NOT re-add personal_email/work_email/phone here.
+    # Redact the whole residence for view_only: street lines, ZIP, and (since
+    # #440) city/state/country, which the survey now fills with a genuine HOME
+    # address. ``region`` is kept — it is derived from the WORK state (#283),
+    # not from any of these. Email and phone are INTENTIONALLY left visible
+    # (#166) so view_only can contact alumni for outreach — do NOT re-add
+    # personal_email/work_email/phone here. The employer's location on
+    # ``current_career`` is likewise untouched; outreach depends on it.
     contact = (
         profile.contact.model_copy(
             update={
                 "address_line_1": None,
                 "address_line_2": None,
                 "zip": None,
+                "city": None,
+                "state": None,
+                "country": None,
                 # best_contact holds a raw phone-or-email value straight off the
                 # intake sheet — which may be a HOME number the address redaction
                 # above is meant to withhold. The frontend never renders it at
@@ -787,13 +811,18 @@ def _audit_alumni(
     field_name: str | None = None,
     old_value: str | None = None,
     new_value: str | None = None,
+    change_set_id: str | None = None,
 ) -> None:
     """Record a profile-activity audit event against the alumni entity, so it
     surfaces in the profile Audit tab. No-op when the actor is unknown.
 
     The optional field/old/new args capture WHAT changed (used by interaction
     edit/delete so the FERPA trail can reconstruct altered/removed relationship
-    notes, not just that a change happened)."""
+    notes, not just that a change happened).
+
+    ``change_set_id`` groups the rows written by one save into one version;
+    ``source`` is read from the request-scoped provenance contextvar so no
+    callsite has to thread it through (#45)."""
     if actor_user_id is not None:
         session.add(
             AuditLog(
@@ -804,6 +833,8 @@ def _audit_alumni(
                 field_name=field_name,
                 old_value=old_value,
                 new_value=new_value,
+                change_set_id=change_set_id,
+                source=audit_source(),
             )
         )
 
@@ -811,6 +842,50 @@ def _audit_alumni(
 def _audit_str(value: object) -> str | None:
     """Stringify a value for an audit old/new column (None stays None)."""
     return None if value is None else str(value)
+
+
+# The per-row employment / education tables are LISTS: an alumnus can hold
+# several prior roles and several degrees, so "employment_title changed" is
+# ambiguous without saying WHICH row. The audit schema has no row-id column, so
+# the row id rides in ``field_name``: ``employment[12].employment_title``,
+# ``education[7].degree``. An add/delete names the row alone (``employment[12]``)
+# and carries a snapshot of the whole row in new_value/old_value — mirroring how
+# delete_interaction already preserves a removed note's content, since a hard
+# delete otherwise loses it irrecoverably.
+def _row_field(kind: str, row_id: object, field: str | None = None) -> str:
+    return f"{kind}[{row_id}]" + (f".{field}" if field else "")
+
+
+def _row_snapshot(row: object, fields: tuple[str, ...]) -> str:
+    """Human-readable one-line snapshot of *row*, for an add/delete audit value.
+
+    Same shape as ``delete_interaction``'s snapshot: ``name=value`` pairs with
+    ``repr`` values, so an empty string is distinguishable from NULL.
+    """
+    return "; ".join(f"{field}={getattr(row, field, None)!r}" for field in fields)
+
+
+# Snapshot field lists — the meaningful columns of each per-row table (the
+# surrogate id and alumni_id are already on the audit row).
+_EMPLOYMENT_FIELDS = (
+    "employer_name",
+    "employment_title",
+    "employment_industry",
+    "city",
+    "state",
+    "start_year",
+    "end_year",
+    "is_current",
+)
+_EDUCATION_FIELDS = (
+    "university",
+    "college",
+    "department",
+    "degree",
+    "major",
+    "degree_status",
+    "degree_year",
+)
 
 
 async def add_interaction(
@@ -862,6 +937,7 @@ async def update_interaction(
     # Audit each field that actually changes with its old + new value, so a later
     # FERPA review can see exactly what a note edit altered — not just that an
     # edit occurred. A true no-op writes no audit row.
+    change_set_id = new_change_set_id()
     for field, value in data.items():
         old = getattr(row, field)
         if old == value:
@@ -872,9 +948,13 @@ async def update_interaction(
             actor_user_id,
             "update_interaction",
             alumni_id,
+            # Left as the bare field name on purpose: rows already in the
+            # database use it, and re-keying them mid-stream would split one
+            # field's history across two naming schemes.
             field_name=field,
             old_value=_audit_str(old),
             new_value=_audit_str(value),
+            change_set_id=change_set_id,
         )
     await session.commit()
     await session.refresh(row)
@@ -992,7 +1072,18 @@ async def add_employment(
         is_current=payload.is_current,
     )
     session.add(row)
-    _audit_alumni(session, actor_user_id, "add_employment", alumni_id)
+    # Flush to obtain the surrogate id BEFORE auditing, so the trail names the row
+    # it created. Nothing about what gets written changes — the commit below
+    # already flushed this INSERT; it just happens a moment earlier.
+    await session.flush()
+    _audit_alumni(
+        session,
+        actor_user_id,
+        "add_employment",
+        alumni_id,
+        field_name=_row_field("employment", row.employment_history_id),
+        new_value=_row_snapshot(row, _EMPLOYMENT_FIELDS),
+    )
     await session.commit()
     await session.refresh(row)
     return EmploymentHistoryRead.model_validate(row)
@@ -1014,9 +1105,26 @@ async def update_employment(
             f"Employment history {employment_history_id} not found."
         )
     data = payload.model_dump(exclude_unset=True)
+    # Audit each field that actually changes with its old + new value (#45),
+    # mirroring update_interaction — until now this path recorded only that an
+    # edit happened, so a corrected employer or title was unrecoverable. One
+    # change set groups the whole save; a true no-op writes no audit row.
+    change_set_id = new_change_set_id()
     for field, value in data.items():
+        old = getattr(row, field)
+        if old == value:
+            continue
         setattr(row, field, value)
-    _audit_alumni(session, actor_user_id, "update_employment", alumni_id)
+        _audit_alumni(
+            session,
+            actor_user_id,
+            "update_employment",
+            alumni_id,
+            field_name=_row_field("employment", employment_history_id, field),
+            old_value=_audit_str(old),
+            new_value=_audit_str(value),
+            change_set_id=change_set_id,
+        )
     await session.commit()
     await session.refresh(row)
     return EmploymentHistoryRead.model_validate(row)
@@ -1036,8 +1144,18 @@ async def delete_employment(
         raise NotFoundError(
             f"Employment history {employment_history_id} not found."
         )
+    # Snapshot the row BEFORE deleting so the trail retains what was removed — a
+    # hard delete otherwise loses the whole role irrecoverably (#45).
+    snapshot = _row_snapshot(row, _EMPLOYMENT_FIELDS)
     await session.delete(row)
-    _audit_alumni(session, actor_user_id, "delete_employment", alumni_id)
+    _audit_alumni(
+        session,
+        actor_user_id,
+        "delete_employment",
+        alumni_id,
+        field_name=_row_field("employment", employment_history_id),
+        old_value=snapshot,
+    )
     await session.commit()
 
 
@@ -1060,7 +1178,16 @@ async def add_education(
         degree_year=payload.degree_year,
     )
     session.add(row)
-    _audit_alumni(session, actor_user_id, "add_education", alumni_id)
+    # Flush for the surrogate id before auditing (see add_employment).
+    await session.flush()
+    _audit_alumni(
+        session,
+        actor_user_id,
+        "add_education",
+        alumni_id,
+        field_name=_row_field("education", row.education_id),
+        new_value=_row_snapshot(row, _EDUCATION_FIELDS),
+    )
     await session.commit()
     await session.refresh(row)
     return EducationRead.model_validate(row)
@@ -1080,9 +1207,23 @@ async def update_education(
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Education {education_id} not found.")
     data = payload.model_dump(exclude_unset=True)
+    # Per-field old/new capture, as in update_employment (#45).
+    change_set_id = new_change_set_id()
     for field, value in data.items():
+        old = getattr(row, field)
+        if old == value:
+            continue
         setattr(row, field, value)
-    _audit_alumni(session, actor_user_id, "update_education", alumni_id)
+        _audit_alumni(
+            session,
+            actor_user_id,
+            "update_education",
+            alumni_id,
+            field_name=_row_field("education", education_id, field),
+            old_value=_audit_str(old),
+            new_value=_audit_str(value),
+            change_set_id=change_set_id,
+        )
     await session.commit()
     await session.refresh(row)
     return EducationRead.model_validate(row)
@@ -1100,8 +1241,17 @@ async def delete_education(
     row = await session.get(EducationHistory, education_id)
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Education {education_id} not found.")
+    # Snapshot before the hard delete, as in delete_employment (#45).
+    snapshot = _row_snapshot(row, _EDUCATION_FIELDS)
     await session.delete(row)
-    _audit_alumni(session, actor_user_id, "delete_education", alumni_id)
+    _audit_alumni(
+        session,
+        actor_user_id,
+        "delete_education",
+        alumni_id,
+        field_name=_row_field("education", education_id),
+        old_value=snapshot,
+    )
     await session.commit()
 
 

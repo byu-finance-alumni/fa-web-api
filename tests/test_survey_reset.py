@@ -142,6 +142,11 @@ def _ddl(conn):
             " payload TEXT NOT NULL,"
             " status VARCHAR(20) NOT NULL,"
             " staged_photo_path VARCHAR(255),"
+            # Which campaign the reply answered (#497). Nullable, never
+            # backfilled, and nothing on the reset path reads it — it is here
+            # only because the model selects it.
+            " cycle_seq INTEGER,"
+            " stage SMALLINT,"
             " submitted_at TIMESTAMP NOT NULL,"
             " reviewed_by_user_id INTEGER,"
             " reviewed_at TIMESTAMP)"

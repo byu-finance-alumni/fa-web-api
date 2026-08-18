@@ -29,6 +29,7 @@ from app.api.routes import (
     health,
     maintenance,
     notes,
+    opportunity_links,
     storage,
     support,
     survey,
@@ -181,6 +182,7 @@ app.include_router(donations.router)
 app.include_router(audit.router)
 app.include_router(geography.router)
 app.include_router(notes.router)
+app.include_router(opportunity_links.router)
 app.include_router(tasks.router)
 app.include_router(vocabulary.router)
 app.include_router(vocabulary.admin_router)

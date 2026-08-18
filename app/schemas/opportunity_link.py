@@ -44,6 +44,16 @@ from app.schemas.alumni import (
 # per-token rate limiter bounds the number of calls on top of it.
 MAX_LINKS_PER_SUBMIT = 10
 
+# How many links ONE bulk-delete call may remove. Unlike the submit cap above
+# this is not about an unauthenticated writer — the route needs `links.delete`,
+# which is super_admin + engineer only — it is about blast radius: a bulk delete
+# is the one call in this feature that destroys rows, and an uncapped id list
+# turns a single mis-click (or a single stolen super-admin session) into "delete
+# the whole table". 100 comfortably covers selecting every row of a full 50-row
+# page twice over, and a caller with more to remove pages through it, which is
+# also what makes the audit trail land in reviewable batches.
+MAX_LINKS_PER_BULK_DELETE = 100
+
 RoleType = Literal["internship", "full_time", "both"]
 LinkStatus = Literal["pending", "approved", "rejected"]
 LinkSource = Literal["survey", "staff"]
@@ -403,6 +413,55 @@ class OpportunityLinkPage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class OpportunityLinkBulkDeleteRequest(BaseModel):
+    """The ids a staff member multi-selected in the Links tab and asked to delete.
+
+    Capped at :data:`MAX_LINKS_PER_BULK_DELETE`; duplicates in the list are
+    collapsed by the service, so sending the same id twice deletes one row and
+    reports it once.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    opportunity_link_ids: list[int] = Field(
+        min_length=1,
+        max_length=MAX_LINKS_PER_BULK_DELETE,
+        description=(
+            "Ids of the links to delete. At most "
+            f"{MAX_LINKS_PER_BULK_DELETE} per call."
+        ),
+    )
+
+    @field_validator("opportunity_link_ids")
+    @classmethod
+    def _check_ids(cls, value: list[int]) -> list[int]:
+        # Mirrors `IdPath`'s ge=1: a zero or negative id can never match a row,
+        # so it is a malformed request rather than a miss to report back.
+        if any(v < 1 for v in value):
+            raise ValueError("Link ids must be positive.")
+        return value
+
+
+class OpportunityLinkBulkDeleteResult(BaseModel):
+    """What a bulk delete actually did — per id, not just a count.
+
+    BEST-EFFORT, NOT ALL-OR-NOTHING, and the response is shaped to make that
+    safe. The ids come from a list the browser rendered some seconds ago, so an
+    id can be stale for the most ordinary reason there is: somebody else already
+    deleted it. Failing the whole batch over a row that is already in the state
+    the caller asked for would mean the more links you select the more likely the
+    button does nothing — and the caller would have to diff the list by hand to
+    find out which. So every id that resolves is deleted, in ONE transaction, and
+    the ids that did not resolve are named in ``missing_ids`` rather than
+    silently folded into a smaller count. Nothing is guessed at and nothing is
+    hidden: ``len(deleted_ids) + len(missing_ids) == requested``.
+    """
+
+    requested: int
+    deleted_ids: list[int]
+    missing_ids: list[int]
 
 
 class OpportunityLinkSubmitResult(BaseModel):

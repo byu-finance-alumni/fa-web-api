@@ -553,16 +553,91 @@ async def update_link(
     return items[0]
 
 
+def _stage_delete_audit(
+    session: AsyncSession, link: OpportunityLink, actor_user_id: int | None
+) -> None:
+    """Snapshot a link into the audit trail, immediately before it is removed.
+
+    The snapshot is the WHOLE point of this helper existing: once the row is
+    gone, the audit entry is the only thing left that can answer "what did we
+    delete?". It is taken while the object is still populated — after
+    ``session.delete`` the instance is expired and ``_summary`` would read
+    detached attributes. Shared by the single delete and the bulk delete so the
+    two produce identical trails; a bulk delete is N ordinary deletions in the
+    log, not one opaque event.
+    """
+    _audit(
+        session,
+        actor_user_id,
+        "delete_opportunity_link",
+        link,
+        old_value=_summary(link),
+    )
+
+
 async def delete_link(
     session: AsyncSession, link_id: int, actor_user_id: int | None
 ) -> None:
     """Delete a link. The row is snapshotted into the audit trail first, so a
     later review can still answer what was removed and by whom."""
     link = await _load(session, link_id)
-    snapshot = _summary(link)
-    _audit(session, actor_user_id, "delete_opportunity_link", link, old_value=snapshot)
+    _stage_delete_audit(session, link, actor_user_id)
     await session.delete(link)
     await session.commit()
+
+
+async def delete_links(
+    session: AsyncSession, link_ids: list[int], actor_user_id: int | None
+) -> tuple[list[int], list[int]]:
+    """Delete several links at once. Returns ``(deleted_ids, missing_ids)``.
+
+    BEST-EFFORT BY DESIGN. An id that no longer resolves is REPORTED, not raised
+    on: the caller multi-selected from a list their browser rendered seconds ago,
+    and the commonest reason an id is stale is that the row is already gone —
+    i.e. already in the state they asked for. Refusing the batch over that would
+    make the button less reliable the more rows you select, and would leave the
+    caller to work out by hand which id was the problem. Both lists come back
+    sorted so the response is stable regardless of the order the ids were sent.
+
+    ONE TRANSACTION, though. Best-effort is about which ids are *attempted*, not
+    about half-finishing: every resolvable row and every one of its audit rows
+    commit together, so the trail can never disagree with the table.
+
+    Duplicate ids collapse — one row, one audit entry, one entry in
+    ``deleted_ids``. The rows are fetched in a single ``IN`` query rather than
+    one ``get`` per id; the caller's list is capped
+    (``MAX_LINKS_PER_BULK_DELETE``) so that query is bounded.
+    """
+    wanted = sorted(set(link_ids))
+    if not wanted:
+        return [], []
+    rows = (
+        (
+            await session.execute(
+                select(OpportunityLink).where(
+                    OpportunityLink.opportunity_link_id.in_(wanted)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    found = {link.opportunity_link_id: link for link in rows}
+    # Snapshot EVERY row before deleting ANY of them. Interleaving would still be
+    # correct today, but this keeps "the audit row is written from a live object"
+    # true by construction rather than by delete-ordering luck.
+    for link_id in wanted:
+        link = found.get(link_id)
+        if link is not None:
+            _stage_delete_audit(session, link, actor_user_id)
+    for link_id in wanted:
+        link = found.get(link_id)
+        if link is not None:
+            await session.delete(link)
+    await session.commit()
+    deleted_ids = [i for i in wanted if i in found]
+    missing_ids = [i for i in wanted if i not in found]
+    return deleted_ids, missing_ids
 
 
 # -------------------------------------------------------------- moderation ----

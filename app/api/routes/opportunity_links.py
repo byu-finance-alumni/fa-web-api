@@ -17,16 +17,23 @@ AUTHORIZATION, and why it is drawn where it is:
     403 rather than a silently narrowed result — a filter that quietly does
     something else is worse than a refusal.
   * **Writes and moderation** require ``surveys.manage``.
+  * **DELETION requires ``links.delete``** — its own capability, and NOT held by
+    full_access. See below.
 
-``surveys.manage`` rather than a brand-new ``links.manage`` capability, on
-purpose: these links arrive through the survey and moderating one is the same job
-as reviewing a survey response, held by the same people (super_admin,
-full_access, and the engineer override). Splitting it out would be a new
-capability code, a seed migration, and a row in the permission matrix for a
-distinction nobody has asked for yet. If the office later wants "can moderate
-links" delegated separately from "can run survey campaigns", that is a clean
-follow-up: add the code to ``app/core/capabilities.py``, seed it from the roles
-that hold ``surveys.manage``, and swap the guard here.
+``surveys.manage`` covers creating, editing, approving and rejecting, on purpose:
+these links arrive through the survey and moderating one is the same job as
+reviewing a survey response, held by the same people (super_admin, full_access,
+and the engineer override).
+
+DELETION IS THE ONE EXCEPTION, and the line is drawn by REVERSIBILITY, not by
+endpoint. Rejecting a link takes it out of circulation and can be undone — the
+row survives, and that row is the record that we once saw the thing. Deleting
+destroys it, and all that is left is the audit snapshot. Those are different
+levels of trust, so they are different capabilities: ``links.delete`` defaults to
+super_admin + the engineer override only, and a full_access moderator working the
+queue every day can approve and reject all they like without being able to erase
+from it. ONE rule covers both delete routes (single and bulk) so there is a
+single answer to "who can remove a link", never two that can drift apart.
 
 The PUBLIC submit route is NOT here — it lives on the survey router as
 ``POST /survey/respond/{token}/links``, next to the other token-gated respond
@@ -40,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     PermissionConfig,
+    RequireLinksDelete,
     RequireSurveysManage,
     RequireViewAccess,
 )
@@ -51,6 +59,8 @@ from app.core.security import AuthorizationError
 from app.schemas.auth import UserContext
 from app.schemas.opportunity_link import (
     LinkStatus,
+    OpportunityLinkBulkDeleteRequest,
+    OpportunityLinkBulkDeleteResult,
     OpportunityLinkCreate,
     OpportunityLinkPage,
     OpportunityLinkRead,
@@ -178,13 +188,56 @@ async def update_opportunity_link(
         raise InvalidRequestError(str(exc)) from exc
 
 
+@router.post("/bulk-delete", response_model=OpportunityLinkBulkDeleteResult)
+async def bulk_delete_opportunity_links(
+    payload: OpportunityLinkBulkDeleteRequest,
+    user: RequireLinksDelete,
+    session: SessionDep,
+) -> OpportunityLinkBulkDeleteResult:
+    """Delete the links a staff member multi-selected (``links.delete``).
+
+    POST rather than ``DELETE`` with a body: a request body on DELETE is legal
+    but under-specified, and proxies and clients are entitled to drop it — which
+    would turn "delete these three" into a malformed request, or worse, silence.
+
+    BEST-EFFORT, and the response says exactly what happened. Every id that
+    resolves is deleted; ids that no longer resolve come back in ``missing_ids``
+    instead of failing the batch, because the commonest reason an id is stale is
+    that the row is already gone. It is still ONE transaction — the rows and
+    their audit snapshots commit together. See ``OpportunityLinkBulkDeleteResult``
+    for the full reasoning, and note that a caller wanting strict all-or-nothing
+    can get it by checking ``missing_ids`` is empty.
+
+    Each deleted row is snapshotted to the audit trail individually, exactly as
+    the single delete does, so a bulk delete is reconstructible row by row.
+
+    422 if the list is empty, contains a non-positive id, or exceeds
+    ``MAX_LINKS_PER_BULK_DELETE`` — the cap is what stops one call from being an
+    unbounded row-destruction primitive.
+    """
+    deleted_ids, missing_ids = await service.delete_links(
+        session, payload.opportunity_link_ids, actor_user_id=user.user_id
+    )
+    return OpportunityLinkBulkDeleteResult(
+        requested=len(set(payload.opportunity_link_ids)),
+        deleted_ids=deleted_ids,
+        missing_ids=missing_ids,
+    )
+
+
 @router.delete("/{link_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_opportunity_link(
     link_id: IdPath,
-    user: RequireSurveysManage,
+    user: RequireLinksDelete,
     session: SessionDep,
 ) -> None:
-    """Delete a link (surveys.manage). Snapshotted to the audit trail first."""
+    """Delete one link (``links.delete``, NOT ``surveys.manage``).
+
+    Re-gated onto the same capability the bulk route uses, so deletion has one
+    rule rather than two: it would be indefensible for a role to be refused the
+    multi-select and then be able to loop this endpoint to the same effect.
+    Snapshotted to the audit trail first.
+    """
     await service.delete_link(session, link_id, actor_user_id=user.user_id)
 
 

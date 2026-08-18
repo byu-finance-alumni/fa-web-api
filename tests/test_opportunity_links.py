@@ -851,10 +851,15 @@ def test_the_page_envelope_reports_the_unpaged_total():
 # =============================================================================
 
 
+# DELETE is deliberately ABSENT from this table. It moved off `surveys.manage`
+# onto its own `links.delete` capability (#441 follow-up), which full_access does
+# NOT hold — so it would fail the "a holder of surveys.manage gets past the
+# guard" probe below, correctly. Its gating lives in
+# tests/test_links_delete_capability.py, which also pins that holding
+# surveys.manage is not enough.
 _WRITE_PROBES = [
     ("post", "/opportunity-links", {"json": {}}),
     ("patch", "/opportunity-links/1", {"json": {}}),
-    ("delete", "/opportunity-links/1", {}),
     ("post", "/opportunity-links/1/approve", {}),
     ("post", "/opportunity-links/1/reject", {}),
 ]

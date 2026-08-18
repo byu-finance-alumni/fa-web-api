@@ -1120,6 +1120,33 @@ CREATE TABLE dashboard_presets (
     updated_at          timestamptz NOT NULL DEFAULT now()
 );
 
+-- API failure alerting (#444). One row per INCIDENT — a contiguous period of
+-- server errors — not one row per error. At most one row per environment may be
+-- open (`resolved_at IS NULL`), enforced by the partial unique index below, and
+-- that constraint is what makes "one email per incident" true across concurrent
+-- serverless instances that share no memory. Holds route TEMPLATES and status
+-- codes only: its contents are emailed off-platform, so no PII may land here.
+-- See migrations/2026-08-18_service_incidents.sql.
+CREATE TABLE service_incidents (
+    incident_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    environment      varchar(40)  NOT NULL,
+    started_at       timestamptz  NOT NULL DEFAULT now(),
+    last_failure_at  timestamptz  NOT NULL DEFAULT now(),
+    failure_count    integer      NOT NULL DEFAULT 1,
+    first_path       varchar(200),
+    last_path        varchar(200),
+    status_code      integer,
+    error_kind       varchar(100),
+    alert_sent_at    timestamptz,
+    recovery_sent_at timestamptz,
+    resolved_at      timestamptz,
+    created_at       timestamptz  NOT NULL DEFAULT now(),
+    updated_at       timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT ck_service_incidents_failure_count CHECK (failure_count >= 0),
+    CONSTRAINT ck_service_incidents_resolved_after_start
+        CHECK (resolved_at IS NULL OR resolved_at >= started_at)
+);
+
 -- -----------------------------------------------------------------------------
 -- Indexes on foreign keys / common lookups
 -- -----------------------------------------------------------------------------
@@ -1191,6 +1218,14 @@ CREATE INDEX idx_notes_interaction_id                 ON notes (interaction_id);
 CREATE INDEX idx_notes_event_id                       ON notes (event_id);
 CREATE INDEX idx_donations_alumni_id                  ON donations (alumni_id);
 CREATE INDEX idx_donations_year                       ON donations (donation_year);
+
+-- THE dedup constraint behind #444: at most one OPEN incident per environment,
+-- so concurrent serverless instances observing the same outage can only ever
+-- open one of them (the rest hit ON CONFLICT DO NOTHING) and only one email
+-- goes out. Removing this index turns the feature into one email per instance.
+CREATE UNIQUE INDEX uq_service_incidents_open
+    ON service_incidents (environment) WHERE resolved_at IS NULL;
+CREATE INDEX idx_service_incidents_started_at ON service_incidents (started_at DESC);
 
 -- city_geo lookups: by state for the map's per-state work, by county FIPS for
 -- the county rollups.

@@ -36,6 +36,7 @@ from app.api.routes import (
     tasks,
     vocabulary,
 )
+from app.core import failure_monitor
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.errors import (
@@ -169,6 +170,16 @@ async def security_headers_middleware(request: Request, call_next):
     return response
 
 
+# Registered LAST, so it is the OUTERMOST middleware (Starlette wraps in reverse
+# registration order). That position is deliberate: it must see the final status
+# code of every response, and it must also see an exception that escaped the
+# route stack — the catch-all ``Exception`` handler below runs in Starlette's
+# ServerErrorMiddleware, which is further out still, so an unhandled error passes
+# through here as a raise rather than as a 500 response. See
+# app/core/failure_monitor.py (#444).
+app.middleware("http")(failure_monitor.failure_alert_middleware)
+
+
 app.include_router(health.router)
 app.include_router(maintenance.router)
 app.include_router(auth.router)
@@ -207,7 +218,15 @@ async def maintenance_mode_handler(
     NOT logged as a security event: a paused user hitting the API is expected
     behaviour during maintenance, not an intrusion signal, and logging every one
     of them would bury the real events.
+
+    For the same reason it is marked ``alert_ignore``: this 503 is the engineer's
+    own doing, so the failure monitor (#444) must not read a maintenance window
+    as an outage — that would both page them about a switch they flipped and
+    park an open incident that masks a real failure afterwards. ``request.state``
+    is backed by the ASGI scope, so the flag set here is visible to the outer
+    middleware that reads it.
     """
+    request.state.alert_ignore = True
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"error": {"code": "maintenance_mode", "message": exc.message}},

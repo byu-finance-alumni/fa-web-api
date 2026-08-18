@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.models.opportunity_link import (
     CITY_MAX,
     COMPANY_NAME_MAX,
+    COUNTRY_MAX,
     DETAILS_MAX,
     STATE_MAX,
     URL_MAX,
@@ -218,6 +219,59 @@ def validate_details(value: str) -> str:
     return value
 
 
+def _today() -> datetime.date:
+    """The server's current date.
+
+    Derived from a TIMEZONE-AWARE UTC ``datetime`` and immediately narrowed to a
+    ``date``, rather than from ``datetime.date.today()`` (which reads the process
+    timezone) or from a naive ``datetime`` compared against the column. The
+    column is a ``date``; the only sound comparison is date-to-date, and the only
+    reproducible clock this app has is UTC — which is what the deploy target runs
+    on and what every other "today" in this codebase already uses
+    (``services.profile``, ``routes.dashboard``).
+    """
+    return datetime.datetime.now(datetime.UTC).date()
+
+
+def validate_application_deadline(
+    value: datetime.date | None,
+) -> datetime.date | None:
+    """The rule for ``application_deadline``: not in the past.
+
+    ⚠️ THE BOUNDARY IS INCLUSIVE — **today is accepted**, and only a STRICTLY
+    EARLIER date is refused.
+
+    That is a deliberate choice, not an off-by-one. The stored value is a calendar
+    DATE with no time on it, so "deadline: today" means "applications close at the
+    end of today" — the posting is still actionable for the rest of the day, and
+    the person most likely to type today's date is an alum forwarding an opening
+    that closes tonight. Refusing it would reject the single most urgent, most
+    useful submission the form receives. It also matches how this codebase already
+    reads a bare date elsewhere: ``routes.events`` sorts ``event_date >= today``
+    as UPCOMING, not as past.
+
+    KNOWN EDGE, stated rather than hidden: ``_today()`` is the UTC date, and the
+    owner is in Mountain Time (UTC-6/-7). Between about 18:00 local and midnight
+    the UTC date has already rolled over, so a same-day deadline typed late in the
+    evening is refused. That errs toward refusing a deadline that has all but
+    arrived, never toward accepting a stale one, and it is one consistent clock
+    rather than a timezone this app has no other notion of. Do not "fix" it by
+    comparing a naive ``datetime`` against the column.
+
+    ``None`` passes through: a deadline is optional, and "no closing date stated"
+    is a real answer, not an expired one.
+    """
+    if value is None:
+        return None
+    today = _today()
+    if value < today:
+        raise ValueError(
+            "Application deadline cannot be in the past "
+            f"(today is {today.isoformat()})."
+        )
+    return value
+
+
 class OpportunityLinkBase(BaseModel):
     """The fields a submitter (alum or staff) supplies. ``extra='forbid'`` so an
     unknown key is a 422 rather than something silently dropped — the caller
@@ -230,6 +284,7 @@ class OpportunityLinkBase(BaseModel):
     url: str
     location_city: str | None = None
     location_state: str | None = None
+    location_country: str | None = None
     role_type: RoleType
     application_deadline: datetime.date | None = None
     details: str | None = None
@@ -262,12 +317,32 @@ class OpportunityLinkBase(BaseModel):
             return None
         return _validate_short_text(value, field="State", max_length=STATE_MAX)
 
+    @field_validator("location_country")
+    @classmethod
+    def _check_country(cls, value: str | None) -> str | None:
+        # Same rule as city and state: length cap, control/invisible characters,
+        # the disallowed punctuation set, and the CSV formula lead. This field is
+        # reachable from the PUBLIC survey submit, so it is attacker-supplied text
+        # destined for a staff export exactly like the two above it; a weaker rule
+        # here would just move the hole one column to the right.
+        if value is None or not value.strip():
+            return None
+        return _validate_short_text(value, field="Country", max_length=COUNTRY_MAX)
+
     @field_validator("details")
     @classmethod
     def _check_details(cls, value: str | None) -> str | None:
         if value is None or not value.strip():
             return None
         return validate_details(value)
+
+    @field_validator("application_deadline")
+    @classmethod
+    def _check_deadline(cls, value: datetime.date | None) -> datetime.date | None:
+        # Creation only — a NEW posting whose application window has already shut
+        # is not a posting. See `OpportunityLinkUpdate` for why the same rule
+        # deliberately does NOT appear as a validator on the edit shape.
+        return validate_application_deadline(value)
 
     @model_validator(mode="after")
     def _company_identity(self) -> OpportunityLinkBase:
@@ -309,6 +384,23 @@ class OpportunityLinkUpdate(BaseModel):
 
     ``model_fields_set`` is what distinguishes "not sent" from "sent as null", so
     clearing a deadline is expressible and omitting it is not a clear.
+
+    ⚠️ NOTE THE ABSENCE of an ``application_deadline`` validator here, unlike
+    ``OpportunityLinkBase``. It is missing ON PURPOSE and must stay missing.
+
+    "Not in the past" is a rule about a NEW deadline, and this schema cannot tell
+    a new one from the one already on the row — it never sees the stored value. A
+    validator here would refuse two things it must not:
+
+      * a reviewer fixing a typo in the details of a posting whose deadline has
+        already passed (the row must stay editable — an expired posting with a
+        wrong URL is worse than an expired posting), and
+      * any client that PATCHes the whole object back, deadline included,
+        unchanged.
+
+    So the rule is enforced in ``services.opportunity_links.update_link``, which
+    holds both the submitted value and the stored one and applies it only when the
+    two differ. A past deadline that is genuinely BEING SET is still refused there.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -318,6 +410,7 @@ class OpportunityLinkUpdate(BaseModel):
     url: str | None = None
     location_city: str | None = None
     location_state: str | None = None
+    location_country: str | None = None
     role_type: RoleType | None = None
     application_deadline: datetime.date | None = None
     details: str | None = None
@@ -351,6 +444,18 @@ class OpportunityLinkUpdate(BaseModel):
         if value is None or not value.strip():
             return None
         return _validate_short_text(value, field="State", max_length=STATE_MAX)
+
+    @field_validator("location_country")
+    @classmethod
+    def _check_country(cls, value: str | None) -> str | None:
+        # Same rule as city and state: length cap, control/invisible characters,
+        # the disallowed punctuation set, and the CSV formula lead. This field is
+        # reachable from the PUBLIC survey submit, so it is attacker-supplied text
+        # destined for a staff export exactly like the two above it; a weaker rule
+        # here would just move the hole one column to the right.
+        if value is None or not value.strip():
+            return None
+        return _validate_short_text(value, field="Country", max_length=COUNTRY_MAX)
 
     @field_validator("details")
     @classmethod
@@ -395,6 +500,7 @@ class OpportunityLinkRead(BaseModel):
     url: str
     location_city: str | None = None
     location_state: str | None = None
+    location_country: str | None = None
     role_type: RoleType
     application_deadline: datetime.date | None = None
     details: str | None = None

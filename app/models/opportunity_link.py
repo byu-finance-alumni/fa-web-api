@@ -51,6 +51,10 @@ URL_MAX = 2048
 COMPANY_NAME_MAX = 255
 CITY_MAX = 100
 STATE_MAX = 100
+# Same width as city/state, and the same width as `current_employment.current_country`
+# already uses — a location field is a location field, and a country that would not
+# fit the column the rest of the app stores countries in is not a country.
+COUNTRY_MAX = 100
 DETAILS_MAX = 2000
 
 # The moderation states. `pending` is where a survey submission lands; `approved`
@@ -121,6 +125,12 @@ class OpportunityLink(Base):
 
     location_city: Mapped[str | None] = mapped_column(String(CITY_MAX))
     location_state: Mapped[str | None] = mapped_column(String(STATE_MAX))
+    # Nullable, and deliberately NOT defaulted to "United States". Both entry
+    # forms grew an "outside the United States" mode, so a country can now be
+    # stated — but a row where nobody stated one is genuinely unknown, and
+    # inventing a value would turn "we never asked" into "we were told". The
+    # pre-existing rows were written before the field existed; they stay NULL.
+    location_country: Mapped[str | None] = mapped_column(String(COUNTRY_MAX))
 
     role_type: Mapped[str] = mapped_column(String(20), nullable=False)
     application_deadline: Mapped[datetime.date | None] = mapped_column(Date)

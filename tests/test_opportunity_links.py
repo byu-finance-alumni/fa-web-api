@@ -35,14 +35,22 @@ from app.main import app
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.employment import CurrentEmployment
-from app.models.opportunity_link import ROLE_TYPES, URL_MAX, OpportunityLink
+from app.models.opportunity_link import (
+    COUNTRY_MAX,
+    ROLE_TYPES,
+    URL_MAX,
+    OpportunityLink,
+)
 from app.models.user import User
 from app.schemas.auth import UserContext
 from app.schemas.opportunity_link import (
     MAX_LINKS_PER_SUBMIT,
     OpportunityLinkCreate,
     OpportunityLinkSubmitRequest,
+    OpportunityLinkUpdate,
     OpportunitySurveyLinkSubmit,
+    _today,
+    validate_application_deadline,
     validate_opportunity_url,
 )
 from app.services import opportunity_links as service
@@ -1009,3 +1017,608 @@ def test_public_submit_422s_a_hostile_url(client):
         },
     )
     assert response.status_code == 422
+
+
+# =============================================================================
+# 8. location_country — the "outside the United States" field
+# =============================================================================
+#
+# The column exists because `location_city` + `location_state` cannot express a
+# non-US opening. It is reachable from the PUBLIC survey submit, so it gets the
+# SAME treatment as `location_city`: a length cap that mirrors the column, and
+# the CSV-formula-lead defence. Every assertion below that says "on the public
+# path" is the point of the section — a rule that is stricter on the staff path
+# than on the public one is a rule that does not exist.
+
+
+def test_the_country_cap_mirrors_the_column():
+    """`COUNTRY_MAX` is what the schemas enforce; the column width is what the DB
+    will actually hold. A drift means we accept a value the column truncates or
+    rejects at apply time."""
+    assert OpportunityLink.__table__.c.location_country.type.length == COUNTRY_MAX
+
+
+def test_country_round_trips_through_staff_create():
+    async def _body():
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, alumni_rows=[alum], employment_rows=[_employment()]
+        )
+        payload = OpportunityLinkCreate(
+            alumni_id=1,
+            company_name="Acme Capital",
+            url=GOOD_URL,
+            role_type="full_time",
+            location_city="Toronto",
+            location_state="Ontario",
+            location_country="Canada",
+        )
+        result = await service.create_link(session, payload, actor_user_id=9)
+        # Persisted...
+        assert session.links[0].location_country == "Canada"
+        # ...and projected back onto the read shape the staff list binds to.
+        assert result.location_country == "Canada"
+
+    _run(_body())
+
+
+def test_country_round_trips_through_the_public_survey_submit(monkeypatch):
+    async def _body():
+        monkeypatch.setattr(
+            "app.services.opportunity_links.verify_survey_token", lambda token: 7
+        )
+        session = _FakeSession(alumni=_alum(alumni_id=7))
+        payload = OpportunityLinkSubmitRequest(
+            links=[
+                {
+                    "company_name": "Nomura",
+                    "url": GOOD_URL,
+                    "role_type": "internship",
+                    "location_city": "Tokyo",
+                    "location_country": "Japan",
+                }
+            ]
+        )
+        result = await service.submit_links(session, "tok", payload)
+        assert result.link_count == 1
+        staged = session.links[0]
+        assert staged.location_country == "Japan"
+        assert staged.location_city == "Tokyo"
+        # A non-US opening does not have to invent a state.
+        assert staged.location_state is None
+        assert staged.status == "pending"
+
+    _run(_body())
+
+
+def test_country_round_trips_through_an_edit():
+    async def _body():
+        link = _link(location_country=None)
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, link=link, alumni_rows=[alum], employment_rows=[]
+        )
+        result = await service.update_link(
+            session,
+            42,
+            OpportunityLinkUpdate(location_country="United Kingdom"),
+            actor_user_id=9,
+        )
+        assert result.location_country == "United Kingdom"
+        # And it can be cleared again — an opening that moves back onshore.
+        result = await service.update_link(
+            session,
+            42,
+            OpportunityLinkUpdate(location_country=None),
+            actor_user_id=9,
+        )
+        assert result.location_country is None
+
+    _run(_body())
+
+
+def test_country_reaches_the_read_projection_from_the_list():
+    async def _body():
+        alum = _alum()
+        link = _link(location_country="Singapore")
+        session = _FakeSession(
+            alumni_rows=[alum], employment_rows=[], link_rows=[link], count=1
+        )
+        page = await service.list_links(session)
+        assert page.items[0].location_country == "Singapore"
+
+    _run(_body())
+
+
+def test_country_is_searchable_like_the_other_location_columns():
+    async def _body():
+        """Country is part of "location" for the free-text box. Leaving it out
+        would make a non-US posting unfindable by the one word that says where it
+        is — the export/list parity trap this codebase keeps re-learning."""
+        session = _FakeSession(count=0)
+        await service.list_links(session, search="Japan")
+        sql = " ".join(str(s) for s in session.statements)
+        assert "opportunity_links.location_country" in sql
+
+    _run(_body())
+
+
+def test_country_is_length_capped_on_the_public_path():
+    too_long = "a" * (COUNTRY_MAX + 1)
+    with pytest.raises(ValueError):
+        OpportunitySurveyLinkSubmit(
+            company_name="Acme",
+            url=GOOD_URL,
+            role_type="internship",
+            location_country=too_long,
+        )
+    # The boundary itself is accepted, so the cap is the column's and not a
+    # tighter accident.
+    exact = "a" * COUNTRY_MAX
+    assert (
+        OpportunitySurveyLinkSubmit(
+            company_name="Acme",
+            url=GOOD_URL,
+            role_type="internship",
+            location_country=exact,
+        ).location_country
+        == exact
+    )
+
+
+@pytest.mark.parametrize("bad", ["=cmd|'/c calc'!A1", "+1+1", "@SUM(A1)", "-2+3"])
+def test_country_refuses_a_csv_formula_lead_on_the_public_path(bad):
+    """This text is attacker-supplied and lands in a staff CSV export, exactly
+    like `company_name` and `location_city`."""
+    with pytest.raises(ValueError):
+        OpportunitySurveyLinkSubmit(
+            company_name="Acme",
+            url=GOOD_URL,
+            role_type="internship",
+            location_country=bad,
+        )
+
+
+def test_country_is_revalidated_below_pydantic_on_the_public_path(monkeypatch):
+    async def _body():
+        """The finding this feature was built around, re-pinned for the new
+        column: a caller that skipped model validation entirely still cannot
+        persist an over-long or formula-leading country."""
+        monkeypatch.setattr(
+            "app.services.opportunity_links.verify_survey_token", lambda token: 1
+        )
+        for hostile_country in ("=1+1", "a" * (COUNTRY_MAX + 1)):
+            session = _FakeSession(alumni=_alum())
+            item = OpportunitySurveyLinkSubmit.model_construct(
+                is_own_company=False,
+                company_name="Acme",
+                url=GOOD_URL,
+                location_city=None,
+                location_state=None,
+                location_country=hostile_country,
+                role_type="internship",
+                application_deadline=None,
+                details=None,
+            )
+            payload = OpportunityLinkSubmitRequest.model_construct(links=[item])
+            with pytest.raises(ValueError):
+                await service.submit_links(session, "tok", payload)
+            assert session.links == []
+
+    _run(_body())
+
+
+def test_the_public_route_422s_an_over_long_country(client):
+    app.dependency_overrides.pop(get_current_db_user, None)
+    rate_limit.reset()
+    response = client.post(
+        "/survey/respond/tok-country/links",
+        json={
+            "links": [
+                {
+                    "company_name": "Acme",
+                    "url": GOOD_URL,
+                    "role_type": "internship",
+                    "location_country": "a" * (COUNTRY_MAX + 1),
+                }
+            ]
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_a_null_country_stays_valid_everywhere(monkeypatch):
+    async def _body():
+        """Nothing about this column is required, and the pre-existing rows that
+        predate it are NULL by design — never backfilled to "United States"."""
+        # Schema: omitted and explicit-null both land as None.
+        assert (
+            OpportunitySurveyLinkSubmit(
+                company_name="Acme", url=GOOD_URL, role_type="both"
+            ).location_country
+            is None
+        )
+        assert (
+            OpportunitySurveyLinkSubmit(
+                company_name="Acme",
+                url=GOOD_URL,
+                role_type="both",
+                location_country=None,
+            ).location_country
+            is None
+        )
+        # Blank / whitespace normalises to None rather than storing "   ".
+        assert (
+            OpportunitySurveyLinkSubmit(
+                company_name="Acme",
+                url=GOOD_URL,
+                role_type="both",
+                location_country="   ",
+            ).location_country
+            is None
+        )
+        # Service: a row with no country reads back cleanly.
+        monkeypatch.setattr(
+            "app.services.opportunity_links.verify_survey_token", lambda token: 1
+        )
+        session = _FakeSession(alumni=_alum())
+        await service.submit_links(
+            session,
+            "tok",
+            OpportunityLinkSubmitRequest(
+                links=[{"company_name": "Acme", "url": GOOD_URL, "role_type": "both"}]
+            ),
+        )
+        assert session.links[0].location_country is None
+
+    _run(_body())
+
+
+# =============================================================================
+# 9. application_deadline must not be in the past
+# =============================================================================
+#
+# BOUNDARY, stated once here and asserted below: **today is ACCEPTED**; only a
+# strictly earlier date is refused. A bare date with no time on it means
+# "applications close at the end of that day", so a posting due today is still
+# actionable — and it is the most urgent thing the form ever receives. Matches
+# how `routes.events` already reads `event_date >= today` as UPCOMING.
+#
+# The dates below are computed RELATIVE to the server's current date rather than
+# hard-coded, so this section does not quietly start testing something else the
+# moment the calendar moves past a literal.
+
+
+def _past(days: int = 1) -> datetime.date:
+    return _today() - datetime.timedelta(days=days)
+
+
+def _future(days: int = 30) -> datetime.date:
+    return _today() + datetime.timedelta(days=days)
+
+
+def test_today_is_an_acceptable_deadline():
+    """The documented boundary: inclusive. A posting that closes at the end of
+    today has not expired."""
+    assert validate_application_deadline(_today()) == _today()
+    assert (
+        OpportunitySurveyLinkSubmit(
+            company_name="Acme",
+            url=GOOD_URL,
+            role_type="internship",
+            application_deadline=_today(),
+        ).application_deadline
+        == _today()
+    )
+
+
+def test_yesterday_is_not():
+    with pytest.raises(ValueError):
+        validate_application_deadline(_past())
+
+
+def test_a_null_deadline_stays_valid():
+    """Optional field: "no closing date stated" is a real answer, not an expired
+    one."""
+    assert validate_application_deadline(None) is None
+    assert (
+        OpportunitySurveyLinkSubmit(
+            company_name="Acme", url=GOOD_URL, role_type="both"
+        ).application_deadline
+        is None
+    )
+
+
+def test_staff_create_refuses_a_past_deadline():
+    """Both layers: the schema 422s it, and the service refuses it again below
+    Pydantic for any caller that skipped model validation."""
+    with pytest.raises(ValueError):
+        OpportunityLinkCreate(
+            alumni_id=1,
+            company_name="Acme",
+            url=GOOD_URL,
+            role_type="internship",
+            application_deadline=_past(),
+        )
+
+    async def _body():
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, alumni_rows=[alum], employment_rows=[_employment()]
+        )
+        payload = OpportunityLinkCreate.model_construct(
+            alumni_id=1,
+            is_own_company=False,
+            company_name="Acme",
+            url=GOOD_URL,
+            location_city=None,
+            location_state=None,
+            location_country=None,
+            role_type="internship",
+            application_deadline=_past(),
+            details=None,
+        )
+        with pytest.raises(ValueError):
+            await service.create_link(session, payload, actor_user_id=9)
+        assert session.links == []
+        assert session.committed is False
+
+    _run(_body())
+
+
+def test_staff_create_accepts_a_future_deadline():
+    async def _body():
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, alumni_rows=[alum], employment_rows=[_employment()]
+        )
+        result = await service.create_link(
+            session,
+            OpportunityLinkCreate(
+                alumni_id=1,
+                company_name="Acme",
+                url=GOOD_URL,
+                role_type="internship",
+                application_deadline=_future(),
+            ),
+            actor_user_id=9,
+        )
+        assert result.application_deadline == _future()
+
+    _run(_body())
+
+
+def test_the_public_survey_submit_refuses_a_past_deadline(monkeypatch):
+    with pytest.raises(ValueError):
+        OpportunitySurveyLinkSubmit(
+            company_name="Acme",
+            url=GOOD_URL,
+            role_type="internship",
+            application_deadline=_past(),
+        )
+
+    async def _body():
+        """And below Pydantic, on the path the public actually writes through —
+        the whole batch is refused, nothing is staged."""
+        monkeypatch.setattr(
+            "app.services.opportunity_links.verify_survey_token", lambda token: 1
+        )
+        session = _FakeSession(alumni=_alum())
+        item = OpportunitySurveyLinkSubmit.model_construct(
+            is_own_company=False,
+            company_name="Acme",
+            url=GOOD_URL,
+            location_city=None,
+            location_state=None,
+            location_country=None,
+            role_type="internship",
+            application_deadline=_past(),
+            details=None,
+        )
+        payload = OpportunityLinkSubmitRequest.model_construct(links=[item])
+        with pytest.raises(ValueError):
+            await service.submit_links(session, "tok", payload)
+        assert session.links == []
+        assert session.committed is False
+
+    _run(_body())
+
+
+def test_the_public_route_422s_a_past_deadline(client):
+    app.dependency_overrides.pop(get_current_db_user, None)
+    rate_limit.reset()
+    response = client.post(
+        "/survey/respond/tok-deadline/links",
+        json={
+            "links": [
+                {
+                    "company_name": "Acme",
+                    "url": GOOD_URL,
+                    "role_type": "internship",
+                    "application_deadline": _past().isoformat(),
+                }
+            ]
+        },
+    )
+    assert response.status_code == 422
+
+
+# --- and the subtle half: an EXISTING expired row stays editable --------------
+
+
+def test_an_expired_row_is_still_editable_when_the_deadline_is_untouched():
+    async def _body():
+        """THE case this rule is written around. The dev data deliberately carries
+        a row with a passed deadline. A reviewer must still be able to fix a typo
+        in it — an expired posting with a wrong URL is worse than an expired
+        posting — so the rule must not freeze the row by the mere passage of time.
+        """
+        expired = _link(application_deadline=_past(days=45))
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, link=expired, alumni_rows=[alum], employment_rows=[]
+        )
+        result = await service.update_link(
+            session,
+            42,
+            OpportunityLinkUpdate(details="Corrected: the role is Provo-based."),
+            actor_user_id=9,
+        )
+        assert result.details == "Corrected: the role is Provo-based."
+        # The stale deadline survives the edit untouched — it is not silently
+        # cleared, bumped, or refused.
+        assert result.application_deadline == _past(days=45)
+
+    _run(_body())
+
+
+def test_an_expired_row_can_be_read():
+    async def _body():
+        expired = _link(application_deadline=_past(days=45))
+        alum = _alum()
+        session = _FakeSession(
+            alumni_rows=[alum], employment_rows=[], link_rows=[expired], count=1
+        )
+        page = await service.list_links(session)
+        assert page.items[0].application_deadline == _past(days=45)
+
+    _run(_body())
+
+
+def test_resending_the_same_expired_deadline_is_not_a_change():
+    async def _body():
+        """A client that PATCHes the whole object back — deadline included,
+        unchanged — must not be refused. "Changed" means "differs from what is
+        stored", not "was present in the body"."""
+        expired = _link(application_deadline=_past(days=45))
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, link=expired, alumni_rows=[alum], employment_rows=[]
+        )
+        result = await service.update_link(
+            session,
+            42,
+            OpportunityLinkUpdate(
+                details="Same posting, tidier wording.",
+                application_deadline=_past(days=45),
+            ),
+            actor_user_id=9,
+        )
+        assert result.application_deadline == _past(days=45)
+        assert result.details == "Same posting, tidier wording."
+
+    _run(_body())
+
+
+def test_an_edit_that_sets_a_past_deadline_is_refused():
+    async def _body():
+        """Moving the deadline INTO the past is a change, and changes are checked."""
+        link = _link(application_deadline=_future())
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, link=link, alumni_rows=[alum], employment_rows=[]
+        )
+        with pytest.raises(ValueError):
+            await service.update_link(
+                session,
+                42,
+                OpportunityLinkUpdate(application_deadline=_past()),
+                actor_user_id=9,
+            )
+        # Nothing was written and nothing was committed.
+        assert link.application_deadline == _future()
+        assert session.committed is False
+
+    _run(_body())
+
+
+def test_an_edit_that_moves_an_expired_deadline_further_into_the_past_is_refused():
+    async def _body():
+        """The lenience is for LEAVING a stale deadline alone, not for editing one
+        stale value into another."""
+        expired = _link(application_deadline=_past(days=45))
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, link=expired, alumni_rows=[alum], employment_rows=[]
+        )
+        with pytest.raises(ValueError):
+            await service.update_link(
+                session,
+                42,
+                OpportunityLinkUpdate(application_deadline=_past(days=10)),
+                actor_user_id=9,
+            )
+
+    _run(_body())
+
+
+def test_an_expired_deadline_can_be_cleared_or_pushed_forward():
+    async def _body():
+        """The two repairs a reviewer actually needs on a stale row."""
+        alum = _alum()
+
+        cleared = _link(application_deadline=_past(days=45))
+        session = _FakeSession(
+            alumni=alum, link=cleared, alumni_rows=[alum], employment_rows=[]
+        )
+        result = await service.update_link(
+            session,
+            42,
+            OpportunityLinkUpdate(application_deadline=None),
+            actor_user_id=9,
+        )
+        assert result.application_deadline is None
+
+        bumped = _link(application_deadline=_past(days=45))
+        session = _FakeSession(
+            alumni=alum, link=bumped, alumni_rows=[alum], employment_rows=[]
+        )
+        result = await service.update_link(
+            session,
+            42,
+            OpportunityLinkUpdate(application_deadline=_future()),
+            actor_user_id=9,
+        )
+        assert result.application_deadline == _future()
+
+    _run(_body())
+
+
+def test_setting_todays_date_on_an_edit_is_accepted():
+    async def _body():
+        """The inclusive boundary holds on the edit path too, not just on create."""
+        link = _link(application_deadline=_future(days=60))
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, link=link, alumni_rows=[alum], employment_rows=[]
+        )
+        result = await service.update_link(
+            session,
+            42,
+            OpportunityLinkUpdate(application_deadline=_today()),
+            actor_user_id=9,
+        )
+        assert result.application_deadline == _today()
+
+    _run(_body())
+
+
+def test_moderating_an_expired_link_still_works():
+    async def _body():
+        """Approve/reject never touch the deadline, so a stale row stays
+        moderatable — rejecting a dead posting is the normal way it leaves the
+        queue."""
+        expired = _link(
+            status="pending", source="survey", application_deadline=_past(days=45)
+        )
+        alum = _alum()
+        session = _FakeSession(
+            alumni=alum, link=expired, alumni_rows=[alum], employment_rows=[]
+        )
+        result = await service.moderate_link(
+            session, 42, approve=False, actor_user_id=9
+        )
+        assert result.status == "rejected"
+        assert result.application_deadline == _past(days=45)
+
+    _run(_body())

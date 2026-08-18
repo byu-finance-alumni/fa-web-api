@@ -1054,7 +1054,16 @@ CREATE TABLE opportunity_links (
     url                  varchar(2048) NOT NULL,
     location_city        varchar(100),
     location_state       varchar(100),
+    -- Nullable and NEVER backfilled to 'United States' (#441 follow-up): a row
+    -- written before the field existed has a genuinely unknown country, and an
+    -- invented one is indistinguishable from a stated one forever after.
+    location_country     varchar(100),
     role_type            varchar(20) NOT NULL,
+    -- Application-level rule, deliberately NOT a CHECK: a new deadline must not
+    -- be in the past (today IS accepted), but an EXISTING row whose deadline has
+    -- since passed stays editable. A `current_date` CHECK is not immutable and
+    -- would freeze exactly those rows. See
+    -- app/schemas/opportunity_link.validate_application_deadline.
     application_deadline date,
     details              text,
     status               varchar(20) NOT NULL DEFAULT 'pending',

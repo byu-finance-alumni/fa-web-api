@@ -73,6 +73,7 @@ from app.models.employment import CurrentEmployment
 from app.models.opportunity_link import (
     CITY_MAX,
     COMPANY_NAME_MAX,
+    COUNTRY_MAX,
     STATE_MAX,
     OpportunityLink,
 )
@@ -85,6 +86,7 @@ from app.schemas.opportunity_link import (
     OpportunityLinkSubmitResult,
     OpportunityLinkUpdate,
     _validate_short_text,
+    validate_application_deadline,
     validate_details,
     validate_opportunity_url,
 )
@@ -100,7 +102,7 @@ def _now() -> datetime.datetime:
 # --------------------------------------------------------------- validation ---
 
 
-def _validated_fields(payload) -> dict:
+def _validated_fields(payload, *, check_deadline: bool = True) -> dict:
     """Re-run every field rule and return the values that may be written.
 
     Raises ``ValueError`` (which the routes surface as a 422) on the first bad
@@ -114,6 +116,16 @@ def _validated_fields(payload) -> dict:
     Accepts either creation shape (staff or survey); they share a base, and that
     sameness is deliberate — a rule that is stricter on the staff path than the
     public one is a rule that does not exist.
+
+    ``check_deadline`` is the ONE rule that is not unconditional, and the reason
+    is that it is a rule about a value being SET, not about a value being stored.
+    Creation and the public submit always pass it (default ``True``): a brand-new
+    posting whose window has already closed is not a posting. ``update_link``
+    passes ``False`` when the caller did not change the deadline, so a row whose
+    deadline has since passed stays editable — otherwise a reviewer could not fix
+    a typo in an expired posting, and the row would be frozen by the mere passage
+    of time. Everything else in here stays unconditional: a value that was never
+    acceptable does not become acceptable because it is already on the row.
     """
     url = validate_opportunity_url(payload.url)
     company = payload.company_name
@@ -137,6 +149,16 @@ def _validated_fields(payload) -> dict:
         state = _validate_short_text(state, field="State", max_length=STATE_MAX)
     else:
         state = None
+    country = payload.location_country
+    if country and country.strip():
+        country = _validate_short_text(
+            country, field="Country", max_length=COUNTRY_MAX
+        )
+    else:
+        country = None
+    deadline = payload.application_deadline
+    if check_deadline:
+        deadline = validate_application_deadline(deadline)
     details = payload.details
     if details and details.strip():
         details = validate_details(details)
@@ -148,8 +170,9 @@ def _validated_fields(payload) -> dict:
         "url": url,
         "location_city": city,
         "location_state": state,
+        "location_country": country,
         "role_type": payload.role_type,
-        "application_deadline": payload.application_deadline,
+        "application_deadline": deadline,
         "details": details,
     }
 
@@ -195,6 +218,7 @@ def _to_read(
         url=link.url,
         location_city=link.location_city,
         location_state=link.location_state,
+        location_country=link.location_country,
         role_type=link.role_type,
         application_deadline=link.application_deadline,
         details=link.details,
@@ -367,6 +391,10 @@ def _filtered(
                 OpportunityLink.details.ilike(term, escape="\\"),
                 OpportunityLink.location_city.ilike(term, escape="\\"),
                 OpportunityLink.location_state.ilike(term, escape="\\"),
+                # Country is part of "location" for search, same as city/state —
+                # leaving it out would make a non-US posting unfindable by the one
+                # word that identifies where it is.
+                OpportunityLink.location_country.ilike(term, escape="\\"),
                 OpportunityLink.url.ilike(term, escape="\\"),
             )
         )
@@ -506,6 +534,13 @@ async def update_link(
 
     Editing does NOT change ``status``. Moderation has its own endpoints; a staff
     member fixing a typo in a pending link must not silently approve it.
+
+    ⚠️ THE DEADLINE RULE IS CONDITIONAL HERE, and that is the subtle part. Create
+    and the public submit refuse a deadline in the past outright. On an edit the
+    same rule is applied only when the deadline is actually CHANGING: a posting
+    whose deadline has since passed must stay editable, or a reviewer could never
+    correct a wrong URL on an expired listing and the row would be frozen by
+    nothing but the calendar. Setting a NEW past deadline is still refused.
     """
     link = await _load(session, link_id)
     sent = payload.model_fields_set
@@ -529,13 +564,27 @@ async def update_link(
         url=merged_required("url"),
         location_city=merged("location_city"),
         location_state=merged("location_state"),
+        location_country=merged("location_country"),
         role_type=merged_required("role_type"),
         application_deadline=merged("application_deadline"),
         details=merged("details"),
     )
 
+    # "The deadline must not be in the past" is checked ONLY when the deadline is
+    # actually moving. Two comparisons, both necessary: the key must have been
+    # sent at all (`model_fields_set`, so an omitted deadline is untouched), AND
+    # the sent value must differ from the stored one (so a client that PATCHes the
+    # whole object back, deadline included, is not refused for re-sending what is
+    # already there). Clearing it to `null` differs from a stored date and so
+    # counts as a change — and `validate_application_deadline(None)` allows it,
+    # because "no closing date" is a real answer.
+    deadline_changed = (
+        "application_deadline" in sent
+        and payload.application_deadline != link.application_deadline
+    )
+
     before = _summary(link)
-    fields = _validated_fields(candidate)
+    fields = _validated_fields(candidate, check_deadline=deadline_changed)
     for key, value in fields.items():
         setattr(link, key, value)
     link.updated_at = _now()

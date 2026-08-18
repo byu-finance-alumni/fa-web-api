@@ -27,16 +27,23 @@ Offline throughout -- fake sessions, no Postgres.
 
 import asyncio
 import datetime
+import types
 
 import pytest
 from pydantic import ValidationError
 
+from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.schemas.alumni import AlumniCreateFull, AlumniUpdateFull, CareerCreate
 from app.services import alumni as service
-from app.services import hygiene
+from app.services import hygiene, import_csv, survey_responses
+from tests.test_alumni_import import _csv_bytes, _row_values
+from tests.test_alumni_update_import import FakeUpdateSession
 from tests.test_audit_field_capture import _alumnus, _patch_get, _SectionSession
+from tests.test_survey_apply_audit import _alum as _survey_alum
+from tests.test_survey_apply_audit import _apply, _fake_resp
+from tests.test_survey_apply_audit import _Session as _SurveySession
 
 
 class _ArchiveSession(_SectionSession):
@@ -371,3 +378,306 @@ def test_control_key_sets_agree():
     keep passing a control key through and the write path would try to `setattr`
     it onto the Alumni row."""
     assert service.CONTROL_KEYS == hygiene._CONTROL_KEYS
+
+
+# =============================================================================
+# The employer-change rule (survey + import trigger)
+# =============================================================================
+#
+# The staff path asks a human. The survey and the import cannot, and the product
+# owner decided on 2026-08-18 that they should INFER from the employer moving
+# rather than never archive. He was shown the cost -- a typo fix, a company
+# rename, or a cleanup pass can mint a prior role nobody held -- and accepted it.
+# These tests pin how narrowly the comparison is drawn to limit that cost.
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("Acme Corp", "Beta Capital"),  # the real case
+        ("Acme Corp", "Acme Corporation"),  # indistinguishable from a real move
+    ],
+)
+def test_employer_changed_is_true_for_a_different_name(old, new):
+    assert service.employer_changed(old, new) is True
+
+
+@pytest.mark.parametrize(
+    "old, new, why",
+    [
+        ("Acme Corp", "Acme Corp", "identical"),
+        ("Acme Corp", "ACME CORP", "casing cleanup"),
+        ("Acme Corp", "  Acme   Corp  ", "whitespace cleanup"),
+        (None, "Acme Corp", "first employer ever recorded"),
+        ("", "Acme Corp", "blank stored value"),
+        ("Acme Corp", None, "question skipped"),
+        ("Acme Corp", "   ", "empty spreadsheet cell"),
+    ],
+)
+def test_employer_changed_is_false(old, new, why):
+    """Each of these is a mass-edit shape that would otherwise archive at scale.
+
+    A casing or spacing pass is the single most likely bulk edit to this column.
+    Blank on either side is the dangerous one: named -> blank on an 8,000-row
+    sheet with one empty Employer column would demote every alum at once.
+    """
+    assert service.employer_changed(old, new) is False, why
+
+
+# =============================================================================
+# Survey apply path
+# =============================================================================
+
+
+def _survey_job(**overrides):
+    values = {
+        "alumni_id": 5,
+        "current_employer": "Old Bank",
+        "current_title": "Analyst",
+        "current_industry": None,
+        "current_industry_secondary": None,
+        "current_city": "Provo",
+        "current_state": "Utah",
+        "current_country": None,
+        "current_zip": None,
+        "seniority_level": "Individual Contributor",
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def test_survey_apply_archives_when_the_employer_moves(monkeypatch):
+    job = _survey_job()
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Goldman Sachs"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    (archived,) = _history(session)
+    assert archived.alumni_id == 5
+    assert archived.employer_name == "Old Bank"
+    assert archived.employment_title == "Analyst"
+    assert archived.city == "Provo"
+    assert archived.is_current is False
+    assert archived.start_year is None
+    assert archived.end_year == datetime.datetime.now(datetime.UTC).year
+    # ...and the current row really did move on.
+    assert job.current_employer == "Goldman Sachs"
+
+
+def test_survey_apply_does_not_archive_on_a_no_op_reconfirm(monkeypatch):
+    """The dominant case by far. An alum re-confirming their details resubmits
+    every answer, so if a re-confirm archived, an ordinary confirmation round
+    would duplicate the current role into history for the whole cohort."""
+    job = _survey_job()
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(
+            payload={
+                "employment.current_employer": "Old Bank",
+                "employment.current_title": "Analyst",
+            }
+        ),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    assert _history(session) == []
+    assert _archive_audits(session) == []
+
+
+def test_survey_apply_does_not_archive_on_a_title_only_change(monkeypatch):
+    """A promotion at the same employer is a real role change that this path
+    deliberately does NOT catch -- the trigger is the EMPLOYER, and inferring
+    from the title too would fire on every job-title tidy-up."""
+    job = _survey_job()
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_title": "Associate"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    assert _history(session) == []
+
+
+def test_survey_apply_does_not_archive_a_first_ever_employer(monkeypatch):
+    """An alum with no employment row at all has nothing to demote. The row is
+    CREATED by the apply, so archiving it would file the brand-new job as one
+    they had already left."""
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Goldman Sachs"}),
+        monkeypatch,
+        side_rows=({}, {}, {}),
+    )
+
+    assert _history(session) == []
+
+
+def test_survey_archive_audit_is_stamped_survey_not_manual(monkeypatch):
+    """`source` is what lets a later restore tell an alum's own answer from a
+    staff edit from a spreadsheet overwrite. A demotion nobody typed is exactly
+    the row that needs it."""
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Goldman Sachs"}),
+        monkeypatch,
+        side_rows=({}, {5: _survey_job()}, {}),
+    )
+
+    (row,) = _archive_audits(session)
+    assert row.source == "survey"
+    assert row.field_name == "employment[77]"
+    assert "seniority_level='Individual Contributor'" in row.old_value
+
+
+def test_survey_archive_shares_the_approvals_change_set(monkeypatch):
+    """The summary row, the field rows and the demotion are one approval, so
+    version history must read them as one version."""
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Goldman Sachs"}),
+        monkeypatch,
+        side_rows=({}, {5: _survey_job()}, {}),
+    )
+
+    change_sets = {a.change_set_id for a in _audits(session)}
+    assert len(change_sets) == 1
+    assert None not in change_sets
+
+
+# =============================================================================
+# CSV import path
+# =============================================================================
+
+
+class _ImportSession(FakeUpdateSession):
+    """`FakeUpdateSession` whose flush also assigns `employment_history_id`."""
+
+    async def flush(self) -> None:
+        await super().flush()
+        for obj in self.added:
+            if isinstance(obj, EmploymentHistory) and obj.employment_history_id is None:
+                obj.employment_history_id = 77
+
+
+def _import_session(employment) -> _ImportSession:
+    return _ImportSession(
+        index_rows=[(1, "123456789", None, "Jane", "Doe", 2018, False)],
+        alumni={
+            1: Alumni(alumni_id=1, byu_id="123456789", first_name="Jane", archived=False)
+        },
+        sections={"current_employment": employment} if employment is not None else {},
+    )
+
+
+def _import_employment(**overrides) -> CurrentEmployment:
+    values: dict[str, object] = {
+        "current_employment_id": 5,
+        "alumni_id": 1,
+        "current_employer": "Old Co",
+        "current_title": "Analyst",
+        "seniority_level": "Individual Contributor",
+    }
+    values.update(overrides)
+    return CurrentEmployment(**values)
+
+
+def _import(session, **cells):
+    csv = _csv_bytes(_row_values(byu_id="123456789", **cells))
+    rows, _ = import_csv.parse_and_map(csv)
+    # An actor is REQUIRED for the audit assertions: `_audit` no-ops when the
+    # acting user is unknown, so an actor-less import would "pass" the audit tests
+    # by writing no rows at all.
+    return asyncio.run(
+        import_csv.commit_update(session, rows, actor_user_id=9)
+    )
+
+
+def test_import_archives_when_the_sheet_names_a_different_employer():
+    employment = _import_employment()
+    session = _import_session(employment)
+
+    result = _import(session, current_employer="New Co")
+
+    assert result["updated"] == 1
+    (archived,) = _history(session)
+    assert archived.employer_name == "Old Co"
+    assert archived.employment_title == "Analyst"
+    assert archived.is_current is False
+    assert employment.current_employer == "New Co"
+
+
+def test_import_does_not_archive_when_the_employer_cell_is_unchanged():
+    """A round-trip export/edit resubmits the employer on every row. If that
+    archived, one unrelated cell edit would demote the whole file's roles."""
+    employment = _import_employment()
+    session = _import_session(employment)
+
+    _import(session, current_employer="Old Co", current_city="New York")
+
+    assert _history(session) == []
+    assert _archive_audits(session) == []
+    # The row really was applied -- this is a no-archive, not a no-write.
+    assert employment.current_city == "New York"
+
+
+def test_import_does_not_archive_on_a_blank_employer_cell():
+    """A blank cell means "unchanged" in update mode -- `_build_update_model`
+    merges the stored value back in. This is the failure that would hurt most at
+    scale: a sheet exported without the Employer column would otherwise demote
+    every alum in it."""
+    employment = _import_employment()
+    session = _import_session(employment)
+
+    _import(session, current_city="New York")
+
+    assert _history(session) == []
+    assert employment.current_employer == "Old Co"
+    assert employment.current_city == "New York"
+
+
+def test_import_archive_audit_is_stamped_import_not_manual():
+    session = _import_session(_import_employment())
+
+    _import(session, current_employer="New Co")
+
+    (row,) = _archive_audits(session)
+    assert row.source == "import"
+    assert row.field_name == "employment[77]"
+    assert "seniority_level='Individual Contributor'" in row.old_value
+    assert "employer_name='Old Co'" in row.new_value
+
+
+def test_import_archive_shares_the_rows_change_set():
+    session = _import_session(_import_employment())
+
+    _import(session, current_employer="New Co")
+
+    change_sets = {a.change_set_id for a in _audits(session)}
+    assert len(change_sets) == 1
+    assert None not in change_sets
+
+
+# =============================================================================
+# All three paths agree
+# =============================================================================
+
+
+def test_every_path_uses_the_one_archive_implementation():
+    """Three triggers, ONE writer. A second implementation for the survey or the
+    import would drift -- different columns copied, a different end-year rule --
+    and the Employment panel would show rows whose shape depended on which path
+    happened to demote them."""
+    assert survey_responses.archive_current_role is service.archive_current_role
+    assert survey_responses.audit_role_archive is service.audit_role_archive
+    assert import_csv.alumni_service.employer_changed is service.employer_changed

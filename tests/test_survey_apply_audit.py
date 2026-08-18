@@ -58,7 +58,7 @@ from app.core.audit_context import (
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
-from app.models.employment import CurrentEmployment
+from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.engineer_action import EngineerActionLog
 from app.services import survey_responses as sr
@@ -112,7 +112,12 @@ class _Session:
         self.added.append(obj)
 
     async def flush(self):
-        pass
+        # Assign the surrogate id Postgres would, so a row added mid-apply and
+        # then named in an audit row (#446's demotion names `employment[<id>]`)
+        # is named by its real id rather than by None.
+        for obj in self.added:
+            if isinstance(obj, EmploymentHistory) and obj.employment_history_id is None:
+                obj.employment_history_id = 77
 
     async def commit(self):
         self.committed += 1
@@ -176,11 +181,19 @@ def _summary(session) -> AuditLog:
 
 
 def _fields(session) -> dict[str, tuple[str | None, str | None]]:
-    """``{field_name: (old_value, new_value)}`` for the field-level rows only."""
+    """``{field_name: (old_value, new_value)}`` for the field-level rows only.
+
+    Keyed on ``action_type == "update"`` rather than on "has a field_name",
+    because an apply can now also emit a ``archive_current_role`` row (#446):
+    that row carries a field_name too (the demoted history row's id) but it is
+    not a field change, and letting it in here would make every assertion in this
+    module about WHICH FIELDS MOVED depend on whether the employer moved as well.
+    Its own behaviour is pinned in ``tests/test_employment_archiving.py``.
+    """
     return {
         a.field_name: (a.old_value, a.new_value)
         for a in _audits(session)
-        if a.field_name is not None
+        if a.field_name is not None and a.action_type == "update"
     }
 
 

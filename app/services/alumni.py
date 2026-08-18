@@ -343,15 +343,121 @@ def _snapshot_text(values: dict[str, object]) -> str:
     return "; ".join(f"{field}={value!r}" for field, value in values.items())
 
 
-async def _archive_current_role(
+def career_snapshot(row: object) -> dict[str, object]:
+    """The whole of a ``current_employment`` row, detached, ready to archive.
+
+    Public because all three write paths (staff edit, survey apply, CSV import)
+    have to take this snapshot at the same moment and in the same shape, or the
+    rows they archive and the audit values they record would not match.
+    """
+    return _snapshot(row, _CAREER_SNAPSHOT_FIELDS)
+
+
+def _employer_key(value: object) -> str | None:
+    """An employer name reduced to its comparison key, or ``None`` if blank.
+
+    Trims, collapses internal whitespace runs, and casefolds - so "  ACME   Corp"
+    and "Acme Corp" are the same employer. Whitespace collapsing matches what
+    ``hygiene`` already does to this column on write, and the casefold is added on
+    top so a CASING cleanup pass cannot read as a job change.
+    """
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split()).casefold() or None
+
+
+def employer_changed(old: object, new: object) -> bool:
+    """True when *old* -> *new* is a MOVE BETWEEN NAMED EMPLOYERS (#446).
+
+    This is the trigger the SURVEY and IMPORT paths archive on, decided by the
+    product owner on 2026-08-18. The staff edit path does not use it: there the
+    trigger is the explicit "this is a new role" checkbox, because a person is
+    present to answer the question. Nobody is present on the other two, and the
+    owner chose to infer rather than to leave those paths never archiving.
+
+    The tradeoff was put to him explicitly and accepted: because the values alone
+    cannot distinguish a job change from a correction, a fixed typo, a company
+    rename ("Facebook" -> "Meta") or a vendor sheet that spells employers
+    differently WILL manufacture prior-role rows that nobody held. The rule below
+    is therefore drawn as narrowly as it can be while still firing on a real move:
+
+    * **Case- and whitespace-insensitive.** A casing or spacing cleanup pass is
+      the single most likely mass edit to this column, and it is not a job change.
+    * **Blank on EITHER side is not a change.** Blank -> named is an alum whose
+      employer was simply never on file: there is no prior employer to preserve,
+      and treating a first-ever entry as a job change would archive a role the
+      alum never left. Named -> blank is a skipped question or an empty
+      spreadsheet cell far more often than it is "I quit"; archiving on it would
+      let one blank column demote every alum in an 8,000-row sheet.
+
+    What it deliberately does NOT protect against is a genuine misspelling being
+    corrected to a different string. That case is indistinguishable from a real
+    move without asking a human, and asking is exactly what these two paths
+    cannot do.
+    """
+    old_key, new_key = _employer_key(old), _employer_key(new)
+    if old_key is None or new_key is None:
+        return False
+    return old_key != new_key
+
+
+def audit_role_archive(
+    session: AsyncSession,
+    actor_user_id: int | None,
+    alumni_id: int,
+    *,
+    outgoing: dict[str, object],
+    archived: EmploymentHistory,
+    change_set_id: str | None,
+) -> None:
+    """Record a role demotion in the audit trail (#446).
+
+    Shared by all three write paths so the rows they produce are identical and a
+    reader never has to know which path demoted a role. ``source`` comes from the
+    request-scoped provenance contextvar via ``_audit``, so a survey apply stamps
+    ``survey`` and an import stamps ``import`` without any callsite saying so.
+
+    This is a row NOBODY TYPED - the save wrote an ``employment_history`` entry no
+    human filled in - so it has to be legible as its own act rather than inferred
+    from a career field having changed. Pass the enclosing save's
+    *change_set_id* so the demotion and the new role's field changes read as one
+    version.
+
+    The row id rides in ``field_name`` (``employment[12]``), the convention the
+    per-row employment endpoints already use, since ``audit_logs`` has no row-id
+    column. ``old_value`` snapshots the WHOLE outgoing ``current_employment`` row
+    - including ``current_country`` / ``current_zip`` / ``seniority_level`` /
+    ``current_industry_secondary``, which ``employment_history`` has no column for
+    - so the trail preserves what the archived row cannot. ``new_value``
+    snapshots the history row actually created, which is where the synthesised
+    ``end_year`` becomes visible as ours rather than a human's.
+    """
+    _audit(
+        session,
+        actor_user_id,
+        "archive_current_role",
+        alumni_id,
+        field_name=f"employment[{archived.employment_history_id}]",
+        old_value=_snapshot_text(outgoing),
+        new_value=_snapshot_text(
+            _snapshot(archived, _EMPLOYMENT_HISTORY_SNAPSHOT_FIELDS)
+        ),
+        change_set_id=change_set_id,
+    )
+
+
+async def archive_current_role(
     session: AsyncSession, alumni_id: int, outgoing: dict[str, object]
 ) -> EmploymentHistory | None:
     """Copy the OUTGOING current role into ``employment_history`` (#446).
 
-    Called only when the caller explicitly ticked "this is a new role" AND the
-    career upsert actually changed something. Returns the created row (flushed,
-    so it has an id for the audit trail), or ``None`` when the outgoing role held
-    nothing worth keeping.
+    The ONE implementation, shared by the staff edit, survey apply and CSV import
+    paths, so an archived role looks the same however it was demoted. Only the
+    TRIGGER differs between them (see ``employer_changed``): staff tick a
+    checkbox, the other two infer from the employer moving.
+
+    Returns the created row (flushed, so it has an id for the audit trail), or
+    ``None`` when the outgoing role held nothing worth keeping.
 
     **Dates.** This is the part nobody typed, so it is spelled out:
 
@@ -935,7 +1041,7 @@ async def update_alumni(
         # simply nothing to act on, not an error: an alum whose first employer is
         # being entered has no previous role to demote.
         if stored_role is not None:
-            outgoing_role = _snapshot(stored_role, _CAREER_SNAPSHOT_FIELDS)
+            outgoing_role = career_snapshot(stored_role)
     if career is not None and career.has_values():
         career_changes = await _upsert_section(
             session,
@@ -953,7 +1059,7 @@ async def update_alumni(
         # never manufacture history — the same rule that governs every other write
         # in this function.
         if career_changes and outgoing_role is not None:
-            archived_role = await _archive_current_role(
+            archived_role = await archive_current_role(
                 session, alumni_id, outgoing_role
             )
     if education is not None and education.has_values():
@@ -1024,32 +1130,18 @@ async def update_alumni(
                 new_value=new,
                 change_set_id=change_set_id,
             )
-        # #446: the demotion is a row NOBODY TYPED — the save wrote an
-        # employment_history entry the staff member never filled in — so it has to
-        # be legible in the trail as its own act, not inferable from a career
-        # field changing. Same change set as the rest of the save, so version
-        # history reads "this one save moved the old role down and set the new
-        # one" rather than two unrelated events.
-        #
-        # The row id rides in `field_name` (`employment[12]`), the convention the
-        # per-row employment endpoints already use, since audit_logs has no
-        # row-id column. `old_value` snapshots the WHOLE outgoing
-        # current_employment row — including current_country / current_zip /
-        # seniority_level / current_industry_secondary, which employment_history
-        # has no column for — so the trail preserves what the archived row cannot.
-        # `new_value` snapshots the history row actually created, which is where
-        # the synthesised `end_year` becomes visible as ours rather than a human's.
+        # #446 — the demotion, if this save made one. Same change set as the
+        # rest of the save, so version history reads "this one save moved the old
+        # role down and set the new one" rather than two unrelated events. The
+        # row's shape and provenance are decided in `audit_role_archive`, shared
+        # with the survey and import paths.
         if archived_role is not None:
-            _audit(
+            audit_role_archive(
                 session,
                 actor_user_id,
-                "archive_current_role",
                 alumni_id,
-                field_name=f"employment[{archived_role.employment_history_id}]",
-                old_value=_snapshot_text(outgoing_role or {}),
-                new_value=_snapshot_text(
-                    _snapshot(archived_role, _EMPLOYMENT_HISTORY_SNAPSHOT_FIELDS)
-                ),
+                outgoing=outgoing_role or {},
+                archived=archived_role,
                 change_set_id=change_set_id,
             )
         await session.commit()

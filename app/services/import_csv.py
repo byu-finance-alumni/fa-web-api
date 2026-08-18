@@ -1960,6 +1960,26 @@ async def _build_update_model(
         }
         merged.update(provided)
         partial[section] = merged
+        # #446 — a sheet has no "this is a new role" checkbox, so when the
+        # Employer cell names a DIFFERENT employer than the one on file, the
+        # outgoing role is demoted into employment_history. Decided by the product
+        # owner on 2026-08-18, over leaving import as the one path that never
+        # archives; see `alumni_service.employer_changed` for exactly what counts
+        # as different and for the accepted cost (a vendor sheet that spells
+        # employers differently, or a cleanup pass, can mint prior roles nobody
+        # held).
+        #
+        # Setting the SAME flag the staff checkbox sets, rather than archiving
+        # here, is what keeps the three paths writing identical rows: the whole
+        # demotion, its audit row and its change set all happen inside
+        # `update_alumni` exactly as they do for a hand edit. A blank Employer
+        # cell cannot fire it — `merged` has just filled it from the stored row,
+        # so the two sides compare equal.
+        if section == "career" and alumni_service.employer_changed(
+            getattr(current_row, "current_employer", None),
+            merged.get("current_employer"),
+        ):
+            partial["archive_previous_role"] = True
     return AlumniUpdateFull(**partial)
 
 

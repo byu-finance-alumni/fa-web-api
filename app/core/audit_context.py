@@ -6,12 +6,14 @@ threaded through every callsite.
 
 1. **Engineer suppression (#199)** — see below.
 2. **Write source / provenance (#45)** — whether the rows being written come from
-   a hand edit or a bulk CSV import. Both go through
-   ``alumni_service.update_alumni``, so an audit row alone cannot tell them
-   apart; a later restore feature must not silently revert a value an import
-   legitimately corrected. The importer wraps its apply loop in
-   ``audit_source_scope(AUDIT_SOURCE_IMPORT)`` and everything else defaults to
-   ``manual``.
+   a hand edit, a bulk CSV import, or a staff approval of an alum's survey
+   submission. The first two go through ``alumni_service.update_alumni``, so an
+   audit row alone cannot tell them apart; a later restore feature must not
+   silently revert a value an import legitimately corrected, nor treat an answer
+   the alum gave about themselves as a staff edit. The importer wraps its apply
+   loop in ``audit_source_scope(AUDIT_SOURCE_IMPORT)``, the survey review queue
+   wraps its apply in ``audit_source_scope(AUDIT_SOURCE_SURVEY)``, and everything
+   else defaults to ``manual``.
 
 Also home to ``new_change_set_id()``: the per-save grouping key that makes one
 save read as one version (see ``AuditLog.change_set_id``).
@@ -42,6 +44,14 @@ ENGINEER_ROLE = "engineer"
 # written into the database and a later restore UI reads them back.
 AUDIT_SOURCE_MANUAL = "manual"
 AUDIT_SOURCE_IMPORT = "import"
+# A staff approval of an alum's own survey submission (#45). A THIRD provenance,
+# not a flavour of the other two: the values were typed by the alumnus about
+# themselves and a staff reviewer only approved them, so the change is neither a
+# staff hand edit nor a spreadsheet correction. Restore has to be able to tell
+# them apart -- reverting an alum's own correction of their employer is a very
+# different act from reverting an import that overwrote it -- and provenance
+# cannot be reconstructed after the fact, so it is recorded at write time.
+AUDIT_SOURCE_SURVEY = "survey"
 
 _actor_is_engineer: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "audit_actor_is_engineer", default=False

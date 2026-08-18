@@ -26,6 +26,11 @@ constants), because two copies of "what is a valid name / year / birthday" drift
 and the drift is invisible until someone notices the public path accepting what
 the staff path rejects — which is the whole bug this file keeps re-fixing.
 
+An apply is also audited FIELD BY FIELD (#45) — see `apply_response`. The
+`setattr` is exactly why: nothing upstream of it records what a column held
+before, so the capture lives at the write. Audit `field_name`s use the STAFF
+path's namespace, not the survey key's — see `_AUDIT_SECTION_BY_GROUP`.
+
 These rows ARE the survey history the profile's Surveys tab shows: it derives
 from them in `profile._derive_survey_history`. Do NOT also insert into the
 legacy `surveys` table (see `models.crm.Survey`) — one fact, one home.
@@ -41,6 +46,12 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_context import (
+    AUDIT_SOURCE_SURVEY,
+    audit_source,
+    audit_source_scope,
+    new_change_set_id,
+)
 from app.core.dropdowns import (
     INDUSTRIES,
     MARITAL_STATUSES,
@@ -66,6 +77,7 @@ from app.schemas.survey import (
     SurveySubmitResult,
 )
 from app.services import hygiene, supabase_storage
+from app.services.alumni import _unchanged
 from app.services.survey_email import (
     LINK_DEAD_MESSAGE,
     sent_cycle_and_stage,
@@ -863,6 +875,41 @@ _FIELD_BY_KEY = {f.key: f for f in _FIELDS}
 # rename — middle/preferred names are not part of the dedup identity.
 _DEDUP_NAME_COLUMNS = frozenset({"first_name", "last_name"})
 
+# A survey field's `group` -> the audit `field_name` prefix (#45).
+#
+# TWO NAMESPACES MEET HERE, and they had to be reconciled deliberately or the
+# same column would appear in one history stream under two different names.
+#
+#   * A survey payload KEY (`_Field.key`) is `profile.linkedin_url`,
+#     `employment.current_employer`, `program.piff_donor`. That namespace exists
+#     for the FORM: it groups the questions into the cards the alum sees, and
+#     `profile.` covers the alumni core row.
+#   * An audit `field_name` written by the staff edit path is the BARE column for
+#     the alumni row itself and `<section>.<column>` for a nested row, where the
+#     section is one of `alumni_service.SECTION_KEYS` -- so `linkedin_url`,
+#     `career.current_employer`, `engagement.piff_donor`.
+#
+# The audit convention wins, because the audit table is where the two paths meet:
+# staff edits, CSV imports and survey applies all land in one trail that version
+# history and a later restore read as ONE stream. Writing the survey's form
+# namespace into it would give `employment.current_employer` and
+# `career.current_employer` -- the same column of the same table -- and every
+# per-field comparison, grouping and restore would silently treat them as two
+# different fields. Provenance is what `source` is for; the field name says WHICH
+# COLUMN, and there is only one answer to that.
+#
+# Mapped off `group` (the table) rather than off the key's prefix, since `group`
+# is already the thing that decides which row gets the `setattr` just below.
+_AUDIT_SECTION_BY_GROUP = {
+    # The alumni core row: no prefix, exactly as `update_alumni` writes it.
+    "alumni": None,
+    "contact": "contact",  # AlumniContactInfo
+    # NOT "employment": `update_alumni` calls the CurrentEmployment section
+    # "career", and this is that same row.
+    "employment": "career",
+    "engagement": "engagement",  # AlumniProgramEngagement
+}
+
 _TRUE = frozenset({"yes", "true", "1"})
 
 # How much of an UNRECOGNIZED payload key reaches the log, and how many of them.
@@ -892,6 +939,22 @@ def _log_safe_keys(keys: list[str]) -> str:
     if len(keys) > _LOG_KEYS_MAX:
         rendered += f", ... ({len(keys) - _LOG_KEYS_MAX} more)"
     return rendered
+
+
+def _audit_field_name(field: _Field) -> str:
+    """The audit `field_name` for *field* -- see `_AUDIT_SECTION_BY_GROUP`.
+
+    `profile.linkedin_url` -> `linkedin_url`;
+    `employment.current_employer` -> `career.current_employer`.
+
+    A group with no mapping falls back to prefixing with the group name itself,
+    which is wrong-but-recorded rather than crash-mid-apply: adding a group is a
+    code change, and losing an alum's approved answer to a KeyError is far worse
+    than an oddly-named audit row. A parity test pins every group in `_FIELDS` to
+    a real `SECTION_KEYS` section, so the fallback cannot be reached quietly.
+    """
+    section = _AUDIT_SECTION_BY_GROUP.get(field.group, field.group)
+    return field.column if section is None else f"{section}.{field.column}"
 
 
 def _text(value: object) -> str:
@@ -1351,6 +1414,25 @@ async def apply_response(
     rename path, because two alumni genuinely can share a name and a graduation
     year and a marriage rename into a real collision is sometimes correct. The
     point is that the person who approved it is told.
+
+    AUDIT (#45). This path writes with a raw `setattr` rather than going through
+    `alumni_service.update_alumni` — deliberately, because the whitelist and the
+    server-chosen values above it are the load-bearing part of a PUBLIC write
+    surface — so it never inherited the field-level capture the staff and import
+    paths have. It recorded one summary row saying how many fields moved, and
+    nothing about WHICH, or from what. Every survey approval ever made is
+    therefore unreconstructable, and that is permanent: old values exist only at
+    the instant they are overwritten.
+
+    So capture happens HERE, where the writes happen: one audit row per field that
+    ACTUALLY changed, carrying its real old and new value, all sharing one
+    `change_set_id` with the summary row so the whole approval reads as a single
+    version, and all stamped `source='survey'` so a restore can tell an alum's own
+    answer from a staff edit or a spreadsheet correction.
+
+    The old values are PII (an alum's phone, home city, employer, birthday). They
+    go to `audit_logs` and nowhere else — nothing below logs a value, only counts
+    and (already-safe) field keys.
     """
     resp = await _get_pending(session, response_id)
     alum = (
@@ -1401,6 +1483,32 @@ async def apply_response(
     # fuzzy duplicate check keys off (with graduation_year). Nothing else the survey
     # can write affects it, so the extra query below runs on renames only.
     name_changed = False
+    # (audit field_name, old, new) for every field this apply ACTUALLY moved (#45).
+    # Collected during the loop because the old value exists only until the
+    # `setattr` on the next line overwrites it, and emitted as audit rows at the
+    # bottom so the summary row stays the FIRST row of the change set.
+    #
+    # "Actually moved" is `alumni_service._unchanged` — imported, not restated,
+    # so the survey path and the staff path agree on what counts as a change.
+    # It matters here for the same reason it matters there: a survey re-confirms
+    # the whole form, so most applies resubmit values identical to what is on
+    # file, and a naive `!=` would fill the trail with "" -> None non-changes and
+    # bury the two fields the alum really corrected.
+    field_changes: list[tuple[str, object, object]] = []
+    # Side rows this apply CREATED (an alum who had no contact / employment /
+    # engagement row). On one of those every column reads back None, so the
+    # brand-new-row rule from `_upsert_section` applies: record the fields that
+    # carry something, skip the ones that are blank or False. "Nothing became No"
+    # is not history, it is noise that would bury the real answers.
+    created_rows: set[str] = set()
+
+    def _capture(field: _Field, old: object, new: object) -> None:
+        if _unchanged(old, new):
+            return
+        if field.group in created_rows and new is False:
+            return
+        field_changes.append((_audit_field_name(field), old, new))
+
     for key, raw in (resp.payload or {}).items():
         field = _FIELD_BY_KEY.get(key)
         if field is None:
@@ -1411,25 +1519,38 @@ async def apply_response(
             ignored.append(key)
             continue
         written += 1
+        # The old value is read immediately before each `setattr`, which is the
+        # only moment it exists. Nothing about the WRITE changes below.
         if field.group == "alumni":
-            if field.column in _DEDUP_NAME_COLUMNS and getattr(alum, field.column) != value:
+            old = getattr(alum, field.column, None)
+            if field.column in _DEDUP_NAME_COLUMNS and old != value:
                 name_changed = True
             setattr(alum, field.column, value)
+            _capture(field, old, value)
         elif field.group == "contact":
             if contact is None:
                 contact = AlumniContactInfo(alumni_id=alum.alumni_id)
                 session.add(contact)
+                created_rows.add("contact")
+            old = getattr(contact, field.column, None)
             setattr(contact, field.column, value)
+            _capture(field, old, value)
         elif field.group == "employment":
             if job is None:
                 job = CurrentEmployment(alumni_id=alum.alumni_id)
                 session.add(job)
+                created_rows.add("employment")
+            old = getattr(job, field.column, None)
             setattr(job, field.column, value)
+            _capture(field, old, value)
         elif field.group == "engagement":
             if eng is None:
                 eng = AlumniProgramEngagement(alumni_id=alum.alumni_id)
                 session.add(eng)
+                created_rows.add("engagement")
+            old = getattr(eng, field.column, None)
             setattr(eng, field.column, value)
+            _capture(field, old, value)
 
     if dropped:
         log.warning(
@@ -1478,19 +1599,61 @@ async def apply_response(
     resp.status = "applied"
     resp.reviewed_by_user_id = actor_user_id
     resp.reviewed_at = datetime.datetime.now(datetime.UTC)
-    session.add(
-        AuditLog(
-            user_id=actor_user_id,
-            action_type="apply_survey_response",
-            entity_type="alumni",
-            entity_id=alum.alumni_id,
-            new_value=(
-                f"survey_response={response_id} fields={len(resp.payload or {})} "
-                f"written={written} dropped={len(dropped)} ignored={len(ignored)}"
-                + (f" duplicate_warnings={len(duplicate_warnings)}" if name_changed else "")
-            ),
+
+    # One approval = one version (#45), shared by the summary row and every field
+    # row below, so the whole apply reads as a single change set. Minted
+    # unconditionally rather than only when something changed, because the summary
+    # row is written either way and an ungrouped summary row could not be tied to
+    # the field rows that belong with it.
+    change_set_id = new_change_set_id()
+    # `source` reaches the rows through the request-scoped contextvar, the same
+    # mechanism `import_csv.commit_update` uses, rather than a literal typed in at
+    # each `AuditLog(...)`: the value is registered once in `app.core.audit_context`
+    # and anything else this block ends up writing is labelled with it too.
+    with audit_source_scope(AUDIT_SOURCE_SURVEY):
+        # KEPT, not replaced. The summary row is the only place the counts live —
+        # how many keys the payload carried, how many were written, how many were
+        # DROPPED (unknown key) and how many IGNORED (known field, refused value).
+        # None of that is a field change, so no per-field row can express it, and
+        # dropping it would lose the one signal that a rename on either side of
+        # the wire is silently eating alumni answers. It now also carries the
+        # change set and the source, so it reads as the header of this approval
+        # rather than as an unrelated row.
+        session.add(
+            AuditLog(
+                user_id=actor_user_id,
+                action_type="apply_survey_response",
+                entity_type="alumni",
+                entity_id=alum.alumni_id,
+                new_value=(
+                    f"survey_response={response_id} fields={len(resp.payload or {})} "
+                    f"written={written} dropped={len(dropped)} ignored={len(ignored)}"
+                    + (f" duplicate_warnings={len(duplicate_warnings)}" if name_changed else "")
+                ),
+                change_set_id=change_set_id,
+                source=audit_source(),
+            )
         )
-    )
+        # ADDED: the field-level history this path never had. `action_type` is
+        # "update" — the same action the staff and import paths record, because
+        # this IS an update to the alumni record and version history must find it
+        # with one filter; `source` is what says the update came from a survey.
+        # Values are stringified exactly as `alumni_service._audit` does it, so
+        # rows from the two paths compare directly.
+        for field_name, old, new in field_changes:
+            session.add(
+                AuditLog(
+                    user_id=actor_user_id,
+                    action_type="update",
+                    entity_type="alumni",
+                    entity_id=alum.alumni_id,
+                    field_name=field_name,
+                    old_value=None if old is None else str(old),
+                    new_value=None if new is None else str(new),
+                    change_set_id=change_set_id,
+                    source=audit_source(),
+                )
+            )
     await session.commit()
     return duplicate_warnings
 

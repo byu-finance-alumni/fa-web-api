@@ -838,10 +838,12 @@ CREATE TABLE audit_logs (
     -- NULL on rows written before the column existed. See migration
     -- 2026-08-17_audit_change_set_and_source.sql.
     change_set_id varchar(36),
-    -- Write provenance: 'manual' | 'import' (#45). Hand edits and bulk CSV
-    -- updates share one write path, so a later restore feature can't otherwise
-    -- tell a spreadsheet correction from a typed one. NULL where the writing
-    -- path carries no provenance (logins, exports, disclosure reads).
+    -- Write provenance: 'manual' | 'import' | 'survey' (#45). Hand edits and bulk
+    -- CSV updates share one write path, so a later restore feature can't
+    -- otherwise tell a spreadsheet correction from a typed one; 'survey' is a
+    -- staff approval of an alum's own submission, which is neither. NULL where
+    -- the writing path carries no provenance (logins, exports, disclosure reads).
+    -- See migration 2026-08-17_audit_source_survey.sql.
     source       varchar(20),
     created_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_audit_logs_user_id FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE SET NULL

@@ -35,10 +35,12 @@ class AuditLog(Base):
     # written before this column existed, and on paths that write a single row
     # (nothing to group). See app/core/audit_context.new_change_set_id.
     change_set_id: Mapped[str | None] = mapped_column(String(36))
-    # Where the write came from: 'manual' | 'import' (#45). Hand edits and bulk
-    # CSV updates both flow through alumni_service.update_alumni, so without this
-    # the trail cannot tell a spreadsheet correction from a typed one — which a
-    # later restore feature needs, so it doesn't revert good imported data. NULL
+    # Where the write came from: 'manual' | 'import' | 'survey' (#45). Hand edits
+    # and bulk CSV updates both flow through alumni_service.update_alumni, so
+    # without this the trail cannot tell a spreadsheet correction from a typed one
+    # — which a later restore feature needs, so it doesn't revert good imported
+    # data. 'survey' is a staff approval of an alum's own submission
+    # (survey_responses.apply_response), which is neither of the other two. NULL
     # on audit rows from paths that don't carry provenance.
     source: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime.datetime] = mapped_column(

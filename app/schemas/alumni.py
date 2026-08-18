@@ -783,6 +783,25 @@ class AlumniUpdateFull(AlumniUpdate):
     career: CareerCreate | None = None
     education: EducationCreate | None = None
     engagement: EngagementCreate | None = None
+    # #446 - "This is a new role" on the Employment edit section. NOT a stored
+    # column and NOT a field of `career`: it changes what the save DOES (the
+    # outgoing current role is copied into employment_history before the new one
+    # overwrites it), so it is a WRITE CONTROL, not data. It lives at the top
+    # level rather than inside `CareerCreate` because that section's dump is fed
+    # straight to the column upsert - a non-column key in there would try to set
+    # an attribute current_employment does not have.
+    #
+    # DEFAULT FALSE, deliberately and permanently. The whole point of asking is
+    # that a job change and a typo correction are indistinguishable from the
+    # values alone: defaulting on would manufacture a bogus prior role every time
+    # someone fixes a misspelled employer, and a data-cleanup pass would mint
+    # hundreds of them. Inference from "did the employer string change?" was
+    # considered and rejected - it is wrong in BOTH directions (it misses a
+    # promotion at the same company and it invents history on a spelling fix).
+    #
+    # Only on UPDATE. A create has no outgoing role to archive, so the flag is
+    # absent from `AlumniCreateFull` rather than accepted and ignored.
+    archive_previous_role: bool = False
 
 
 class AlumniRead(BaseModel):

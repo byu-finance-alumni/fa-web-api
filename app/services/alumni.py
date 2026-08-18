@@ -258,9 +258,146 @@ SECTION_KEYS = frozenset(
     {"contact", "career", "education", "engagement", "former", "leadership"}
 )
 
+# Payload keys that are WRITE CONTROLS, not data: they change what the save does
+# rather than naming a column to write. They arrive at the top level of the
+# payload alongside the core fields, so every "everything that isn't a section is
+# a core column" comprehension has to exclude them or it will try to `setattr`
+# them onto the Alumni row and blow up with an AttributeError.
+#
+# Mirrored as `hygiene._CONTROL_KEYS` (that module is imported BY this one and so
+# cannot import back, exactly as `_SECTIONS` mirrors `SECTION_KEYS`), which drops
+# them from the cleaned payload so `/preview` never shows a checkbox as a stored
+# field. A parity test pins the two together.
+CONTROL_KEYS = frozenset({"archive_previous_role"})
+
+# current_employment column -> employment_history column, for #446's demotion of
+# an outgoing current role. Only the five columns BOTH tables have appear here:
+# employment_history has no home for current_industry_secondary, current_country,
+# current_zip or seniority_level. Those are not silently dropped - the archive
+# audit row carries a snapshot of the WHOLE outgoing current_employment row in
+# its old_value (see `_CAREER_SNAPSHOT_FIELDS`), so the trail keeps what the
+# table cannot. Widening employment_history to hold them is a schema change with
+# read-model and UI consequences, deliberately not bundled into this one.
+_ROLE_ARCHIVE_COLUMNS = {
+    "current_employer": "employer_name",
+    "current_title": "employment_title",
+    "current_industry": "employment_industry",
+    "current_city": "city",
+    "current_state": "state",
+}
+
+# Everything meaningful on a current_employment row, for the audit snapshot.
+# `company_address` is deliberately absent - it is retired and pending drop
+# (#287), so snapshotting it would keep a dead column alive in the trail.
+_CAREER_SNAPSHOT_FIELDS = (
+    "current_employer",
+    "current_title",
+    "current_industry",
+    "current_industry_secondary",
+    "current_city",
+    "current_state",
+    "current_country",
+    "current_zip",
+    "seniority_level",
+)
+
+# Snapshot fields for the employment_history row we create. Same tuple and same
+# order as `profile._EMPLOYMENT_FIELDS`, which is the established shape for an
+# add/delete audit value on this table; kept local rather than imported because
+# it is another service's private detail and importing it would couple two
+# services for four lines.
+_EMPLOYMENT_HISTORY_SNAPSHOT_FIELDS = (
+    "employer_name",
+    "employment_title",
+    "employment_industry",
+    "city",
+    "state",
+    "start_year",
+    "end_year",
+    "is_current",
+)
+
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
+
+
+def _snapshot(row: object, fields: tuple[str, ...]) -> dict[str, object]:
+    """Detach *fields* off *row* into a plain dict.
+
+    Detaching MATTERS here and is not defensive habit: the row this is called on
+    is the very ``current_employment`` row ``_upsert_section`` is about to mutate,
+    and SQLAlchemy's identity map hands both callers the SAME object — so holding
+    a reference and reading it after the upsert would read the NEW values and
+    archive the incoming role instead of the outgoing one.
+    """
+    return {field: getattr(row, field, None) for field in fields}
+
+
+def _snapshot_text(values: dict[str, object]) -> str:
+    """A snapshot dict as a one-line audit old/new value.
+
+    Same rendering as ``profile._row_snapshot``: ``name=value`` pairs with
+    ``repr`` values, so an empty string is distinguishable from NULL in the trail.
+    """
+    return "; ".join(f"{field}={value!r}" for field, value in values.items())
+
+
+async def _archive_current_role(
+    session: AsyncSession, alumni_id: int, outgoing: dict[str, object]
+) -> EmploymentHistory | None:
+    """Copy the OUTGOING current role into ``employment_history`` (#446).
+
+    Called only when the caller explicitly ticked "this is a new role" AND the
+    career upsert actually changed something. Returns the created row (flushed,
+    so it has an id for the audit trail), or ``None`` when the outgoing role held
+    nothing worth keeping.
+
+    **Dates.** This is the part nobody typed, so it is spelled out:
+
+    * ``start_year`` stays NULL. ``current_employment`` has no start column, so
+      the date the alum began the outgoing role was never recorded anywhere. Any
+      value here would be invented, and a wrong start year is worse than an
+      absent one - the "worked in year X" filter reads ``start_year`` as a hard
+      bound. NULL is already the ordinary state of this column.
+    * ``end_year`` is the year of THIS EDIT. It is genuinely synthesised, and it
+      means "the year this role stopped being the current one **in this
+      database**" - not necessarily the year the alum actually left, which may
+      have been earlier and which nobody knows. Leaving it NULL was the tempting
+      alternative and is actively wrong: NULL ``end_year`` already MEANS "still
+      held" everywhere it is read (the dashboard's recent-employer roll-up treats
+      ``end_year IS NULL`` as current, and the worked-in-year filter treats it as
+      open-ended), so an archived role with no end date would go on counting as a
+      job the alum still holds - the exact confusion this feature exists to end.
+      Staff can correct it on the Employment panel; the audit row records that we
+      supplied it rather than a human.
+    * ``is_current`` is False. It is history now, by definition.
+
+    ``source_id`` stays NULL: the row came from a demotion, not from a named
+    data source.
+    """
+    values = {
+        target: outgoing.get(source)
+        for source, target in _ROLE_ARCHIVE_COLUMNS.items()
+    }
+    # Nothing but blanks means there is no role here to preserve; writing the row
+    # anyway would leave an empty entry on the Employment panel that a human then
+    # has to go and delete. Mirrors `_upsert_section`'s all-blank rule.
+    if all(_is_blank(value) for value in values.values()):
+        return None
+    row = EmploymentHistory(
+        alumni_id=alumni_id,
+        is_current=False,
+        start_year=None,
+        end_year=_now().year,
+        **values,
+    )
+    session.add(row)
+    # Flush to obtain the surrogate id BEFORE the audit row is written, so the
+    # trail names the row it created (same reason as `profile.add_employment`).
+    # Still one transaction - `update_alumni` commits once, below.
+    await session.flush()
+    return row
 
 
 def _audit(
@@ -441,8 +578,16 @@ async def create_alumni(
         raise ConflictError(blockers[0]["message"])
 
     # Core columns only — nested sections are popped off before constructing the
-    # Alumni row (they map to related tables, not the alumni table).
-    core = {k: v for k, v in cleaned.items() if k not in SECTION_KEYS}
+    # Alumni row (they map to related tables, not the alumni table), and so are
+    # the write-control keys, which name no column at all. `AlumniCreateFull`
+    # carries no control key today (a create has no outgoing role to archive);
+    # the exclusion is here so adding one later can't silently become
+    # `Alumni(archive_previous_role=...)`.
+    core = {
+        k: v
+        for k, v in cleaned.items()
+        if k not in SECTION_KEYS and k not in CONTROL_KEYS
+    }
     await _validate_spouse_link(session, core.get("spouse_alumni_id"))
     # Last-updated provenance (#285): stamp the creator as the updater so a brand
     # new record reads "Last updated <created> by <name>" instead of falling back
@@ -687,8 +832,14 @@ async def update_alumni(
     if blockers:
         raise ConflictError(blockers[0]["message"])
 
-    # Core columns only — nested sections are handled via upsert below.
-    changes = {k: v for k, v in cleaned.items() if k not in SECTION_KEYS}
+    # Core columns only — nested sections are handled via upsert below, and the
+    # write-control keys (#446's `archive_previous_role`) are not columns at all:
+    # left in here they would be `setattr`-ed onto the Alumni row.
+    changes = {
+        k: v
+        for k, v in cleaned.items()
+        if k not in SECTION_KEYS and k not in CONTROL_KEYS
+    }
     if "spouse_alumni_id" in changes:
         await _validate_spouse_link(
             session, changes["spouse_alumni_id"], self_id=alumni_id
@@ -754,21 +905,57 @@ async def update_alumni(
                 ),
             )
         )
-    if career is not None and career.has_values():
-        section_applied.update(
-            _namespaced(
-                "career",
-                await _upsert_section(
-                    session,
-                    CurrentEmployment,
-                    alumni_id,
-                    hygiene.clean_section(
-                        "career", career.model_dump(exclude_unset=True)
-                    ),
-                    order_by=CurrentEmployment.current_employment_id.desc(),
-                ),
-            )
+    # #446 — "this is a new role". The outgoing current role is copied down into
+    # employment_history instead of being overwritten away. The trigger is this
+    # EXPLICIT flag and nothing else: the values alone cannot distinguish a job
+    # change from a typo correction, so nothing is inferred from whether the
+    # employer string moved.
+    #
+    # The snapshot has to be taken BEFORE the upsert, which mutates the stored row
+    # in place; `_upsert_section` returns only the fields that changed, so the
+    # untouched ones (a seniority level that stayed put while the employer moved)
+    # exist nowhere else by the time it returns.
+    archived_role: EmploymentHistory | None = None
+    outgoing_role: dict[str, object] | None = None
+    # getattr, not attribute access: the plain `AlumniUpdate` schema and the
+    # direct service callers in tests carry no control keys, matching how every
+    # nested section is read just above.
+    if (
+        getattr(payload, "archive_previous_role", False)
+        and career is not None
+        and career.has_values()
+    ):
+        stored_role = await session.scalar(
+            select(CurrentEmployment)
+            .where(CurrentEmployment.alumni_id == alumni_id)
+            .order_by(CurrentEmployment.current_employment_id.desc())
+            .limit(1)
         )
+        # `None` when the alum has no current role on file yet — the flag is then
+        # simply nothing to act on, not an error: an alum whose first employer is
+        # being entered has no previous role to demote.
+        if stored_role is not None:
+            outgoing_role = _snapshot(stored_role, _CAREER_SNAPSHOT_FIELDS)
+    if career is not None and career.has_values():
+        career_changes = await _upsert_section(
+            session,
+            CurrentEmployment,
+            alumni_id,
+            hygiene.clean_section("career", career.model_dump(exclude_unset=True)),
+            order_by=CurrentEmployment.current_employment_id.desc(),
+        )
+        section_applied.update(_namespaced("career", career_changes))
+        # Gated on the career section ACTUALLY changing, which is a no-op guard,
+        # not inference: the flag is still required and still does all the
+        # deciding. Without it a mis-ticked box on a save that changed nothing
+        # would clone the current role into history, leaving the record reading
+        # "left Acme in 2026, currently at Acme". A save that changes nothing must
+        # never manufacture history — the same rule that governs every other write
+        # in this function.
+        if career_changes and outgoing_role is not None:
+            archived_role = await _archive_current_role(
+                session, alumni_id, outgoing_role
+            )
     if education is not None and education.has_values():
         # NOTE (#175): the full-edit-form education block edits the alumnus's
         # MOST-RECENT degree in place (single-row upsert). Multi-degree records
@@ -835,6 +1022,34 @@ async def update_alumni(
                 field_name=field,
                 old_value=old,
                 new_value=new,
+                change_set_id=change_set_id,
+            )
+        # #446: the demotion is a row NOBODY TYPED — the save wrote an
+        # employment_history entry the staff member never filled in — so it has to
+        # be legible in the trail as its own act, not inferable from a career
+        # field changing. Same change set as the rest of the save, so version
+        # history reads "this one save moved the old role down and set the new
+        # one" rather than two unrelated events.
+        #
+        # The row id rides in `field_name` (`employment[12]`), the convention the
+        # per-row employment endpoints already use, since audit_logs has no
+        # row-id column. `old_value` snapshots the WHOLE outgoing
+        # current_employment row — including current_country / current_zip /
+        # seniority_level / current_industry_secondary, which employment_history
+        # has no column for — so the trail preserves what the archived row cannot.
+        # `new_value` snapshots the history row actually created, which is where
+        # the synthesised `end_year` becomes visible as ours rather than a human's.
+        if archived_role is not None:
+            _audit(
+                session,
+                actor_user_id,
+                "archive_current_role",
+                alumni_id,
+                field_name=f"employment[{archived_role.employment_history_id}]",
+                old_value=_snapshot_text(outgoing_role or {}),
+                new_value=_snapshot_text(
+                    _snapshot(archived_role, _EMPLOYMENT_HISTORY_SNAPSHOT_FIELDS)
+                ),
                 change_set_id=change_set_id,
             )
         await session.commit()

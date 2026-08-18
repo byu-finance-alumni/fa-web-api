@@ -72,6 +72,14 @@ class SurveyApplyResult(BaseModel):
     """
 
     duplicate_warnings: list[DuplicateWarning] = []
+    # True when the response HAD a photo staged but it could not be decoded, so
+    # the field changes were applied and the photo was thrown away. The reviewer
+    # approved a submission that showed a photo, and the alum's profile still
+    # shows the old one — if this is not surfaced they will believe the new photo
+    # went live. Warn-and-continue for the same reason as the duplicates above:
+    # failing the apply would leave a response with good field changes stuck
+    # pending forever, since the retry hits the same undecodable bytes.
+    photo_dropped: bool = False
 
 
 class SurveyRespondInfo(BaseModel):

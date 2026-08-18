@@ -9,3 +9,8 @@ python-multipart>=0.0.9
 pyjwt[crypto]>=2.8
 # Outbound HTTP to the Supabase Auth Admin API (super_admin password reset).
 httpx>=0.27
+# Headshot normalisation (services/images.py), imported at module level. Must stay
+# in step with pyproject.toml: Vercel installs from pyproject, but CI's import
+# smoke check installs from HERE, so a dep in only one of them fails in only one
+# place -- this file passing deploy and that file passing CI.
+pillow>=11.0

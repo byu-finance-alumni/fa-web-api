@@ -20,6 +20,7 @@ import datetime
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_context import audit_source, new_change_set_id
 from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
 from app.models.alumni import Alumni
@@ -271,12 +272,23 @@ def _audit(
     field_name: str | None = None,
     old_value: object | None = None,
     new_value: object | None = None,
+    change_set_id: str | None = None,
 ) -> None:
     """Record an alumni audit event when an acting user is known.
 
     For field-level changes (updates), ``field_name`` + old/new values are
     captured so the audit doubles as version history. Values are stringified to
     fit the ``text`` audit columns; ``None`` stays ``NULL``.
+
+    ``field_name`` is the core column name for the alumni row itself, and
+    ``<section>.<column>`` for a nested section (e.g. ``contact.email``,
+    ``career.current_employer``) — the section prefixes are exactly
+    ``SECTION_KEYS``, so a reader can tell "the record's own ``region``" from
+    "the contact row's ``region``" without a second lookup.
+
+    ``change_set_id`` groups every row written by ONE save; pass the same value
+    for all of them. ``source`` is read from the request-scoped provenance
+    contextvar so no callsite has to thread it through (#45).
     """
     if actor_user_id is not None:
         session.add(
@@ -288,6 +300,8 @@ def _audit(
                 field_name=field_name,
                 old_value=None if old_value is None else str(old_value),
                 new_value=None if new_value is None else str(new_value),
+                change_set_id=change_set_id,
+                source=audit_source(),
             )
         )
 
@@ -556,6 +570,18 @@ def _unchanged(old: object, new: object) -> bool:
     return bool(old == new)
 
 
+def _namespaced(
+    section: str, changes: dict[str, tuple[object, object]]
+) -> dict[str, tuple[object, object]]:
+    """Prefix a section's changed-field map with its section key (#45).
+
+    ``{"email": (a, b)}`` -> ``{"contact.email": (a, b)}``. The prefix is always
+    one of ``SECTION_KEYS``, which is what lets one flat audit stream carry both
+    the alumni row's own ``region`` and the contact row's ``region`` unambiguously.
+    """
+    return {f"{section}.{field}": value for field, value in changes.items()}
+
+
 async def _upsert_section(
     session: AsyncSession,
     model: type,
@@ -563,21 +589,28 @@ async def _upsert_section(
     values: dict[str, object],
     *,
     order_by=None,
-) -> bool:
+) -> dict[str, tuple[object, object]]:
     """Update the existing related row for *alumni_id* (or insert one) from
-    *values*. Returns True only when something ACTUALLY changed.
+    *values*. Returns ``{field: (old, new)}`` for the fields that ACTUALLY
+    changed — empty when nothing did.
 
     The matching read query mirrors ``profile.get_profile`` so we update the
     same row the profile/edit page shows.
 
-    The return value gates ``manually_edited_at`` / ``profile_updated_by_user_id``
-    / ``updated_at`` in ``update_alumni``, so it must answer "did this write
-    change the record?", not "was this section submitted?" (#285). Opening Edit ->
-    Employment and saving without touching a field submits a full, populated
-    section; reporting that as written would stamp the profile "updated today by
-    <whoever opened it>" and make the very date this card exists to fix
-    untrustworthy. Fields that match what is stored are left alone entirely, so a
-    no-op save doesn't even dirty the session.
+    Truthiness of the return value gates ``manually_edited_at`` /
+    ``profile_updated_by_user_id`` / ``updated_at`` in ``update_alumni``, so it
+    must answer "did this write change the record?", not "was this section
+    submitted?" (#285). Opening Edit -> Employment and saving without touching a
+    field submits a full, populated section; reporting that as written would stamp
+    the profile "updated today by <whoever opened it>" and make the very date this
+    card exists to fix untrustworthy. Fields that match what is stored are left
+    alone entirely, so a no-op save doesn't even dirty the session.
+
+    It returns the CHANGED MAP rather than a bare bool (#45) because the old
+    values are read here and nowhere else: returning a bool discarded them, which
+    is why every section edit ever made recorded only that *something* changed.
+    Since history cannot be reconstructed after the fact, capturing them at the
+    one place they exist is the whole point.
 
     Callers gate on ``has_values`` (plus the derived-region merge for contact), so
     *values* always carries something; a row that doesn't exist yet is still only
@@ -588,18 +621,27 @@ async def _upsert_section(
     if order_by is not None:
         stmt = stmt.order_by(order_by)
     existing = await session.scalar(stmt.limit(1))
+    changed: dict[str, tuple[object, object]] = {}
     if existing is not None:
-        changed = False
         for field, value in values.items():
-            if _unchanged(getattr(existing, field, None), value):
+            old = getattr(existing, field, None)
+            if _unchanged(old, value):
                 continue
             setattr(existing, field, value)
-            changed = True
+            changed[field] = (old, value)
         return changed
     if all(_is_blank(v) or v is False for v in values.values()):
-        return False
+        return {}
     session.add(model(alumni_id=alumni_id, **values))
-    return True
+    # A brand-new section row: every field that carries something is a change
+    # FROM nothing, so it audits as ``None -> value``. Blank/False fields are
+    # skipped by the same rule that decides whether to insert at all — recording
+    # "empty became empty" would bury the real changes in noise.
+    return {
+        field: (None, value)
+        for field, value in values.items()
+        if not (_is_blank(value) or value is False)
+    }
 
 
 async def update_alumni(
@@ -672,7 +714,11 @@ async def update_alumni(
     career = getattr(payload, "career", None)
     education = getattr(payload, "education", None)
     engagement = getattr(payload, "engagement", None)
-    section_written = False
+    # {"<section>.<field>": (old, new)} for every nested-section field that
+    # actually changed (#45). Namespaced by section so it can be merged with the
+    # core `applied` map without a collision — `region` lives on BOTH the alumni
+    # row and the contact row.
+    section_applied: dict[str, tuple[object, object]] = {}
     contact_values = (
         hygiene.clean_section("contact", contact.model_dump(exclude_unset=True))
         if contact is not None and contact.has_values()
@@ -696,20 +742,32 @@ async def update_alumni(
     if derived_region is not None and "region" not in contact_values:
         contact_values["region"] = derived_region
     if contact_values:
-        section_written |= await _upsert_section(
-            session,
-            AlumniContactInfo,
-            alumni_id,
-            contact_values,
-            order_by=AlumniContactInfo.contact_info_id,
+        section_applied.update(
+            _namespaced(
+                "contact",
+                await _upsert_section(
+                    session,
+                    AlumniContactInfo,
+                    alumni_id,
+                    contact_values,
+                    order_by=AlumniContactInfo.contact_info_id,
+                ),
+            )
         )
     if career is not None and career.has_values():
-        section_written |= await _upsert_section(
-            session,
-            CurrentEmployment,
-            alumni_id,
-            hygiene.clean_section("career", career.model_dump(exclude_unset=True)),
-            order_by=CurrentEmployment.current_employment_id.desc(),
+        section_applied.update(
+            _namespaced(
+                "career",
+                await _upsert_section(
+                    session,
+                    CurrentEmployment,
+                    alumni_id,
+                    hygiene.clean_section(
+                        "career", career.model_dump(exclude_unset=True)
+                    ),
+                    order_by=CurrentEmployment.current_employment_id.desc(),
+                ),
+            )
         )
     if education is not None and education.has_values():
         # NOTE (#175): the full-edit-form education block edits the alumnus's
@@ -717,34 +775,58 @@ async def update_alumni(
         # (e.g. BS + MBA) are managed via the dedicated per-row endpoints
         # (POST/PATCH/DELETE /alumni/{id}/education); this path intentionally does
         # NOT create a second row, so a form save can't silently fan out degrees.
-        section_written |= await _upsert_section(
-            session,
-            EducationHistory,
-            alumni_id,
-            hygiene.clean_section("education", education.model_dump(exclude_unset=True)),
-            order_by=EducationHistory.degree_year.desc().nullslast(),
+        section_applied.update(
+            _namespaced(
+                "education",
+                await _upsert_section(
+                    session,
+                    EducationHistory,
+                    alumni_id,
+                    hygiene.clean_section(
+                        "education", education.model_dump(exclude_unset=True)
+                    ),
+                    order_by=EducationHistory.degree_year.desc().nullslast(),
+                ),
+            )
         )
     if engagement is not None and engagement.has_values():
-        section_written |= await _upsert_section(
-            session,
-            AlumniProgramEngagement,
-            alumni_id,
-            hygiene.clean_section("engagement", engagement.model_dump(exclude_unset=True)),
+        section_applied.update(
+            _namespaced(
+                "engagement",
+                await _upsert_section(
+                    session,
+                    AlumniProgramEngagement,
+                    alumni_id,
+                    hygiene.clean_section(
+                        "engagement", engagement.model_dump(exclude_unset=True)
+                    ),
+                ),
+            )
         )
 
-    if applied or section_written:
+    if applied or section_applied:
         # Any manual edit (core or section) stamps provenance so later imports
         # won't clobber it.
         alumnus.manually_edited_at = _now()
         # Last-updated provenance (#285): record WHO made this edit. Gated on the
-        # same `applied or section_written` condition as manually_edited_at, so a
+        # same `applied or section_applied` condition as manually_edited_at, so a
         # no-op save never re-attributes the profile. Touching the Alumni row here
         # also guarantees TimestampMixin.onupdate bumps `updated_at` even for a
         # section-only edit (career/contact/...), keeping the profile's
         # "Last updated" honest for the employment edits that prompted this card.
         if actor_user_id is not None:
             alumnus.profile_updated_by_user_id = actor_user_id
-        for field, (old, new) in applied.items():
+        # One save = one change set (#45), so a five-field edit reads as one
+        # version instead of five unrelated rows. Minted here, inside the
+        # "something changed" branch, so a no-op save mints nothing.
+        change_set_id = new_change_set_id()
+        # Core fields AND section fields, each with its own old/new. Sections used
+        # to fall into a single bare row with no field/old/new — and only when NO
+        # core field changed, because the old `if section_written and not applied`
+        # guard skipped it otherwise. That guard is gone: a save that touched a
+        # core field and a section field recorded the section change NOWHERE, and
+        # since old values can't be reconstructed, that history was lost for good.
+        for field, (old, new) in [*applied.items(), *section_applied.items()]:
             _audit(
                 session,
                 actor_user_id,
@@ -753,10 +835,8 @@ async def update_alumni(
                 field_name=field,
                 old_value=old,
                 new_value=new,
+                change_set_id=change_set_id,
             )
-        if section_written and not applied:
-            # Record at least one audit entry for a section-only edit.
-            _audit(session, actor_user_id, "update", alumni_id)
         await session.commit()
         await session.refresh(alumnus)
     # Hand the soft duplicate warnings back to the caller (#627). Fuzzy matches

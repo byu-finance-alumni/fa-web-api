@@ -28,6 +28,21 @@ class AuditLog(Base):
     # (user_id -> NULL), so the trail never loses who performed an action.
     actor_email: Mapped[str | None] = mapped_column(String(255))
     actor_name: Mapped[str | None] = mapped_column(String(255))
+    # Groups the rows written by ONE save into one version (#45). A save that
+    # changes five fields writes five rows; without this they can only be grouped
+    # by created_at, which is transaction-start time and therefore identical
+    # across every record in a bulk import's single transaction. NULL on rows
+    # written before this column existed, and on paths that write a single row
+    # (nothing to group). See app/core/audit_context.new_change_set_id.
+    change_set_id: Mapped[str | None] = mapped_column(String(36))
+    # Where the write came from: 'manual' | 'import' | 'survey' (#45). Hand edits
+    # and bulk CSV updates both flow through alumni_service.update_alumni, so
+    # without this the trail cannot tell a spreadsheet correction from a typed one
+    # — which a later restore feature needs, so it doesn't revert good imported
+    # data. 'survey' is a staff approval of an alum's own submission
+    # (survey_responses.apply_response), which is neither of the other two. NULL
+    # on audit rows from paths that don't carry provenance.
+    source: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -83,6 +98,11 @@ def _reroute_engineer_audit_rows(session, flush_context, instances):
                     field_name=obj.field_name,
                     old_value=obj.old_value,
                     new_value=obj.new_value,
+                    # Carry the grouping key and provenance across too (#45), so a
+                    # suppressed engineer save is still readable as ONE change set
+                    # in the oversight trail rather than N unrelated rows.
+                    change_set_id=obj.change_set_id,
+                    source=obj.source,
                 )
             )
             session.expunge(obj)

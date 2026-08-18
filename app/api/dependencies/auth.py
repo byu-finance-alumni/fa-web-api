@@ -325,6 +325,12 @@ require_alumni_photos = require_capability(Capability.ALUMNI_PHOTOS)
 require_events_manage = require_capability(Capability.EVENTS_MANAGE)
 require_notes_manage = require_capability(Capability.NOTES_MANAGE)
 require_surveys_manage = require_capability(Capability.SURVEYS_MANAGE)
+# Deleting an opportunity link (#441 follow-up). Carved OUT of surveys.manage
+# rather than added alongside it: surveys.manage still covers approve / reject /
+# add / edit, and this guard is the single rule for deletion — both the one-at-a-
+# time DELETE and the multi-select bulk route check it, so there is one answer to
+# "who can erase a link" instead of two. Defaults to super_admin + engineer only.
+require_links_delete = require_capability(Capability.LINKS_DELETE)
 require_reports_advanced = require_capability(Capability.REPORTS_ADVANCED)
 # Event authoring (#378), split out of ALUMNI_FULL as two separate capabilities
 # so the engineer can widen "create an event" without also widening "upload a
@@ -363,6 +369,7 @@ RequireEventsImport = Annotated[UserContext, Depends(require_events_import)]
 RequireEventsManage = Annotated[UserContext, Depends(require_events_manage)]
 RequireNotesManage = Annotated[UserContext, Depends(require_notes_manage)]
 RequireSurveysManage = Annotated[UserContext, Depends(require_surveys_manage)]
+RequireLinksDelete = Annotated[UserContext, Depends(require_links_delete)]
 RequireReportsAdvanced = Annotated[UserContext, Depends(require_reports_advanced)]
 RequireAlumniEdit = Annotated[UserContext, Depends(require_alumni_edit)]
 RequireInteractionsCreate = Annotated[

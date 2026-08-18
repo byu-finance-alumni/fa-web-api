@@ -35,13 +35,22 @@ class _FakeSession:
     def add(self, obj) -> None:
         self.added.append(obj)
 
+    async def flush(self) -> None:
+        # ``add_education`` flushes before auditing so the audit row can name the
+        # id the INSERT generated (#45); stamp it here as Postgres would.
+        self._assign_pk()
+
     async def commit(self) -> None:
         self.committed += 1
 
     async def refresh(self, obj) -> None:
         # Stamp the generated PK the DB would assign so EducationRead validates.
-        if isinstance(obj, EducationHistory) and obj.education_id is None:
-            obj.education_id = 1
+        self._assign_pk()
+
+    def _assign_pk(self) -> None:
+        for obj in self.added:
+            if isinstance(obj, EducationHistory) and obj.education_id is None:
+                obj.education_id = 1
 
 
 def test_add_education_persists_degree_year():

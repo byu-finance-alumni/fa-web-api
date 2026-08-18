@@ -138,9 +138,10 @@ def test_minimize_strips_interaction_notes_but_preserves_logged_by():
 
 def test_minimize_exposes_email_phone_hides_home_address_for_view_only():
     # #166 (INTENTIONAL product decision): view_only SHOULD see email + phone so
-    # a "Professor" can reach out to alumni, but the home mailing address
-    # (street + ZIP) stays hidden. City/state/region/country are directory-style
-    # and remain visible.
+    # a "Professor" can reach out to alumni, but the residence stays hidden —
+    # street + ZIP, and since #440 city/state/country too (the survey writes a
+    # real home address into those). ``region`` is derived from the WORK state
+    # (#283) and remains visible.
     from app.schemas.profile import ContactRead, ProfileRead
     from app.services.profile import _minimize_profile_for_view_only
 
@@ -181,11 +182,69 @@ def test_minimize_exposes_email_phone_hides_home_address_for_view_only():
     assert scoped.contact.best_contact is None
     # Linked spouse's resolved name is spouse PII — redacted for view_only.
     assert scoped.spouse_alumni_name is None
-    # Directory-style location survives.
-    assert scoped.contact.city == "Provo"
-    assert scoped.contact.state == "Utah"
+    # #440: the residence city/state/country are redacted too — they now carry a
+    # genuine home address written by the survey, not the employer's.
+    assert scoped.contact.city is None
+    assert scoped.contact.state is None
+    assert scoped.contact.country is None
+    # region is a work-state-derived catchment label (#283), not a residence.
     assert scoped.contact.region == "West"
-    assert scoped.contact.country == "USA"
+
+
+def test_minimize_redacts_residence_but_keeps_work_location_for_view_only():
+    # #440: view_only must not see where an alum LIVES, but must still see where
+    # they WORK — outreach runs on the employer location.
+    from app.schemas.profile import ContactRead, CurrentCareerRead, ProfileRead
+    from app.services.profile import _minimize_profile_for_view_only
+
+    contact = ContactRead(
+        contact_info_id=1,
+        address_line_1="123 Home St",
+        address_line_2="Apt 4",
+        city="Springville",
+        state="Utah",
+        zip="84663",
+        country="USA",
+        region="Mountain West",
+    )
+    career = CurrentCareerRead(
+        current_employment_id=5,
+        current_employer="Goldman Sachs",
+        current_title="Analyst",
+        current_city="New York",
+        current_state="New York",
+        current_country="USA",
+        current_zip="10282",
+    )
+    profile = ProfileRead.model_construct(
+        alumni=AlumniRead.model_validate(_alumni_model()),
+        contact=contact,
+        current_career=career,
+        interactions=[],
+        surveys=[],
+        engagement_notes=[],
+        program_engagement=None,
+        audit=[],
+    )
+    scoped = _minimize_profile_for_view_only(profile)
+
+    # Residence: nothing left that locates the alum's home.
+    assert scoped.contact.address_line_1 is None
+    assert scoped.contact.address_line_2 is None
+    assert scoped.contact.zip is None
+    assert scoped.contact.city is None
+    assert scoped.contact.state is None
+    assert scoped.contact.country is None
+
+    # Work location: fully intact.
+    assert scoped.current_career.current_employer == "Goldman Sachs"
+    assert scoped.current_career.current_city == "New York"
+    assert scoped.current_career.current_state == "New York"
+    assert scoped.current_career.current_country == "USA"
+    assert scoped.current_career.current_zip == "10282"
+
+    # region stays: derived from the work state (#283), not the residence.
+    assert scoped.contact.region == "Mountain West"
 
 
 # --- Fake session for service-level profile/export tests ---------------------

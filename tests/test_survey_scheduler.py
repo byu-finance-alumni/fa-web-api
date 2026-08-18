@@ -1146,8 +1146,10 @@ def test_list_schedules_includes_stage_counts():
             _Res(rows=[(2001, 0, 3), (2001, 1, 1)]),
             _Res(rows=[(2001, 4)]),  # 4 alumni need manual follow-up
             _Res(rows=[(2001, 4)]),  # 4 emails ever sent for the year (#398)
-            # 6 emailed, 2 of them replied, 1 of those still to review (#543).
-            _Res(rows=[(2001, 6, 2, 1)]),
+            # 6 emailed, 2 of them replied, 1 of those still to review (#543);
+            # 1 applied and 1 rejected on review (#497). The rejected one is NOT
+            # in the 2 who replied — staff binned that submission.
+            _Res(rows=[(2001, 6, 2, 1, 1, 1)]),
         ]
     )
     items = asyncio.run(survey_schedule.list_schedules(session))

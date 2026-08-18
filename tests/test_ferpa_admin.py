@@ -228,6 +228,26 @@ def test_reset_password_rate_limited_returns_429(client):
     assert seen[-1] == 429
 
 
+def test_delete_user_rate_limited_returns_429(client):
+    # #425: permanent deletion carries the same 5-per-10-minutes budget as
+    # reset-password (it was 20). Drive the limiter directly: the 6th call in
+    # the window is refused before the endpoint does anything.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    seen = []
+    for _ in range(6):
+        # _load_user returns None -> a clean 404 before any Supabase call, so
+        # the allowed requests never delete anything; we only care that the 6th
+        # is blocked by the limiter (429) regardless of that downstream 404.
+        app.dependency_overrides[get_session] = _with_session(
+            _FakeSession(scalars=[None])
+        )
+        seen.append(client.delete("/admin/users/2").status_code)
+    assert seen[:5] == [404] * 5
+    assert seen[-1] == 429
+
+
 def test_rate_limit_is_per_actor(client):
     # Actor 1 exhausts their budget; actor 2 is unaffected (independent window).
     rate_limit.reset()

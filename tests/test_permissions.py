@@ -83,6 +83,10 @@ def test_default_grants_reproduce_historical_guards():
         # super_admin. donations.manage defaults to exactly the old user_admin
         # holders (super_admin + engineer), so donation writes are unchanged (#189).
         Capability.DONATIONS_MANAGE,
+        # links.delete (#441 follow-up) is newer still, and the first capability
+        # deliberately NARROWER than the one it was carved out of: full_access
+        # keeps surveys.manage (approve / reject / add / edit) but cannot delete.
+        Capability.LINKS_DELETE,
         Capability.PROFILE_COMPLETENESS,
     }
 

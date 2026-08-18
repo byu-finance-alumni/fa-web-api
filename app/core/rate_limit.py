@@ -152,10 +152,16 @@ RESET_PASSWORD_LIMITER = rate_limiter(
 )
 CREATE_USER_LIMITER = rate_limiter("admin:create_user", limit=10, window_seconds=600)
 ASSIGN_ROLE_LIMITER = rate_limiter("admin:assign_role", limit=30, window_seconds=600)
-# Permanent user deletion is destructive and irreversible. A generous cap (bulk
-# cleanup may be legitimate) that still brakes a runaway loop / compromised
-# session from wiping the directory in one burst.
-DELETE_USER_LIMITER = rate_limiter("admin:delete_user", limit=20, window_seconds=600)
+# Permanent user deletion is destructive and irreversible, so it gets the same
+# tight budget as reset-password (#425). This used to be 20 on the theory that
+# "bulk cleanup may be legitimate" — it isn't: the user directory is a couple of
+# dozen staff accounts, so nobody ever deletes more than a handful in a sitting,
+# and 20 was simply the loosest destructive budget in the file for the most
+# irreversible call in it. Five still covers any real correction pass while
+# narrowing what a runaway loop or a compromised session can wipe in one burst.
+# Same in-process caveat as every limiter here (see the module docstring): this
+# narrows the blast radius of one warm instance, it is not a global ceiling.
+DELETE_USER_LIMITER = rate_limiter("admin:delete_user", limit=5, window_seconds=600)
 # Login recording is open to ANY authenticated user (they can only record their
 # OWN login), so it's gated by the force-change-exempt resolver rather than an
 # admin guard. No human logs in 10 times in 10 minutes; this just brakes a
@@ -279,8 +285,14 @@ BulkHeadshotRateLimit = Annotated[
 # Two independent budgets per request, both required:
 #
 # * per TOKEN — the precise one. A token addresses exactly one alum's record, so
-#   this is what stops one leaked/forwarded link being replayed into a flood,
-#   whatever address it is replayed from.
+#   this is the budget that tracks the thing being abused rather than the host
+#   abusing it, and unlike the IP key it is not spoofable: reaching it at all
+#   costs a valid HMAC, so header games cannot move a caller onto a fresh key.
+#   That makes it the better-aimed of the two — NOT a ceiling. It is the same
+#   in-process counter as everything else here, so it is per warm instance and
+#   starts over at zero on a cold start; a leaked link replayed slowly enough,
+#   or across enough instances, still gets through. It brakes a naive replay
+#   flood, it does not stop a patient one.
 # * per CLIENT IP — the broad one. Catches a single host working several tokens
 #   at once. Deliberately loose, because alumni share egress addresses (one
 #   employer's network, one campus, mobile CGNAT) and blocking a real alum is a
@@ -310,8 +322,9 @@ def _client_key(request: Request) -> str:
     preferring Vercel's own header since nothing upstream of the edge can set it.
     A spoofed ``X-Forwarded-For`` then only lengthens the chain we ignore.
 
-    The per-token budget is the real control regardless — it needs a valid HMAC,
-    so no header games reach it. This is the loose second layer.
+    The per-token budget is the better-aimed control regardless — it needs a
+    valid HMAC, so no header games reach it (though it is best-effort and
+    per-instance like everything else here). This is the loose second layer.
     """
     for header in ("x-vercel-forwarded-for", "x-forwarded-for"):
         raw = request.headers.get(header)
@@ -347,8 +360,11 @@ def public_token_rate_limiter(
     """
 
     async def _dependency(request: Request, token: str) -> None:
-        # Token budget first: it is the one an attacker cannot dodge, so it is
-        # the one that should decide the outcome when both are near their cap.
+        # Token budget first: it keys on the credential rather than the address,
+        # so it is the better-aimed of the two and should decide the outcome
+        # when both are near their cap. (Better-aimed, not unavoidable — it is
+        # the same best-effort per-instance counter as every other limiter here;
+        # see the module docstring.)
         _check(
             f"{bucket}:token",
             _token_key(token),
@@ -382,6 +398,17 @@ SURVEY_SUBMIT_LIMITER = public_token_rate_limiter(
 # retried a few times still fits.
 SURVEY_PHOTO_LIMITER = public_token_rate_limiter(
     "survey:respond_photo", token_limit=5, ip_limit=30, window_seconds=_SURVEY_WINDOW
+)
+# Submitting opportunity links (#441). The SAME budget as the field submit, and
+# deliberately its own bucket rather than a share of that one: they are two
+# independent calls the survey page makes, so sharing a budget would mean a
+# submit-then-fix-a-typo cycle on one form silently eating the other form's
+# allowance. Each call can create up to `MAX_LINKS_PER_SUBMIT` rows in the
+# moderation queue, so this is a queue-flood surface exactly like the field
+# submit — 10 per token per ten minutes is well past any real alum and a hard
+# brake on a replayed link.
+OPPORTUNITY_LINK_SUBMIT_LIMITER = public_token_rate_limiter(
+    "survey:respond_links", token_limit=10, ip_limit=60, window_seconds=_SURVEY_WINDOW
 )
 
 

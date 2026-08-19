@@ -78,10 +78,11 @@ from app.schemas.survey import (
     SurveyUnreachableAlum,
     SurveyUsage,
 )
+from app.services import mailer
 
 log = logging.getLogger(__name__)
 
-_RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
+_RESEND_BATCH_URL = mailer.RESEND_BATCH_URL
 
 # The survey is ANNUAL: once an alum replies, they're not re-surveyed for a year.
 # A response submitted on/after this cutoff counts as "already surveyed this
@@ -1673,15 +1674,15 @@ async def _send_batch(emails: list[dict]) -> tuple[int | None, int | None]:
     if not key:
         raise ServiceError("Resend API key is not configured (RESEND_API_KEY).")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                _RESEND_BATCH_URL,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
-                json=emails,
-            )
+        # Shared transport (app/services/mailer.py) — one Resend integration for
+        # the whole app. The ERROR POLICY below stays here: only this caller
+        # knows that an ambiguous outcome must not be retried at an alum.
+        response = await mailer.post_json(
+            _RESEND_BATCH_URL,
+            api_key=key,
+            payload=emails,
+            timeout=_TIMEOUT_SECONDS,
+        )
     except httpx.HTTPError as exc:
         # AMBIGUOUS: the request may have reached Resend and been queued before
         # the connection died. Distinct exception type so the caller keeps the

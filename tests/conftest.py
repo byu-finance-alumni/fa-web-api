@@ -14,9 +14,10 @@ directly in tests/test_permissions.py.
 import pytest
 
 from app.api.dependencies.auth import get_permission_config
-from app.core import rate_limit
+from app.core import failure_monitor, rate_limit
 from app.core.capabilities import DEFAULT_GRANTS
 from app.main import app
+from app.services import failure_alert
 
 
 @pytest.fixture(autouse=True)
@@ -38,4 +39,24 @@ def _fresh_rate_limit_windows():
     collectively and a test could fail depending only on what ran before it.
     """
     rate_limit.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _fresh_failure_monitor():
+    """Start every test with an empty failure-alert gate (#444).
+
+    Same problem as the rate-limit windows above: ``app/core/failure_monitor.py``
+    keeps its report/probe throttle in module-level state, so one test that makes
+    the API return a 5xx would otherwise spend the throttle for whatever runs
+    next and make an alerting assertion depend on test ordering.
+
+    ``failure_alert`` keeps a SECOND, separate piece of module state -- the
+    degraded-path cooldown used when the dedup database is itself unreachable.
+    Resetting only the monitor left that one shared: whichever degraded test ran
+    first spent the cooldown and the next one silently observed zero emails.
+    That passed locally and failed in CI purely on collection order.
+    """
+    failure_monitor.reset()
+    failure_alert.reset_degraded_state()
     yield

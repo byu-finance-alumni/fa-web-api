@@ -98,7 +98,7 @@ def _cell(header_row, data_row, header):
     return data_row[header_row.index(header)]
 
 
-# --- (a) headers == EXPECTED_HEADERS, one row per matching alumnus -----------
+# --- (a) headers == TEMPLATE_HEADERS, one row per matching alumnus -----------
 
 
 def test_cohort_export_headers_and_one_row_each():
@@ -112,7 +112,9 @@ def test_cohort_export_headers_and_one_row_each():
     text = _run(import_csv.build_cohort_update_csv(session, graduation_year=2018, actor_user_id=7))
 
     header_row, data_rows = _parse(text)
-    assert header_row == import_csv.EXPECTED_HEADERS
+    # The cohort file uses the SAME layout as the blank template, inert #448
+    # placeholders included, so the two sheets have one column order.
+    assert header_row == import_csv.TEMPLATE_HEADERS
     assert len(data_rows) == 2
     # Disclosure audit written + committed.
     assert session.committed == 1
@@ -322,7 +324,9 @@ def test_route_cohort_export_returns_csv_attachment():
         in resp.headers["content-disposition"]
     )
     header_row, data_rows = _parse(resp.text)
-    assert header_row == import_csv.EXPECTED_HEADERS
+    # The cohort file uses the SAME layout as the blank template, inert #448
+    # placeholders included, so the two sheets have one column order.
+    assert header_row == import_csv.TEMPLATE_HEADERS
     assert len(data_rows) == 1
 
 

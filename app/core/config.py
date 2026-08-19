@@ -92,6 +92,29 @@ class Settings(BaseSettings):
     survey_usage_baseline_at: datetime.datetime | None = Field(default=None)
     survey_usage_baseline_today: int = Field(default=0)
     survey_usage_baseline_month: int = Field(default=0)
+    # API failure alerting (#444) — the engineer's pager. Comma-separated
+    # recipients; UNSET (the default) DISABLES ALERTING ENTIRELY, which is what
+    # keeps local runs, CI and preview deployments silent without a second flag
+    # to remember. Sending reuses the survey's Resend account (RESEND_API_KEY),
+    # so alerting is also off wherever mail is off.
+    alert_email_to: str | None = Field(default=None)  # ALERT_EMAIL_TO
+    # From-address for alerts. Falls back to SURVEY_FROM_EMAIL when unset — one
+    # verified sending domain is all this app has. Kept separate so alerts can be
+    # moved to their own address later without touching the survey identity.
+    alert_from_email: str | None = Field(default=None)  # ALERT_FROM_EMAIL
+    alert_from_name: str = Field(default="BYU Finance Alumni API")
+
+    @property
+    def alert_recipients(self) -> list[str]:
+        """Parse the comma-separated alert recipients into a clean list."""
+        raw = self.alert_email_to or ""
+        return [addr.strip() for addr in raw.split(",") if addr.strip()]
+
+    @property
+    def alert_sender(self) -> str | None:
+        """The From address alerts go out as (falls back to the survey sender)."""
+        return self.alert_from_email or self.survey_from_email
+
     # Shared secret protecting the survey send-scheduler cron endpoint
     # (POST /survey/cron/run). Vercel Cron sends `Authorization: Bearer
     # $CRON_SECRET` automatically when CRON_SECRET is set as a project env var;

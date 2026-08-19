@@ -78,7 +78,13 @@ from app.schemas.survey import (
     SurveySubmitResult,
 )
 from app.services import hygiene, supabase_storage
-from app.services.alumni import _unchanged
+from app.services.alumni import (
+    _unchanged,
+    archive_current_role,
+    audit_role_archive,
+    career_snapshot,
+    employer_changed,
+)
 from app.services.images import normalise_headshot
 from app.services.survey_email import (
     LINK_DEAD_MESSAGE,
@@ -1457,6 +1463,18 @@ async def apply_response(
     The old values are PII (an alum's phone, home city, employer, birthday). They
     go to `audit_logs` and nowhere else — nothing below logs a value, only counts
     and (already-safe) field keys.
+
+    EMPLOYMENT ARCHIVING (#446). When this apply moves the alum to a DIFFERENT
+    named employer, the outgoing `current_employment` row is copied down into
+    `employment_history` first, through the same `archive_current_role` the staff
+    edit and CSV import paths use, so a demoted role looks identical whichever
+    path produced it. The staff path asks a human ("this is a new role"); nobody
+    is present here to ask, and the product owner decided on 2026-08-18 that the
+    survey should infer from the employer rather than never archive at all —
+    over both "no archiving" and "ask the reviewer at apply time". The accepted
+    cost is that a corrected typo or a company rename produces a prior role the
+    alum never left; `alumni_service.employer_changed` documents how narrowly the
+    comparison is drawn to limit it.
     """
     resp = await _get_pending(session, response_id)
     alum = (
@@ -1579,6 +1597,17 @@ async def apply_response(
     # carry something, skip the ones that are blank or False. "Nothing became No"
     # is not history, it is noise that would bury the real answers.
     created_rows: set[str] = set()
+    # #446 — the outgoing current role, snapshotted BEFORE the write loop, which
+    # overwrites `job` in place. `job is None` (an alum with no employment row
+    # yet) means there is nothing to demote.
+    #
+    # The survey has NO checkbox and, by the product owner's decision of
+    # 2026-08-18, does not get one: an alum re-confirming their details cannot be
+    # asked "is this a new role?", and asking the reviewer instead was considered
+    # and rejected. So this path archives when the EMPLOYER moves — see
+    # `alumni_service.employer_changed` for exactly what counts and for the
+    # tradeoff that was accepted to get it.
+    outgoing_role = career_snapshot(job) if job is not None else None
 
     def _capture(field: _Field, old: object, new: object) -> None:
         if _unchanged(old, new):
@@ -1629,6 +1658,20 @@ async def apply_response(
             old = getattr(eng, field.column, None)
             setattr(eng, field.column, value)
             _capture(field, old, value)
+
+    # #446 — demote the outgoing role once the loop has written the new one, so
+    # the comparison is against what this apply actually stored. Done here rather
+    # than inside the loop because the employer and the rest of the role arrive as
+    # separate payload keys in no guaranteed order: archiving mid-loop would
+    # snapshot a half-written row.
+    archived_role = None
+    if outgoing_role is not None and employer_changed(
+        outgoing_role.get("current_employer"),
+        getattr(job, "current_employer", None),
+    ):
+        archived_role = await archive_current_role(
+            session, alum.alumni_id, outgoing_role
+        )
 
     if dropped:
         log.warning(
@@ -1739,6 +1782,18 @@ async def apply_response(
                     change_set_id=change_set_id,
                     source=audit_source(),
                 )
+            )
+        # #446 — the demotion, inside this scope so it is stamped `survey` like
+        # everything else this approval wrote, and sharing the approval's change
+        # set so the moved-down role and the new one read as one version.
+        if archived_role is not None:
+            audit_role_archive(
+                session,
+                actor_user_id,
+                alum.alumni_id,
+                outgoing=outgoing_role or {},
+                archived=archived_role,
+                change_set_id=change_set_id,
             )
     await session.commit()
     return ApplyOutcome(

@@ -47,6 +47,18 @@ from app.services.state_regions import region_for_state
 
 _SECTIONS = ("contact", "career", "education", "engagement")
 
+# Top-level payload keys that are WRITE CONTROLS, not data: they change what the
+# save DOES rather than naming a column to write (#446's `archive_previous_role`
+# demotes the outgoing current role into employment_history). They are skipped
+# entirely here so `cleaned` keeps meaning "the values that will be stored" --
+# `/preview` renders that dict as the record-to-be, and a checkbox showing up in
+# it as a field would be a lie about what is being saved.
+#
+# Mirrors `alumni_service.CONTROL_KEYS`, the same way `_SECTIONS` mirrors
+# `alumni_service.SECTION_KEYS`: this module is imported BY the alumni service,
+# so it cannot import back.
+_CONTROL_KEYS = frozenset({"archive_previous_role"})
+
 # Human labels for every cleanable field, keyed by (section, field). Only fields
 # we actually clean need an entry; everything else passes through untouched.
 _LABELS: dict[tuple[str, str], str] = {
@@ -468,7 +480,7 @@ def clean_alumni_payload(
     # Core fields (everything that isn't a nested section).
     cleaned: dict = {}
     for field, value in data.items():
-        if field in _SECTIONS:
+        if field in _SECTIONS or field in _CONTROL_KEYS:
             continue
         after = _clean_field("core", field, value)
         cleaned[field] = after

@@ -40,6 +40,7 @@ from app.repositories.alumni_search import (
     _RELATED_WEIGHT,
     _SIMILARITY_FLOOR,
     _WORD_SIMILARITY_FLOOR,
+    _word_similarity_floor,
     relevance_expression,
 )
 
@@ -188,12 +189,17 @@ def test_routing_is_generic_over_the_real_data_not_a_list_of_names():
         return _sql(build_alumni_query(q=f"at {company}"))
 
     assert shape("Adobe") == shape("Snowflake")
-    assert shape("Adobe") == shape("Ramp")
+    # Term LENGTH does change the shape — a four-letter term drops the
+    # word-extent leg (#447, section E2) — but only length: every four-letter
+    # company still compiles to the same SQL as every other.
+    assert shape("Ramp") == shape("Domo")
+    assert shape("Ramp") == shape("Nike")
     # Same for a place: routing does not consult any list of city names.
     def place_shape(city: str) -> str:
         return _sql(build_alumni_query(q=f"in {city}"))
 
-    assert place_shape("Lehi") == place_shape("Kalamazoo")
+    assert place_shape("Provo") == place_shape("Kalamazoo")
+    assert place_shape("Lehi") == place_shape("Kyiv")
     # And the parse is a PURE function — it cannot have looked anything up.
     assert parse_free_text("at Snowflake") == parse_free_text("at Snowflake")
 
@@ -302,6 +308,83 @@ def test_the_relevance_case_tiers_are_emitted_in_precision_order():
     assert first_case.index("= %(") < first_case.index("LIKE")
     assert "ELSE" in first_case
     assert "similarity" in first_case
+
+
+# --- E2. a short company name (#447) -----------------------------------------
+#
+# Jake, 2026-08-18, stating the requirement in his own words: "if a company is
+# in our database then you should be able to search it just by typing it and
+# nothing else and it pulls people who work there and who have worked there".
+#
+# ``q=Domo`` did the second half and failed the first: alongside the two people
+# who had actually worked there it returned five with no connection at all.
+# Reproduced on dev with seven seeded rows (7 rows before, 2 after); the
+# similarity numbers quoted below were measured in the same session.
+
+
+def test_the_word_similarity_floor_rises_as_the_term_gets_shorter():
+    # THE bug, in one line of arithmetic. word_similarity is
+    # shared / (term_trigrams + extent - shared), and a four-character term has
+    # only five trigrams — so THREE shared trigrams score exactly 3/5 = 0.600 and
+    # cleared the flat floor. Three trigrams is the term's first three letters:
+    # a shared prefix, not a typo. Every unrelated row dev returned for q=Domo
+    # (Dominguez, Dominic, Domingo, Dominion Energy, Domain Architect, an alumna
+    # in the Dominican Republic) scored exactly 0.600.
+    assert _word_similarity_floor("domo") is None
+    assert _word_similarity_floor("chase") == 5 / 6
+    assert _word_similarity_floor("stripe") == 5 / 7
+    assert _word_similarity_floor("fidelty") == 5 / 8
+    # Eight characters and up are untouched — 5/9 is already below the flat floor.
+    assert _word_similarity_floor("delloite") == _WORD_SIMILARITY_FLOOR
+    assert _word_similarity_floor("charlesschwabb") == _WORD_SIMILARITY_FLOOR
+
+
+def test_the_word_floor_never_drops_below_the_index_operators_threshold():
+    # `<%` is answered from the GIN index using the session threshold (0.6). The
+    # recheck may only ever NARROW that; if it went below, the operator would
+    # stop being a superset pre-filter and which rows matched would depend on a
+    # GUC again.
+    for term in ("chase", "stripe", "fidelty", "delloite", "charlesschwabb"):
+        assert _word_similarity_floor(term) >= _WORD_SIMILARITY_FLOOR
+
+
+def test_a_four_letter_company_emits_no_word_extent_leg():
+    # At exactly MIN_FUZZY_LENGTH the word-extent leg degenerates into "starts
+    # with the same three letters". Nothing short of the whole term can clear its
+    # floor now, and the whole term is already the contains leg, so the leg is
+    # not emitted at all — one fewer index probe per column, not one more.
+    sql = _sql(build_alumni_query(q="Domo"))
+    assert "word_similarity(" not in sql
+    # The whole-string measure survives at four characters and is well behaved
+    # there (it penalises the length difference): on dev 'domoo' still found
+    # Domo at 0.571, while the closest unrelated value, 'dominic', sat at 0.300.
+    assert "similarity(" in sql
+    assert "word_similarity(" in _sql(build_alumni_query(q="Fidelity"))
+
+
+def test_a_company_name_typed_alone_finds_current_and_former_employees():
+    # Both halves of Jake's sentence. An unrouted term searches the current
+    # employer AND the employment history...
+    sql = _sql(build_alumni_query(q="Domo"))
+    assert _searches(sql, "current_employment", "current_employer")
+    assert _searches(sql, "employment_history", "employer_name")
+    # ...and so does the same name with the "at" hint in front of it.
+    routed = _sql(build_alumni_query(q="at Domo"))
+    assert _searches(routed, "current_employment", "current_employer")
+    assert _searches(routed, "employment_history", "employer_name")
+
+
+def test_the_short_term_fix_narrows_the_floor_and_not_the_column_set():
+    # A four-letter query must keep reaching every searchable field — the fix is
+    # about how loosely one leg may fire, not about what q covers. Searching a
+    # name, a city or an industry still works.
+    sql = _sql(build_alumni_query(q="Kyle"))
+    assert _searches(sql, "alumni", "first_name")
+    assert _searches(sql, "alumni", "last_name")
+    assert _searches(sql, "current_employment", "current_city")
+    assert _searches(sql, "current_employment", "current_industry")
+    assert _searches(sql, "current_employment", "current_title")
+    assert _searches(sql, "employment_history", "employer_name")
 
 
 # --- F. ordering and pagination ----------------------------------------------

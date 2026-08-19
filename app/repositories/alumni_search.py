@@ -43,6 +43,11 @@ compares the query against the best *extent* of the stored value and stays at
 typo; word similarity is the one that finds a short query inside a long company
 name. A term passes if EITHER clears its own floor.
 
+That second measure is the one that has to be length-aware. Ignoring the rest of
+the stored value is exactly what makes it useful, and exactly what makes it
+reckless for a SHORT term: see ``_MIN_SHARED_TRIGRAMS`` below for why a flat
+floor let ``q=Domo`` return the Dominguez family (#447).
+
 INDEX USE
 ---------
 Each fuzzy leg is written as ``<trigram operator> AND <explicit floor>``:
@@ -54,7 +59,10 @@ Each fuzzy leg is written as ``<trigram operator> AND <explicit floor>``:
 
 Because ``_SIMILARITY_FLOOR`` (0.45) is ABOVE the operator's 0.3 default, the
 operator is a pure superset pre-filter and the recheck narrows it to exactly the
-intended set. Conceptually the plan is: GIN bitmap index scan on the normalized
+intended set. The same holds for the word leg: its floor is never allowed BELOW
+``_WORD_SIMILARITY_FLOOR`` (0.6), which is the ``<%`` session threshold, so
+tightening it for a short term narrows the recheck and never the index probe.
+Conceptually the plan is: GIN bitmap index scan on the normalized
 expression -> recheck the floor -> (for the list) evaluate the ranking CASE over
 just the surviving rows. No sequential scan, no per-row scoring of the whole
 table.
@@ -90,10 +98,40 @@ _SIMILARITY_FLOOR = 0.45
 
 #: Word-extent floor, used for the "short query inside a long stored value" case.
 #: Left at PostgreSQL's own default (``pg_trgm.word_similarity_threshold`` =
-#: 0.6) so the ``<%`` index operator and this recheck agree exactly. Measured
-#: noise at this floor on real dev data is tiny and sensible ('cite'->Citi,
-#: 'dell'->Deloitte) and always ranks below the exact hit.
+#: 0.6) so the ``<%`` index operator and this recheck agree exactly, and it
+#: always ranks below the exact hit.
+#:
+#: It is the FLOOR ON THE FLOOR now, not the floor itself — see
+#: ``_MIN_SHARED_TRIGRAMS``, which raises it for a short term. The noise this
+#: constant was originally called tiny and sensible ('cite'->Citi,
+#: 'dell'->Deloitte) turned out to be the #447 bug wearing a friendly face:
+#: 'dell' pulled all ten dev Deloitte alumni into a search for Dell.
 _WORD_SIMILARITY_FLOOR = 0.6
+
+#: Fewest trigrams a word-similarity hit has to actually SHARE with the term
+#: (#447). ``word_similarity`` is ``shared / (term_trigrams + extent - shared)``
+#: and ``shared <= extent``, so a score of W over a term of N trigrams proves at
+#: least ``W * N`` shared trigrams. Read backwards: demanding K shared trigrams
+#: is the floor ``K / N`` — a floor that RISES as the term gets shorter, which is
+#: precisely what a flat floor cannot do.
+#:
+#: WHY IT WAS NEEDED. A four-character term has five trigrams, so a flat 0.6 is
+#: cleared by THREE shared trigrams — the term's first three letters and nothing
+#: else. Three characters is the smallest overlap trigram matching can express at
+#: all: that is a shared prefix, not a typo. Reproduced on dev with seven seeded
+#: rows, ``q=Domo`` returned Dominguez, Dominic, Dominion Energy, Domain
+#: Architect and an alumna in the Dominican Republic, every one of them scoring
+#: exactly 0.600, none of them ever employed by Domo.
+#:
+#: WHY FIVE. It is the smallest K that rejects all of those (and 'chase'->
+#: Chastain, 0.667) while keeping every correction the flat floor was tuned for,
+#: measured on dev: 'fidelty'->fidelityinvestments 0.625 = 5/8, exactly its own
+#: floor; 'vanguad'->vanguardgroup 0.750; 'microsft'->microsoftcorporation
+#: 0.667; 'qualtrcs'->qualtricsinternational 0.667; 'blackstne'->blackstonegroup
+#: 0.700; 'goldmanschs'->goldmansachs 0.667; 'morganstanly'->morganstanleyandco
+#: 0.846; 'charlesschwabb'->charlesschwabcorporation 0.867. Terms of eight
+#: characters or more are untouched — 5/9 is already below 0.6.
+_MIN_SHARED_TRIGRAMS = 5
 
 # Ranking tiers. The only invariant that matters: _FUZZY_CEILING (the most an
 # approximate match can score) is strictly BELOW _CONTAINS_SCORE (the least a
@@ -203,6 +241,23 @@ def _matches(normalized, term: str):
     return _matches_one(normalized, term)
 
 
+def _word_similarity_floor(term: str) -> float | None:
+    """Word-extent floor for ``term``, or ``None`` when the leg cannot add a row.
+
+    Never below ``_WORD_SIMILARITY_FLOOR`` (the ``<%`` session threshold), so the
+    index probe stays a superset of whatever this returns.
+
+    ``None`` once ``_MIN_SHARED_TRIGRAMS`` no longer fits inside the term: the
+    only extent that could clear the floor is then the whole term, which the
+    ``contains`` leg already matches, so emitting the leg would cost an index
+    probe that can never contribute a row.
+    """
+    trigrams = len(term) + 1
+    if trigrams <= _MIN_SHARED_TRIGRAMS:
+        return None
+    return max(_WORD_SIMILARITY_FLOOR, _MIN_SHARED_TRIGRAMS / trigrams)
+
+
 def _matches_one(normalized, term: str):
     """Exact / prefix / contains / trigram-similar, for a single spelling."""
     legs = [normalized.like(f"%{term}%")]
@@ -215,14 +270,16 @@ def _matches_one(normalized, term: str):
                 func.similarity(normalized, term) >= _SIMILARITY_FLOOR,
             )
         )
-        legs.append(
-            and_(
-                # `<%` wants the query on the LEFT and the indexed expression on
-                # the RIGHT for the index to be usable.
-                literal(term).op("<%", is_comparison=True)(normalized),
-                func.word_similarity(term, normalized) >= _WORD_SIMILARITY_FLOOR,
+        word_floor = _word_similarity_floor(term)
+        if word_floor is not None:
+            legs.append(
+                and_(
+                    # `<%` wants the query on the LEFT and the indexed expression
+                    # on the RIGHT for the index to be usable.
+                    literal(term).op("<%", is_comparison=True)(normalized),
+                    func.word_similarity(term, normalized) >= word_floor,
+                )
             )
-        )
     return or_(*legs)
 
 

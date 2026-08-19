@@ -79,6 +79,22 @@ repo has nowhere to run one. That is a separate piece of work, not something thi
 module can fake.
 
 --------------------------------------------------------------------------------
+TWO DELIVERY CHANNELS, INDEPENDENTLY OPTIONAL
+--------------------------------------------------------------------------------
+An alert is rendered ONCE, as a subject plus label/value rows, and then delivered
+to every channel that is configured: email via Resend (``ALERT_EMAIL_TO``) and
+Slack via an incoming webhook (``SLACK_ALERT_WEBHOOK_URL``). Each is enabled by
+its own setting being present and by nothing else, so a deployment can have
+email only, Slack only, both, or neither — and "neither" is the default, which is
+what keeps local dev, CI and preview deployments silent with no extra flag.
+
+The channels are independent in FAILURE too: they are dispatched concurrently
+with ``return_exceptions=True``, so Slack being down cannot swallow the email and
+a slow Resend cannot delay the Slack post. Neither can raise into the caller —
+see the amplification rule below, which now covers two third parties instead of
+one.
+
+--------------------------------------------------------------------------------
 THE ALERTER MUST NOT AMPLIFY THE FAILURE
 --------------------------------------------------------------------------------
 Every entry point here is best-effort and NEVER raises: it runs on a request that
@@ -87,13 +103,21 @@ Every path is time-boxed, a send is never retried, and an alert email is CLAIMED
 BEFORE IT IS SENT (mirroring the survey sender's claim-then-send rule) so a send
 that dies mid-flight cannot come back as a second email.
 
+Nor can it RECURSE. The two things an alert delivery does are an outbound HTTP
+POST and a log line. The outbound POST is not an inbound request, so it is never
+seen by ``failure_alert_middleware`` and cannot open an incident about itself;
+the log line goes to the platform logger, which nothing in this app monitors. The
+one way to build a loop here would be to alert about a failed alert — so a failed
+delivery is logged and dropped, never re-reported.
+
 --------------------------------------------------------------------------------
 NO PII, NO SECRETS
 --------------------------------------------------------------------------------
-This content leaves the system and lands in a mailbox. It carries route TEMPLATES
-(``/alumni/{alumni_id}``), status codes, and an exception CLASS NAME. Never a
-real path with ids, never a query string, never an exception message (which can
-quote a row), never a header, never an alumni field, never a key.
+This content leaves the system and lands in a mailbox AND in a Slack channel. It
+carries route TEMPLATES (``/alumni/{alumni_id}``), status codes, and an exception
+CLASS NAME. Never a real path with ids, never a query string, never an exception
+message (which can quote a row), never a header, never an alumni field, never a
+key. The Slack webhook URL is itself a credential and is never logged or echoed.
 """
 
 from __future__ import annotations
@@ -112,7 +136,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import __version__
 from app.core import database
 from app.core.config import get_settings
-from app.services import mailer
+from app.services import mailer, slack
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +163,10 @@ _STALE_INCIDENT_SECONDS = 600
 # deliberately short: better a missed alert than a request held open.
 _DB_TIMEOUT_SECONDS = 3.0
 _EMAIL_TIMEOUT_SECONDS = 6.0
+# Slack's own budget. Shorter than the email one because the two are dispatched
+# CONCURRENTLY, so the delivery step costs max(email, slack) rather than their
+# sum, and a webhook POST that has not answered in four seconds is not going to.
+_SLACK_TIMEOUT_SECONDS = 4.0
 
 # DEGRADED path only: minimum gap between two per-process alerts when the
 # database (the real dedup store) is unreachable. 30 minutes bounds the worst
@@ -439,7 +467,7 @@ def _render_body(intro: str, rows: list[tuple[str, str]]) -> tuple[str, str]:
     return html, "\n".join(text_lines)
 
 
-async def send_alert_email(subject: str, intro: str, rows: list[tuple[str, str]]) -> bool:
+async def _send_email(subject: str, intro: str, rows: list[tuple[str, str]]) -> bool:
     """Send one operational email through the shared Resend transport.
 
     NEVER raises and NEVER retries. Returns True when Resend accepted it.
@@ -484,19 +512,139 @@ async def send_alert_email(subject: str, intro: str, rows: list[tuple[str, str]]
             subject,
         )
         return False
-    log.warning("failure_alert: sent %r", subject)
+    log.warning("failure_alert: emailed %r", subject)
     return True
+
+
+def render_slack(subject: str, intro: str, rows: list[tuple[str, str]]) -> dict:
+    """Build the Slack incoming-webhook payload for an alert.
+
+    Kept separate from sending, exactly like :func:`render_alert`, so the exact
+    wording is unit-testable — including the assertion that nothing PII-shaped
+    can appear in it.
+
+    ``text`` is set as well as ``blocks`` deliberately: Slack uses it for the
+    notification preview on a phone's lock screen and in the channel list, and a
+    payload carrying only blocks shows up there as "This content can't be
+    displayed". The subject alone is the right preview — it already names the
+    environment and what broke.
+
+    Every value goes through :func:`slack.escape_mrkdwn`. The values here are ours
+    (route templates, counts, timestamps), but an exception CLASS NAME and a route
+    template are both derived from code that changes, and a single ``<`` in a
+    rendered value would silently eat the rest of that line in the channel.
+    """
+    esc = slack.escape_mrkdwn
+    lines = "\n".join(f"*{esc(label)}:* {esc(value)}" for label, value in rows)
+    return {
+        "text": subject,
+        "blocks": [
+            {
+                # A header block is plain_text, not mrkdwn — no escaping applies,
+                # but Slack rejects one over 150 characters, so it is cut here
+                # rather than losing the whole message to a 400.
+                "type": "header",
+                "text": {"type": "plain_text", "text": subject[:150], "emoji": False},
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"{esc(intro)}\n\n{lines}"},
+            },
+        ],
+    }
+
+
+async def _send_slack(subject: str, intro: str, rows: list[tuple[str, str]]) -> bool:
+    """Post one alert to the configured Slack incoming webhook.
+
+    NEVER raises and NEVER retries, for the same reasons as the email path — plus
+    one that is specific to having two channels: if a Slack failure could raise,
+    it would take the email down with it, and the whole point of a second channel
+    is that either one alone still gets the message out.
+
+    Returns True when Slack accepted it. A failure is logged WITHOUT the webhook
+    URL: that URL is the entire credential for posting to the channel and must
+    never reach the platform logs.
+    """
+    url = get_settings().slack_webhook
+    if not url:
+        return False
+    try:
+        response = await slack.post_webhook(
+            url,
+            payload=render_slack(subject, intro, rows),
+            timeout=_SLACK_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - the alerter must never raise
+        log.error("failure_alert: could not reach Slack to post %r", subject)
+        return False
+    if not response.is_success:
+        # Slack answers a dead or revoked webhook with 404 `no_service` / 403
+        # `invalid_token`. The response body can echo the request, so it is not
+        # logged either.
+        log.error(
+            "failure_alert: Slack rejected the alert (HTTP %s) for %r",
+            response.status_code,
+            subject,
+        )
+        return False
+    log.warning("failure_alert: posted to Slack %r", subject)
+    return True
+
+
+async def deliver_alert(subject: str, intro: str, rows: list[tuple[str, str]]) -> bool:
+    """Deliver one alert to EVERY configured channel. True if any of them landed.
+
+    Renders once and fans out. The sends run CONCURRENTLY with
+    ``return_exceptions=True`` so that:
+
+      * the delivery step costs max(email, slack) rather than their sum — this
+        sits on a request that is already failing, so wall time matters; and
+      * one channel being down cannot suppress the other. That independence is
+        the entire reason for having a second channel, and an
+        ``await email(); await slack()`` sequence would quietly lose it the first
+        time the leading call raised.
+
+    ``return_exceptions=True`` is belt-and-braces: both helpers already swallow
+    everything. It is here so that a future edit forgetting that rule degrades
+    into a missed alert rather than an exception raised on the failure path of an
+    already-broken request.
+    """
+    results = await asyncio.gather(
+        _send_email(subject, intro, rows),
+        _send_slack(subject, intro, rows),
+        return_exceptions=True,
+    )
+    return any(r is True for r in results)
 
 
 # --------------------------------------------------------------- entry points --
 
 
-def alerting_enabled() -> bool:
-    """Alerting is ON only when there is somewhere to send and something to send
-    with. Unset recipients is the single off switch — it keeps local runs, the
-    test suite, CI and preview deployments silent with no second flag."""
+def email_alerting_enabled() -> bool:
+    """Email alerting is ON only when there is somewhere to send and something to
+    send with. Unset recipients is its single off switch."""
     settings = get_settings()
     return bool(settings.alert_recipients and settings.alert_sender and settings.resend_api_key)
+
+
+def slack_alerting_enabled() -> bool:
+    """Slack alerting is ON iff a webhook URL is configured. The URL is both the
+    destination and the credential, so there is nothing else to check — and one
+    setting means one off switch, exactly matching ``ALERT_EMAIL_TO``."""
+    return bool(get_settings().slack_webhook)
+
+
+def alerting_enabled() -> bool:
+    """Alerting is ON when AT LEAST ONE channel is configured.
+
+    Unset-means-off, per channel, is what keeps local runs, the test suite, CI and
+    preview deployments silent with no second flag to remember — and OR-ing the
+    channels is what lets a deployment page Slack without a mailbox, or the
+    reverse. Every piece of detection work in this module and in
+    ``failure_monitor`` is gated on this, so "neither configured" still costs
+    nothing on the hot path of every request."""
+    return email_alerting_enabled() or slack_alerting_enabled()
 
 
 async def note_failure(signal: FailureSignal, *, process_sustained: bool) -> None:
@@ -554,7 +702,7 @@ async def _note_failure_durable(signal: FailureSignal) -> None:
     if incident is None:
         return
     subject, rows = render_alert(incident)
-    await send_alert_email(
+    await deliver_alert(
         subject,
         "The API has been failing for long enough to be an incident. "
         "You will get one more email when it clears.",
@@ -596,7 +744,7 @@ async def _note_success_durable() -> None:
 
 async def _send_recovery(incident: dict) -> None:
     subject, rows = render_recovery(incident)
-    await send_alert_email(
+    await deliver_alert(
         subject, "The API is serving requests again. This incident is closed.", rows
     )
 
@@ -626,7 +774,7 @@ async def _degraded_alert(signal: FailureSignal, *, process_sustained: bool) -> 
     # Claim before sending, same rule as the durable path.
     _degraded_last_alert_at = now
     env = get_settings().environment
-    await send_alert_email(
+    await deliver_alert(
         f"[fa-web-api {env}] API failing (degraded alerting: dedup store unreachable)",
         "The API is failing AND the incident store could not be reached, which "
         "usually means the database itself is the problem. This alert is "

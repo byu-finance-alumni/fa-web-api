@@ -173,6 +173,11 @@ class _FakeSettings:
     alert_from_name = "BYU Finance Alumni API"
     alert_recipients = ["engineer@example.edu"]
     alert_sender = "alerts@example.edu"
+    # Email-only, which is what every test in THIS file is about. Slack delivery
+    # is the same alert through a second channel and is covered end to end in
+    # tests/test_slack_alerts.py; leaving it unset here keeps these assertions
+    # counting Resend payloads and nothing else.
+    slack_webhook = None
 
 
 @pytest.fixture
@@ -415,6 +420,7 @@ def test_alerting_is_off_unless_it_is_configured(monkeypatch, table):
             alert_recipients=[],
             alert_sender=None,
             alert_from_name="x",
+            slack_webhook=None,
         ),
     )
     asyncio.run(_fail(table, times=20, gap=15))

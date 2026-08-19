@@ -103,6 +103,29 @@ class Settings(BaseSettings):
     # moved to their own address later without touching the survey identity.
     alert_from_email: str | None = Field(default=None)  # ALERT_FROM_EMAIL
     alert_from_name: str = Field(default="BYU Finance Alumni API")
+    # Slack incoming-webhook URL alerts are ALSO posted to (#456). Same on/off
+    # rule as ALERT_EMAIL_TO above and for the same reason: UNSET DISABLES SLACK
+    # ENTIRELY, so local runs, the test suite, CI and preview deployments stay
+    # silent without a second flag to remember to turn off. The two channels are
+    # independently optional -- email only, Slack only, both, or neither -- so a
+    # deployment can page a channel without a mailbox, or the reverse.
+    #
+    # This is a SECRET: the URL is the entire credential (anyone holding it can
+    # post to the channel), so it lives only in backend env vars, is never
+    # returned by an endpoint, and is never logged. Nothing in this app renders
+    # it; the alerter logs the failure, never the target.
+    slack_alert_webhook_url: str | None = Field(default=None)  # SLACK_ALERT_WEBHOOK_URL
+
+    @property
+    def slack_webhook(self) -> str | None:
+        """The Slack incoming-webhook URL, or None when Slack alerting is off.
+
+        Whitespace-only is treated as unset: Vercel env vars are edited in a web
+        form and an accidental space would otherwise read as "configured" and
+        turn every alert into a failed HTTP POST.
+        """
+        raw = (self.slack_alert_webhook_url or "").strip()
+        return raw or None
 
     @property
     def alert_recipients(self) -> list[str]:

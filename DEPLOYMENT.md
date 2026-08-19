@@ -46,6 +46,7 @@ public deploy, rotate them in Supabase and use the new values below:
 | `CRON_SECRET` | long random string — protects the survey send-scheduler cron (see below). Optional; unset ⇒ the cron endpoint rejects everything. |
 | `ALERT_EMAIL_TO` | engineer address(es), comma-separated, that get the "the API is failing" / "the API recovered" emails (#444). Optional; **unset ⇒ alerting is off entirely**, which is the right setting everywhere except prod. |
 | `ALERT_FROM_EMAIL` | From-address for those alerts. Optional; falls back to `SURVEY_FROM_EMAIL`. Must be on the **verified** Resend domain — the dev domain is not verified, so alert sends fail there by design. |
+| `SLACK_ALERT_WEBHOOK_URL` | Slack **incoming-webhook** URL that alerts are also posted to (#456) — both the API-failure alerts and the new login-abuse alerts. Optional; **unset ⇒ Slack is off**, the same single-switch rule as `ALERT_EMAIL_TO`. The two channels are independent: email only, Slack only, both, or neither. ⚠️ The URL is a **credential** (anyone holding it can post to the channel) — set it as a normal encrypted env var, never anywhere the frontend can read it, and rotate it by deleting and re-adding the webhook in Slack. |
 
 > Use the **transaction pooler (6543)**, not the session pooler (5432), on
 > serverless. The DB layer detects `:6543` and disables prepared-statement

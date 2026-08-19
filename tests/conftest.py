@@ -17,6 +17,7 @@ from app.api.dependencies.auth import get_permission_config
 from app.core import failure_monitor, rate_limit
 from app.core.capabilities import DEFAULT_GRANTS
 from app.main import app
+from app.services import failure_alert
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +50,13 @@ def _fresh_failure_monitor():
     keeps its report/probe throttle in module-level state, so one test that makes
     the API return a 5xx would otherwise spend the throttle for whatever runs
     next and make an alerting assertion depend on test ordering.
+
+    ``failure_alert`` keeps a SECOND, separate piece of module state -- the
+    degraded-path cooldown used when the dedup database is itself unreachable.
+    Resetting only the monitor left that one shared: whichever degraded test ran
+    first spent the cooldown and the next one silently observed zero emails.
+    That passed locally and failed in CI purely on collection order.
     """
     failure_monitor.reset()
+    failure_alert.reset_degraded_state()
     yield

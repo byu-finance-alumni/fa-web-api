@@ -62,7 +62,11 @@ from app.schemas.alumni import (
 )
 from app.services import alumni as alumni_service
 from app.services import alumni_export, hygiene
-from scripts.export_intake_template import _ALUMNI_COLUMNS, _FRIEND_COLUMNS
+from scripts.export_intake_template import (
+    _ALUMNI_COLUMNS,
+    _FRIEND_COLUMNS,
+    is_placeholder_header,
+)
 
 log = logging.getLogger(__name__)
 
@@ -103,8 +107,13 @@ MAX_IMPORT_ROWS = 2000
 # ("Home country" is NOT part of this block — it's the country of ORIGIN, about
 # the alum, and stays on core.home_country.)
 #
-# Keys are the EXACT header text from the finalized 66-column intake template, in
-# that order, so a drift in the template surfaces as a header error here.
+# Keys are the EXACT header text of the 68 REAL intake-template columns (the two
+# inert placeholder columns are deliberately absent — see TEMPLATE_HEADERS), so a
+# drift in the template surfaces as a header error here rather than silently
+# writing a pasted value into the wrong field. The literal order BELOW groups
+# related fields for readability and is NOT the template's column order — import
+# resolves every cell by header NAME, never by position, which is why the #448
+# reorder could not rebind a single column.
 
 _MAPPING: dict[str, tuple[str, str, str]] = {
     "Filled out Survey": ("core", "survey_completed_date", "date"),
@@ -245,11 +254,35 @@ _MAPPING: dict[str, tuple[str, str, str]] = {
     "Best Contact": ("contact", "best_contact", "str"),
 }
 
-# Ordered list of expected headers — same source + order as the xlsx Alumni
-# sheet (the template generator's _ALUMNI_COLUMNS). Used for header validation
-# and to build the downloadable CSV template.
-EXPECTED_HEADERS: list[str] = [header for header, _ in _ALUMNI_COLUMNS]
-EXAMPLE_ROW: list[str] = [example for _, example in _ALUMNI_COLUMNS]
+# --- Template layout vs. required columns ------------------------------------
+#
+# TEMPLATE_HEADERS is what we HAND OUT: every column of the xlsx Alumni sheet in
+# order, including the inert placeholders that keep our column positions lined up
+# with the department's source spreadsheet (#448).
+#
+# EXPECTED_HEADERS is what we REQUIRE on upload: the same list with the
+# placeholders removed. Keeping the two apart is what makes a placeholder inert —
+# it is never required, never mapped, and never counted in the pinned column
+# total, so a genuinely missing column can't hide behind one. It also keeps the
+# reorder backwards-compatible: a sheet downloaded before #448 has neither the
+# placeholders nor the new order, and still imports (validation is by header
+# NAME, not position).
+TEMPLATE_HEADERS: list[str] = [header for header, _ in _ALUMNI_COLUMNS]
+TEMPLATE_EXAMPLE_ROW: list[str] = [example for _, example in _ALUMNI_COLUMNS]
+
+PLACEHOLDER_HEADERS: tuple[str, ...] = tuple(
+    header for header in TEMPLATE_HEADERS if is_placeholder_header(header)
+)
+
+EXPECTED_HEADERS: list[str] = [
+    header for header, _ in _ALUMNI_COLUMNS if not is_placeholder_header(header)
+]
+# The example row aligned to EXPECTED_HEADERS (the handed-out template uses
+# TEMPLATE_EXAMPLE_ROW instead). Kept because it is the row that pairs with the
+# REQUIRED column list — any caller building a minimal valid file wants this one.
+EXAMPLE_ROW: list[str] = [
+    example for header, example in _ALUMNI_COLUMNS if not is_placeholder_header(header)
+]
 
 # --- Friend (non-alumni contact) column set (#294) ---------------------------
 #
@@ -667,7 +700,14 @@ def _parse_and_map(
     if partial:
         headers = [_match_known_header(h, expected) for h in headers]
         header_errors = _validate_partial_headers(headers, expected)
-        ignored = [h for h in headers if h and h not in set(expected)]
+        # Placeholder columns are ours and always ignored, so they are not worth
+        # reporting back as "columns we didn't recognize" — that list is meant to
+        # surface the user's own stray columns.
+        ignored = [
+            h
+            for h in headers
+            if h and h not in set(expected) and not is_placeholder_header(h)
+        ]
     else:
         header_errors = _validate_headers(headers, expected)
     if header_errors:
@@ -764,7 +804,11 @@ def _validate_headers(headers: list[str], expected_headers: list[str]) -> list[s
         if missing not in seen:
             errors.append(f"Missing required column: {missing!r}.")
     for extra in headers:
-        if extra and extra not in expected:
+        # Placeholder columns (#448) are ours — they ship in the template purely
+        # to hold a source-spreadsheet position. Accept and discard them so a
+        # file made from the template round-trips instead of being rejected as
+        # carrying unexpected columns.
+        if extra and extra not in expected and not is_placeholder_header(extra):
             errors.append(f"Unexpected column: {extra!r}.")
     # Wrong-delimiter hint: a single "column" carrying several ';'/tab separators
     # is almost always a semicolon/tab-delimited file fed to a comma parser.
@@ -1960,6 +2004,26 @@ async def _build_update_model(
         }
         merged.update(provided)
         partial[section] = merged
+        # #446 — a sheet has no "this is a new role" checkbox, so when the
+        # Employer cell names a DIFFERENT employer than the one on file, the
+        # outgoing role is demoted into employment_history. Decided by the product
+        # owner on 2026-08-18, over leaving import as the one path that never
+        # archives; see `alumni_service.employer_changed` for exactly what counts
+        # as different and for the accepted cost (a vendor sheet that spells
+        # employers differently, or a cleanup pass, can mint prior roles nobody
+        # held).
+        #
+        # Setting the SAME flag the staff checkbox sets, rather than archiving
+        # here, is what keeps the three paths writing identical rows: the whole
+        # demotion, its audit row and its change set all happen inside
+        # `update_alumni` exactly as they do for a hand edit. A blank Employer
+        # cell cannot fire it — `merged` has just filled it from the stored row,
+        # so the two sides compare equal.
+        if section == "career" and alumni_service.employer_changed(
+            getattr(current_row, "current_employer", None),
+            merged.get("current_employer"),
+        ):
+            partial["archive_previous_role"] = True
     return AlumniUpdateFull(**partial)
 
 
@@ -2105,15 +2169,21 @@ async def commit_update(
 def build_template_csv(friend: bool = False) -> str:
     """Return the import template as CSV text: the exact headers plus one example
     row. Derived from the same column source as the xlsx template. ``friend=True``
-    returns the curated friend (non-alumni contact) column set (#294)."""
+    returns the curated friend (non-alumni contact) column set (#294).
+
+    The alumni template emits :data:`TEMPLATE_HEADERS` — the FULL sheet layout,
+    inert placeholders included — so its columns line up with the department's
+    source spreadsheet and a whole-block paste lands in the right fields (#448).
+    Re-uploading this file is fine: the placeholders are accepted and discarded.
+    """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     if friend:
         writer.writerow(FRIEND_EXPECTED_HEADERS)
         writer.writerow(FRIEND_EXAMPLE_ROW)
     else:
-        writer.writerow(EXPECTED_HEADERS)
-        writer.writerow(EXAMPLE_ROW)
+        writer.writerow(TEMPLATE_HEADERS)
+        writer.writerow(TEMPLATE_EXAMPLE_ROW)
     return buffer.getvalue()
 
 
@@ -2122,7 +2192,9 @@ def build_template_csv(friend: bool = False) -> str:
 # The inverse of the empty template above: emit a FILLED intake-template CSV for
 # one graduation-year cohort, so staff can download the cohort, edit cells
 # offline, and re-upload through ``POST /alumni/import/update`` (the bulk-update
-# path above). The header row is EXACTLY :data:`EXPECTED_HEADERS` and every cell
+# path above). The header row is EXACTLY :data:`TEMPLATE_HEADERS` — the same
+# layout as the blank template, inert placeholders included, so the cohort file
+# and the template have ONE column order (#448) — and every cell
 # is formatted to the template's TEXT form (dates -> YYYY-MM-DD, bools -> Yes/No,
 # ints -> str), so the file round-trips: a value written here re-parses via
 # ``_map_row`` back to the same value.
@@ -2185,7 +2257,7 @@ async def build_cohort_update_csv(
     ``build_alumni_query`` — same archived / alumni-vs-friend gating the list and
     export use), plus their 1:1 contact / career / education / engagement rows
     (batch-loaded once each, no N+1). Emits a CSV whose header row is EXACTLY
-    ``EXPECTED_HEADERS`` and whose cells are reverse-mapped through ``_MAPPING``
+    ``TEMPLATE_HEADERS`` and whose cells are reverse-mapped through ``_MAPPING``
     and formatted for a clean re-import.
 
     Enforces the SAME hard row cap as the customizable export
@@ -2220,10 +2292,10 @@ async def build_cohort_update_csv(
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(EXPECTED_HEADERS)
+    writer.writerow(TEMPLATE_HEADERS)
     for alumnus in alumni:
         row_out: list[str] = []
-        for header in EXPECTED_HEADERS:
+        for header in TEMPLATE_HEADERS:
             target = _MAPPING.get(header)
             if target is None:
                 row_out.append("")  # no clean single-field source -> blank

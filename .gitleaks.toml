@@ -13,4 +13,8 @@ description = "Test-only dummy secrets (offline HS256 JWT tests in tests/test_au
 # secret accidentally added to a test would still be flagged.
 regexes = [
   '''(test|wrong)-secret-0123456789-abcdefghij-klmno''',
+  # tests/test_failure_alert.py: a fake signed blob used to prove the alert
+  # scrubber replaces an opaque survey token with {id} before it can reach a
+  # mailbox. Not a credential, and it decodes to {"alg":"HS256"} and filler.
+  '''eyJhbGciOiJIUzI1NiJ9\.abcdefghijklmnopqrstuvwxyz0123456789''',
 ]

@@ -31,6 +31,7 @@ from app.models.maintenance import MaintenanceMode
 from app.models.note import Note
 from app.models.opportunity_link import OpportunityLink
 from app.models.role_capability import RoleCapability
+from app.models.service_incident import ServiceIncident
 from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
 from app.models.survey_retirement import SurveyCampaignRetirement
@@ -69,6 +70,7 @@ __all__ = [
     "OpportunityLink",
     "Role",
     "RoleCapability",
+    "ServiceIncident",
     "StatusLabel",
     "Survey",
     "SurveyCampaignRetirement",

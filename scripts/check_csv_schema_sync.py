@@ -14,7 +14,9 @@ This check asserts, for each CSV surface, that:
     (so adding a header without wiring it — or wiring a header that no longer
     exists — fails here, not in production), and
   * any controlled-vocabulary column a CSV constrains resolves to a non-empty
-    canonical source.
+    canonical source, and
+  * the alumni intake template's inert placeholder columns (#448) stay inert —
+    never mapped, never required, never counted toward the pinned column total.
 
 Covered surfaces (extend ``CHECKS`` for future ones):
 
@@ -160,6 +162,59 @@ def _check_friend_import(errors: list[str]) -> None:
             )
 
 
+def _check_intake_placeholders(errors: list[str]) -> None:
+    """The intake template's inert placeholder columns (#448) must stay inert.
+
+    Placeholders exist only to hold a source-spreadsheet column position so a
+    whole-block paste lands in the right fields. If one ever became importable —
+    or if a REAL column were silently reclassified as a placeholder — a pasted
+    value would land in the wrong field, or a genuinely missing column would hide
+    behind the placeholder instead of failing the pinned column count.
+    """
+    from app.services import import_csv
+
+    surface = "alumni intake template (#448 placeholders)"
+    template = import_csv.TEMPLATE_HEADERS
+    expected = import_csv.EXPECTED_HEADERS
+
+    for header in import_csv.PLACEHOLDER_HEADERS:
+        if header in import_csv._MAPPING:
+            errors.append(
+                f"[{surface}] placeholder column {header!r} is bound in _MAPPING — "
+                f"a placeholder must never map to a field."
+            )
+        if header in expected:
+            errors.append(
+                f"[{surface}] placeholder column {header!r} is in EXPECTED_HEADERS — "
+                f"placeholders must not be required on upload or counted."
+            )
+        if header in import_csv.FRIEND_EXPECTED_HEADERS:
+            errors.append(
+                f"[{surface}] placeholder column {header!r} leaked into the friend "
+                f"template, which carries no placeholders."
+            )
+
+    # The template layout must be EXPECTED_HEADERS with the placeholders spliced
+    # in — same columns, same relative order. Anything else means the handed-out
+    # sheet and the importer's column list have drifted.
+    stripped = [h for h in template if not import_csv.is_placeholder_header(h)]
+    if stripped != expected:
+        errors.append(
+            f"[{surface}] TEMPLATE_HEADERS minus placeholders != EXPECTED_HEADERS — "
+            f"the template layout and the importer's column list have drifted "
+            f"(template has {len(stripped)} real columns, importer expects "
+            f"{len(expected)})."
+        )
+    for header in template:
+        if import_csv.is_placeholder_header(header) and header not in set(
+            import_csv.PLACEHOLDER_HEADERS
+        ):
+            errors.append(
+                f"[{surface}] template column {header!r} looks like a placeholder "
+                f"but is not declared in PLACEHOLDER_HEADERS."
+            )
+
+
 def _check_alumni_export(errors: list[str]) -> None:
     from app.services import alumni_export
 
@@ -234,6 +289,7 @@ def _check_industry_vocab(errors: list[str]) -> None:
 CHECKS = (
     _check_alumni_import,
     _check_friend_import,
+    _check_intake_placeholders,
     _check_alumni_export,
     _check_events_import,
     _check_donations_import,

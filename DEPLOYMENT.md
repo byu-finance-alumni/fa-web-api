@@ -44,6 +44,8 @@ public deploy, rotate them in Supabase and use the new values below:
 | `ENVIRONMENT` | `production` |
 | `DEBUG` | `false` |
 | `CRON_SECRET` | long random string — protects the survey send-scheduler cron (see below). Optional; unset ⇒ the cron endpoint rejects everything. |
+| `ALERT_EMAIL_TO` | engineer address(es), comma-separated, that get the "the API is failing" / "the API recovered" emails (#444). Optional; **unset ⇒ alerting is off entirely**, which is the right setting everywhere except prod. |
+| `ALERT_FROM_EMAIL` | From-address for those alerts. Optional; falls back to `SURVEY_FROM_EMAIL`. Must be on the **verified** Resend domain — the dev domain is not verified, so alert sends fail there by design. |
 
 > Use the **transaction pooler (6543)**, not the session pooler (5432), on
 > serverless. The DB layer detects `:6543` and disables prepared-statement

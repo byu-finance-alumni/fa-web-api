@@ -442,6 +442,29 @@ def test_degraded_alerting_when_the_dedup_store_is_down(sent, monkeypatch):
     assert len(sent) == 1
 
 
+def test_degraded_alerting_fires_on_a_freshly_booted_instance(sent, monkeypatch):
+    """A COLD instance must still be able to send the first degraded alert.
+
+    `time.monotonic()` counts from an arbitrary origin -- on Linux, machine boot
+    -- so seconds after start it returns a small number. When the cooldown
+    baseline was initialised to 0.0, `now - 0.0 < 1800` was TRUE on any instance
+    younger than half an hour, and the alert was dropped as a duplicate of one
+    that had never been sent.
+
+    That is the worst possible place for the bug: on Vercel every cold start is a
+    fresh instance, so the suppressed alert is the first one after a deploy, or
+    the one where the database went down and took the durable dedup store with
+    it. It passed on a developer machine with 28 hours of uptime and failed in
+    CI, whose runners boot seconds before the tests.
+    """
+    monkeypatch.setattr(failure_alert.time, "monotonic", lambda: 3.0)
+
+    asyncio.run(failure_alert.note_failure(_signal(), process_sustained=True))
+
+    assert len(sent) == 1
+    assert "degraded" in sent[0]["subject"]
+
+
 def test_degraded_alerting_still_ignores_a_blip(sent, monkeypatch):
     """A single failure plus a flaky connection is not an incident."""
     monkeypatch.setattr(failure_alert.database, "SessionLocal", None)

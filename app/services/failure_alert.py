@@ -147,13 +147,24 @@ _DEGRADED_COOLDOWN_SECONDS = 1800
 
 # Module state for the degraded path ONLY. Deliberately the sole piece of memory
 # in this module, and it is never trusted while the database is answering.
-_degraded_last_alert_at: float = 0.0
+#
+# None means "has never alerted", and it MUST NOT be 0.0. `time.monotonic()` is
+# measured from an arbitrary origin -- on Linux, machine boot -- so on a freshly
+# started instance it returns a small number. Against a 0.0 initial value the
+# cooldown check below then reads as "we alerted moments ago" and swallows the
+# alert for the first half hour of that instance's life. On Vercel every cold
+# start is a fresh instance, so the alert most likely to be suppressed is the
+# first one after a deploy, or the one where the database went down and took
+# the durable dedup store with it. CI caught this because its runners boot
+# seconds before the tests run; it passed locally only because that machine had
+# been up for 28 hours.
+_degraded_last_alert_at: float | None = None
 
 
 def reset_degraded_state() -> None:
     """Clear the degraded-path cooldown. For tests (see tests/conftest.py)."""
     global _degraded_last_alert_at
-    _degraded_last_alert_at = 0.0
+    _degraded_last_alert_at = None
 
 
 @dataclass(frozen=True)
@@ -607,7 +618,10 @@ async def _degraded_alert(signal: FailureSignal, *, process_sustained: bool) -> 
     if not process_sustained:
         return
     now = time.monotonic()
-    if now - _degraded_last_alert_at < _DEGRADED_COOLDOWN_SECONDS:
+    if (
+        _degraded_last_alert_at is not None
+        and now - _degraded_last_alert_at < _DEGRADED_COOLDOWN_SECONDS
+    ):
         return
     # Claim before sending, same rule as the durable path.
     _degraded_last_alert_at = now

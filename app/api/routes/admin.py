@@ -5,6 +5,10 @@ user's password, edit a user's name, and create a brand-new login user. Creating
 a user provisions a Supabase *auth* identity over the Admin API (service-role
 key, server-side only) and returns a one-time temporary password exactly once —
 the same security posture as the password-reset flow (see docs/PRE-LAUNCH.md).
+
+Also hosts the ENGINEER-gated security screens, which are a different audience
+from the super_admin user administration above: the sign-in log, the failed
+sign-in log, and the live-session inventory with its revoke controls.
 """
 
 import datetime
@@ -12,6 +16,7 @@ import logging
 import re
 import secrets
 import unicodedata
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -33,6 +38,7 @@ from app.core.rate_limit import (
     CreateUserRateLimit,
     DeleteUserRateLimit,
     ResetPasswordRateLimit,
+    RevokeSessionRateLimit,
 )
 from app.core.roles import ROLE_LABELS, ROLE_ORDER, RoleName
 from app.core.security import AuthorizationError
@@ -43,6 +49,7 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
+from app.services import auth_sessions
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -531,6 +538,323 @@ async def list_login_failures(
 
     return LoginFailurePage(
         items=items, total=int(total or 0), limit=limit, offset=offset
+    )
+
+
+# --- Live sessions: see them, and end them -----------------------------------
+#
+# The neighbouring engineer tabs above are HISTORIES — who signed in, who failed
+# to. This one is an INVENTORY: which sessions are alive right now. It exists
+# because Supabase sessions run for up to 400 days by default and this app's idle
+# timeout is browser-memory only (#684), so a session opened weeks ago is still a
+# live credential — and until now the only way to see one was to query
+# ``auth.sessions`` by hand against production, and the only way to end one was
+# to write a DELETE.
+#
+# HOW REVOCATION ACTUALLY ENDS ACCESS (both halves, and why one is not enough) is
+# documented at length in app/services/auth_sessions.py. The short version: the
+# ``auth.sessions`` DELETE kills the refresh token so no new access token can be
+# minted, and the ``users.active_session_id`` sentinel (#147's machinery, reused
+# exactly as maintenance mode reuses it) invalidates the OUTSTANDING access token
+# on the very next request instead of leaving it valid until it expires. Both run
+# in one transaction, so a revoke cannot half-apply.
+
+
+class ActiveSessionRow(BaseModel):
+    """One live Supabase session.
+
+    ``user_id``/``roles`` come from OUR ``users`` table via the auth id; both are
+    null/empty for a Supabase auth identity with no application user row, which
+    is shown rather than hidden because a live session on one is an anomaly worth
+    seeing. ``age_seconds`` is measured from ``created_at`` and is the number the
+    screen exists to surface; ``idle_seconds`` runs from ``last_active_at``
+    (the newest of created / updated / last-refreshed).
+
+    ``is_current`` marks the caller's OWN session, so revoking it can be
+    presented as the deliberate act it is. ``is_account_active_session`` says
+    whether this is the session our API currently honours for that account
+    (``users.active_session_id``) — a false here means #147 is already rejecting
+    it even though Supabase would still refresh it.
+    """
+
+    session_id: uuid.UUID
+    user_id: int | None = None
+    email: str | None = None
+    roles: list[str] = []
+    account_active: bool
+    created_at: datetime.datetime
+    last_active_at: datetime.datetime
+    refreshed_at: datetime.datetime | None = None
+    age_seconds: int
+    idle_seconds: int
+    is_current: bool
+    is_account_active_session: bool
+
+
+class ActiveSessionPage(BaseModel):
+    """A page of live sessions, OLDEST FIRST, with the total for pagination.
+
+    Oldest-first is the opposite of the neighbouring log endpoints and is
+    deliberate: the row that matters is the one that has been open for five
+    weeks, so it must not be paged past.
+    """
+
+    items: list[ActiveSessionRow]
+    total: int
+    limit: int
+    offset: int
+
+
+class SessionRevokeResult(BaseModel):
+    """Outcome of a revoke.
+
+    ``sessions_deleted`` counts ``auth.sessions`` rows removed (the Supabase
+    half). ``access_revoked`` says whether the ``users.active_session_id``
+    sentinel was stamped (our half) — i.e. whether any outstanding access token
+    on that account was invalidated immediately rather than left to expire.
+    ``self_revoked`` is true when the caller ended their own current session and
+    is about to be signed out.
+    """
+
+    revoked: bool
+    sessions_deleted: int
+    access_revoked: bool
+    self_revoked: bool
+    user_id: int | None = None
+    email: str | None = None
+
+
+@router.get("/sessions", response_model=ActiveSessionPage)
+async def list_active_sessions(
+    actor: RequireEngineer,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> ActiveSessionPage:
+    """List every LIVE Supabase session, oldest first (paginated). Engineer only.
+
+    Backs the Admin -> Sessions tab. Rows come from ``auth.sessions`` joined to
+    our ``users``/``roles`` tables, filtered to sessions that have not expired.
+    Engineer-gated and paginated (default 50, hard cap 200) exactly like the
+    logins / login-failures endpoints.
+
+    Reading the inventory is itself audited (``read_active_sessions``; actor +
+    applied limit/offset) — the returned rows are not logged. As with every other
+    engineer action, the audit layer reroutes an engineer's ``AuditLog`` to
+    ``engineer_action_log`` (#199).
+
+    NOT rate-limited, on purpose: this is the read an engineer uses to DECIDE
+    what to revoke, and throttling it would brake the recovery path rather than
+    the destructive one (the same reasoning that leaves maintenance-mode DISABLE
+    unthrottled).
+    """
+    rows, total = await auth_sessions.list_active(
+        session, limit=limit, offset=offset
+    )
+    now = datetime.datetime.now(datetime.UTC)
+    items = [
+        ActiveSessionRow(
+            session_id=r["session_id"],
+            user_id=r["user_id"],
+            email=r["email"],
+            roles=list(r["roles"] or []),
+            account_active=bool(r["account_active"]),
+            created_at=r["created_at"],
+            last_active_at=r["last_active_at"],
+            refreshed_at=r["refreshed_at"],
+            age_seconds=auth_sessions.age_seconds(r["created_at"], now),
+            idle_seconds=auth_sessions.age_seconds(r["last_active_at"], now),
+            is_current=(
+                actor.session_id is not None
+                and str(r["session_id"]) == actor.session_id
+            ),
+            is_account_active_session=bool(r["is_account_active_session"]),
+        )
+        for r in rows
+    ]
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_active_sessions",
+            entity_type="auth_session",
+            field_name=f"limit={limit};offset={offset}",
+        )
+    )
+    await session.commit()
+
+    return ActiveSessionPage(
+        items=items, total=total, limit=limit, offset=offset
+    )
+
+
+@router.delete("/sessions/{session_id}", response_model=SessionRevokeResult)
+async def revoke_active_session(
+    session_id: uuid.UUID,
+    actor: RevokeSessionRateLimit,
+    session: SessionDep,
+    confirm_self: Annotated[bool, Query()] = False,
+) -> SessionRevokeResult:
+    """Revoke ONE live session. Engineer only. Destructive and irreversible —
+    the person is signed out and must sign in again.
+
+    Both halves, in one transaction (see app/services/auth_sessions.py):
+      1. DELETE the ``auth.sessions`` row. ``auth.refresh_tokens`` cascades, so
+         no new access token can ever be minted for that session.
+      2. Stamp ``users.active_session_id`` with a ``revoked:<uuid4>`` sentinel
+         when — and only when — that is needed to kill the OUTSTANDING access
+         token: the session is the account's currently-honoured one, or the
+         account has no claimed session at all (NULL fails open under #147). If
+         the account has since claimed a DIFFERENT session, we do not stamp:
+         #147 already rejects the revoked one, and stamping would sign the user
+         out of the session they are legitimately using.
+
+    SELF-REVOCATION (the lockout question). Ending your own current session is a
+    legitimate thing to want — "sign me out of this device" — so it is allowed,
+    but never as a side effect: it requires an explicit ``confirm_self=true``,
+    and without it the call is refused (409) with nothing changed. The flag is
+    the deliberate act; the confirmation dialog in the console is the second.
+
+    It is NOT irrecoverable, and that is the point worth being explicit about.
+    Unlike maintenance mode — where the switch that pauses the site could hide
+    the switch that un-pauses it — nothing here touches the ability to sign in:
+    the account is not locked, not deactivated, the password is unchanged, and
+    ``POST /auth/login`` runs on the force-change-EXEMPT resolver, which does NOT
+    enforce the single-session guard. So the very next sign-in re-claims
+    ``active_session_id`` and clears the sentinel. The guard exists to prevent an
+    ACCIDENT, not to prevent a lockout that cannot happen.
+
+    404 if the session no longer exists (already expired, already revoked, or the
+    listing was stale) — deliberately not a silent success, so the console does
+    not report ending access it did not end.
+    """
+    self_revoke = (
+        actor.session_id is not None and str(session_id) == actor.session_id
+    )
+    if self_revoke and not confirm_self:
+        # Checked BEFORE anything is written, so a refusal changes nothing.
+        raise ConflictError(
+            "That is the session you are signed in with. Confirm that you want "
+            "to sign yourself out of it."
+        )
+
+    # --- Supabase half ---
+    auth_user_id = await auth_sessions.delete_supabase_session(session, session_id)
+    if auth_user_id is None:
+        # Nothing was deleted, so nothing was committed; roll back the empty
+        # transaction rather than leaving it open.
+        await session.rollback()
+        raise NotFoundError("That session no longer exists.")
+
+    # --- our half ---
+    target = await session.scalar(
+        select(User).where(User.auth_user_id == auth_user_id)
+    )
+    access_revoked = False
+    if target is not None and auth_sessions.should_stamp_sentinel(
+        active_session_id=target.active_session_id,
+        revoked_session_id=str(session_id),
+    ):
+        target.active_session_id = auth_sessions.new_sentinel()
+        target.active_session_at = datetime.datetime.now(datetime.UTC)
+        access_revoked = True
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="revoke_session",
+            entity_type="auth_session",
+            entity_id=target.user_id if target is not None else None,
+            field_name="session_id",
+            old_value=str(session_id),
+            new_value=(
+                f"revoked access_revoked={str(access_revoked).lower()} "
+                f"self={str(self_revoke).lower()}"
+            ),
+        )
+    )
+    await session.commit()
+
+    return SessionRevokeResult(
+        revoked=True,
+        sessions_deleted=1,
+        access_revoked=access_revoked,
+        self_revoked=self_revoke,
+        user_id=target.user_id if target is not None else None,
+        email=target.email if target is not None else None,
+    )
+
+
+@router.delete("/users/{user_id}/sessions", response_model=SessionRevokeResult)
+async def revoke_user_sessions(
+    user_id: IdPath,
+    actor: RevokeSessionRateLimit,
+    session: SessionDep,
+    confirm_self: Annotated[bool, Query()] = False,
+) -> SessionRevokeResult:
+    """Revoke EVERY live session for one user. Engineer only. Destructive and
+    irreversible — the person is signed out on every device.
+
+    Same two halves as the single revoke, except the sentinel is ALWAYS stamped:
+    ending every session on the account is exactly what was asked for, so there
+    is no case where leaving an outstanding access token alive is correct. Runs
+    even when the user currently has zero ``auth.sessions`` rows — stamping the
+    sentinel still invalidates any access token already in flight, so "sign this
+    person out" does the whole job rather than most of it.
+
+    SELF-REVOCATION: this necessarily includes the caller's own current session
+    when they target themselves, so targeting your own account requires
+    ``confirm_self=true`` — the same explicit act the single revoke requires,
+    for the same reason (see ``revoke_active_session`` for why signing yourself
+    out is recoverable and therefore permitted at all).
+
+    SCOPE: there is deliberately no "revoke everything, everyone" endpoint. The
+    only mass sign-out in this app is maintenance mode, which is built to keep
+    engineers signed in precisely so the operator cannot strand themselves; a
+    second, unguarded fleet-wide revoke would reintroduce that risk for no
+    benefit this screen needs. Per-user is the widest blast radius offered here.
+    """
+    if user_id == actor.user_id and not confirm_self:
+        # Checked BEFORE anything is written, so a refusal changes nothing.
+        raise ConflictError(
+            "That is your own account. Confirm that you want to sign yourself "
+            "out everywhere, including this device."
+        )
+
+    target = await _load_user(session, user_id)
+
+    # --- Supabase half: every session row for this auth identity ---
+    deleted = await auth_sessions.delete_supabase_sessions_for_user(
+        session, target.auth_user_id
+    )
+
+    # --- our half: always, for this endpoint ---
+    target.active_session_id = auth_sessions.new_sentinel()
+    target.active_session_at = datetime.datetime.now(datetime.UTC)
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="revoke_user_sessions",
+            entity_type="user",
+            entity_id=user_id,
+            field_name="sessions",
+            old_value=target.email,
+            new_value=(
+                f"revoked sessions_deleted={deleted} "
+                f"self={str(user_id == actor.user_id).lower()}"
+            ),
+        )
+    )
+    await session.commit()
+
+    return SessionRevokeResult(
+        revoked=True,
+        sessions_deleted=deleted,
+        access_revoked=True,
+        self_revoked=user_id == actor.user_id,
+        user_id=user_id,
+        email=target.email,
     )
 
 

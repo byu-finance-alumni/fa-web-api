@@ -75,7 +75,8 @@ per (environment, source IP), and the alert is CLAIMED with
 concurrent transaction can win under READ COMMITTED.
 
 An incident is one CAMPAIGN from one source. It closes after
-``_INCIDENT_QUIET_SECONDS`` of silence from that source, so the same address
+``_INCIDENT_QUIET_SECONDS`` of silence from that source — which also sends the
+"that attack has stopped" report — so the same address
 coming back next week is a new incident and alerts again — dedup is per incident,
 not "one alert ever".
 
@@ -216,11 +217,25 @@ SPRAY_MIN_DISTINCT_EMAILS = 8
 # Every real source above clears it by a factor of six or more.
 BURST_MIN_ATTEMPTS = 30
 
-# An incident closes after this long with no failure from the source, so the same
-# address returning later is a NEW incident and alerts again. An hour: long enough
-# that a campaign pausing to re-target stays one incident and one message, short
-# enough that a genuinely separate visit next week is reported.
-_INCIDENT_QUIET_SECONDS = 3600
+# An incident closes after this long with no failure from the source. It is the
+# definition of "that campaign is over", so it decides TWO things at once and
+# they cannot be separated: when the "the attack has stopped" report goes out,
+# and when the same address returning counts as a NEW campaign worth announcing
+# again.
+#
+# FIVE MINUTES, down from an hour, at the owner's request: "after the attack has
+# stopped for 5 minutes from that ip tell me that the attack from that ip is
+# done". An hour was chosen to keep a campaign that pauses to re-target as one
+# message; five minutes accepts a second message in that case, which is the right
+# trade for a report that actually arrives while you still care. It is still long
+# enough that the gaps INSIDE a campaign do not split it -- every real source on
+# 2026-08-19 ran its whole campaign in under ten minutes, most in seconds.
+#
+# ⚠️ THE REPORT IS NOT A TIMER. Nothing in this stack runs on its own; the sweep
+# rides the next request the API serves after the window (see `note_success`). On
+# a quiet night the report waits for the next visitor. Five minutes is when it
+# becomes ELIGIBLE, not when it is guaranteed to arrive.
+_INCIDENT_QUIET_SECONDS = 300
 
 # One evaluation per process per this many seconds.
 #

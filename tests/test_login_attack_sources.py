@@ -226,34 +226,49 @@ def test_window_and_limit_are_echoed_and_applied():
     assert session.params[0] == {"window_seconds": 6 * 3600, "limit": 10}
 
 
-def test_defaults_to_a_recent_window():
-    """No params: a day of history, 50 sources. Sensible for a page you open
-    during an incident, and bounded so it cannot aggregate all of history."""
+def test_defaults_to_all_of_history():
+    """No params: EVERY attempt ever recorded, 50 sources.
+
+    It defaulted to 24 hours, and the morning after the first real campaigns
+    that made the table read as empty — the sources were a day old, so they aged
+    out overnight and the owner read it as the rows having been deleted. "Has
+    anyone ever come at us" has no window; the row cap is what bounds the answer.
+    """
     resp, session = _get([])
     body = resp.json()
-    assert body["window_hours"] == 24
+    assert body["window_hours"] is None
     assert body["limit"] == 50
-    assert session.params[0]["window_seconds"] == 24 * 3600
+    assert session.params[0]["window_seconds"] is None
 
 
 @pytest.mark.parametrize(
     "query",
-    ["?hours=0", "?hours=169", "?limit=0", "?limit=201", "?hours=-1"],
+    ["?hours=0", "?hours=8761", "?limit=0", "?limit=201", "?hours=-1"],
 )
 def test_window_and_limit_are_capped(query):
-    """A week of window and 200 sources are the ceilings; below/above is a 422
-    before any query runs."""
+    """A year of window and 200 sources are the ceilings; below/above is a 422
+    before any query runs.
+
+    The window cap moved from a week to a year when `hours` became optional. It
+    still exists — an explicit absurd value should be refused rather than
+    silently clamped — but it is deliberately high enough that the PARAMETER can
+    never be the thing that hides an incident. Omitting it entirely is the
+    supported way to ask for everything.
+    """
     resp, session = _get([], query)
     assert resp.status_code == 422
     assert session.params == []
 
 
-def test_empty_window_is_a_valid_answer_not_an_error():
-    """The state the page shows on a normal day: no sources, still a 200 with the
-    window, so the console can say "nothing in the last 24 hours"."""
+def test_no_sources_is_a_valid_answer_not_an_error():
+    """The state the page shows on a normal day: no sources, still a 200, so the
+    console can say "nothing has ever come at us" rather than showing an error.
+
+    ``window_hours`` is null here, which is the console's cue to say exactly
+    that instead of naming a window it did not apply."""
     resp, _ = _get([])
     assert resp.status_code == 200
-    assert resp.json() == {"items": [], "window_hours": 24, "limit": 50}
+    assert resp.json() == {"items": [], "window_hours": None, "limit": 50}
 
 
 def test_read_is_audited_with_the_applied_parameters():

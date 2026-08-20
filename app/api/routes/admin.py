@@ -334,7 +334,10 @@ class LoginAttackSourcePage(BaseModel):
     """
 
     items: list[LoginAttackSource]
-    window_hours: int
+    #: Hours of history summarised, or None for EVERY attempt ever recorded.
+    #: Echoed rather than assumed so the console states the window it actually
+    #: got instead of the one it asked for.
+    window_hours: int | None
     limit: int
 
 
@@ -754,10 +757,18 @@ async def list_login_failures(
 async def list_login_attack_sources(
     actor: RequireEngineer,
     session: SessionDep,
-    hours: Annotated[int, Query(ge=1, le=168)] = 24,
+    hours: Annotated[int | None, Query(ge=1, le=8760)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> LoginAttackSourcePage:
-    """Failed sign-ins rolled up per SOURCE IP over a recent window. Engineer only.
+    """Failed sign-ins rolled up per SOURCE IP. Engineer only.
+
+    ⚠️ OMITTING ``hours`` SUMMARISES EVERYTHING, and that is the console's
+    default. It used to default to 24 and cap at a week, which made yesterday's
+    incident disappear overnight — the morning after the first real campaigns the
+    owner read the empty table as "the rows were deleted" rather than "the window
+    moved". "Has anyone ever come at us" is the question this table answers, and
+    it has no window. A caller that wants one can still pass ``hours``; the cap
+    is a year, high enough not to be the thing that hides an incident.
 
     Backs the attack table on the engineer Maintenance page — the screen the
     owner opens during an incident. GET /admin/login-failures answers "what
@@ -797,12 +808,15 @@ async def list_login_attack_sources(
     source, and one "unknown" bucket would sum unrelated people into a row that
     looks like a campaign) — they remain visible per-attempt on /login-failures.
 
-    ``hours`` defaults to 24 and is capped at a week; ``limit`` defaults to 50
-    and is hard-capped at 200, mirroring the neighbouring log endpoints, so one
-    request cannot ask the database to aggregate unbounded history.
+    ``hours`` is optional (unset = all history) and capped at a year; ``limit``
+    defaults to 50 and is hard-capped at 200, mirroring the neighbouring log
+    endpoints. The row cap is what bounds the RESPONSE now that the time range
+    does not — and `login_failures` is an incident log that is purged on a
+    retention schedule, not a traffic log, so "all history" is small by
+    construction.
     """
     sources = await login_abuse.summarize_sources(
-        session, window_seconds=hours * 3600, limit=limit
+        session, window_seconds=None if hours is None else hours * 3600, limit=limit
     )
 
     session.add(

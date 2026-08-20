@@ -502,6 +502,10 @@ def classify_source(attempts: int, distinct_emails: int) -> str:
 # unit is a SOURCE, and one "unknown" bucket would sum unrelated people into a
 # row that looks like a campaign. They are still visible per-attempt on the
 # Login-failures page, which the console links to.
+#: The aggregate, with the time predicate written so that a NULL window means
+#: EVERY attempt ever recorded rather than none of them. One statement, not two:
+#: a second copy differing only in a WHERE clause is how the windowed and
+#: all-time views end up disagreeing about what an attack was.
 _SQL_SOURCES = text(
     """
     SELECT ip_address,
@@ -513,7 +517,11 @@ _SQL_SOURCES = text(
            max(region)           AS region,
            max(country)          AS country
       FROM login_failures
-     WHERE occurred_at >= now() - (:window_seconds * interval '1 second')
+     WHERE (
+             CAST(:window_seconds AS integer) IS NULL
+             OR occurred_at >= now()
+                - (CAST(:window_seconds AS integer) * interval '1 second')
+           )
        AND ip_address IS NOT NULL
      GROUP BY ip_address
      ORDER BY count(*) DESC, max(occurred_at) DESC
@@ -523,9 +531,16 @@ _SQL_SOURCES = text(
 
 
 async def summarize_sources(
-    session: AsyncSession, *, window_seconds: int, limit: int
+    session: AsyncSession, *, window_seconds: int | None, limit: int
 ) -> list[dict]:
-    """Group recent ``login_failures`` by source IP, busiest first.
+    """Group ``login_failures`` by source IP, busiest first.
+
+    ``window_seconds=None`` means EVERY attempt ever recorded. The console asks
+    for that by default: a 24-hour window made yesterday's incident vanish
+    overnight, which reads as "the data was deleted" rather than "the window
+    moved" -- it did exactly that to the owner the morning after the first real
+    campaigns. A summary of attacks is not a live feed; the question it answers
+    is "has anyone ever come at us", and that question has no window.
 
     Returns plain dicts carrying the counts, the window the source was active
     over, and ``classify_source``'s label. Never the attempted addresses.
@@ -544,13 +559,15 @@ async def summarize_sources(
     heap for ``email``. That index is right for what it was built for (one source
     inside a window, on the login hot path) and simply does not apply here.
 
-    No third index is added for this. The window is bounded (hours, capped at a
-    week), the existing time index already reduces the scan to exactly the rows
-    being aggregated, and the reader is one engineer on one page — the cost is a
-    scan of one window's failures, which is small precisely because the table is
-    an incident log rather than a traffic log. If ``login_failures`` is ever left
-    to grow into the millions, the answer is the retention purge that already
-    runs on the record route, not another index on a table written to on every
+    No third index is added for this, INCLUDING for the all-time case, where the
+    plan is a sequential scan and an aggregate over the whole table. That is the
+    right trade here: ``login_failures`` is an incident log, not a traffic log —
+    every row is a FAILED sign-in, it is purged on a retention schedule by the
+    record route, and the real production campaigns that made this feature exist
+    were 750 rows between them. The reader is one engineer, on one page, behind
+    an engineer gate, opening it a handful of times a year. If ``login_failures`` is ever left
+    to grow into the millions, the answer is that same retention purge — or
+    putting the window back — not another index on a table written to on every
     failed login.
     """
     rows = (

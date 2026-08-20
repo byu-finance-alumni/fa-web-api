@@ -30,7 +30,7 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import User
 from app.schemas.auth import AuthenticatedUser, UserContext
-from app.services import login_lockout, maintenance
+from app.services import login_abuse, login_lockout, maintenance
 
 logger = logging.getLogger(__name__)
 
@@ -544,6 +544,23 @@ async def login_record(
     # error-swallowing, so it can neither roll back the counter nor change the
     # response below.
     await _purge_expired_login_records(session)
+    # Brute-force detection (#456), hooked HERE for the same reason the purge is:
+    # this route is the only thing in the app that creates `login_failures` rows,
+    # so creation and evaluation share one trigger and the check runs hardest
+    # exactly when the abuse is happening. It runs AFTER the row it measures has
+    # been committed, is self-throttled to one query per process per interval, is
+    # a no-op entirely when no alert channel is configured, and swallows every
+    # error — so like the purge it can neither roll back the counter nor alter
+    # the response body, which is what keeps the anti-enumeration contract above
+    # intact. See app/services/login_abuse.py for the thresholds and the cost.
+    context = payload.context
+    await login_abuse.observe_failure(
+        session,
+        ip_address=_clean(context.ip_address) if context else None,
+        city=_clean(context.city) if context else None,
+        region=_clean(context.region) if context else None,
+        country=_clean(context.country) if context else None,
+    )
     return LoginThrottleStatus(
         allowed=status_dict["allowed"],
         reason=status_dict["reason"],

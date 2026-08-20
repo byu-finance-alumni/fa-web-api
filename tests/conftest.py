@@ -17,7 +17,7 @@ from app.api.dependencies.auth import get_permission_config
 from app.core import failure_monitor, rate_limit
 from app.core.capabilities import DEFAULT_GRANTS
 from app.main import app
-from app.services import failure_alert
+from app.services import failure_alert, login_abuse
 
 
 @pytest.fixture(autouse=True)
@@ -59,4 +59,10 @@ def _fresh_failure_monitor():
     """
     failure_monitor.reset()
     failure_alert.reset_degraded_state()
+    # ``app/services/login_abuse.py`` keeps a THIRD piece of module state: the
+    # gate limiting brute-force evaluation to one query per process per interval
+    # (#456). Same failure mode as the two above — whichever test triggered a
+    # failed login first would spend the gate, and the next one would silently
+    # observe no detection at all, passing or failing purely on collection order.
+    login_abuse.reset()
     yield

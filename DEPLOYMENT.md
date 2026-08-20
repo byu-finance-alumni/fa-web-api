@@ -46,6 +46,10 @@ public deploy, rotate them in Supabase and use the new values below:
 | `CRON_SECRET` | long random string — protects the survey send-scheduler cron (see below). Optional; unset ⇒ the cron endpoint rejects everything. |
 | `ALERT_EMAIL_TO` | engineer address(es), comma-separated, that get the "the API is failing" / "the API recovered" emails (#444). Optional; **unset ⇒ alerting is off entirely**, which is the right setting everywhere except prod. |
 | `ALERT_FROM_EMAIL` | From-address for those alerts. Optional; falls back to `SURVEY_FROM_EMAIL`. Must be on the **verified** Resend domain — the dev domain is not verified, so alert sends fail there by design. |
+| `SLACK_ALERT_WEBHOOK_URL` | Slack **incoming-webhook** URL for **operational** alerts — the API-failure / recovery messages from #444. Points at **`#error-alerts`**. Optional; **unset ⇒ that channel is off**, the same single-switch rule as `ALERT_EMAIL_TO`. |
+| `SLACK_SECURITY_WEBHOOK_URL` | Slack **incoming-webhook** URL for **security** alerts — login brute-force / credential-guessing (#456). Points at **`#security-alerts`**. Optional. **Fallback, one direction only:** if this is unset but `SLACK_ALERT_WEBHOOK_URL` is set, security alerts go to `#error-alerts` rather than being dropped — a forgotten env var must never mean a missing attack alert. Outage alerts never divert the other way. Messages are tagged `SECURITY` / `OUTAGE` so a mixed channel still reads at a glance. |
+
+> ⚠️ Both webhook URLs are **credentials** — anyone holding one can post to that channel. Set them as normal encrypted env vars, never anywhere the frontend can read them, and rotate by deleting and re-adding the webhook in Slack. Every channel is independently optional: email only, one Slack channel, both, all three, or nothing at all.
 
 > Use the **transaction pooler (6543)**, not the session pooler (5432), on
 > serverless. The DB layer detects `:6543` and disables prepared-statement

@@ -15,12 +15,20 @@ The requirement is a NEGATIVE one in both directions — 750 attempts must not
 produce 750 messages, and a fumbling human must not produce one — so nearly every
 assertion here counts messages rather than checking that one happened.
 
+Since #457 the detector also BLOCKS the sources it reports, so a few tests here
+cover the seam: that a block is applied without any alert channel configured,
+that the kill switch turns the whole path off, and that the message says what was
+done about the source. The block's own safety properties — above all "never block
+an address with a recent successful sign-in" — live in
+tests/test_login_auto_block.py, which drives the same fake database.
+
 HOW THE DATABASE IS FAKED, AND WHAT THAT DOES AND DOES NOT PROVE.
-:class:`FakeAbuseData` is a real implementation of the two semantics the service
-depends on: at most ONE open incident per (environment, source), and "claim by
-setting a column that must still be NULL". The service's real statements are
-dispatched to it by identity, so these tests exercise the actual call sequence,
-the actual parameters and the actual decisions.
+:class:`FakeAbuseData` is a real implementation of the semantics the services
+depend on: at most ONE open incident per (environment, source), "claim by setting
+a column that must still be NULL", at most one un-lifted block per (environment,
+source), and the three exemptions guarding block creation. The services' real
+statements are dispatched to it by identity, so these tests exercise the actual
+call sequence, the actual parameters and the actual decisions.
 
 What it CANNOT prove is that Postgres provides those semantics — that comes from
 the partial unique index ``uq_login_abuse_open`` and from
@@ -33,13 +41,14 @@ testing the dedup.
 
 import asyncio
 import datetime
+import math
 import re
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from app.services import failure_alert, login_abuse
+from app.services import failure_alert, login_abuse, login_block
 
 UTC = datetime.UTC
 
@@ -57,21 +66,39 @@ class _Result:
     def first(self):
         return dict(self._rows[0]) if self._rows else None
 
+    def all(self):
+        return [dict(r) for r in self._rows]
+
 
 class FakeAbuseData:
-    """In-memory ``login_failures`` + ``login_abuse_incidents``.
+    """In-memory ``login_failures`` + ``login_abuse_incidents`` + ``login_events``
+    + ``login_ip_blocks``.
 
     Shared by every :class:`FakeSession`, the way one database is shared by every
     serverless instance. Holds a single clock used for both the wall time the SQL
     would see (``now()``) and the monotonic clock the in-process gate reads, so a
     replay advances them together and cannot drift.
+
+    THE BLOCK STORE IS A REAL IMPLEMENTATION OF THE THREE EXEMPTIONS (#457), not
+    a stub: the ``NOT EXISTS`` clauses in ``login_block._SQL_BLOCK`` are the
+    safety properties of the whole feature, so a fake that ignored them would let
+    every safety test pass while proving nothing. It also honours "at most one
+    un-lifted row per (environment, ip)" — the partial unique index — and expiry
+    by comparison against the shared clock rather than by any sweep, which is how
+    the real one behaves. See tests/test_login_auto_block.py, which drives this
+    same store and includes the mutation checks that prove these clauses are what
+    the safety assertions actually depend on.
     """
 
     def __init__(self):
         self.failures: list[dict] = []
         self.incidents: list[dict] = []
+        self.successes: list[dict] = []
+        self.blocks: list[dict] = []
         self.next_id = 1
+        self.next_block_id = 1
         self.measurements = 0
+        self.block_writes = 0
         self.now = datetime.datetime(2026, 8, 19, 8, 47, 12, tzinfo=UTC)
         self.monotonic = 100_000.0
 
@@ -82,6 +109,159 @@ class FakeAbuseData:
     def record_failure(self, *, ip: str, email: str) -> None:
         """What ``_record_login_failure`` commits before the detector is called."""
         self.failures.append({"ip": ip, "email": email, "at": self.now})
+
+    def record_success(self, *, ip: str, engineer: bool = False) -> None:
+        """A ``login_events`` row — what ``POST /auth/login`` writes.
+
+        ⚠️ Only an AUTHENTICATED caller can produce one of these, which is the
+        reason the exemption built on them is not forgeable by the same party
+        that can forge ``ip_address``.
+        """
+        self.successes.append({"ip": ip, "at": self.now, "engineer": engineer})
+
+    # -- login_ip_blocks -------------------------------------------------------
+
+    def active_block(self, ip: str, environment: str = "production") -> dict | None:
+        """The un-lifted, unexpired block for a source, if any."""
+        row = self._unlifted(environment, ip)
+        if row is None or row["blocked_until"] <= self.now:
+            return None
+        return row
+
+    def _unlifted(self, environment, ip):
+        # The partial unique index: at most one un-lifted row per (env, ip).
+        for row in self.blocks:
+            if (
+                row["environment"] == environment
+                and row["ip_address"] == ip
+                and row["lifted_at"] is None
+            ):
+                return row
+        return None
+
+    def is_blocked(self, params):
+        row = self._unlifted(params["environment"], params["ip"])
+        # ⚠️ `blocked_until > now()` IS THE EXPIRY — in the read, not in a sweep.
+        if row is None or row["blocked_until"] <= self.now:
+            return []
+        left = math.ceil((row["blocked_until"] - self.now).total_seconds())
+        return [{"seconds_left": left}]
+
+    def block(self, params):
+        """``_SQL_BLOCK``: the guarded INSERT ... ON CONFLICT DO UPDATE.
+
+        The three ``NOT EXISTS`` clauses, in the order the statement has them.
+        """
+        self.block_writes += 1
+        env, ip = params["environment"], params["ip"]
+
+        # 1. A successful sign-in from this address inside the lookback.
+        cutoff = self.now - datetime.timedelta(
+            seconds=params["success_lookback_seconds"]
+        )
+        if any(s["ip"] == ip and s["at"] >= cutoff for s in self.successes):
+            return []
+        # 2. An ENGINEER has signed in from this address — ever, no time bound.
+        if any(s["ip"] == ip and s["engineer"] for s in self.successes):
+            return []
+        # 3. An engineer lifted a block on this source recently.
+        grace = self.now - datetime.timedelta(seconds=params["lift_grace_seconds"])
+        if any(
+            b["environment"] == env
+            and b["ip_address"] == ip
+            and b["lifted_at"] is not None
+            and b["lifted_at"] >= grace
+            for b in self.blocks
+        ):
+            return []
+
+        until = self.now + datetime.timedelta(seconds=params["block_seconds"])
+        row = self._unlifted(env, ip)
+        if row is None:
+            row = {
+                "block_id": self.next_block_id,
+                "environment": env,
+                "ip_address": ip,
+                "blocked_at": self.now,
+                "blocked_until": until,
+                "attempt_count": params["attempts"],
+                "distinct_email_count": params["distinct_emails"],
+                "pattern": params["pattern"],
+                "abuse_incident_id": params["incident_id"],
+                "lifted_at": None,
+                "lifted_by_user_id": None,
+            }
+            self.next_block_id += 1
+            self.blocks.append(row)
+        else:
+            # A re-arm restarts the current period; GREATEST on the expiry means
+            # it may extend, never shorten.
+            row["blocked_at"] = self.now
+            row["blocked_until"] = max(row["blocked_until"], until)
+            row["attempt_count"] = max(row["attempt_count"], params["attempts"])
+            row["distinct_email_count"] = max(
+                row["distinct_email_count"], params["distinct_emails"]
+            )
+            row["pattern"] = params["pattern"]
+            row["abuse_incident_id"] = (
+                params["incident_id"] or row["abuse_incident_id"]
+            )
+        return [
+            {
+                key: row[key]
+                for key in (
+                    "block_id",
+                    "ip_address",
+                    "blocked_at",
+                    "blocked_until",
+                    "attempt_count",
+                    "distinct_email_count",
+                    "pattern",
+                )
+            }
+        ]
+
+    def link_incident(self, params):
+        for row in self.blocks:
+            if (
+                row["block_id"] == params["block_id"]
+                and row["abuse_incident_id"] is None
+            ):
+                row["abuse_incident_id"] = params["incident_id"]
+        return []
+
+    def list_blocks(self, params):
+        rows = [
+            {
+                **row,
+                "active": row["lifted_at"] is None
+                and row["blocked_until"] > self.now,
+            }
+            for row in self.blocks
+            if row["environment"] == params["environment"]
+        ]
+        if params["active_only"]:
+            rows = [r for r in rows if r["active"]]
+        rows.sort(key=lambda r: (r["active"], r["blocked_at"]), reverse=True)
+        return rows[: params["limit"]]
+
+    def lift(self, params):
+        for row in self.blocks:
+            if (
+                row["block_id"] == params["block_id"]
+                and row["environment"] == params["environment"]
+                and row["lifted_at"] is None
+            ):
+                row["lifted_at"] = self.now
+                row["lifted_by_user_id"] = params["actor_id"]
+                return [
+                    {
+                        "block_id": row["block_id"],
+                        "ip_address": row["ip_address"],
+                        "blocked_until": row["blocked_until"],
+                    }
+                ]
+        return []
 
     def _open(self, environment, ip):
         for row in self.incidents:
@@ -197,6 +377,18 @@ class FakeSession:
             return _Result(self.data.upsert(params))
         if statement is login_abuse._SQL_CLAIM_ALERT:
             return _Result(self.data.claim_alert(params))
+        # The block store (#457) lives in the same fake database, because in
+        # production it lives in the same real one and in the same transaction.
+        if statement is login_block._SQL_IS_BLOCKED:
+            return _Result(self.data.is_blocked(params))
+        if statement is login_block._SQL_BLOCK:
+            return _Result(self.data.block(params))
+        if statement is login_block._SQL_LINK_INCIDENT:
+            return _Result(self.data.link_incident(params))
+        if statement is login_block._SQL_LIST:
+            return _Result(self.data.list_blocks(params))
+        if statement is login_block._SQL_LIFT:
+            return _Result(self.data.lift(params))
         raise AssertionError(f"unexpected statement: {statement}")
 
     async def commit(self):
@@ -254,6 +446,7 @@ def sent(monkeypatch):
     monkeypatch.setattr(failure_alert.slack, "post_webhook", fake_slack)
     monkeypatch.setattr(failure_alert, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(login_abuse, "get_settings", lambda: _FakeSettings())
+    monkeypatch.setattr(login_block, "get_settings", lambda: _FakeSettings())
     return messages
 
 
@@ -264,12 +457,19 @@ def alerts(messages):
 
 @pytest.fixture
 def sim(monkeypatch):
-    """A shared fake database with the in-process gate wired to its clock."""
+    """A shared fake database with the in-process gate wired to its clock.
+
+    Also points ``login_block`` at the same settings object, so the block rows
+    and the incident rows agree about which environment they are in — they are
+    scoped per environment in production and a fake that let them disagree would
+    quietly test two unrelated stores.
+    """
     data = FakeAbuseData()
     login_abuse.reset()
     monkeypatch.setattr(
         login_abuse, "time", SimpleNamespace(monotonic=lambda: data.monotonic)
     )
+    monkeypatch.setattr(login_block, "get_settings", lambda: _FakeSettings())
     return data
 
 
@@ -517,10 +717,8 @@ def test_a_successful_login_and_an_unattributed_failure_cost_nothing(sent, sim):
     assert sent == []
 
 
-def test_detection_is_off_entirely_when_no_channel_is_configured(monkeypatch, sim):
-    """Unconfigured means untouched: not one query on the login path. This is the
-    state local dev, CI, the test suite and every preview deployment run in."""
-    unconfigured = SimpleNamespace(
+def _unconfigured(*, blocking: bool):
+    return SimpleNamespace(
         environment="development",
         resend_api_key=None,
         alert_recipients=[],
@@ -528,14 +726,65 @@ def test_detection_is_off_entirely_when_no_channel_is_configured(monkeypatch, si
         alert_from_name="x",
         slack_webhook=None,
         slack_security_webhook=None,
+        login_auto_block_enabled=blocking,
     )
-    monkeypatch.setattr(failure_alert, "get_settings", lambda: unconfigured)
-    monkeypatch.setattr(login_abuse, "get_settings", lambda: unconfigured)
+
+
+def test_no_channel_configured_means_no_incident_and_no_message(monkeypatch, sim):
+    """With nowhere to send a message, none is sent and NO incident row is opened.
+
+    ``login_abuse_incidents`` exists to dedup a message; with no channel there is
+    no message to dedup, so writing rows there would be accumulating state nobody
+    will ever read.
+
+    ⚠️ THIS TEST USED TO ASSERT ``sim.measurements == 0`` — "unconfigured means
+    untouched, not one query". #457 deliberately broke that, and this is the
+    counterpart to :func:`test_blocking_does_not_depend_on_the_alert_webhook`
+    below: the aggregate now runs because BLOCKING needs it, and blocking is a
+    protection rather than an observability channel. Alerting is still exactly as
+    off as it was.
+    """
+    monkeypatch.setattr(failure_alert, "get_settings", lambda: _unconfigured(blocking=True))
+    monkeypatch.setattr(login_abuse, "get_settings", lambda: _unconfigured(blocking=True))
+    monkeypatch.setattr(login_block, "get_settings", lambda: _unconfigured(blocking=True))
+
+    replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
+
+    assert sim.incidents == []
+
+
+def test_blocking_does_not_depend_on_the_alert_webhook(monkeypatch, sim):
+    """A source is blocked with no Slack webhook and no alert mailbox set (#457).
+
+    Wiring a security control to the presence of a webhook means rotating that
+    webhook silently disables it — the exact "a forgotten env var must never
+    become silence about an attack" failure this module's own docstring argues
+    against. So blocking sits in front of the alerting gate, not behind it.
+    """
+    monkeypatch.setattr(failure_alert, "get_settings", lambda: _unconfigured(blocking=True))
+    monkeypatch.setattr(login_abuse, "get_settings", lambda: _unconfigured(blocking=True))
+    monkeypatch.setattr(login_block, "get_settings", lambda: _unconfigured(blocking=True))
+
+    replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
+
+    assert sim.active_block("134.82.68.139", environment="development") is not None
+    assert sim.incidents == [], "still no incident row and still no message"
+
+
+def test_the_kill_switch_turns_the_whole_path_off(monkeypatch, sim):
+    """With alerting unset AND ``LOGIN_AUTO_BLOCK_ENABLED=false``, nothing at all
+    happens — not one query on the login path. That is the ONLY way back to the
+    old "unconfigured means untouched" behaviour, and it has to be said out loud
+    rather than achieved by forgetting to set something."""
+    monkeypatch.setattr(failure_alert, "get_settings", lambda: _unconfigured(blocking=False))
+    monkeypatch.setattr(login_abuse, "get_settings", lambda: _unconfigured(blocking=False))
+    monkeypatch.setattr(login_block, "get_settings", lambda: _unconfigured(blocking=False))
 
     replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
 
     assert sim.measurements == 0
     assert sim.incidents == []
+    assert sim.blocks == []
 
 
 def test_a_broken_detector_never_breaks_the_login_response(sent, sim, monkeypatch):
@@ -644,6 +893,32 @@ def test_the_alert_never_names_a_single_attempted_address(sent, sim):
         # Nothing that even LOOKS like an address, so a future field that quietly
         # starts carrying one fails here rather than in the channel.
         assert "@" not in text
+
+
+def test_the_alert_says_what_was_done_about_the_source(sent, sim):
+    """The useful half of the message (#457). Before automatic blocking existed
+    this alert ended by telling the reader to block the IP at the Vercel
+    firewall — a control this account does not have. It now reports what already
+    happened, with the expiry, so nobody has to go and do anything."""
+    replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
+    body = alerts(sent)[0]["body"]
+
+    assert "*Action taken:* BLOCKED" in body
+    assert "expires on its own" in body
+    assert "Vercel firewall" not in body, "that instruction was never actionable"
+
+
+def test_the_alert_says_when_a_source_was_deliberately_not_blocked(sent, sim):
+    """The other outcome, and the one that would otherwise be baffling: an alert
+    about a campaign with no block behind it. The reader has to be told the
+    address was EXEMPT rather than left to assume the block failed."""
+    sim.record_success(ip="159.26.103.94")  # a real sign-in from that address
+    replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
+    body = alerts(sent)[0]["body"]
+
+    assert "*Action taken:* NOT blocked" in body
+    assert "exempt" in body
+    assert sim.blocks == []
 
 
 def test_the_message_says_the_addresses_were_withheld_on_purpose(sent, sim):

@@ -125,6 +125,9 @@ CREATE TABLE login_failures (
     reason           varchar(64)
 );
 CREATE INDEX idx_login_failures_occurred_at ON login_failures (occurred_at DESC);
+-- The abuse detector aggregates over ONE source inside a 15-minute window (#456);
+-- the time-only index above would make that a scan of every source in the window.
+CREATE INDEX idx_login_failures_ip_occurred ON login_failures (ip_address, occurred_at DESC);
 
 CREATE TABLE roles (
     role_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1147,6 +1150,39 @@ CREATE TABLE service_incidents (
         CHECK (resolved_at IS NULL OR resolved_at >= started_at)
 );
 
+-- Login brute-force / credential-guessing detection (#456). One row per CAMPAIGN
+-- from one source IP -- not one row per attempt -- created only once a source
+-- crosses a threshold, so a row here always means something happened. At most one
+-- row per (environment, ip_address) may be open (`resolved_at IS NULL`), enforced
+-- by the partial unique index below, and that constraint is what makes "one alert
+-- per campaign" true across concurrent serverless instances that share no memory.
+-- Holds counts and a coarse IP geolocation only: its contents are emailed and
+-- posted to Slack, and the ATTEMPTED ADDRESSES are deliberately NOT stored here
+-- (they are unverified input and some belong to real people; they stay in
+-- login_failures). See migrations/2026-08-19_login_abuse_incidents.sql.
+CREATE TABLE login_abuse_incidents (
+    abuse_incident_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    environment          varchar(40)  NOT NULL,
+    ip_address           varchar(64)  NOT NULL,
+    started_at           timestamptz  NOT NULL DEFAULT now(),
+    last_seen_at         timestamptz  NOT NULL DEFAULT now(),
+    attempt_count        integer      NOT NULL DEFAULT 0,
+    distinct_email_count integer      NOT NULL DEFAULT 0,
+    window_seconds       integer      NOT NULL,
+    city                 varchar(128),
+    region               varchar(128),
+    country              varchar(64),
+    pattern              varchar(64),
+    alert_sent_at        timestamptz,
+    resolved_at          timestamptz,
+    created_at           timestamptz  NOT NULL DEFAULT now(),
+    updated_at           timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT ck_login_abuse_counts
+        CHECK (attempt_count >= 0 AND distinct_email_count >= 0),
+    CONSTRAINT ck_login_abuse_resolved_after_start
+        CHECK (resolved_at IS NULL OR resolved_at >= started_at)
+);
+
 -- -----------------------------------------------------------------------------
 -- Indexes on foreign keys / common lookups
 -- -----------------------------------------------------------------------------
@@ -1226,6 +1262,11 @@ CREATE INDEX idx_donations_year                       ON donations (donation_yea
 CREATE UNIQUE INDEX uq_service_incidents_open
     ON service_incidents (environment) WHERE resolved_at IS NULL;
 CREATE INDEX idx_service_incidents_started_at ON service_incidents (started_at DESC);
+-- Login abuse detection (#456): one open incident per source per environment is
+-- the dedup that makes 750 attempts produce one alert.
+CREATE UNIQUE INDEX uq_login_abuse_open
+    ON login_abuse_incidents (environment, ip_address) WHERE resolved_at IS NULL;
+CREATE INDEX idx_login_abuse_started_at ON login_abuse_incidents (started_at DESC);
 
 -- city_geo lookups: by state for the map's per-state work, by county FIPS for
 -- the county rollups.

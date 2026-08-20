@@ -26,10 +26,23 @@ shared by nobody.
 A campaign that spreads itself across 200 addresses is invisible to a per-email
 counter by construction. That is the gap this module fills: it counts per SOURCE.
 
-Neither of those is replaced. This module does not block anything, throttle
-anything, or lock anything — it only NOTICES and tells a human, who can then
-block the source at the edge. A detector that silently starts refusing logins is
-a detector that can lock the department out on a false positive.
+Neither of those is replaced.
+
+⚠️ UPDATED BY #457 — THIS MODULE NOW ALSO BLOCKS. The paragraph that used to sit
+here said this module notices and tells a human, "who can then block the source
+at the edge", and that a detector which silently starts refusing logins can lock
+the department out on a false positive. The first half turned out to be false:
+Vercel's edge rate limiting is a Pro feature and this account is on Hobby, so
+"block it at the edge" is not a control this project has. The throttle therefore
+has to live in the app, and ``evaluate`` now calls ``login_block.apply`` on the
+same measurement, at the same threshold, in the same transaction.
+
+The second half still stands and is why blocking is built the way it is rather
+than as a counter: a block NEVER applies to an address with a recent successful
+sign-in, NEVER to one an engineer has signed in from, expires on its own within
+the hour, and fails open when its store cannot be read. Read the safety-property
+block in ``app/services/login_block.py`` before changing anything here — that
+module owns the block, this one owns the measurement and the message.
 
 --------------------------------------------------------------------------------
 THE TWO SHAPES, AND WHY ONE RULE IS NOT ENOUGH
@@ -88,8 +101,12 @@ Three separate brakes keep it off the hot path:
 
  1. It never runs on a SUCCESSFUL login, on the pre-check, or on any other route.
     A real sign-in costs exactly nothing.
- 2. It never runs when alerting is unconfigured — local dev, CI, the test suite
-    and every preview deployment return before touching the database.
+ 2. It never runs when BOTH alerting and blocking are switched off — which is
+    what local dev, CI and the test suite mean when they set no webhook and no
+    ``LOGIN_AUTO_BLOCK_ENABLED``... except that blocking DEFAULTS ON (#457), so
+    in practice this brake is now only reachable by turning the kill switch off
+    as well. That is deliberate: alerting is observability and may be unset,
+    blocking is protection and a missing env var must not disable it.
  3. When it does run, an in-process gate limits it to ONE query every
     ``_EVAL_INTERVAL_SECONDS`` per process — so the 222-attempt burst costs about
     four queries rather than 222. Normal operation is a handful of failed logins a
@@ -146,7 +163,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.services import failure_alert
+from app.services import failure_alert, login_block
 
 log = logging.getLogger(__name__)
 
@@ -349,7 +366,18 @@ _SQL_CLAIM_ALERT = text(
 
 
 def is_abusive(attempts: int, distinct_emails: int) -> bool:
-    """Either rule alone is enough. See the threshold block for the arithmetic."""
+    """Either rule alone is enough. See the threshold block for the arithmetic.
+
+    ⚠️ SINCE #457 THIS ALSO DECIDES WHO GETS BLOCKED, not only who gets reported.
+    ``login_block.apply`` is called on exactly the sources this returns True for,
+    so retuning either constant above moves the block, the Slack alert and the
+    engineer console's attack table together — which is the point, and is why
+    there is no second threshold in ``login_block``. The owner asked for five
+    distinct addresses; the argument for keeping it at eight (they stop the same
+    three campaigns within seconds of each other, and five is inside the range a
+    single confused staff member can reach on their own) is written out in that
+    module's docstring.
+    """
     return (
         distinct_emails >= SPRAY_MIN_DISTINCT_EMAILS or attempts >= BURST_MIN_ATTEMPTS
     )
@@ -513,11 +541,22 @@ async def evaluate(
     region: str | None = None,
     country: str | None = None,
 ) -> dict | None:
-    """Measure one source and fold the result into the durable incident state.
+    """Measure one source, BLOCK it if it is abusive, and fold the result into
+    the durable incident state.
 
     Returns the incident row when THIS caller won the right to send the message,
     and ``None`` in every other case (under threshold, incident merely opened or
-    updated, someone else already claimed it).
+    updated, someone else already claimed it, alerting switched off). The returned
+    dict carries two extra keys the alert renders — ``block_applied`` and
+    ``blocked_until`` — so the message can say what was actually DONE about the
+    source, which is the useful half of it.
+
+    ORDER MATTERS AND IT IS BLOCK-FIRST (#457). The block is applied before the
+    incident is opened and before anything is claimed, because it is the
+    PROTECTION and the rest is the observability. If the incident upsert or the
+    claim fails, the source is still blocked; if the block fails, the alert still
+    goes out. Neither half can take the other down with it, and the half that
+    matters more runs first.
 
     Commits before returning: the claim must be durable before a message goes out,
     never after. If the commit fails no message is sent — the correct direction to
@@ -536,13 +575,39 @@ async def evaluate(
     attempts = int((measured or {}).get("attempts") or 0)
     distinct_emails = int((measured or {}).get("distinct_emails") or 0)
 
-    # Under threshold: no row is written at all. `login_abuse_incidents` holds
-    # incidents, not observations, so a directory full of honest typos never
-    # appears in it and a row in that table always means something happened.
+    # Under threshold: no row is written at all, and nothing is blocked.
+    # `login_abuse_incidents` holds incidents, not observations, so a directory
+    # full of honest typos never appears in it and a row in that table always
+    # means something happened. The same is true of `login_ip_blocks`.
     if not is_abusive(attempts, distinct_emails):
         # Close the read transaction the SELECT opened rather than leaving it
         # idle: this session belongs to the request and the route still has work
         # to do on it.
+        await session.commit()
+        return None
+
+    pattern = classify(attempts, distinct_emails)
+
+    # --- THE BLOCK (#457) ----------------------------------------------------
+    # Same measurement, same threshold, same transaction. `apply` returns None
+    # when the source is EXEMPT — a recent successful sign-in from that address,
+    # an engineer's address, or a block an engineer lifted in the last day — and
+    # those three exemptions are `NOT EXISTS` clauses Postgres evaluates inside
+    # the INSERT, not conditions this caller checks. See app/services/login_block.py.
+    block = await login_block.apply(
+        session,
+        ip_address=ip_address,
+        attempts=attempts,
+        distinct_emails=distinct_emails,
+        pattern=pattern,
+    )
+
+    # --- THE MESSAGE ---------------------------------------------------------
+    # Alerting is independently optional (no webhook, no email => nothing to send
+    # to). Blocking above is NOT behind this gate, on purpose: a rotated Slack
+    # webhook must never silently disable a security control. Commit what was
+    # written and stop.
+    if not failure_alert.alerting_enabled():
         await session.commit()
         return None
 
@@ -568,7 +633,7 @@ async def evaluate(
                     "city": city,
                     "region": region,
                     "country": country,
-                    "pattern": classify(attempts, distinct_emails),
+                    "pattern": pattern,
                 },
             )
         )
@@ -577,9 +642,22 @@ async def evaluate(
     )
     if upserted is None:
         # Raced: the open incident was resolved between the close and the upsert.
-        # The next failed login re-opens it.
+        # The next failed login re-opens it. The block above already landed and
+        # is unaffected — that is the point of doing it first.
         await session.commit()
         return None
+
+    if block is not None:
+        # Best-effort back-link so the console can tie a block to the campaign
+        # that caused it. Deliberately AFTER both writes rather than passed into
+        # the block above: doing it the other way round would make the block
+        # depend on the incident upsert succeeding, i.e. would put the
+        # observability on the protection's critical path.
+        await login_block.link_incident(
+            session,
+            block_id=block["block_id"],
+            incident_id=upserted["abuse_incident_id"],
+        )
 
     claimed = (
         (
@@ -596,7 +674,15 @@ async def evaluate(
         .first()
     )
     await session.commit()
-    return dict(claimed) if claimed is not None else None
+    if claimed is None:
+        return None
+    incident = dict(claimed)
+    # What was DONE about the source, carried on the claimed row so the message
+    # can state it. `False` here is not a failure — it is the anti-DoS exemption
+    # doing its job, and the alert says which.
+    incident["block_applied"] = block is not None
+    incident["blocked_until"] = block["blocked_until"] if block is not None else None
+    return incident
 
 
 # ----------------------------------------------------------------- rendering ---
@@ -609,6 +695,36 @@ def _location(incident: dict) -> str:
         if incident.get(key)
     ]
     return ", ".join(parts) if parts else "unknown"
+
+
+def _action_taken(incident: dict) -> str:
+    """One sentence naming what the app DID about this source (#457).
+
+    Three outcomes, and the reader has to be able to tell them apart at a glance
+    — "blocked", "deliberately not blocked", and "blocking is switched off" are
+    very different facts to wake up to. The exempt wording names all three
+    exemptions rather than the one that fired: which one it was is a property of
+    the address, and spelling it out in a channel would say something about who
+    signs in from where.
+    """
+    if not login_block.blocking_enabled():
+        return (
+            "NONE — automatic blocking is switched off "
+            "(LOGIN_AUTO_BLOCK_ENABLED=false). Nothing is refusing this source."
+        )
+    if not incident.get("block_applied"):
+        return (
+            "NOT blocked — this address is exempt: it has a recent successful "
+            "sign-in, or an engineer has signed in from it, or an engineer "
+            "lifted a block on it in the last 24 hours. The address is "
+            "client-supplied, so blocking it could have locked out whoever "
+            "really signs in from there."
+        )
+    until = failure_alert._fmt_ts(incident.get("blocked_until"))
+    return (
+        f"BLOCKED — sign-in attempts from this address are refused until {until}. "
+        "It expires on its own; no action is needed to end it."
+    )
 
 
 def render_alert(incident: dict) -> tuple[str, list[tuple[str, str]]]:
@@ -651,10 +767,16 @@ def render_alert(incident: dict) -> tuple[str, list[tuple[str, str]]]:
             "Attempted addresses",
             "withheld on purpose (unverified input; some may be real people)",
         ),
+        # THE USEFUL HALF (#457). Before this line the message told the reader
+        # about an attack and left them to do something about it at an edge this
+        # account cannot configure. Now it says what already happened.
+        ("Action taken", _action_taken(incident)),
         (
             "Next step",
-            "block this IP at the Vercel firewall; the engineer console's "
-            "Login-failures tab has the per-attempt detail",
+            "nothing is required — the block ends by itself. To end it early, "
+            "or if this was a false positive, lift it from the engineer "
+            "console's Login blocks list; the Login-failures tab has the "
+            "per-attempt detail",
         ),
         ("Build", failure_alert._deployment_note()),
         ("Incident", f"#{incident.get('abuse_incident_id')}"),
@@ -697,11 +819,26 @@ async def observe_failure(
     it buys them is silence, not access: none of this grants a login, and the
     per-email cooldown and hard lock are unaffected because they key on the email.
     Verify against the edge's own logs before blocking anything.
+
+    ⚠️ SINCE #457 THIS FIELD CAN GET SOMEONE REFUSED, not merely reported, which
+    raises the stakes on the paragraph above considerably. Putting an innocent
+    address here no longer just makes it look guilty in a Slack message — it
+    would refuse that address's sign-ins for an hour, which is a denial of
+    service an attacker gets for the price of one header. The answer is NOT to
+    stop using the field (there is no other per-attacker identifier in this data);
+    it is that ``login_block`` refuses to block any address with a recent
+    successful sign-in, or any address an engineer has ever signed in from, and
+    those refusals are `NOT EXISTS` clauses inside the INSERT rather than checks
+    anyone could forget. Read that module before touching this argument.
     """
     global _last_eval_at
-    if not failure_alert.alerting_enabled():
-        # Unconfigured: local dev, CI, the test suite, every preview deployment.
-        # Not one query, not one comparison beyond this line.
+    if not (failure_alert.alerting_enabled() or login_block.blocking_enabled()):
+        # Nothing to send a message to AND nothing to enforce: not one query, not
+        # one comparison beyond this line. Note the OR (#457) — blocking defaults
+        # ON, so an unset webhook alone no longer disables the whole path. A
+        # deployment that wants the old "touch nothing" behaviour has to say so
+        # with LOGIN_AUTO_BLOCK_ENABLED=false, because a security control that is
+        # off until someone remembers an env var is off.
         return
     ip = (ip_address or "").strip()
     if not ip:

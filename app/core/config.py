@@ -124,6 +124,19 @@ class Settings(BaseSettings):
     slack_alert_webhook_url: str | None = Field(default=None)  # SLACK_ALERT_WEBHOOK_URL
     slack_security_webhook_url: str | None = Field(default=None)  # SLACK_SECURITY_WEBHOOK_URL
 
+    # Automatic login blocking (#457). The kill switch for the feature: false
+    # stops blocks being CREATED and stops existing ones being ENFORCED, so
+    # flipping it off unblocks everyone immediately without deleting anything.
+    #
+    # DEFAULTS TO TRUE, unlike every alerting setting above, and the difference is
+    # deliberate. Those default off because an unset webhook means "there is
+    # nowhere to send a message"; this is a protection, not an observability
+    # channel, and a security control that is off until someone remembers to set
+    # an env var is off. It also does NOT sit behind the alerting gate for the
+    # same reason: rotating a Slack webhook must never silently disable blocking.
+    # See app/services/login_block.py.
+    login_auto_block_enabled: bool = Field(default=True)  # LOGIN_AUTO_BLOCK_ENABLED
+
     @staticmethod
     def _clean_webhook(raw: str | None) -> str | None:
         """Trim a webhook URL and treat whitespace-only as unset.

@@ -49,7 +49,7 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
-from app.services import auth_sessions, login_abuse
+from app.services import auth_sessions, login_abuse, login_block
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -324,6 +324,54 @@ class LoginAttackSourcePage(BaseModel):
     items: list[LoginAttackSource]
     window_hours: int
     limit: int
+
+
+class LoginIpBlockRow(BaseModel):
+    """One automatic login block (#457), for the engineer console's list.
+
+    ``active`` is computed by the database as
+    ``lifted_at IS NULL AND blocked_until > now()`` rather than by the client,
+    so a stale browser tab cannot show a lapsed block as live. ``blocked_until``
+    is the whole safety story in one field: it is never null and never more than
+    24 hours out, so every row here ends by itself.
+
+    ⚠️ There is deliberately NO email field, for the same reason the attack table
+    has none — see that endpoint's docstring.
+    """
+
+    block_id: int
+    ip_address: str
+    blocked_at: datetime.datetime
+    blocked_until: datetime.datetime
+    active: bool
+    attempt_count: int
+    distinct_email_count: int
+    pattern: str | None = None
+    abuse_incident_id: int | None = None
+    lifted_at: datetime.datetime | None = None
+    lifted_by_user_id: int | None = None
+
+
+class LoginIpBlockPage(BaseModel):
+    """Blocks for this environment, active ones first.
+
+    ``block_seconds`` and ``auto_block_enabled`` are echoed so the console can
+    say how long a new block lasts, and can show "automatic blocking is OFF"
+    rather than presenting an empty list as if it meant "nobody is blocked".
+    """
+
+    items: list[LoginIpBlockRow]
+    active_only: bool
+    limit: int
+    block_seconds: int
+    auto_block_enabled: bool
+
+
+class LoginIpBlockLifted(BaseModel):
+    """Acknowledgement that a block was lifted, echoing what stopped applying."""
+
+    block_id: int
+    ip_address: str
 
 
 class RoleAssign(BaseModel):
@@ -965,6 +1013,110 @@ async def revoke_user_sessions(
         self_revoked=user_id == actor.user_id,
         user_id=user_id,
         email=target.email,
+    )
+
+
+@router.get("/login-ip-blocks", response_model=LoginIpBlockPage)
+async def list_login_ip_blocks(
+    actor: RequireEngineer,
+    session: SessionDep,
+    active_only: Annotated[bool, Query()] = True,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> LoginIpBlockPage:
+    """Automatic login blocks for this environment (#457). Engineer only.
+
+    The "see it" half of the requirement that an engineer can see and lift
+    blocks; DELETE below is the "lift it" half. Active blocks come first, then —
+    when ``active_only=false`` — recent history including lifted and lapsed ones,
+    which is what makes "did this ever fire on us?" answerable.
+
+    Read-only and side-effect free apart from the read audit
+    (``read_login_ip_blocks``), exactly like /login-attack-sources.
+
+    ⚠️ NO ATTEMPTED EMAIL ADDRESSES ARE RETURNED — only ``distinct_email_count``.
+    Same rule and same reason as the attack table and the Slack alert: those
+    addresses are unverified strings a stranger typed, some belong to real
+    people, and a list of them is an enumeration oracle for anything that reaches
+    this response.
+
+    ⚠️ ``ip_address`` IS CLIENT-SUPPLIED, forwarded from ``x-forwarded-for``. It
+    is a LEAD, not a verdict, and the console states this alongside the table.
+    Blocking on it is safe only because ``login_block`` refuses to block an
+    address with a recent successful sign-in or one an engineer has signed in
+    from — read that module before drawing conclusions from a row here.
+    """
+    blocks = await login_block.list_blocks(
+        session, active_only=active_only, limit=limit
+    )
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_login_ip_blocks",
+            entity_type="login_ip_block",
+            field_name=f"active_only={active_only};limit={limit}",
+        )
+    )
+    await session.commit()
+
+    return LoginIpBlockPage(
+        items=[LoginIpBlockRow(**b) for b in blocks],
+        active_only=active_only,
+        limit=limit,
+        block_seconds=login_block.BLOCK_SECONDS,
+        auto_block_enabled=login_block.blocking_enabled(),
+    )
+
+
+@router.delete("/login-ip-blocks/{block_id}", response_model=LoginIpBlockLifted)
+async def lift_login_ip_block(
+    block_id: IdPath,
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> LoginIpBlockLifted:
+    """Lift one automatic login block early (#457). Engineer only.
+
+    The manual override on a control that can refuse people. It exists because a
+    block is a heuristic acting on a CLIENT-SUPPLIED address, and the person who
+    can tell it got one wrong must be able to say so without waiting out the
+    hour or editing the production database by hand.
+
+    A lifted source is not automatically re-blocked for
+    ``login_block.LIFT_GRACE_SECONDS`` (24 hours). Without that grace the next
+    failed login from the same address would re-open the block and this endpoint
+    would be decorative — the false positive would outlive the fix.
+
+    404 if there is no ACTIVE block with that id (already lifted, or never
+    existed), so a double-click is a clean 404 rather than a second lift that
+    rewrites who lifted it.
+
+    Engineer-gated (RequireEngineer) like the neighbouring login endpoints, and
+    audited (``lift_login_ip_block`` + the source address). Note the gate is on
+    the ROLE the caller holds, not on where they are calling from: blocks are
+    consulted only on the two unauthenticated pre-login routes, so an engineer
+    signing in from a blocked address is unaffected and can reach this endpoint
+    to clear it.
+    """
+    lifted = await login_block.lift(
+        session, block_id=block_id, actor_user_id=actor.user_id
+    )
+    if lifted is None:
+        raise NotFoundError("No active login block with that id.")
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="lift_login_ip_block",
+            entity_type="login_ip_block",
+            entity_id=block_id,
+            field_name="lifted_at",
+            new_value=str(lifted["ip_address"]),
+        )
+    )
+    await session.commit()
+
+    return LoginIpBlockLifted(
+        block_id=int(lifted["block_id"]), ip_address=str(lifted["ip_address"])
     )
 
 

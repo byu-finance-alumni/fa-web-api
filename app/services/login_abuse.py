@@ -356,6 +356,140 @@ def classify(attempts: int, distinct_emails: int) -> str:
     return "spraying: many addresses, a few passwords each"
 
 
+# The label for a source that has failed a few sign-ins and tripped NEITHER rule.
+# ``classify`` deliberately has no such branch — it is only ever reached for a
+# source already known to be abusive, and giving it a fourth return value would
+# mean the alert could one day say "not an attack". So the below-threshold case
+# lives here, in the one function that has to render both kinds of source.
+NOT_AN_ATTACK = "no attack pattern: isolated failed sign-ins"
+
+
+def classify_source(attempts: int, distinct_emails: int) -> str:
+    """The "type of attack" cell for ONE source on the engineer console.
+
+    The console lists every source with a failed sign-in in the window, not only
+    the abusive ones (an empty table is the reassurance the page exists to give,
+    and a source at seven addresses is worth seeing before it reaches eight). So
+    it needs a label for the honest ones too, which is the only thing this adds.
+
+    ⚠️ IT MUST STAY A WRAPPER. The console and the Slack alert must never
+    disagree about what an attack was — reading "spraying" in a message and
+    "enumeration" in the table for the same IP would make the reader distrust
+    both. That is guaranteed structurally here rather than by discipline: the
+    same ``is_abusive`` decides whether it is an attack at all and the same
+    ``classify`` names the shape, so a retuned threshold or a reworded pattern
+    moves both surfaces in one edit. Do not reimplement either rule here.
+    """
+    if not is_abusive(attempts, distinct_emails):
+        return NOT_AN_ATTACK
+    return classify(attempts, distinct_emails)
+
+
+# ----------------------------------------------------- console: per-source roll-up --
+
+# One row per source IP over a window, for the engineer Maintenance page's
+# attack table (the same shape the detector measures for ONE ip, widened to all
+# of them). Read-only: it writes nothing, opens no incident and sends no alert.
+#
+# ⚠️ NO EMAIL COLUMN, AND THERE MUST NEVER BE ONE. `count(DISTINCT email)` is
+# the number the reader acts on; the addresses themselves are unverified strings
+# a stranger typed, some belong to real people, and returning a list of them
+# would hand any engineer-console reader — or anything that later proxies this
+# response — the enumeration oracle the whole feature is trying to deny the
+# attacker. Same rule as the alert body (see the PII note in this module's
+# docstring); tests assert the response cannot carry an address.
+#
+# `city`/`region`/`country` are taken with `max()` rather than "the latest one".
+# They are derived from the IP by the edge, so every row for one source carries
+# the same value and any aggregate picks it; `max()` is the cheap one and, unlike
+# an ordered pick, it cannot be NULL just because the most recent attempt
+# happened to arrive without geo headers.
+#
+# Attempts with NO ip_address are excluded, not lumped together: this table's
+# unit is a SOURCE, and one "unknown" bucket would sum unrelated people into a
+# row that looks like a campaign. They are still visible per-attempt on the
+# Login-failures page, which the console links to.
+_SQL_SOURCES = text(
+    """
+    SELECT ip_address,
+           count(*)              AS attempts,
+           count(DISTINCT email) AS distinct_emails,
+           min(occurred_at)      AS first_seen,
+           max(occurred_at)      AS last_seen,
+           max(city)             AS city,
+           max(region)           AS region,
+           max(country)          AS country
+      FROM login_failures
+     WHERE occurred_at >= now() - (:window_seconds * interval '1 second')
+       AND ip_address IS NOT NULL
+     GROUP BY ip_address
+     ORDER BY count(*) DESC, max(occurred_at) DESC
+     LIMIT :limit
+    """
+)
+
+
+async def summarize_sources(
+    session: AsyncSession, *, window_seconds: int, limit: int
+) -> list[dict]:
+    """Group recent ``login_failures`` by source IP, busiest first.
+
+    Returns plain dicts carrying the counts, the window the source was active
+    over, and ``classify_source``'s label. Never the attempted addresses.
+
+    PERFORMANCE — WHICH INDEX SERVES THIS. The predicate is a bare time range and
+    the grouping key is ``ip_address``, so the index this query wants is the
+    time-ordered one that has been there since #423,
+    ``idx_login_failures_occurred_at (occurred_at DESC)``: a range scan over the
+    window, then a heap fetch for email/ip/geo and a hash aggregate over just
+    those rows.
+
+    It is NOT served by ``idx_login_failures_ip_occurred (ip_address,
+    occurred_at DESC)``, the composite the detector's migration added — that
+    index leads on ``ip_address``, and a query with no ip predicate cannot range-
+    scan it, so Postgres would have to read the whole index and still visit the
+    heap for ``email``. That index is right for what it was built for (one source
+    inside a window, on the login hot path) and simply does not apply here.
+
+    No third index is added for this. The window is bounded (hours, capped at a
+    week), the existing time index already reduces the scan to exactly the rows
+    being aggregated, and the reader is one engineer on one page — the cost is a
+    scan of one window's failures, which is small precisely because the table is
+    an incident log rather than a traffic log. If ``login_failures`` is ever left
+    to grow into the millions, the answer is the retention purge that already
+    runs on the record route, not another index on a table written to on every
+    failed login.
+    """
+    rows = (
+        (
+            await session.execute(
+                _SQL_SOURCES, {"window_seconds": window_seconds, "limit": limit}
+            )
+        )
+        .mappings()
+        .all()
+    )
+    sources = []
+    for row in rows:
+        attempts = int(row["attempts"] or 0)
+        distinct_emails = int(row["distinct_emails"] or 0)
+        sources.append(
+            {
+                "ip_address": row["ip_address"],
+                "city": row["city"],
+                "region": row["region"],
+                "country": row["country"],
+                "first_seen": row["first_seen"],
+                "last_seen": row["last_seen"],
+                "attempts": attempts,
+                "distinct_emails": distinct_emails,
+                "attack_type": classify_source(attempts, distinct_emails),
+                "is_attack": is_abusive(attempts, distinct_emails),
+            }
+        )
+    return sources
+
+
 # ------------------------------------------------------------- state machine ---
 
 

@@ -43,6 +43,7 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
+from app.services import login_abuse
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -279,6 +280,44 @@ class LoginFailurePage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class LoginAttackSource(BaseModel):
+    """One source IP rolled up from ``login_failures``, for the Maintenance
+    page's attack table (#456).
+
+    ``attempts`` and ``distinct_emails`` are counts over the requested window;
+    ``first_seen``/``last_seen`` bound the source's activity inside it, so a
+    16-second burst and a 10-minute grind are told apart. ``attack_type`` is
+    ``login_abuse.classify_source`` — the same classifier the Slack alert uses,
+    so the table and the alert cannot disagree — and ``is_attack`` says whether
+    the source crossed the detector's thresholds at all.
+
+    ⚠️ There is deliberately NO email field. See the endpoint docstring.
+    """
+
+    ip_address: str
+    city: str | None = None
+    region: str | None = None
+    country: str | None = None
+    first_seen: datetime.datetime
+    last_seen: datetime.datetime
+    attempts: int
+    distinct_emails: int
+    attack_type: str
+    is_attack: bool
+
+
+class LoginAttackSourcePage(BaseModel):
+    """The attack table: sources busiest-first, plus the window they cover.
+
+    ``window_hours`` and ``limit`` echo what was actually applied so the console
+    can say "in the last N hours" without re-deriving it from the request.
+    """
+
+    items: list[LoginAttackSource]
+    window_hours: int
+    limit: int
 
 
 class RoleAssign(BaseModel):
@@ -531,6 +570,78 @@ async def list_login_failures(
 
     return LoginFailurePage(
         items=items, total=int(total or 0), limit=limit, offset=offset
+    )
+
+
+@router.get("/login-attack-sources", response_model=LoginAttackSourcePage)
+async def list_login_attack_sources(
+    actor: RequireEngineer,
+    session: SessionDep,
+    hours: Annotated[int, Query(ge=1, le=168)] = 24,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> LoginAttackSourcePage:
+    """Failed sign-ins rolled up per SOURCE IP over a recent window. Engineer only.
+
+    Backs the attack table on the engineer Maintenance page — the screen the
+    owner opens during an incident. GET /admin/login-failures answers "what
+    attempts happened"; this answers "who is doing it", which is the question
+    that matters when 750 rows scroll past. One row per source: where it appears
+    to be, when it started and stopped, how many attempts, how many distinct
+    addresses, and what shape the campaign is.
+
+    Read-only and side-effect free: it opens no incident, sends no alert, and
+    never blocks anything. Engineer-gated (RequireEngineer) exactly like
+    /login-failures and /logins, and the read is audited
+    (``read_login_attack_sources``; actor + applied window/limit).
+
+    THE CLASSIFIER IS SHARED, ON PURPOSE. ``attack_type`` comes from
+    ``login_abuse.classify_source``, which wraps the very ``is_abusive`` and
+    ``classify`` the Slack alert renders. The table and the alert therefore
+    cannot describe the same IP two different ways, and retuning a threshold
+    moves both at once.
+
+    ⚠️ NO ATTEMPTED EMAIL ADDRESSES ARE RETURNED. Only ``distinct_emails``, the
+    count. Those addresses are unverified strings typed by a stranger, some of
+    them belong to real people, and a list of them is both the material the
+    attacker was probing with and an enumeration oracle for anyone who reaches
+    this response. The per-attempt detail, addresses included, stays where it
+    already was: GET /admin/login-failures, behind the same engineer gate.
+
+    ⚠️ ``ip_address`` IS CLIENT-SUPPLIED. It is copied from ``login_failures``,
+    which the Next.js login action populates from the incoming request's
+    ``x-forwarded-for``. Anyone calling this API directly can put anything there,
+    so a source here can be forged to implicate an innocent address or rotated
+    per request to evade the grouping entirely. It is the only per-attacker
+    identifier this data has, so it is used — but it is a LEAD, not a verdict.
+    Verify against the edge's own logs before blocking on it. The console states
+    this alongside the table.
+
+    Attempts with no captured IP are excluded (they cannot be attributed to a
+    source, and one "unknown" bucket would sum unrelated people into a row that
+    looks like a campaign) — they remain visible per-attempt on /login-failures.
+
+    ``hours`` defaults to 24 and is capped at a week; ``limit`` defaults to 50
+    and is hard-capped at 200, mirroring the neighbouring log endpoints, so one
+    request cannot ask the database to aggregate unbounded history.
+    """
+    sources = await login_abuse.summarize_sources(
+        session, window_seconds=hours * 3600, limit=limit
+    )
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_login_attack_sources",
+            entity_type="login_failure",
+            field_name=f"hours={hours};limit={limit}",
+        )
+    )
+    await session.commit()
+
+    return LoginAttackSourcePage(
+        items=[LoginAttackSource(**s) for s in sources],
+        window_hours=hours,
+        limit=limit,
     )
 
 

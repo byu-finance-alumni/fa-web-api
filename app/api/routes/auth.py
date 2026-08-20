@@ -30,7 +30,7 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import User
 from app.schemas.auth import AuthenticatedUser, UserContext
-from app.services import login_lockout, maintenance
+from app.services import login_abuse, login_block, login_lockout, maintenance
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +62,22 @@ class LoginContext(BaseModel):
 
 
 class LoginPrecheckRequest(BaseModel):
-    """Email to evaluate the pre-login throttle/lock state for."""
+    """Email to evaluate the pre-login throttle/lock state for.
+
+    ``context`` is OPTIONAL and carries the same client IP / geo the record call
+    already forwards. It was added by #457 so the pre-check — the call that
+    actually stops a sign-in being attempted — can see whether the caller's
+    source is blocked. A client that omits it (any frontend built before #457)
+    simply gets no block evaluation here and is refused at
+    ``POST /auth/login/record`` instead: the feature degrades, it does not break.
+
+    Nothing in ``context`` is trusted for authorization; see LoginContext.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     email: str = _EmailField
+    context: LoginContext | None = None
 
 
 class LoginRecordRequest(BaseModel):
@@ -459,6 +470,41 @@ async def _record_login_failure(
             pass
 
 
+async def _blocked_status(
+    session: AsyncSession, context: LoginContext | None
+) -> LoginThrottleStatus | None:
+    """The refusal for a source under an automatic block, or ``None`` (#457).
+
+    ⚠️ THE RETURNED SHAPE IS THE EXISTING ``cooldown`` REFUSAL, AND THAT IS THE
+    WHOLE ANTI-ENUMERATION ARGUMENT. These routes are contractually identical
+    whatever email you send (see the note in app/services/login_lockout.py), and
+    the frontend already collapses ``cooldown`` and ``locked`` into ONE generic
+    user-facing message. Introducing a ``blocked`` reason would add a string the
+    deployed frontend has never seen and a state the response can be in, which is
+    a new thing for an attacker to distinguish; reusing ``cooldown`` — a
+    time-boxed refusal that clears itself, which is exactly what a block is —
+    keeps the response set unchanged and needs no frontend work.
+
+    ``retry_after_seconds`` is derived from the SOURCE and from nothing else, so
+    the body is byte-identical for a registered address and for one that has
+    never existed. Both callers below return it BEFORE looking the address up, so
+    not even the query pattern differs.
+
+    Returns ``None`` — proceed — whenever the caller forwarded no address, when
+    blocking is switched off, and on every error. See
+    ``login_block.seconds_remaining``: an unreadable block store must never be
+    the thing that refuses someone.
+    """
+    seconds = await login_block.seconds_remaining(
+        session, ip_address=_clean(context.ip_address) if context else None
+    )
+    if seconds is None:
+        return None
+    return LoginThrottleStatus(
+        allowed=False, reason="cooldown", retry_after_seconds=seconds
+    )
+
+
 @router.post(
     "/login/precheck",
     response_model=LoginThrottleStatus,
@@ -478,7 +524,22 @@ async def login_precheck(
     caller, never of the account, which is what keeps it out of the
     anti-enumeration contract. The frontend fails open on any non-OK response, so
     being throttled here skips the pre-check rather than blocking a sign-in.
+
+    AUTOMATIC BLOCK (#457): if the forwarded source address is under a block,
+    this refuses BEFORE the email is looked up at all — so the refusal is a
+    property of the caller and cannot say anything about the account. This is the
+    call that actually stops the attempt: the frontend does not attempt the
+    Supabase sign-in when ``allowed`` is false. It needs ``context.ip_address``
+    in the body to do it; a client that sends only ``email`` is unaffected here
+    and is refused on the record call instead.
+
+    SCOPE. The block is consulted HERE and on ``/auth/login/record``, and
+    nowhere else in the application. The public survey — the only public page,
+    used by alumni worldwide — never touches it.
     """
+    blocked = await _blocked_status(session, payload.context)
+    if blocked is not None:
+        return blocked
     status_dict = await login_lockout.check_login(session, payload.email)
     return LoginThrottleStatus(**status_dict)
 
@@ -515,6 +576,10 @@ async def login_record(
     Per-IP rate limited (#423), on the same route-dependency-before-the-body
     basis as ``/auth/login/precheck``.
 
+    AUTOMATIC BLOCK (#457): a source under a block is refused here with the same
+    generic, account-independent status the pre-check returns, and nothing at all
+    is written for it. See the comment at the top of the body.
+
     RETENTION (#423): the failure path also triggers the expired-record purge,
     at most once an hour per process. It is hooked HERE, and nowhere else, on
     purpose — this route is the only thing in the app that CREATES a row in
@@ -528,6 +593,26 @@ async def login_record(
     on the success path or on ``/auth/login/precheck``: neither creates rows, and
     both are on the critical path of a real sign-in.
     """
+    # AUTOMATIC BLOCK (#457), checked FIRST and before the body's email is used
+    # for anything. A blocked source gets the generic time-boxed refusal and
+    # NOTHING IS WRITTEN — no counter bump, no `login_failures` row, no
+    # evaluation. That is deliberate on both counts:
+    #
+    #   * it closes the anonymous row-creation primitive this route is (see the
+    #     #423 note above) for the one caller already known to be abusing it, and
+    #   * it stops a blocked source driving OTHER people's accounts toward the
+    #     hard lock. The per-email lockout keys on the email, so an attacker's
+    #     reports of "victim@byu.edu failed" would otherwise still count against
+    #     the victim. Refusing to record them can only help the victim: the only
+    #     failures suppressed are the ones from an address that is already barred
+    #     from signing in.
+    #
+    # The block does not need this route to keep running to stay in force — it is
+    # a row with an expiry — so declining the write costs the feature nothing.
+    blocked = await _blocked_status(session, payload.context)
+    if blocked is not None:
+        return blocked
+
     if payload.success:
         # Do NOT clear/delete the login_attempts row for an unauthenticated
         # "success" claim. Report the benign status without mutating state.
@@ -544,6 +629,23 @@ async def login_record(
     # error-swallowing, so it can neither roll back the counter nor change the
     # response below.
     await _purge_expired_login_records(session)
+    # Brute-force detection (#456), hooked HERE for the same reason the purge is:
+    # this route is the only thing in the app that creates `login_failures` rows,
+    # so creation and evaluation share one trigger and the check runs hardest
+    # exactly when the abuse is happening. It runs AFTER the row it measures has
+    # been committed, is self-throttled to one query per process per interval, is
+    # a no-op entirely when no alert channel is configured, and swallows every
+    # error — so like the purge it can neither roll back the counter nor alter
+    # the response body, which is what keeps the anti-enumeration contract above
+    # intact. See app/services/login_abuse.py for the thresholds and the cost.
+    context = payload.context
+    await login_abuse.observe_failure(
+        session,
+        ip_address=_clean(context.ip_address) if context else None,
+        city=_clean(context.city) if context else None,
+        region=_clean(context.region) if context else None,
+        country=_clean(context.country) if context else None,
+    )
     return LoginThrottleStatus(
         allowed=status_dict["allowed"],
         reason=status_dict["reason"],

@@ -27,6 +27,7 @@ from app.models.event import Event, EventAttendance
 from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
+from app.models.login_ip_block import LoginIpBlock
 from app.models.maintenance import MaintenanceMode
 from app.models.note import Note
 from app.models.opportunity_link import OpportunityLink
@@ -65,6 +66,7 @@ __all__ = [
     "LoginAttempt",
     "LoginEvent",
     "LoginFailure",
+    "LoginIpBlock",
     "MaintenanceMode",
     "Note",
     "OpportunityLink",

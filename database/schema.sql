@@ -125,6 +125,9 @@ CREATE TABLE login_failures (
     reason           varchar(64)
 );
 CREATE INDEX idx_login_failures_occurred_at ON login_failures (occurred_at DESC);
+-- The abuse detector aggregates over ONE source inside a 15-minute window (#456);
+-- the time-only index above would make that a scan of every source in the window.
+CREATE INDEX idx_login_failures_ip_occurred ON login_failures (ip_address, occurred_at DESC);
 
 CREATE TABLE roles (
     role_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1147,6 +1150,78 @@ CREATE TABLE service_incidents (
         CHECK (resolved_at IS NULL OR resolved_at >= started_at)
 );
 
+-- Login brute-force / credential-guessing detection (#456). One row per CAMPAIGN
+-- from one source IP -- not one row per attempt -- created only once a source
+-- crosses a threshold, so a row here always means something happened. At most one
+-- row per (environment, ip_address) may be open (`resolved_at IS NULL`), enforced
+-- by the partial unique index below, and that constraint is what makes "one alert
+-- per campaign" true across concurrent serverless instances that share no memory.
+-- Holds counts and a coarse IP geolocation only: its contents are emailed and
+-- posted to Slack, and the ATTEMPTED ADDRESSES are deliberately NOT stored here
+-- (they are unverified input and some belong to real people; they stay in
+-- login_failures). See migrations/2026-08-19_login_abuse_incidents.sql.
+CREATE TABLE login_abuse_incidents (
+    abuse_incident_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    environment          varchar(40)  NOT NULL,
+    ip_address           varchar(64)  NOT NULL,
+    started_at           timestamptz  NOT NULL DEFAULT now(),
+    last_seen_at         timestamptz  NOT NULL DEFAULT now(),
+    attempt_count        integer      NOT NULL DEFAULT 0,
+    distinct_email_count integer      NOT NULL DEFAULT 0,
+    window_seconds       integer      NOT NULL,
+    city                 varchar(128),
+    region               varchar(128),
+    country              varchar(64),
+    pattern              varchar(64),
+    alert_sent_at        timestamptz,
+    resolved_at          timestamptz,
+    created_at           timestamptz  NOT NULL DEFAULT now(),
+    updated_at           timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT ck_login_abuse_counts
+        CHECK (attempt_count >= 0 AND distinct_email_count >= 0),
+    CONSTRAINT ck_login_abuse_resolved_after_start
+        CHECK (resolved_at IS NULL OR resolved_at >= started_at)
+);
+
+-- Automatic, self-expiring login blocks (#457). One row per BLOCKED SOURCE per
+-- environment -- not one per attempt -- written only when a source crosses the
+-- SAME threshold that opens a login_abuse_incidents row, so the block, the alert
+-- and the console's attack table are one decision. At most one un-lifted row per
+-- (environment, ip_address), enforced by the partial unique index below.
+--
+-- `blocked_until` is NOT NULL and every read carries `AND blocked_until > now()`:
+-- a block lapses because time passed, not because a cleanup job ran, and there is
+-- no way to spell a permanent block. `ck_login_ip_blocks_bounded` caps any single
+-- block at 24 hours.
+--
+-- ⚠️ `ip_address` is CLIENT-SUPPLIED (copied from login_failures, which the
+-- frontend fills from x-forwarded-for). The statement that writes this table
+-- therefore refuses to block an address with a recent successful sign-in, or any
+-- address an engineer has ever signed in from -- otherwise a forged header would
+-- turn a failed attack into a lockout of the staff. See
+-- app/services/login_block.py and migrations/2026-08-19_login_ip_blocks.sql.
+CREATE TABLE login_ip_blocks (
+    block_id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    environment          varchar(40)  NOT NULL,
+    ip_address           varchar(64)  NOT NULL,
+    blocked_at           timestamptz  NOT NULL DEFAULT now(),
+    blocked_until        timestamptz  NOT NULL,
+    attempt_count        integer      NOT NULL DEFAULT 0,
+    distinct_email_count integer      NOT NULL DEFAULT 0,
+    pattern              varchar(64),
+    abuse_incident_id    bigint,
+    lifted_at            timestamptz,
+    lifted_by_user_id    bigint REFERENCES users(user_id) ON DELETE SET NULL,
+    created_at           timestamptz  NOT NULL DEFAULT now(),
+    updated_at           timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT ck_login_ip_blocks_counts
+        CHECK (attempt_count >= 0 AND distinct_email_count >= 0),
+    CONSTRAINT ck_login_ip_blocks_expiry_after_start
+        CHECK (blocked_until > blocked_at),
+    CONSTRAINT ck_login_ip_blocks_bounded
+        CHECK (blocked_until <= blocked_at + interval '24 hours')
+);
+
 -- -----------------------------------------------------------------------------
 -- Indexes on foreign keys / common lookups
 -- -----------------------------------------------------------------------------
@@ -1226,6 +1301,25 @@ CREATE INDEX idx_donations_year                       ON donations (donation_yea
 CREATE UNIQUE INDEX uq_service_incidents_open
     ON service_incidents (environment) WHERE resolved_at IS NULL;
 CREATE INDEX idx_service_incidents_started_at ON service_incidents (started_at DESC);
+-- Login abuse detection (#456): one open incident per source per environment is
+-- the dedup that makes 750 attempts produce one alert.
+CREATE UNIQUE INDEX uq_login_abuse_open
+    ON login_abuse_incidents (environment, ip_address) WHERE resolved_at IS NULL;
+CREATE INDEX idx_login_abuse_started_at ON login_abuse_incidents (started_at DESC);
+-- Automatic login blocking (#457): at most one un-lifted block per source per
+-- environment, so concurrent serverless instances re-arm one row instead of
+-- inserting twenty. This is the index the service's ON CONFLICT clause infers.
+CREATE UNIQUE INDEX uq_login_ip_blocks_active
+    ON login_ip_blocks (environment, ip_address) WHERE lifted_at IS NULL;
+CREATE INDEX idx_login_ip_blocks_blocked_at ON login_ip_blocks (blocked_at DESC);
+CREATE INDEX idx_login_ip_blocks_lifted
+    ON login_ip_blocks (environment, ip_address, lifted_at DESC)
+    WHERE lifted_at IS NOT NULL;
+-- THE SHIELD'S INDEX (#457). "Has this address signed in successfully lately?"
+-- is a NOT EXISTS over login_events evaluated inside the INSERT that creates a
+-- block -- on an unauthenticated public route, under exactly the flood it
+-- polices. Without it that is a sequential scan of the whole sign-in history.
+CREATE INDEX idx_login_events_ip_occurred ON login_events (ip_address, occurred_at DESC);
 
 -- city_geo lookups: by state for the map's per-state work, by county FIPS for
 -- the county rollups.

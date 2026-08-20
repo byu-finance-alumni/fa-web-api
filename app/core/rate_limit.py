@@ -188,6 +188,23 @@ ENABLE_MAINTENANCE_LIMITER = rate_limiter(
     window_seconds=600,
     actor_guard=require_engineer,
 )
+# Revoking a live session ends someone's access and deletes their Supabase
+# session row, so it gets a brake like the other destructive engineer actions.
+# Budget sized for a real incident rather than a single correction: the user
+# directory is a couple of dozen staff accounts, and an engineer working through
+# "sign everyone out" during a credential-guessing scare legitimately fires this
+# once per account in a few minutes. 30/10min covers that with room to spare
+# while still braking a runaway loop or a compromised engineer token.
+#
+# ONLY the revoke is limited; GET /admin/sessions is not. Throttling the read
+# would brake the screen an engineer uses to DECIDE what to revoke, which is the
+# same lockout-shaped mistake as limiting the maintenance-mode *disable* route.
+REVOKE_SESSION_LIMITER = rate_limiter(
+    "admin:revoke_session",
+    limit=30,
+    window_seconds=600,
+    actor_guard=require_engineer,
+)
 
 ResetPasswordRateLimit = Annotated[UserContext, Depends(RESET_PASSWORD_LIMITER)]
 CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
@@ -197,6 +214,7 @@ RecordLoginRateLimit = Annotated[UserContext, Depends(RECORD_LOGIN_LIMITER)]
 EnableMaintenanceRateLimit = Annotated[
     UserContext, Depends(ENABLE_MAINTENANCE_LIMITER)
 ]
+RevokeSessionRateLimit = Annotated[UserContext, Depends(REVOKE_SESSION_LIMITER)]
 
 # --- Alumni mutation routes (#112a) ------------------------------------------
 #

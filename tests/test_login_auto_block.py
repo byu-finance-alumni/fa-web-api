@@ -63,6 +63,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.sql.elements import TextClause
 
 from app.api.dependencies.auth import get_current_db_user
 from app.core.database import get_session
@@ -1009,3 +1010,80 @@ def test_the_exemptions_are_in_the_statement_not_in_python():
     assert "lift_grace_seconds" in statement
     # And only ONE statement may insert into the table.
     assert source.count("INSERT INTO login_ip_blocks") == 1
+
+
+# ============================== 9. THE SQL IS SQLALCHEMY-LEGAL, NOT JUST SQL ===
+#
+# Everything above this line drives a FAKE database. That is the right trade for
+# testing the policy — the exemptions, the expiry, the fail-open — but it leaves
+# exactly one hole, and the first run against a real Postgres fell straight into
+# it: `text()` does not bind `:name::type`. SQLAlchemy's placeholder pattern
+# refuses a name followed by a colon, so every parameter written with a
+# Postgres-style cast stayed in the statement as literal text and the INSERT died
+# with `syntax error at or near ":"`.
+#
+# It failed SILENTLY in the place it matters most. `apply` runs inside
+# `login_abuse.evaluate`, whose caller swallows every exception so detection can
+# never break a login response — so the feature would have shipped, enforced
+# nothing, created nothing, and logged one warning nobody reads. The tests were
+# all green.
+#
+# These two are the cheap structural guard: no database, no fixtures, just "did
+# SQLAlchemy actually see every placeholder you wrote".
+
+
+def _sql_statements(module):
+    """Every ``text()`` statement defined at module level, by name."""
+    return {
+        name: value
+        for name, value in vars(module).items()
+        if name.startswith("_SQL_") and isinstance(value, TextClause)
+    }
+
+
+#: A ``:placeholder``, ignoring ``::casts`` (the char before is never a colon)
+#: and anything in a ``--`` comment (stripped before the scan).
+_PLACEHOLDER = re.compile(r"(?<![:\w]):([a-z_][a-z0-9_]*)", re.IGNORECASE)
+
+
+def _written_placeholders(stmt) -> set[str]:
+    sql = "\n".join(
+        line.split("--")[0] for line in str(stmt).splitlines()
+    )
+    return set(_PLACEHOLDER.findall(sql))
+
+
+@pytest.mark.parametrize("module", [login_block, login_abuse])
+def test_every_placeholder_written_is_a_placeholder_sqlalchemy_bound(module):
+    """The bug this file exists to never repeat.
+
+    For each statement, the names WRITTEN as ``:name`` must equal the names
+    SQLAlchemy actually registered as bind parameters. They diverge the moment
+    someone writes ``:name::int`` — the cast swallows the parameter, the literal
+    text reaches Postgres, and the statement is a syntax error against a real
+    database while every faked test in this file still passes.
+
+    Use ``CAST(:name AS int)`` instead. It is uglier and it works.
+    """
+    for name, stmt in _sql_statements(module).items():
+        written = _written_placeholders(stmt)
+        bound = set(stmt._bindparams)
+        assert written == bound, (
+            f"{module.__name__}.{name}: SQLAlchemy did not bind "
+            f"{sorted(written - bound)} (a ':name::type' cast swallows the "
+            f"parameter — write CAST(:name AS type))"
+        )
+
+
+def test_apply_passes_exactly_the_parameters_the_block_statement_needs():
+    """A missing parameter is the other way this dies at runtime and nowhere else.
+
+    ``session.execute`` raises on an unbound parameter, inside the same swallowed
+    path, so the failure mode is identical: nothing blocked, nothing said.
+    """
+    source = Path(login_block.__file__).read_text(encoding="utf-8")
+    call = source[source.index("async def apply(") :]
+    call = call[: call.index("async def link_incident")]
+
+    for name in sorted(set(login_block._SQL_BLOCK._bindparams)):
+        assert f'"{name}"' in call, f"apply() never passes :{name}"

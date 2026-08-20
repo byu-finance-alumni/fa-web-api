@@ -250,15 +250,16 @@ _SQL_BLOCK = text(
     INSERT INTO login_ip_blocks
         (environment, ip_address, blocked_at, blocked_until,
          attempt_count, distinct_email_count, pattern, abuse_incident_id)
-    SELECT :environment::varchar, :ip::varchar, now(),
-           now() + (:block_seconds::int * interval '1 second'),
-           :attempts::int, :distinct_emails::int,
-           :pattern::varchar, :incident_id::bigint
+    SELECT CAST(:environment AS varchar), CAST(:ip AS varchar), now(),
+           now() + (CAST(:block_seconds AS int) * interval '1 second'),
+           CAST(:attempts AS int), CAST(:distinct_emails AS int),
+           CAST(:pattern AS varchar), CAST(:incident_id AS bigint)
      WHERE NOT EXISTS (
                SELECT 1 FROM login_events
                 WHERE ip_address = :ip
                   AND occurred_at >= now()
-                      - (:success_lookback_seconds::int * interval '1 second')
+                      - (CAST(:success_lookback_seconds AS int)
+                         * interval '1 second')
            )
        AND NOT EXISTS (
                SELECT 1
@@ -274,7 +275,8 @@ _SQL_BLOCK = text(
                   AND ip_address = :ip
                   AND lifted_at IS NOT NULL
                   AND lifted_at >= now()
-                      - (:lift_grace_seconds::int * interval '1 second')
+                      - (CAST(:lift_grace_seconds AS int)
+                         * interval '1 second')
            )
     ON CONFLICT (environment, ip_address) WHERE lifted_at IS NULL
     DO UPDATE SET

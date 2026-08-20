@@ -216,6 +216,20 @@ EnableMaintenanceRateLimit = Annotated[
 ]
 RevokeSessionRateLimit = Annotated[UserContext, Depends(REVOKE_SESSION_LIMITER)]
 
+# --- Test alert (#457 follow-up) ---------------------------------------------
+#
+# Engineer-only, and it posts to a third party, so it is braked harder than the
+# routes above: this is the one endpoint in the app whose entire job is to send a
+# message somewhere else. Six an hour is plenty for "did the webhook I just
+# rotated work" and nowhere near enough to be a way of spamming a channel.
+TEST_ALERT_LIMITER = rate_limiter(
+    "admin:test_alert",
+    limit=6,
+    window_seconds=3600,
+    actor_guard=require_engineer,
+)
+TestAlertRateLimit = Annotated[UserContext, Depends(TEST_ALERT_LIMITER)]
+
 # --- Alumni mutation routes (#112a) ------------------------------------------
 #
 # Per-endpoint brakes on the alumni write routes (interactions / tasks /

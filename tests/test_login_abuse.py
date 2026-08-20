@@ -311,6 +311,27 @@ class FakeAbuseData:
             row["resolved_at"] = self.now
         return []
 
+    def close_all_quiet(self, params):
+        """The sweep (#457 follow-up): close EVERY quiet campaign, hand each back.
+
+        Returning the closed rows is the claim -- in Postgres only one
+        transaction can flip a given `resolved_at` from NULL, so a row comes back
+        to exactly one sweeper. The fake keeps that property by returning a row
+        only on the transition.
+        """
+        closed = []
+        for row in self.incidents:
+            if row["environment"] != params["environment"]:
+                continue
+            if row["resolved_at"] is not None:
+                continue
+            if row["last_seen_at"] < self.now - datetime.timedelta(
+                seconds=params["quiet_seconds"]
+            ):
+                row["resolved_at"] = self.now
+                closed.append(dict(row))
+        return closed
+
     def upsert(self, params):
         # The partial unique index: an INSERT cannot land while a row for this
         # (environment, source) is open, so the statement folds into the open one.
@@ -373,6 +394,8 @@ class FakeSession:
             return _Result(self.data.measure(params))
         if statement is login_abuse._SQL_CLOSE_IF_QUIET:
             return _Result(self.data.close_if_quiet(params))
+        if statement is login_abuse._SQL_CLOSE_ALL_QUIET:
+            return _Result(self.data.close_all_quiet(params))
         if statement is login_abuse._SQL_UPSERT:
             return _Result(self.data.upsert(params))
         if statement is login_abuse._SQL_CLAIM_ALERT:
@@ -451,8 +474,37 @@ def sent(monkeypatch):
 
 
 def alerts(messages):
-    """Distinct ALERTS, not deliveries: each alert fans out to both channels."""
-    return [m for m in messages if m["channel"] == "slack"]
+    """Distinct ALERTS, not deliveries: each alert fans out to both channels.
+
+    Counted on the SLACK side, arbitrarily but consistently -- one alert produces
+    one message per channel, so either side counts the same. Use `emails` when
+    asserting on CONTENT: since the owner asked for a glanceable channel, Slack
+    carries one line and the mail carries every row.
+    """
+    return [
+        m
+        for m in messages
+        if m["channel"] == "slack" and not m["subject"].endswith("has stopped")
+    ]
+
+
+def resolutions(messages):
+    """The "that campaign is over" reports, which are alerts of a second kind.
+
+    Kept apart from `alerts` so every count above still means what it says: those
+    tests are about how many times an attack is ANNOUNCED, and a campaign closing
+    an hour later is a different event, not a second announcement of the same one.
+    """
+    return [
+        m
+        for m in messages
+        if m["channel"] == "slack" and m["subject"].endswith("has stopped")
+    ]
+
+
+def emails(messages):
+    """The full-detail deliveries -- subject plus every label/value row."""
+    return [m for m in messages if m["channel"] != "slack"]
 
 
 @pytest.fixture
@@ -838,7 +890,11 @@ def test_the_alert_carries_what_the_owner_needs_to_act(sent, sim):
     still running, because a report that waits for the attacker to finish is a
     report that arrives too late to act on."""
     replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
-    message = alerts(sent)[0]
+    # THE MAIL is the artefact with everything in it; Slack carries one line (see
+    # test_the_slack_line_says_who_and_from_where). Both are asserted here, so a
+    # change that quietly moved detail out of the mail as well as out of the
+    # channel would fail rather than pass.
+    message = emails(sent)[0]
     body = message["body"]
 
     assert "159.26.103.94" in body
@@ -856,8 +912,8 @@ def test_the_alert_carries_what_the_owner_needs_to_act(sent, sim):
     assert found, message["subject"]
     addresses, attempts = int(found.group(1)), int(found.group(2))
     assert addresses >= login_abuse.SPRAY_MIN_DISTINCT_EMAILS
-    assert f"*Failed attempts:* {attempts} in the last 15 minutes" in body
-    assert f"*Distinct addresses attempted:* {addresses}" in body
+    assert f"Failed attempts: {attempts} in the last 15 minutes" in body
+    assert f"Distinct addresses attempted: {addresses}" in body
     assert sim.incidents[0]["attempt_count"] >= attempts
 
 
@@ -901,9 +957,9 @@ def test_the_alert_says_what_was_done_about_the_source(sent, sim):
     firewall — a control this account does not have. It now reports what already
     happened, with the expiry, so nobody has to go and do anything."""
     replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
-    body = alerts(sent)[0]["body"]
+    body = emails(sent)[0]["body"]
 
-    assert "*Action taken:* BLOCKED" in body
+    assert "Action taken: BLOCKED" in body
     assert "expires on its own" in body
     assert "Vercel firewall" not in body, "that instruction was never actionable"
 
@@ -914,9 +970,9 @@ def test_the_alert_says_when_a_source_was_deliberately_not_blocked(sent, sim):
     address was EXEMPT rather than left to assume the block failed."""
     sim.record_success(ip="159.26.103.94")  # a real sign-in from that address
     replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
-    body = alerts(sent)[0]["body"]
+    body = emails(sent)[0]["body"]
 
-    assert "*Action taken:* NOT blocked" in body
+    assert "Action taken: NOT blocked" in body
     assert "exempt" in body
     assert sim.blocks == []
 
@@ -926,7 +982,7 @@ def test_the_message_says_the_addresses_were_withheld_on_purpose(sent, sim):
     detector simply failed to collect it."""
     replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
 
-    assert "withheld on purpose" in alerts(sent)[0]["body"]
+    assert "withheld on purpose" in emails(sent)[0]["body"]
 
 
 def test_the_pattern_names_the_shape_of_the_campaign():
@@ -991,3 +1047,111 @@ def test_the_flood_tests_above_are_actually_testing_the_dedup(sent, sim, monkeyp
         "with the claim made naive this replay must flood; if it does not, the "
         "one-alert assertions elsewhere in this file prove nothing"
     )
+
+
+# ============================ THE TWO CHANNELS SAY DIFFERENT AMOUNTS (#457) ===
+#
+# The first real security alert reached prod on 2026-08-19 and the owner's note
+# was immediate: "too many words in the slack message ... the slack is for like
+# you are being attacked by this ip". The mail is the artefact you read to work
+# out what happened; the channel is glanced at on a phone. So Slack gets one
+# line, the mail keeps every row, and these pin that difference in both
+# directions — a change that made Slack verbose again, or that thinned the mail
+# to match, fails here.
+
+
+def test_the_slack_line_says_who_and_from_where(sent, sim):
+    """The whole message, in the owner's words: who is attacking, and from where."""
+    replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
+    body = alerts(sent)[0]["body"]
+
+    assert body.startswith("You are being attacked by 159.26.103.94 from Seattle")
+    # ONE line. The number is generous — the point is that it cannot have grown
+    # back into fourteen labelled rows without someone noticing.
+    assert "\n" not in body
+    assert len(body) < 200
+
+
+def test_the_slack_line_still_says_whether_it_was_blocked(sent, sim):
+    """The one detail worth four words: "and it is already blocked" is the
+    difference between reading this in the morning and getting out of bed."""
+    replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
+
+    assert "blocked" in alerts(sent)[0]["body"]
+
+
+def test_the_mail_keeps_the_detail_the_channel_drops(sent, sim):
+    """The other direction. Shortening Slack must not shorten the record."""
+    replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
+    mail = emails(sent)[0]["body"]
+
+    for row in ("Source IP", "Pattern", "Action taken", "Incident"):
+        assert row in mail
+    assert len(mail) > len(alerts(sent)[0]["body"])
+
+
+def test_a_campaign_that_stops_is_reported_as_over(sent, sim):
+    """The half the owner asked for second: a short report once they are done.
+
+    ⚠️ THE TRIGGER IS THE THING THIS TEST IS REALLY ABOUT. `evaluate` only runs on
+    a failed sign-in FROM a source, so it can never notice a campaign ENDING —
+    the attacker giving up is precisely the absence of the event that would
+    trigger it. The sweep on the success path is what closes the gap, and this
+    asserts a source that never comes back is still reported.
+    """
+    replay(sim, ip="66.234.153.26", attempts=190, addresses=68, seconds=600, geo=ROMANIA)
+    assert len(alerts(sent)) == 1
+    assert resolutions(sent) == []
+
+    # It stops. Nothing more arrives from that address, ever.
+    sim.advance(login_abuse._INCIDENT_QUIET_SECONDS + 600)
+    asyncio.run(login_abuse.sweep_quiet(FakeSession(sim)))
+
+    report = resolutions(sent)
+    assert len(report) == 1
+    body = report[0]["body"]
+    assert "has stopped" in report[0]["subject"]
+    assert "66.234.153.26" in body
+    assert "Bucharest" in body
+    assert "Nothing got in." in body
+    assert "\n" not in body, "the report is a glance, like the alert"
+
+
+def test_a_campaign_nobody_was_told_about_is_closed_silently(sent, sim):
+    """No opening message, no closing one. A "resolved" for an event the reader
+    never saw is pure noise — the same rule the outage recovery follows."""
+    sim.incidents.append(
+        {
+            "abuse_incident_id": 99,
+            "environment": "production",
+            "ip_address": "203.0.113.5",
+            "city": None,
+            "region": None,
+            "country": None,
+            "started_at": sim.now,
+            "last_seen_at": sim.now,
+            "resolved_at": None,
+            "attempt_count": 9,
+            "distinct_email_count": 9,
+            "pattern": "enumeration: 9 addresses",
+            "alert_sent_at": None,  # never announced
+        }
+    )
+    sim.advance(login_abuse._INCIDENT_QUIET_SECONDS + 600)
+    asyncio.run(login_abuse.sweep_quiet(FakeSession(sim)))
+
+    assert resolutions(sent) == []
+    assert sim.incidents[-1]["resolved_at"] is not None, "still closed, just quietly"
+
+
+def test_only_one_sweeper_reports_a_given_campaign(sent, sim):
+    """Twenty instances sweep at once. `UPDATE ... WHERE resolved_at IS NULL
+    RETURNING` is the claim — exactly one transaction can flip a row, so exactly
+    one report goes out and no new column was needed to say so."""
+    replay(sim, ip="66.234.153.26", attempts=190, addresses=68, seconds=600, geo=ROMANIA)
+    sim.advance(login_abuse._INCIDENT_QUIET_SECONDS + 600)
+
+    for _ in range(20):
+        asyncio.run(login_abuse.sweep_quiet(FakeSession(sim)))
+
+    assert len(resolutions(sent)) == 1

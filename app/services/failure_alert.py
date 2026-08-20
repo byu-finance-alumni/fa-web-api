@@ -564,12 +564,25 @@ def render_slack(
     rows: list[tuple[str, str]],
     *,
     purpose: str = OPERATIONAL,
+    summary: str | None = None,
 ) -> dict:
     """Build the Slack incoming-webhook payload for an alert.
 
     Kept separate from sending, exactly like :func:`render_alert`, so the exact
     wording is unit-testable — including the assertion that nothing PII-shaped
     can appear in it.
+
+    ⚠️ ``summary`` IS THE SLACK MESSAGE WHEN IT IS GIVEN, and the rows are then
+    deliberately dropped. The two channels are read differently and the first
+    real security alert proved it: the email's fourteen labelled rows are what
+    you want when you sit down to work out what happened, and they are noise in a
+    channel someone glances at on a phone. Slack answers one question — who is
+    doing what to us, and what already happened about it — in a line or two. The
+    detail is one click away in the mailbox and in the engineer console, and this
+    function is the only place that difference lives.
+
+    Callers that pass no summary keep the old intro-plus-rows rendering, so a new
+    alert type is verbose rather than silent until someone writes it a line.
 
     THE TAG. The headline is prefixed with ``SECURITY`` or ``OUTAGE`` so the two
     kinds are told apart at a glance — first word, large bold header — without
@@ -595,7 +608,11 @@ def render_slack(
     """
     esc = slack.escape_mrkdwn
     headline = f"{_SLACK_TAG.get(purpose, _SLACK_TAG[OPERATIONAL])} \u2014 {subject}"
-    lines = "\n".join(f"*{esc(label)}:* {esc(value)}" for label, value in rows)
+    if summary is not None:
+        body = esc(summary)
+    else:
+        lines = "\n".join(f"*{esc(label)}:* {esc(value)}" for label, value in rows)
+        body = f"{esc(intro)}\n\n{lines}"
     return {
         "text": headline,
         "blocks": [
@@ -609,7 +626,7 @@ def render_slack(
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"{esc(intro)}\n\n{lines}"},
+                "text": {"type": "mrkdwn", "text": body},
             },
         ],
     }
@@ -635,6 +652,7 @@ async def _send_slack(
     rows: list[tuple[str, str]],
     *,
     purpose: str = OPERATIONAL,
+    summary: str | None = None,
 ) -> bool:
     """Post one alert to the Slack channel this ``purpose`` routes to.
 
@@ -654,7 +672,9 @@ async def _send_slack(
     try:
         response = await slack.post_webhook(
             url,
-            payload=render_slack(subject, intro, rows, purpose=purpose),
+            payload=render_slack(
+                subject, intro, rows, purpose=purpose, summary=summary
+            ),
             timeout=_SLACK_TIMEOUT_SECONDS,
         )
     except Exception:  # noqa: BLE001 - the alerter must never raise
@@ -685,8 +705,13 @@ async def deliver_alert(
     rows: list[tuple[str, str]],
     *,
     purpose: str = OPERATIONAL,
+    slack_summary: str | None = None,
 ) -> bool:
     """Deliver one alert to EVERY configured channel. True if any of them landed.
+
+    ``slack_summary`` is the SHORT form, and only Slack gets it: the mail keeps
+    every row. See :func:`render_slack` for why the two channels deliberately say
+    different amounts.
 
     ``purpose`` selects which Slack channel the message routes to and which tag it
     wears (see :data:`OPERATIONAL` / :data:`SECURITY`). It does not affect email:
@@ -709,13 +734,79 @@ async def deliver_alert(
     """
     results = await asyncio.gather(
         _send_email(subject, intro, rows),
-        _send_slack(subject, intro, rows, purpose=purpose),
+        _send_slack(subject, intro, rows, purpose=purpose, summary=slack_summary),
         return_exceptions=True,
     )
     return any(r is True for r in results)
 
 
 # --------------------------------------------------------------- entry points --
+
+
+async def deliver_test_alert(*, purpose: str, requested_by: str | None) -> dict:
+    """Push one clearly-marked TEST message through the REAL delivery path.
+
+    WHY THIS EXISTS. Until now "is alerting actually wired up?" could only be
+    answered by breaking something: an outage alert needs three sustained
+    failures, so proving the operational channel meant deliberately 5xx-ing
+    production for a minute. That is a bad trade for a question worth asking
+    routinely — after rotating a webhook, after moving a channel, after a deploy
+    that touched the env vars.
+
+    It exercises the same renderer, the same fan-out and the same webhooks a real
+    alert uses. What it deliberately does NOT do is touch ``service_incidents`` or
+    ``login_abuse_incidents``: nothing is opened, claimed or resolved, so a test
+    cannot suppress the alert for a real incident that starts a second later.
+
+    ⚠️ REPORTS PER CHANNEL, and that is the point. "Nothing arrived" has two very
+    different causes — the channel is not configured, or it is configured and the
+    send failed — and a single boolean cannot tell them apart. That distinction is
+    exactly what was missing on 2026-08-19, when a security alert landed in
+    #error-alerts and the reason (no ``SLACK_SECURITY_WEBHOOK_URL``, so the
+    documented one-way fallback fired) was not visible from anywhere.
+    """
+    tag = _SLACK_TAG.get(purpose, _SLACK_TAG[OPERATIONAL])
+    subject = f"[fa-web-api {get_settings().environment}] TEST — {tag.lower()} alerting"
+    intro = (
+        "This is a test. Nothing is wrong and no incident was opened — an "
+        "engineer pressed the button that checks this channel is reachable."
+    )
+    rows = [
+        ("Environment", str(get_settings().environment)),
+        ("Channel", purpose),
+        ("Requested by", requested_by or "an engineer"),
+        ("Build", _deployment_note()),
+    ]
+    # The Slack line is a line, exactly like a real alert's.
+    summary = f"Test message — {purpose} alerting is reaching this channel."
+
+    slack_configured = slack_target(purpose) is not None
+    email_configured = email_alerting_enabled()
+    slack_ok, email_ok = False, False
+    if slack_configured or email_configured:
+        results = await asyncio.gather(
+            _send_slack(subject, intro, rows, purpose=purpose, summary=summary),
+            _send_email(subject, intro, rows),
+            return_exceptions=True,
+        )
+        slack_ok, email_ok = (r is True for r in results)
+
+    return {
+        "purpose": purpose,
+        "slack_configured": slack_configured,
+        "slack_delivered": slack_ok,
+        "email_configured": email_configured,
+        "email_delivered": email_ok,
+        # The fallback that surprised everyone the first time, stated up front so
+        # the console can say "this went to the error channel" rather than the
+        # reader working it out from which Slack channel pinged.
+        "fell_back_to_error_channel": (
+            purpose == SECURITY
+            and slack_configured
+            and get_settings().slack_security_webhook == get_settings().slack_webhook
+        ),
+    }
+
 
 
 def email_alerting_enabled() -> bool:

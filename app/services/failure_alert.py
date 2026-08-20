@@ -81,9 +81,14 @@ module can fake.
 --------------------------------------------------------------------------------
 DELIVERY CHANNELS, INDEPENDENTLY OPTIONAL
 --------------------------------------------------------------------------------
-An alert is rendered ONCE, as a subject plus label/value rows, and then delivered
-to every channel that is configured: email via Resend (``ALERT_EMAIL_TO``) and
-Slack via an incoming webhook. Each is enabled by its own setting being present
+An alert is rendered ONCE, as a subject plus label/value rows. SLACK IS THE
+CHANNEL AND EMAIL IS THE BACKSTOP: the alert is posted to Slack, and the email
+(via Resend, ``ALERT_EMAIL_TO``) goes out ONLY if that did not land -- because the
+channel was not configured, or the post failed. Normal operation is therefore one
+message in one place, which is what the owner asked for after the first real
+alert arrived twice; a revoked webhook or a Slack outage still reaches a person,
+which is why the second channel was not simply deleted. Each is enabled by
+its own setting being present
 and by nothing else, so a deployment can have email only, Slack only, both, or
 neither — and "neither" is the default, which is what keeps local dev, CI and
 preview deployments silent with no extra flag.
@@ -107,11 +112,10 @@ The routing is deliberately ASYMMETRIC, and the asymmetry lives in
 Because of that fallback the two can share a channel, so each Slack message is
 tagged ``SECURITY`` or ``OUTAGE`` up front — see :func:`render_slack`.
 
-The channels are independent in FAILURE too: they are dispatched concurrently
-with ``return_exceptions=True``, so Slack being down cannot swallow the email and
-a slow Resend cannot delay the Slack post. Neither can raise into the caller —
-see the amplification rule below, which now covers two third parties instead of
-one.
+Neither channel can raise into the caller — see the amplification rule below,
+which covers two third parties instead of one. Both helpers swallow everything
+and return a bool, which is what makes "send the email only if Slack failed"
+expressible as a plain ``if`` rather than as exception handling.
 
 --------------------------------------------------------------------------------
 THE ALERTER MUST NOT AMPLIFY THE FAILURE
@@ -609,10 +613,26 @@ def render_slack(
     esc = slack.escape_mrkdwn
     headline = f"{_SLACK_TAG.get(purpose, _SLACK_TAG[OPERATIONAL])} \u2014 {subject}"
     if summary is not None:
-        body = esc(summary)
-    else:
-        lines = "\n".join(f"*{esc(label)}:* {esc(value)}" for label, value in rows)
-        body = f"{esc(intro)}\n\n{lines}"
+        # THE SUMMARY IS THE ENTIRE MESSAGE -- no header block, no subject line.
+        # The owner's note on the first real one was that
+        # "SECURITY - [fa-web-api production] Login abuse from 203.0.113.77:
+        # 8 addresses, 8 failed attempts" is four facts he already has from the
+        # sentence underneath it. A header that restates the body is not a
+        # headline; it is the same message twice.
+        #
+        # The tag goes with it. It existed to tell attacks apart from 500s when
+        # the two shared a channel; they are separate channels now, and a line
+        # opening "You are being attacked by" cannot be mistaken for an outage.
+        # If the fallback ever puts them back together, the sentence still says
+        # which it is.
+        return {
+            "text": summary,
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": esc(summary)}}
+            ],
+        }
+    lines = "\n".join(f"*{esc(label)}:* {esc(value)}" for label, value in rows)
+    body = f"{esc(intro)}\n\n{lines}"
     return {
         "text": headline,
         "blocks": [
@@ -732,12 +752,26 @@ async def deliver_alert(
     into a missed alert rather than an exception raised on the failure path of an
     already-broken request.
     """
-    results = await asyncio.gather(
-        _send_email(subject, intro, rows),
-        _send_slack(subject, intro, rows, purpose=purpose, summary=slack_summary),
-        return_exceptions=True,
+    # SLACK IS THE CHANNEL; EMAIL IS THE BACKSTOP. Both used to be sent every
+    # time, which is why one attack produced one Slack message AND one email. The
+    # owner asked for it all in Slack, and the honest way to do that is not to
+    # delete the second channel -- a single channel that breaks is silence, and
+    # silence is the failure this module exists to prevent.
+    #
+    # So: post to Slack, and send the email ONLY if that did not land. Normal
+    # operation is one message in one place. A revoked webhook, a Slack outage or
+    # an unconfigured channel still reaches a person, which is the entire reason
+    # there are two.
+    #
+    # It also costs less on the failing request than the old concurrent fan-out
+    # in the common case -- one call, not two -- and only pays for both when the
+    # first one has already failed.
+    slack_ok = await _send_slack(
+        subject, intro, rows, purpose=purpose, summary=slack_summary
     )
-    return any(r is True for r in results)
+    if slack_ok:
+        return True
+    return await _send_email(subject, intro, rows) is True
 
 
 # --------------------------------------------------------------- entry points --

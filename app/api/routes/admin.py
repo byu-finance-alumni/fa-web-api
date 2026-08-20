@@ -49,8 +49,15 @@ from app.models.login_attempt import LoginAttempt
 from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
+from app.schemas.alert_delivery import AlertDeliveryState, AlertDeliveryUpdate
 from app.schemas.auth import UserContext
-from app.services import auth_sessions, failure_alert, login_abuse, login_block
+
+# ⚠️ KEEP THIS ON ONE LINE. tests/test_login_auto_block.py pins the set of
+# modules that may import ``login_block`` (property 6, "scoped to the login
+# path") with a line-anchored regex, and a parenthesised multi-line import makes
+# this file disappear from it — the guard then reads as "the console does not
+# touch blocks" and stops protecting anything.
+from app.services import alert_delivery, auth_sessions, failure_alert, login_abuse, login_block
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -1184,6 +1191,83 @@ async def send_test_alert(
     await session.commit()
 
     return AlertTestResult(**result)
+
+
+@router.get("/alert-delivery", response_model=AlertDeliveryState)
+async def get_alert_delivery(
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> AlertDeliveryState:
+    """Which channels an alert goes to right now (#458). Engineer only.
+
+    The "see it" half of the setting; PUT below is the "change it" half. Returns
+    the mode, who last set it and when, plus whether each channel is configured
+    at all.
+
+    ⚠️ ``email_configured`` IS NOT DECORATION. The console's job on this screen is
+    to stop somebody reading "Slack only" as "we will be silent if Slack breaks".
+    That promise -- the e-mail backstop still fires when a Slack post does not
+    land -- is only TRUE if a mailbox is actually configured, and the screen
+    cannot say so honestly without being told. Neither flag carries the webhook
+    URL (a credential) or the recipient list (somebody's address); they are
+    booleans.
+
+    UNCACHED, unlike the read on the alerting path: an engineer looking at this
+    must see the true current value, not one up to a minute stale. It can
+    therefore fail -- if the setting is unreadable this 500s and the console
+    renders its load error, rather than quietly displaying the default as though
+    it had been verified.
+
+    DELIBERATELY NOT AUDITED as a read. The neighbouring /login-ip-blocks and
+    /login-attack-sources reads are audited because they return attack data about
+    real sources; this returns one enum value carrying no PII, and it is fetched
+    on every render of the Maintenance page. An audit row per page view would
+    bury the writes below, which are the events worth having a trail of.
+    """
+    return await alert_delivery.get_state(session)
+
+
+@router.put("/alert-delivery", response_model=AlertDeliveryState)
+async def set_alert_delivery(
+    body: AlertDeliveryUpdate,
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> AlertDeliveryState:
+    """Choose whether alerts go to Slack only, or to Slack AND e-mail. Engineer only.
+
+    ``slack_only`` (the default) is what the API does today: Slack is the
+    channel, and the e-mail goes out only when the Slack post did not land.
+    ``slack_and_email`` sends both every time -- the behaviour before
+    2026-08-19, kept because "I want a copy in the mailbox" is a legitimate
+    preference and removing it left no way back.
+
+    A TABLE AND NOT AN ENV VAR, which is the whole reason this endpoint exists:
+    the requirement was to change it without a redeploy. It also has to be a fact
+    about the SERVICE -- on Vercel serverless a module-level variable dies with
+    the invocation and the instances handling an outage share no memory -- so it
+    is a row in ``alert_delivery_config``, following ``maintenance_mode``.
+
+    ⚠️ NEITHER MODE CAN PRODUCE SILENCE, and this endpoint cannot create one that
+    does. There is no value meaning "Slack, and nothing if Slack breaks": in
+    ``slack_only`` a failed, rejected or unconfigured Slack post still falls
+    through to the e-mail. ``AlertDeliveryUpdate`` is a ``Literal`` so an unknown
+    mode is a 422 before any query runs, a CHECK constraint makes it unstorable,
+    and ``failure_alert.deliver_alert`` skips the e-mail on exactly one branch --
+    the one reached when Slack actually landed.
+
+    Takes effect in this process immediately and everywhere else within the
+    read cache's TTL (a minute). PUT rather than POST because it is idempotent:
+    re-selecting the mode already in force is a no-op that only re-stamps who
+    confirmed it and when.
+
+    Audited as ``set_alert_delivery_mode`` with the old and new values. As with
+    every engineer action the write is rerouted from ``audit_logs`` to
+    ``engineer_action_log`` by the ``before_flush`` guard (#199); nothing here
+    writes that table directly.
+    """
+    return await alert_delivery.set_mode(
+        session, mode=body.mode, actor_user_id=actor.user_id
+    )
 
 
 # --- Engineer-action oversight log (#199 / #200 forensic blind spot) ----------

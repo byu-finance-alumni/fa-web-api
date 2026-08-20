@@ -17,7 +17,7 @@ from app.api.dependencies.auth import get_permission_config
 from app.core import failure_monitor, rate_limit
 from app.core.capabilities import DEFAULT_GRANTS
 from app.main import app
-from app.services import failure_alert, login_abuse
+from app.services import alert_delivery, failure_alert, login_abuse
 
 
 @pytest.fixture(autouse=True)
@@ -65,4 +65,9 @@ def _fresh_failure_monitor():
     # failed login first would spend the gate, and the next one would silently
     # observe no detection at all, passing or failing purely on collection order.
     login_abuse.reset()
+    # And a FOURTH: the alert-delivery mode is cached per process (#458). It is
+    # read on every delivery, so without this a test that installed a mode would
+    # leak it into the next test's alert for up to the cache TTL -- the same
+    # order-dependent failure as the three above.
+    alert_delivery.reset_cache()
     yield

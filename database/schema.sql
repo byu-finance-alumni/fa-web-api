@@ -804,6 +804,28 @@ CREATE TABLE maintenance_mode (
     CONSTRAINT fk_maintenance_mode_enabled_by FOREIGN KEY (enabled_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
 
+-- Where an alert goes (#458). Single-row config (id pinned to 1) holding the
+-- engineer's choice between `slack_only` -- Slack is the channel and e-mail is
+-- the BACKSTOP, sent only when the Slack post does not land -- and
+-- `slack_and_email`, both channels every time (the pre-2026-08-19 behaviour). A
+-- table and not an env var because the requirement is to change it WITHOUT a
+-- redeploy, and a fact about the SERVICE rather than about one serverless
+-- invocation. ⚠️ NEITHER MODE CAN PRODUCE SILENCE: in `slack_only` a failed,
+-- rejected or unconfigured Slack post still falls through to e-mail, which is
+-- enforced in app/services/failure_alert.deliver_alert. Reads fail safe to
+-- `slack_only`. See migrations/2026-08-19_alert_delivery_config.sql.
+CREATE TABLE alert_delivery_config (
+    id                  int PRIMARY KEY DEFAULT 1,
+    mode                varchar(20) NOT NULL DEFAULT 'slack_only',
+    updated_by_user_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_alert_delivery_config_singleton CHECK (id = 1),
+    CONSTRAINT ck_alert_delivery_config_mode
+        CHECK (mode IN ('slack_only', 'slack_and_email')),
+    CONSTRAINT fk_alert_delivery_config_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 CREATE TABLE attachments (
     attachment_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id          bigint NOT NULL,

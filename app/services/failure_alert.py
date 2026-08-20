@@ -81,17 +81,30 @@ module can fake.
 --------------------------------------------------------------------------------
 DELIVERY CHANNELS, INDEPENDENTLY OPTIONAL
 --------------------------------------------------------------------------------
-An alert is rendered ONCE, as a subject plus label/value rows. SLACK IS THE
-CHANNEL AND EMAIL IS THE BACKSTOP: the alert is posted to Slack, and the email
-(via Resend, ``ALERT_EMAIL_TO``) goes out ONLY if that did not land -- because the
-channel was not configured, or the post failed. Normal operation is therefore one
-message in one place, which is what the owner asked for after the first real
-alert arrived twice; a revoked webhook or a Slack outage still reaches a person,
-which is why the second channel was not simply deleted. Each is enabled by
-its own setting being present
-and by nothing else, so a deployment can have email only, Slack only, both, or
-neither — and "neither" is the default, which is what keeps local dev, CI and
-preview deployments silent with no extra flag.
+An alert is rendered ONCE, as a subject plus label/value rows. WHICH CHANNELS IT
+GOES TO IS AN ENGINEER SETTING (#458), stored in ``alert_delivery_config`` and
+changeable from the console with no redeploy — see
+``app/services/alert_delivery.py``:
+
+  slack_only       DEFAULT. Slack is the channel and the email (via Resend,
+                   ``ALERT_EMAIL_TO``) is the BACKSTOP: it goes out ONLY if the
+                   Slack post did not land -- because the channel was not
+                   configured, or the post failed. Normal operation is one
+                   message in one place, which is what the owner asked for after
+                   the first real alert arrived twice.
+  slack_and_email  Both channels on every alert; the behaviour before
+                   2026-08-19, kept because "I want a copy in the mailbox" is a
+                   legitimate preference.
+
+⚠️ THE BACKSTOP SURVIVES BOTH MODES. There is no setting, and there must never
+be one, under which a failed or unconfigured Slack post produces no alert at all:
+a revoked webhook or a Slack outage still has to reach a person, which is why the
+second channel was not simply deleted. See :func:`deliver_alert`.
+
+Each channel is enabled by its own setting being present and by nothing else, so
+a deployment can have email only, Slack only, both, or neither — and "neither" is
+the default, which is what keeps local dev, CI and preview deployments silent
+with no extra flag.
 
 TWO SLACK CHANNELS, ROUTED BY PURPOSE. This module carries two kinds of news, and
 they are read in two different moods:
@@ -159,7 +172,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import __version__
 from app.core import database
 from app.core.config import get_settings
-from app.services import mailer, slack
+from app.services import alert_delivery, mailer, slack
 
 log = logging.getLogger(__name__)
 
@@ -727,7 +740,27 @@ async def deliver_alert(
     purpose: str = OPERATIONAL,
     slack_summary: str | None = None,
 ) -> bool:
-    """Deliver one alert to EVERY configured channel. True if any of them landed.
+    """Deliver one alert. True if it landed anywhere at all.
+
+    WHICH CHANNELS ARE USED IS AN ENGINEER SETTING, not an env var and not a
+    constant — see ``app/services/alert_delivery.py`` for why it is a row in
+    Postgres and how it is read without ever raising:
+
+      slack_only       (default) Slack is the channel and e-mail is the BACKSTOP.
+                       One message in one place, which is what the owner asked
+                       for after the first real alert arrived twice.
+      slack_and_email  Both, every time — the behaviour before 2026-08-19.
+
+    ⚠️ THE E-MAIL BACKSTOP SURVIVES BOTH MODES, AND THAT IS THE POINT. The ONLY
+    branch below that does not send the e-mail is reached when Slack actually
+    LANDED. A failed post, a rejected post, a revoked webhook, an unconfigured
+    channel — every one of those returns False from :func:`_send_slack` and
+    falls through to the mail, in either mode. The setting chooses whether
+    e-mail is a copy or a backstop; it can never choose silence, because a
+    single channel that breaks IS silence and silence is the failure this module
+    exists to prevent. ``tests/test_alert_delivery.py`` asserts it for every mode
+    in :data:`alert_delivery.MODES`, not just for the one that looks risky, so a
+    third mode added later cannot quietly opt out of it.
 
     ``slack_summary`` is the SHORT form, and only Slack gets it: the mail keeps
     every row. See :func:`render_slack` for why the two channels deliberately say
@@ -752,25 +785,46 @@ async def deliver_alert(
     into a missed alert rather than an exception raised on the failure path of an
     already-broken request.
     """
-    # SLACK IS THE CHANNEL; EMAIL IS THE BACKSTOP. Both used to be sent every
-    # time, which is why one attack produced one Slack message AND one email. The
-    # owner asked for it all in Slack, and the honest way to do that is not to
-    # delete the second channel -- a single channel that breaks is silence, and
-    # silence is the failure this module exists to prevent.
+    # Reading the setting can never fail and never raises -- an unreadable value
+    # is the default, which is the mode that sends MORE when Slack is unhealthy.
+    mode = await alert_delivery.read_mode()
+
+    if mode == alert_delivery.SLACK_AND_EMAIL:
+        # BOTH CHANNELS, EVERY TIME. Dispatched CONCURRENTLY with
+        # ``return_exceptions=True`` so that the delivery step costs
+        # max(email, slack) rather than their sum -- this sits on a request that
+        # is already failing -- and so that one channel being down cannot
+        # suppress the other. An ``await email(); await slack()`` sequence would
+        # quietly lose that independence the first time the leading call raised,
+        # and independence is the entire reason for having a second channel.
+        results = await asyncio.gather(
+            _send_slack(subject, intro, rows, purpose=purpose, summary=slack_summary),
+            _send_email(subject, intro, rows),
+            return_exceptions=True,
+        )
+        slack_ok, email_ok = (r is True for r in results)
+        return slack_ok or email_ok
+
+    # SLACK ONLY: Slack is the channel, e-mail is the BACKSTOP. Both used to be
+    # sent every time, which is why one attack produced one Slack message AND one
+    # e-mail. The owner asked for it all in Slack, and the honest way to do that
+    # is not to delete the second channel.
     #
-    # So: post to Slack, and send the email ONLY if that did not land. Normal
-    # operation is one message in one place. A revoked webhook, a Slack outage or
-    # an unconfigured channel still reaches a person, which is the entire reason
-    # there are two.
-    #
-    # It also costs less on the failing request than the old concurrent fan-out
-    # in the common case -- one call, not two -- and only pays for both when the
-    # first one has already failed.
+    # So: post to Slack, and send the e-mail ONLY if that did not land. It also
+    # costs less on the failing request than the fan-out above in the common
+    # case -- one call, not two -- and pays for both only when the first has
+    # already failed.
     slack_ok = await _send_slack(
         subject, intro, rows, purpose=purpose, summary=slack_summary
     )
     if slack_ok:
+        # ⚠️ THE ONE BRANCH THAT SKIPS THE E-MAIL, and it is reachable only when
+        # Slack returned True -- i.e. Slack accepted the message. Nothing else in
+        # this function may ever return without having tried a channel that
+        # worked. Do not add a condition here.
         return True
+    # Slack was unconfigured, unreachable, or rejected the post. The backstop is
+    # why there are two channels at all.
     return await _send_email(subject, intro, rows) is True
 
 

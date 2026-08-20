@@ -162,6 +162,7 @@ import time
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import database
 from app.core.config import get_settings
 from app.services import failure_alert, login_block
 
@@ -306,6 +307,34 @@ _SQL_CLOSE_IF_QUIET = text(
        AND ip_address = :ip
        AND resolved_at IS NULL
        AND last_seen_at < now() - (:quiet_seconds * interval '1 second')
+    RETURNING abuse_incident_id, environment, ip_address, city, region, country,
+              started_at, last_seen_at, resolved_at, attempt_count,
+              distinct_email_count, pattern, alert_sent_at
+    """
+)
+
+# The same close, for EVERY source that has gone quiet rather than the one
+# currently attacking. `evaluate` only runs on a failed sign-in FROM a source, so
+# on its own it can never notice that a campaign STOPPED -- the attacker going
+# away is precisely the absence of the event that would trigger it. This is
+# swept from the sampled success path instead (see `sweep_quiet`).
+#
+# ⚠️ `RETURNING` on an `UPDATE ... WHERE resolved_at IS NULL` IS THE CLAIM, and it
+# needs no new column: under READ COMMITTED exactly one transaction can flip a
+# given row's `resolved_at` from NULL, so of twenty instances sweeping at once,
+# one gets the row back and nineteen get nothing. Same trick as the alert claim
+# above, one row later in the lifecycle.
+_SQL_CLOSE_ALL_QUIET = text(
+    """
+    UPDATE login_abuse_incidents
+       SET resolved_at = now(),
+           updated_at = now()
+     WHERE environment = :environment
+       AND resolved_at IS NULL
+       AND last_seen_at < now() - (:quiet_seconds * interval '1 second')
+    RETURNING abuse_incident_id, environment, ip_address, city, region, country,
+              started_at, last_seen_at, resolved_at, attempt_count,
+              distinct_email_count, pattern, alert_sent_at
     """
 )
 
@@ -611,6 +640,15 @@ async def evaluate(
         await session.commit()
         return None
 
+    # A source coming BACK after an hour of silence closes its old campaign so the
+    # upsert below opens a new one rather than bumping a dead row.
+    #
+    # This is now a SAFETY NET rather than the usual path: `observe_failure` runs
+    # `sweep_quiet` first, which closes AND reports every quiet campaign including
+    # this source's. Reporting cannot happen here -- the close has to be reported
+    # by the transaction that wins it, and this function returns the row it won a
+    # different race for (the alert claim). A close that lands here is therefore
+    # silent, which is why it is not where the closing happens.
     await session.execute(
         _SQL_CLOSE_IF_QUIET,
         {
@@ -784,6 +822,178 @@ def render_alert(incident: dict) -> tuple[str, list[tuple[str, str]]]:
     return subject, rows
 
 
+
+def render_slack_summary(incident: dict) -> str:
+    """The SLACK version of an opening alert: who is attacking, and from where.
+
+    One sentence, because that is the whole job. The email carries fourteen
+    labelled rows and it should -- that is the artefact you read when you sit
+    down to work out what happened. This is read on a phone, at a glance, and the
+    only question it has to answer is the one the owner asked for: are we being
+    attacked, by whom, from where.
+
+    Everything else is deliberately left out. Counts, timings, pattern name,
+    withheld-addresses note, next steps: all in the mail, none of them the thing
+    you need in the first two seconds. The action IS kept, in four words, because
+    "and it is already blocked" is the difference between reading this in the
+    morning and getting out of bed.
+    """
+    ip = str(incident.get("ip_address") or "an unknown address")
+    where = _location(incident)
+    lead = f"You are being attacked by {ip}"
+    lead += "." if where == "unknown" else f" from {where}."
+    if not login_block.blocking_enabled():
+        return lead + " NOT blocked — automatic blocking is switched off."
+    if not incident.get("block_applied"):
+        return lead + " Not blocked — the address is exempt (see the email)."
+    return lead + " It is blocked and cannot sign in."
+
+
+def render_resolved(incident: dict) -> tuple[str, list[tuple[str, str]], str]:
+    """The "that campaign is over" message: subject, email rows, Slack line.
+
+    The counterpart to the opening alert, and the half the owner asked for
+    second: one line while it is happening, a short report once it stops. It
+    mirrors the outage path's recovery message exactly -- same shape, same
+    reason -- so the two kinds of incident read the same way and neither leaves
+    you wondering whether it ever ended.
+
+    Sent only for a campaign that was ANNOUNCED (``alert_sent_at`` is set). There
+    is nothing to close for a reader who was never told it opened, and a
+    "resolved" message for an event nobody saw is pure noise.
+    """
+    env = str(incident.get("environment") or "unknown")
+    ip = str(incident.get("ip_address") or "unknown")
+    where = _location(incident)
+    attempts = incident.get("attempt_count")
+    distinct = incident.get("distinct_email_count")
+    duration = failure_alert._fmt_duration(
+        incident.get("started_at"), incident.get("last_seen_at")
+    )
+    subject = f"[fa-web-api {env}] Login abuse from {ip} has stopped"
+    rows = [
+        ("Environment", env),
+        ("Source IP", ip),
+        ("Location (IP geolocation, approximate)", where),
+        ("Total failed attempts", str(attempts)),
+        ("Distinct addresses attempted", str(distinct)),
+        ("First seen", failure_alert._fmt_ts(incident.get("started_at"))),
+        ("Last attempt", failure_alert._fmt_ts(incident.get("last_seen_at"))),
+        ("Attacked for", duration),
+        ("Pattern", str(incident.get("pattern") or "unknown")),
+        # The outcome, stated plainly. Every one of these campaigns so far has
+        # ended this way and the reader should be told so rather than left to
+        # infer it from the absence of bad news.
+        ("Outcome", "no sign-in succeeded — these were attempts, not a breach"),
+        ("Incident", f"#{incident.get('abuse_incident_id')}"),
+    ]
+    summary = (
+        f"The attack from {ip}"
+        + ("" if where == "unknown" else f" ({where})")
+        + f" has stopped. {attempts} attempts across {distinct} addresses "
+        f"over {duration}. Nothing got in."
+    )
+    return subject, rows, summary
+
+
+async def _send_resolved(incident: dict) -> None:
+    """Deliver one "campaign over" report. Best-effort; never raises.
+
+    Silent for a campaign nobody was told about -- see :func:`render_resolved`.
+    """
+    if incident is None or incident.get("alert_sent_at") is None:
+        return
+    subject, rows, summary = render_resolved(incident)
+    try:
+        await asyncio.wait_for(
+            failure_alert.deliver_alert(
+                subject,
+                "The source has been quiet long enough to call this over.",
+                rows,
+                purpose=failure_alert.SECURITY,
+                slack_summary=summary,
+            ),
+            timeout=_DELIVERY_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - the alerter must never raise
+        log.error(
+            "login_abuse: could not deliver the resolved report for %s",
+            incident.get("ip_address"),
+        )
+
+
+async def note_success() -> None:
+    """Report any campaign that has gone quiet. Best-effort; never raises.
+
+    Called on a SAMPLED successful response, from the same hook the outage
+    recovery uses (``app/core/failure_monitor.py``). This is the ONLY thing that
+    can notice an attack ending: every other entry point in this module runs on a
+    failed sign-in, and an attacker who gives up produces no more of those.
+
+    Opens its own session -- there is no request session to borrow on that path --
+    exactly like ``failure_alert.note_success``.
+    """
+    if not failure_alert.alerting_enabled():
+        return
+    if database.SessionLocal is None:
+        return
+    try:
+        async with database.SessionLocal() as session:
+            await sweep_quiet(session)
+    except Exception:  # noqa: BLE001 - monitoring must never break a request
+        log.warning("login_abuse: quiet sweep could not open a session")
+
+
+
+async def sweep_quiet(session: AsyncSession) -> None:
+    """Close every campaign that has gone quiet and report each one. Never raises.
+
+    ⚠️ WITHOUT THIS, A CAMPAIGN THAT SIMPLY STOPS IS NEVER REPORTED AS OVER.
+    ``evaluate`` runs on a failed sign-in FROM a source, so it can only ever
+    notice a campaign ending if that same source comes BACK an hour later -- and
+    an attacker who gives up is exactly the case where they do not. The end of an
+    attack is the absence of an event, and absence needs something else to notice
+    it.
+
+    That something is the SAMPLED SUCCESS PATH, the same hook the outage
+    recovery uses (``failure_alert.note_success``): real traffic is denser than
+    any cron this project can run, and the query is one indexed UPDATE that
+    almost always matches nothing. It is called only when there is an open
+    incident to find -- see the caller in ``app/core/failure_monitor.py``.
+
+    Commits before sending, like every other claim here: the claim must be
+    durable before a message goes out, never after.
+    """
+    if not failure_alert.alerting_enabled():
+        return
+    try:
+        closed = (
+            (
+                await asyncio.wait_for(
+                    session.execute(
+                        _SQL_CLOSE_ALL_QUIET,
+                        {
+                            "environment": get_settings().environment,
+                            "quiet_seconds": _INCIDENT_QUIET_SECONDS,
+                        },
+                    ),
+                    timeout=_DB_TIMEOUT_SECONDS,
+                )
+            )
+            .mappings()
+            .all()
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - monitoring must never break a request
+        log.warning("login_abuse: quiet sweep failed", exc_info=True)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    for incident in closed:
+        await _send_resolved(dict(incident))
+
 # --------------------------------------------------------------- entry point ---
 
 _INTRO = (
@@ -854,6 +1064,15 @@ async def observe_failure(
     # slip through the gate while the first evaluation is in flight.
     _last_eval_at = now
 
+    # Report any campaign that has STOPPED before measuring the one happening
+    # now. It runs here rather than inside `evaluate` for one reason: the close
+    # has to be committed and reported by the transaction that WINS it, and
+    # `evaluate` returns the row it won the ALERT claim for, which is a different
+    # race. Doing it first also keeps campaign identity intact -- the upsert below
+    # then opens a NEW row for a source that has come back, instead of bumping the
+    # one just declared over.
+    await sweep_quiet(session)
+
     try:
         incident = await asyncio.wait_for(
             evaluate(
@@ -885,7 +1104,13 @@ async def observe_failure(
             # case where no security webhook is set and both kinds share
             # #error-alerts. See app/services/failure_alert.py.
             failure_alert.deliver_alert(
-                subject, _INTRO, rows, purpose=failure_alert.SECURITY
+                subject,
+                _INTRO,
+                rows,
+                purpose=failure_alert.SECURITY,
+                # Slack gets ONE line: who, from where, and whether they are
+                # blocked. The mail keeps every row. See render_slack_summary.
+                slack_summary=render_slack_summary(incident),
             ),
             timeout=_DELIVERY_TIMEOUT_SECONDS,
         )

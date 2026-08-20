@@ -256,6 +256,32 @@ ALERT_TEMPLATE_LIMITER = rate_limiter(
 )
 AlertTemplateRateLimit = Annotated[UserContext, Depends(ALERT_TEMPLATE_LIMITER)]
 
+# --- Delete a login-abuse campaign (#457 follow-up) --------------------------
+#
+# Engineer-only, and the most destructive read-path cleanup in the console: one
+# call deletes a source's whole trail across three tables — the per-attempt
+# failures, the detector's incident row, and the block row, which un-blocks that
+# source. There is no undo and nothing to restore from.
+#
+# Budgeted like the other irreversible engineer actions rather than like a read.
+# Ten per ten minutes is sized for a real cleanup pass — the 2026-08-19 incident
+# had THREE sources, and a test run leaves one — with headroom for a mistyped
+# address, while hard-braking a runaway loop or a compromised engineer token
+# trying to wipe the login telemetry wholesale. Same in-process caveat as every
+# limiter here (see the module docstring): it narrows the blast radius of one
+# warm instance, it is not a global ceiling. The forensic trail is the real
+# control: every call writes an ``engineer_action_log`` row the engineer cannot
+# delete, whether it removed anything or not.
+DELETE_LOGIN_CAMPAIGN_LIMITER = rate_limiter(
+    "admin:delete_login_campaign",
+    limit=10,
+    window_seconds=600,
+    actor_guard=require_engineer,
+)
+DeleteLoginCampaignRateLimit = Annotated[
+    UserContext, Depends(DELETE_LOGIN_CAMPAIGN_LIMITER)
+]
+
 # --- Alumni mutation routes (#112a) ------------------------------------------
 #
 # Per-endpoint brakes on the alumni write routes (interactions / tasks /

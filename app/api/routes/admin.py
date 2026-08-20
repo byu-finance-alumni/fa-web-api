@@ -19,7 +19,7 @@ import unicodedata
 import uuid
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,7 @@ from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.rate_limit import (
+    AlertTemplateRateLimit,
     AssignRoleRateLimit,
     CreateUserRateLimit,
     DeleteUserRateLimit,
@@ -50,7 +51,11 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
-from app.services import auth_sessions, failure_alert, login_abuse, login_block
+
+# Kept on ONE LINE on purpose: tests/test_login_auto_block.py pins the set of
+# modules allowed to reach ``login_block`` with a line-anchored regex, and a
+# parenthesised import would drop this file out of that guard silently.
+from app.services import alert_templates, auth_sessions, failure_alert, login_abuse, login_block
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -390,6 +395,71 @@ class LoginIpBlockLifted(BaseModel):
 
     block_id: int
     ip_address: str
+
+
+# --- Editable alert wording (2026-08-20) -------------------------------------
+
+
+class AlertTemplatePlaceholder(BaseModel):
+    """One ``{name}`` a template may use, with what it means and an example.
+
+    The console shows these next to the field, which is the only way an owner
+    editing a sentence can know what he is allowed to say. ``example`` is what
+    drives the live preview.
+    """
+
+    name: str
+    description: str
+    example: str
+
+
+class AlertTemplateRow(BaseModel):
+    """One editable message: its default wording, its current wording, and how
+    the current wording renders.
+
+    ``default_body`` is always sent, so the console can show what "reset" would
+    restore without asking a second time — and so "customised" is visible as a
+    difference rather than as a claim.
+
+    ⚠️ ``placeholders`` IS THE COMPLETE LIST OF FACTS THIS MESSAGE CAN CARRY.
+    There is no placeholder for an attempted email address and there never will
+    be: they are unverified strings a stranger typed, some belong to real people,
+    and a list of them in a Slack channel is an enumeration oracle. See
+    ``app/services/alert_templates.py``.
+    """
+
+    key: str
+    label: str
+    description: str
+    default_body: str
+    body: str
+    customized: bool
+    preview: str
+    placeholders: list[AlertTemplatePlaceholder]
+    max_chars: int
+    updated_at: datetime.datetime | None = None
+    updated_by_user_id: int | None = None
+
+
+class AlertTemplateList(BaseModel):
+    """Every editable message, in the order the console shows them."""
+
+    items: list[AlertTemplateRow]
+
+
+class AlertTemplateUpdate(BaseModel):
+    """New wording for one message.
+
+    ``extra="forbid"`` so a typo'd field is a 422 rather than a silent no-op that
+    looks like a successful save. The real validation — length, control
+    characters, which placeholders are allowed — lives in
+    ``alert_templates.validate_body`` and is applied at RENDER time as well, so a
+    row that arrives some other way is held to the same rules.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    body: str
 
 
 class RoleAssign(BaseModel):
@@ -1184,6 +1254,163 @@ async def send_test_alert(
     await session.commit()
 
     return AlertTestResult(**result)
+
+
+# --- Editable alert wording (2026-08-20) -------------------------------------
+#
+# The owner reads these sentences before he reads anything else, and until now
+# every word of them was a string literal behind a deploy. These three routes make
+# the WORDING data while leaving the FACTS in the renderers: a template names
+# placeholders and can reach nothing else, so no edit here can widen what an
+# alert is able to say. See app/services/alert_templates.py.
+
+#: The message being edited. Bounded and pattern-checked so an absurd path
+#: segment is a 422 before any query runs; the real check is membership of
+#: ``alert_templates.KINDS``, which the service does.
+TemplateKeyPath = Annotated[str, Path(min_length=1, max_length=64, pattern=r"^[a-z_]+$")]
+
+
+@router.get("/alert-templates", response_model=AlertTemplateList)
+async def list_alert_templates(
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> AlertTemplateList:
+    """The editable Slack alert wording, with defaults and previews. Engineer only.
+
+    The "see it" half of letting the owner write his own alerts; PUT below is the
+    "change it" half and DELETE is the undo. Each row carries the built-in
+    default alongside the current body, so the console can show what reset would
+    restore and can mark a message as customised by comparing the two rather than
+    by asking whether a row exists — which matters because the migration SEEDS the
+    defaults, and a seeded row is not an edit.
+
+    Read UNCACHED, unlike the alerting path's read: the console must show what is
+    stored right now, or an engineer saves an edit and appears to see it not take.
+
+    Engineer-gated (``RequireEngineer``) like the neighbouring alerting routes,
+    and audited (``read_alert_templates``). Not rate limited — it is a read, and
+    braking the screen someone uses to fix a bad template is the same
+    lockout-shaped mistake as limiting the maintenance-mode disable route.
+    """
+    items = await alert_templates.list_all(session)
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="read_alert_templates",
+            entity_type="alert_template",
+        )
+    )
+    await session.commit()
+
+    return AlertTemplateList(items=[AlertTemplateRow(**item) for item in items])
+
+
+@router.put("/alert-templates/{template_key}", response_model=AlertTemplateRow)
+async def update_alert_template(
+    template_key: TemplateKeyPath,
+    payload: AlertTemplateUpdate,
+    actor: AlertTemplateRateLimit,
+    session: SessionDep,
+) -> AlertTemplateRow:
+    """Rewrite one alert's wording. Engineer only.
+
+    422 with a message the engineer can act on if the body is empty, longer than
+    ``alert_templates.MAX_BODY_CHARS``, contains a control or invisible character,
+    names a placeholder this message does not have, or carries a brace that is not
+    part of one. Those rules exist because a template that cannot render costs a
+    real alert its wording, and the moment to find that out is while someone is
+    typing — not while the site is down.
+
+    ⚠️ WHAT THIS CANNOT DO. It cannot make an alert say something the renderer
+    does not already compute, and specifically it cannot reach an attempted email
+    address: substitution resolves names against a dict the renderer built, so the
+    reachable facts are exactly the ``placeholders`` list on the GET above. It also
+    cannot silence an alert — a body that will not render is refused here, and a
+    body that somehow gets stored anyway is discarded whole at render time in
+    favour of the built-in default.
+
+    Engineer-gated through the rate limiter's own ``actor_guard`` (the same shape
+    as POST /admin/alerts/test), rate limited to 30 per ten minutes, and audited
+    (``update_alert_template``). The audit records WHICH message changed, not the
+    prose — the wording itself is one SELECT away in the table, and an audit row
+    is not the place to keep a copy of it.
+    """
+    if template_key not in alert_templates.KINDS:
+        raise NotFoundError("No alert message with that name.")
+
+    await alert_templates.set_body(
+        session,
+        kind_key=template_key,
+        body=payload.body,
+        actor_user_id=actor.user_id,
+    )
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="update_alert_template",
+            entity_type="alert_template",
+            field_name=template_key,
+            new_value="customized",
+        )
+    )
+    await session.commit()
+
+    return await _one_alert_template(session, template_key)
+
+
+@router.delete("/alert-templates/{template_key}", response_model=AlertTemplateRow)
+async def reset_alert_template(
+    template_key: TemplateKeyPath,
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> AlertTemplateRow:
+    """Put one alert's wording back to the built-in default. Engineer only.
+
+    The undo, and deliberately the CHEAP direction: it deletes the override row,
+    after which the message says exactly what it said before anybody edited it.
+
+    404 if there was nothing stored, so a double-click is a clean "already the
+    default" rather than a second delete that implies something changed.
+
+    NOT rate limited, on purpose and for the same reason the maintenance-mode
+    *disable* route is not: this is the recovery path from wording that broke the
+    message, and a limiter on the way back is itself the failure mode. The brake
+    belongs on the direction that does the damage, which is the PUT above.
+    """
+    cleared = await alert_templates.clear(session, kind_key=template_key)
+    if not cleared:
+        raise NotFoundError("That alert message is already using its default wording.")
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="reset_alert_template",
+            entity_type="alert_template",
+            field_name=template_key,
+            new_value="default",
+        )
+    )
+    await session.commit()
+
+    return await _one_alert_template(session, template_key)
+
+
+async def _one_alert_template(
+    session: AsyncSession, template_key: str
+) -> AlertTemplateRow:
+    """Re-read one row through the SAME code path the list uses.
+
+    Both writes answer with a freshly read row rather than echoing what they were
+    handed, so the console never has to guess at ``customized`` or at the preview
+    — and so the two writes can never drift from the list in how they describe the
+    same template.
+    """
+    for item in await alert_templates.list_all(session):
+        if item["key"] == template_key:
+            return AlertTemplateRow(**item)
+    raise NotFoundError("No alert message with that name.")
 
 
 # --- Engineer-action oversight log (#199 / #200 forensic blind spot) ----------

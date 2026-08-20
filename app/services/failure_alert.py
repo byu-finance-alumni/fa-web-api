@@ -134,6 +134,20 @@ one way to build a loop here would be to alert about a failed alert — so a fai
 delivery is logged and dropped, never re-reported.
 
 --------------------------------------------------------------------------------
+THE WORDING IS EDITABLE; THE FACTS ARE NOT
+--------------------------------------------------------------------------------
+As of 2026-08-20 the opening and recovery SENTENCES are owner-editable from the
+engineer console (``app/services/alert_templates.py``); the subject line and the
+label/value rows are not. A template names placeholders and can reach nothing
+else, so it can change what the alert SAYS and can never change what it KNOWS —
+the rule below still holds whatever anyone types. Reading a template happens only
+on this path, once per claimed message, right before the outbound POST, and it
+falls back to the built-in wording on any problem. The DEGRADED alert at the
+bottom of this module is deliberately NOT templated: it is the message sent when
+the database is unreachable, so asking the database how to word it would fail
+every single time.
+
+--------------------------------------------------------------------------------
 NO PII, NO SECRETS
 --------------------------------------------------------------------------------
 This content leaves the system and lands in a mailbox AND in a Slack channel. It
@@ -159,7 +173,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import __version__
 from app.core import database
 from app.core.config import get_settings
-from app.services import mailer, slack
+from app.services import alert_templates, mailer, slack
 
 log = logging.getLogger(__name__)
 
@@ -938,12 +952,7 @@ async def _note_failure_durable(signal: FailureSignal) -> None:
     if incident is None:
         return
     subject, rows = render_alert(incident)
-    await deliver_alert(
-        subject,
-        "The API has been failing for long enough to be an incident. "
-        "You will get one more email when it clears.",
-        rows,
-    )
+    await deliver_alert(subject, await _outage_line(incident, opening=True), rows)
 
 
 async def note_success() -> None:
@@ -978,11 +987,62 @@ async def _note_success_durable() -> None:
         await _send_recovery(incident)
 
 
+def outage_template_values(incident: dict) -> dict:
+    """The facts an OUTAGE template may name, and nothing else.
+
+    The counterpart of ``login_abuse._template_values`` and the same boundary: a
+    stored template reaches exactly what is in this dict, narrowed further by the
+    placeholders its kind declares. Everything here is already in the alert's
+    label/value rows and is subject to the same NO PII, NO SECRETS rule at the top
+    of this module — a route TEMPLATE, never a real path; an exception CLASS NAME,
+    never a message.
+    """
+    return {
+        "environment": str(incident.get("environment") or "unknown"),
+        "started": _fmt_ts(incident.get("started_at")),
+        "failures": str(incident.get("failure_count") or 0),
+        "route": str(
+            incident.get("last_path") or incident.get("first_path") or "unknown"
+        ),
+        "status_code": str(incident.get("status_code") or "unknown"),
+        "error_kind": str(incident.get("error_kind") or "unknown"),
+        "duration": _fmt_duration(
+            incident.get("started_at"),
+            incident.get("resolved_at") or incident.get("last_failure_at"),
+        ),
+    }
+
+
+async def _outage_line(incident: dict, *, opening: bool) -> str:
+    """The editable opening / recovery sentence for an outage alert.
+
+    ⚠️ THE READ HAPPENS HERE, ON THE ALERTING PATH, AND NOWHERE ELSE. By the time
+    this runs the email has already been CLAIMED — exactly one instance in the
+    whole outage reaches this line, and it is about to spend seconds on an
+    outbound POST. Nothing in ``failure_monitor``'s middleware, and no request
+    that is merely failing, ever touches the template table. ``load`` never
+    raises and never blocks for long; ``{}`` means "say what the code has always
+    said".
+
+    Unlike the two security lines this one heads the EMAIL as well as the Slack
+    message (an outage alert has no short-form summary — see ``render_slack``), so
+    editing it changes both. That is the honest behaviour: it is one sentence with
+    one meaning, and having the mail and the channel disagree about it would be
+    worse than either wording.
+    """
+    kind = (
+        alert_templates.OUTAGE_OPENING if opening else alert_templates.OUTAGE_RECOVERED
+    )
+    return alert_templates.render(
+        kind,
+        outage_template_values(incident),
+        templates=await alert_templates.load(),
+    )
+
+
 async def _send_recovery(incident: dict) -> None:
     subject, rows = render_recovery(incident)
-    await deliver_alert(
-        subject, "The API is serving requests again. This incident is closed.", rows
-    )
+    await deliver_alert(subject, await _outage_line(incident, opening=False), rows)
 
 
 async def _degraded_alert(signal: FailureSignal, *, process_sustained: bool) -> None:

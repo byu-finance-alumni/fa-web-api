@@ -70,7 +70,7 @@ from app.core.database import get_session
 from app.main import app
 from app.models.login_failure import LoginFailure
 from app.schemas.auth import UserContext
-from app.services import login_abuse, login_block
+from app.services import alert_templates, login_abuse, login_block
 from tests.test_login_abuse import (
     MIAMI,
     ROMANIA,
@@ -1053,7 +1053,11 @@ def _written_placeholders(stmt) -> set[str]:
     return set(_PLACEHOLDER.findall(sql))
 
 
-@pytest.mark.parametrize("module", [login_block, login_abuse])
+# ``alert_templates`` is in this list because it is the next module in the app
+# to write ``text()`` statements, and the trap is not specific to blocking:
+# any new module with raw SQL belongs here, or it ships with the same
+# invisible-until-production bug.
+@pytest.mark.parametrize("module", [login_block, login_abuse, alert_templates])
 def test_every_placeholder_written_is_a_placeholder_sqlalchemy_bound(module):
     """The bug this file exists to never repeat.
 

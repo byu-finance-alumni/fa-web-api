@@ -115,6 +115,7 @@ ALTER TABLE opportunity_links ENABLE ROW LEVEL SECURITY;
 ALTER TABLE service_incidents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE login_abuse_incidents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE login_ip_blocks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alert_message_templates ENABLE ROW LEVEL SECURITY;
 
 -- =============================================================================
 -- THE SWEEP — enable RLS on every public table that does not already have it.

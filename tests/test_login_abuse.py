@@ -219,7 +219,13 @@ class _FakeSettings:
     alert_sender = "alerts@example.edu"
     # hooks.slack.test, not .com: a realistic webhook literal is what gitleaks'
     # bundled rule looks for, and a fixture is not worth an allowlist entry.
-    slack_webhook = "https://hooks.slack.test/services/FAKE/FAKE/FAKE"
+    #
+    # Two DIFFERENT URLs, so a test that miscounted channels — or a regression
+    # that sent a security alert to the error channel — shows up as the wrong URL
+    # rather than passing quietly. Which channel each kind routes to is asserted
+    # directly in tests/test_slack_alerts.py.
+    slack_webhook = "https://hooks.slack.test/services/ERROR/CHANNEL/FAKE"
+    slack_security_webhook = "https://hooks.slack.test/services/SECURITY/CHANNEL/FAKE"
 
 
 @pytest.fixture
@@ -237,6 +243,7 @@ def sent(monkeypatch):
         messages.append(
             {
                 "channel": "slack",
+                "url": url,
                 "subject": payload["text"],
                 "body": payload["blocks"][1]["text"]["text"],
             }
@@ -520,6 +527,7 @@ def test_detection_is_off_entirely_when_no_channel_is_configured(monkeypatch, si
         alert_sender=None,
         alert_from_name="x",
         slack_webhook=None,
+        slack_security_webhook=None,
     )
     monkeypatch.setattr(failure_alert, "get_settings", lambda: unconfigured)
     monkeypatch.setattr(login_abuse, "get_settings", lambda: unconfigured)
@@ -604,6 +612,22 @@ def test_the_alert_carries_what_the_owner_needs_to_act(sent, sim):
     assert sim.incidents[0]["attempt_count"] >= attempts
 
 
+def test_the_abuse_alert_goes_to_the_security_channel_and_says_so(sent, sim):
+    """This detector is the ONE thing in the app that posts to #security-alerts.
+    An outage alert must never arrive there, and this must never arrive in
+    #error-alerts while a security webhook exists — the channel routing is
+    asserted end to end in tests/test_slack_alerts.py, and this is the check that
+    the login path actually asks for it."""
+    replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
+    message = alerts(sent)[0]
+
+    assert message["url"] == _FakeSettings.slack_security_webhook
+    assert message["url"] != _FakeSettings.slack_webhook
+    # Tagged, so it is still obviously an attack if the fallback ever puts it in
+    # the error channel alongside 500s.
+    assert message["subject"].startswith("SECURITY — ")
+
+
 def test_the_alert_never_names_a_single_attempted_address(sent, sim):
     """The attempted addresses are unverified strings a stranger typed, some of
     them belong to real people, and a list of them is the scraped material the
@@ -612,6 +636,8 @@ def test_the_alert_never_names_a_single_attempted_address(sent, sim):
     replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
 
     for message in sent:
+        # Subject and body only — the captured `url` is the webhook the fixture
+        # dialled, not content that was sent anywhere.
         text = message["subject"] + message["body"]
         assert "target0@byu.edu" not in text
         assert "@byu.edu" not in text

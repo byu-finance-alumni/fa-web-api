@@ -103,29 +103,71 @@ class Settings(BaseSettings):
     # moved to their own address later without touching the survey identity.
     alert_from_email: str | None = Field(default=None)  # ALERT_FROM_EMAIL
     alert_from_name: str = Field(default="BYU Finance Alumni API")
-    # Slack incoming-webhook URL alerts are ALSO posted to (#456). Same on/off
-    # rule as ALERT_EMAIL_TO above and for the same reason: UNSET DISABLES SLACK
-    # ENTIRELY, so local runs, the test suite, CI and preview deployments stay
-    # silent without a second flag to remember to turn off. The two channels are
-    # independently optional -- email only, Slack only, both, or neither -- so a
-    # deployment can page a channel without a mailbox, or the reverse.
+    # Slack incoming-webhook URLs (#456). There are TWO, because the two kinds of
+    # alert this app sends are read by the same person in two different moods:
     #
-    # This is a SECRET: the URL is the entire credential (anyone holding it can
-    # post to the channel), so it lives only in backend env vars, is never
-    # returned by an endpoint, and is never logged. Nothing in this app renders
-    # it; the alerter logs the failure, never the target.
+    #   SLACK_ALERT_WEBHOOK_URL     -> #error-alerts    OPERATIONAL alerts: the
+    #                                  API is failing / the API recovered (#444).
+    #   SLACK_SECURITY_WEBHOOK_URL  -> #security-alerts SECURITY alerts: login
+    #                                  brute-force and credential guessing.
+    #
+    # Same on/off rule as ALERT_EMAIL_TO above and for the same reason: UNSET
+    # DISABLES THAT CHANNEL, so local runs, the test suite, CI and preview
+    # deployments stay silent without a flag to remember to turn off. Every
+    # channel is independently optional -- email only, one Slack channel only,
+    # both Slack channels, all three, or nothing at all.
+    #
+    # These are SECRETS: the URL is the entire credential (anyone holding it can
+    # post to the channel), so they live only in backend env vars, are never
+    # returned by an endpoint, and are never logged. Nothing in this app renders
+    # one; the alerter logs the failure, never the target.
     slack_alert_webhook_url: str | None = Field(default=None)  # SLACK_ALERT_WEBHOOK_URL
+    slack_security_webhook_url: str | None = Field(default=None)  # SLACK_SECURITY_WEBHOOK_URL
+
+    @staticmethod
+    def _clean_webhook(raw: str | None) -> str | None:
+        """Trim a webhook URL and treat whitespace-only as unset.
+
+        Vercel env vars are edited in a web form, and an accidental space would
+        otherwise read as "configured" and turn every alert into a failed POST
+        to " " — an alerting channel that is silently broken rather than off.
+        """
+        return (raw or "").strip() or None
 
     @property
     def slack_webhook(self) -> str | None:
-        """The Slack incoming-webhook URL, or None when Slack alerting is off.
+        """The OPERATIONAL Slack channel (#error-alerts), or None when it is off.
 
-        Whitespace-only is treated as unset: Vercel env vars are edited in a web
-        form and an accidental space would otherwise read as "configured" and
-        turn every alert into a failed HTTP POST.
+        No fallback in this direction, deliberately: with only the security
+        webhook set, outage alerts go to email or nowhere — they do NOT divert
+        into the security channel. A channel someone opens to answer "are we
+        under attack?" must not fill up with 500s.
         """
-        raw = (self.slack_alert_webhook_url or "").strip()
-        return raw or None
+        return self._clean_webhook(self.slack_alert_webhook_url)
+
+    @property
+    def slack_security_webhook(self) -> str | None:
+        """The SECURITY Slack channel (#security-alerts), or None when off.
+
+        ⚠️ FALLS BACK TO :attr:`slack_webhook`. If SLACK_SECURITY_WEBHOOK_URL is
+        unset but SLACK_ALERT_WEBHOOK_URL is set, a security alert goes to the
+        ERROR channel rather than being dropped.
+
+        That asymmetry is the whole point. Forgetting to set a second env var is
+        an ordinary mistake — it will happen on a preview, on a re-provisioned
+        project, on the day someone rotates a webhook. The cost of the fallback is
+        an attack alert landing in a slightly wrong channel, where it is still
+        read. The cost of NOT having it is silence about a credential-guessing
+        campaign, which is the exact failure this feature was built to end: on
+        2026-08-19 three sources ran 750 failed sign-ins against prod and the
+        owner found out only because he happened to look. A misfiled alert is a
+        nuisance; a missing one is the bug.
+
+        The two message types are tagged (``SECURITY`` / ``OUTAGE``) precisely so
+        that a fallback-mixed channel still reads correctly at a glance — see
+        ``render_slack`` in app/services/failure_alert.py.
+        """
+        return self._clean_webhook(self.slack_security_webhook_url) or self.slack_webhook
 
     @property
     def alert_recipients(self) -> list[str]:

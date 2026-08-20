@@ -113,6 +113,18 @@ never fail the response. Paying it once per incident is the same trade
 ``failure_alert`` makes on the outage path.
 
 --------------------------------------------------------------------------------
+WHERE THE ALERT GOES
+--------------------------------------------------------------------------------
+Delivery is ``failure_alert.deliver_alert`` with ``purpose=SECURITY``, so this is
+the one thing in the app that posts to #security-alerts
+(``SLACK_SECURITY_WEBHOOK_URL``) rather than #error-alerts. If that webhook is
+unset it falls back to the error channel rather than being dropped — a forgotten
+env var must never become silence about an attack, which is the exact failure
+this module exists to end. Because of that fallback the two kinds can share one
+channel, so every Slack message is tagged ``SECURITY`` or ``OUTAGE`` up front.
+Email, where configured, gets it too; there is one alert mailbox.
+
+--------------------------------------------------------------------------------
 NO PII IN THE ALERT
 --------------------------------------------------------------------------------
 The message names the source IP, its approximate geography, counts, and a time
@@ -730,7 +742,14 @@ async def observe_failure(
     subject, rows = render_alert(incident)
     try:
         await asyncio.wait_for(
-            failure_alert.deliver_alert(subject, _INTRO, rows),
+            # SECURITY, not operational: this routes to #security-alerts
+            # (SLACK_SECURITY_WEBHOOK_URL) and tags the message `SECURITY` so it
+            # is told apart at a glance from an outage — including in the fallback
+            # case where no security webhook is set and both kinds share
+            # #error-alerts. See app/services/failure_alert.py.
+            failure_alert.deliver_alert(
+                subject, _INTRO, rows, purpose=failure_alert.SECURITY
+            ),
             timeout=_DELIVERY_TIMEOUT_SECONDS,
         )
     except Exception:  # noqa: BLE001 - and neither may delivery

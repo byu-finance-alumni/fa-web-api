@@ -44,6 +44,16 @@ async def _async_true(*a, **k):
 async def _async_false(*a, **k):
     return False
 
+
+def _rejecting_webhook(channels):
+    """A Slack endpoint that answers 404, the way a revoked webhook does."""
+
+    async def reject(url, *, payload, timeout):
+        channels["slack"].append((url, payload))
+        return SimpleNamespace(is_success=False, status_code=404)
+
+    return reject
+
 WEBHOOK = "https://hooks.slack.test/services/ERROR/CHANNEL/FAKE"
 SECURITY_WEBHOOK = "https://hooks.slack.test/services/SECURITY/CHANNEL/FAKE"
 
@@ -207,18 +217,36 @@ def test_the_fallback_is_defined_on_settings_not_invented_at_the_call_site():
 # ------------------------------------------------- the two channels are separate --
 
 
-def test_both_channels_get_the_same_alert(monkeypatch, channels):
+def test_slack_gets_the_alert_and_the_mailbox_stays_quiet(monkeypatch, channels):
+    """SLACK IS THE CHANNEL; EMAIL IS THE BACKSTOP (changed 2026-08-19).
+
+    Both used to go every time, so one attack arrived twice. The owner asked for
+    it all in Slack. The email was not deleted — see the test below — it is now
+    conditional on Slack not landing, because a single channel that breaks is
+    silence, and silence is the failure this module exists to prevent."""
     _settings(monkeypatch)
     assert _deliver() is True
 
-    assert len(channels["email"]) == 1
     assert len(channels["slack"]) == 1
+    assert channels["email"] == [], "the mail is a backstop, not a copy"
     url, payload = channels["slack"][0]
     assert url == WEBHOOK
     assert payload["text"] == "OUTAGE — subject"
-    # The EMAIL subject is untagged, byte-for-byte what it was before the split:
-    # mail is already filed by rules people wrote against the old subjects, and a
-    # channel scanned by eye is the thing that needed the marker.
+
+
+def test_the_mail_still_goes_when_slack_rejects_the_post(monkeypatch, channels):
+    """The reason there are two channels at all. A revoked webhook, a Slack
+    outage or a typo'd URL must not turn into silence — the backstop fires with
+    the FULL rows, untagged, byte-for-byte the mail that was sent before."""
+    _settings(monkeypatch)
+    monkeypatch.setattr(
+        failure_alert.slack,
+        "post_webhook",
+        _rejecting_webhook(channels),
+    )
+
+    assert _deliver() is True
+    assert len(channels["email"]) == 1
     assert channels["email"][0]["subject"] == "subject"
 
 

@@ -460,7 +460,9 @@ def sent(monkeypatch):
                 "channel": "slack",
                 "url": url,
                 "subject": payload["text"],
-                "body": payload["blocks"][1]["text"]["text"],
+                # The LAST block: a summary-only payload (the short security
+                # line) has one block and no header, a rows payload has two.
+                "body": payload["blocks"][-1]["text"]["text"],
             }
         )
         return SimpleNamespace(is_success=True, status_code=200)
@@ -471,6 +473,24 @@ def sent(monkeypatch):
     monkeypatch.setattr(login_abuse, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(login_block, "get_settings", lambda: _FakeSettings())
     return messages
+
+
+@pytest.fixture
+def sent_slack_down(sent, monkeypatch):
+    """Same capture, but Slack REJECTS every post.
+
+    Email is the backstop now, not a second copy: in normal operation an alert
+    goes to Slack and nowhere else, so this is the only fixture under which an
+    email exists to assert on. That makes it do double duty -- every mail-content
+    test below is also, for free, a test that the backstop fires when the channel
+    is down.
+    """
+
+    async def rejecting_slack(url, *, payload, timeout):
+        return SimpleNamespace(is_success=False, status_code=404)
+
+    monkeypatch.setattr(failure_alert.slack, "post_webhook", rejecting_slack)
+    return sent
 
 
 def alerts(messages):
@@ -484,7 +504,7 @@ def alerts(messages):
     return [
         m
         for m in messages
-        if m["channel"] == "slack" and not m["subject"].endswith("has stopped")
+        if m["channel"] == "slack" and "has stopped" not in m["body"]
     ]
 
 
@@ -496,9 +516,7 @@ def resolutions(messages):
     an hour later is a different event, not a second announcement of the same one.
     """
     return [
-        m
-        for m in messages
-        if m["channel"] == "slack" and m["subject"].endswith("has stopped")
+        m for m in messages if m["channel"] == "slack" and "has stopped" in m["body"]
     ]
 
 
@@ -562,7 +580,9 @@ def test_the_romania_campaign_produces_exactly_one_alert(sent, sim):
     assert len(sim.incidents) == 1
     subject = alerts(sent)[0]["subject"]
     assert "66.234.153.26" in subject
-    assert "Login abuse" in subject
+    # The Slack notification preview IS the sentence now — there is no separate
+    # subject line to restate it (see render_slack).
+    assert "being attacked" in subject
 
 
 def test_the_seattle_campaign_produces_exactly_one_alert(sent, sim):
@@ -881,7 +901,7 @@ def test_a_failing_delivery_does_not_retry_or_re_report(sim, monkeypatch):
 # --------------------------------------------------------- what is in the alert --
 
 
-def test_the_alert_carries_what_the_owner_needs_to_act(sent, sim):
+def test_the_alert_carries_what_the_owner_needs_to_act(sent_slack_down, sim):
     """Source, geography, both counts, the window and the duration — everything the
     owner needs to decide whether to block the address, without opening a laptop.
 
@@ -894,7 +914,7 @@ def test_the_alert_carries_what_the_owner_needs_to_act(sent, sim):
     # test_the_slack_line_says_who_and_from_where). Both are asserted here, so a
     # change that quietly moved detail out of the mail as well as out of the
     # channel would fail rather than pass.
-    message = emails(sent)[0]
+    message = emails(sent_slack_down)[0]
     body = message["body"]
 
     assert "159.26.103.94" in body
@@ -928,9 +948,11 @@ def test_the_abuse_alert_goes_to_the_security_channel_and_says_so(sent, sim):
 
     assert message["url"] == _FakeSettings.slack_security_webhook
     assert message["url"] != _FakeSettings.slack_webhook
-    # Tagged, so it is still obviously an attack if the fallback ever puts it in
-    # the error channel alongside 500s.
-    assert message["subject"].startswith("SECURITY — ")
+    # The `SECURITY —` tag is gone with the header block: it existed to tell
+    # attacks from 500s when both shared a channel, and the sentence itself does
+    # that job now, in the fallback case too. A line opening "You are being
+    # attacked by" cannot be read as an outage.
+    assert message["body"].startswith("You are being attacked by")
 
 
 def test_the_alert_never_names_a_single_attempted_address(sent, sim):
@@ -951,38 +973,38 @@ def test_the_alert_never_names_a_single_attempted_address(sent, sim):
         assert "@" not in text
 
 
-def test_the_alert_says_what_was_done_about_the_source(sent, sim):
+def test_the_alert_says_what_was_done_about_the_source(sent_slack_down, sim):
     """The useful half of the message (#457). Before automatic blocking existed
     this alert ended by telling the reader to block the IP at the Vercel
     firewall — a control this account does not have. It now reports what already
     happened, with the expiry, so nobody has to go and do anything."""
     replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
-    body = emails(sent)[0]["body"]
+    body = emails(sent_slack_down)[0]["body"]
 
     assert "Action taken: BLOCKED" in body
     assert "expires on its own" in body
     assert "Vercel firewall" not in body, "that instruction was never actionable"
 
 
-def test_the_alert_says_when_a_source_was_deliberately_not_blocked(sent, sim):
+def test_the_alert_says_when_a_source_was_deliberately_not_blocked(sent_slack_down, sim):
     """The other outcome, and the one that would otherwise be baffling: an alert
     about a campaign with no block behind it. The reader has to be told the
     address was EXEMPT rather than left to assume the block failed."""
     sim.record_success(ip="159.26.103.94")  # a real sign-in from that address
     replay(sim, ip="159.26.103.94", attempts=338, addresses=78, seconds=360, geo=SEATTLE)
-    body = emails(sent)[0]["body"]
+    body = emails(sent_slack_down)[0]["body"]
 
     assert "Action taken: NOT blocked" in body
     assert "exempt" in body
     assert sim.blocks == []
 
 
-def test_the_message_says_the_addresses_were_withheld_on_purpose(sent, sim):
+def test_the_message_says_the_addresses_were_withheld_on_purpose(sent_slack_down, sim):
     """So nobody has to wonder whether the list was omitted deliberately or the
     detector simply failed to collect it."""
     replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
 
-    assert "withheld on purpose" in emails(sent)[0]["body"]
+    assert "withheld on purpose" in emails(sent_slack_down)[0]["body"]
 
 
 def test_the_pattern_names_the_shape_of_the_campaign():
@@ -1080,14 +1102,17 @@ def test_the_slack_line_still_says_whether_it_was_blocked(sent, sim):
     assert "blocked" in alerts(sent)[0]["body"]
 
 
-def test_the_mail_keeps_the_detail_the_channel_drops(sent, sim):
+def test_the_mail_keeps_the_detail_the_channel_drops(sent_slack_down, sim):
     """The other direction. Shortening Slack must not shorten the record."""
     replay(sim, ip="134.82.68.139", attempts=222, addresses=202, seconds=16, geo=MIAMI)
-    mail = emails(sent)[0]["body"]
+    mail = emails(sent_slack_down)[0]["body"]
 
     for row in ("Source IP", "Pattern", "Action taken", "Incident"):
         assert row in mail
-    assert len(mail) > len(alerts(sent)[0]["body"])
+    # Nothing reached Slack here (that is what this fixture arranges), so compare
+    # against what WOULD have gone: the renderer is pure.
+    line = login_abuse.render_slack_summary(sim.incidents[0] | {"block_applied": True})
+    assert len(mail) > len(line)
 
 
 def test_a_campaign_that_stops_is_reported_as_over(sent, sim):

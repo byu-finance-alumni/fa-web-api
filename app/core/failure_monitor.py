@@ -33,7 +33,7 @@ import time
 
 from fastapi import Request
 
-from app.services import failure_alert
+from app.services import failure_alert, login_abuse
 from app.services.failure_alert import FailureSignal
 
 log = logging.getLogger(__name__)
@@ -174,6 +174,11 @@ async def observe_success() -> None:
         return
     _state["last_probe_at"] = now
     await failure_alert.note_success()
+    # Same sample, second question. `failure_alert` asks "has the API recovered";
+    # this asks "has an attack stopped". Both are the end of something that can
+    # only be noticed by an ABSENCE of events, which is why neither can live on
+    # the path that observes the events themselves.
+    await login_abuse.note_success()
 
 
 async def failure_alert_middleware(request: Request, call_next):

@@ -17,7 +17,7 @@ import re
 import secrets
 import unicodedata
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -39,6 +39,7 @@ from app.core.rate_limit import (
     DeleteUserRateLimit,
     ResetPasswordRateLimit,
     RevokeSessionRateLimit,
+    TestAlertRateLimit,
 )
 from app.core.roles import ROLE_LABELS, ROLE_ORDER, RoleName
 from app.core.security import AuthorizationError
@@ -49,7 +50,7 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
-from app.services import auth_sessions, login_abuse, login_block
+from app.services import auth_sessions, failure_alert, login_abuse, login_block
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -365,6 +366,23 @@ class LoginIpBlockPage(BaseModel):
     limit: int
     block_seconds: int
     auto_block_enabled: bool
+
+
+class AlertTestResult(BaseModel):
+    """What a test alert actually did, per channel.
+
+    ⚠️ CONFIGURED AND DELIVERED ARE SEPARATE FIELDS ON PURPOSE. "Nothing arrived"
+    has two very different causes -- the channel has no webhook, or it has one and
+    the send failed -- and a single boolean cannot tell them apart. Reporting both
+    is the entire reason this endpoint is more useful than watching a channel.
+    """
+
+    purpose: str
+    slack_configured: bool
+    slack_delivered: bool
+    email_configured: bool
+    email_delivered: bool
+    fell_back_to_error_channel: bool
 
 
 class LoginIpBlockLifted(BaseModel):
@@ -1118,6 +1136,54 @@ async def lift_login_ip_block(
     return LoginIpBlockLifted(
         block_id=int(lifted["block_id"]), ip_address=str(lifted["ip_address"])
     )
+
+
+@router.post("/alerts/test", response_model=AlertTestResult)
+async def send_test_alert(
+    actor: TestAlertRateLimit,
+    session: SessionDep,
+    purpose: Annotated[Literal["operational", "security"], Query()] = "operational",
+) -> AlertTestResult:
+    """Send one clearly-marked TEST alert to a channel. Engineer only.
+
+    Answers "is alerting actually wired up?" without breaking anything. Before
+    this, the only way to prove the operational channel worked was to make the API
+    fail three times over a minute -- a deliberate production outage to check a
+    webhook. The security channel could at least be proved by simulating an
+    attack, which is how the 2026-08-19 misrouting was found at all.
+
+    It uses the real renderer, the real fan-out and the real webhooks, and it
+    touches NO incident state: nothing is opened, claimed or resolved, so a test
+    can never suppress the alert for a real incident starting a second later.
+
+    The response reports each channel separately -- configured, and delivered --
+    plus whether a security alert is currently falling back to the error channel
+    because ``SLACK_SECURITY_WEBHOOK_URL`` is unset. That fallback is deliberate
+    and documented, but it is invisible from inside Slack, which is exactly how it
+    went unnoticed.
+
+    Rate limited to six an hour (engineer-gated on top): it is the one route whose
+    whole job is to post to a third party.
+    """
+    result = await failure_alert.deliver_test_alert(
+        purpose=purpose, requested_by=actor.email
+    )
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="send_test_alert",
+            entity_type="alert",
+            field_name=f"purpose={purpose}",
+            new_value=(
+                f"slack={'sent' if result['slack_delivered'] else 'no'};"
+                f"email={'sent' if result['email_delivered'] else 'no'}"
+            ),
+        )
+    )
+    await session.commit()
+
+    return AlertTestResult(**result)
 
 
 # --- Engineer-action oversight log (#199 / #200 forensic blind spot) ----------

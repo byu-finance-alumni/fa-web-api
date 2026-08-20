@@ -5,6 +5,8 @@ string-based relationships resolve and tooling can discover the full mapping.
 Add new model modules to the imports below as they're built.
 """
 
+from app.models.alert_delivery import AlertDeliveryConfig
+from app.models.alert_template import AlertMessageTemplate
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -43,6 +45,8 @@ from app.models.user import Role, User, UserRole
 from app.models.vocabulary import VocabularyTerm
 
 __all__ = [
+    "AlertDeliveryConfig",
+    "AlertMessageTemplate",
     "Alumni",
     "AlumniContactInfo",
     "AlumniEngagement",

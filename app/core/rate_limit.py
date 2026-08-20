@@ -230,6 +230,58 @@ TEST_ALERT_LIMITER = rate_limiter(
 )
 TestAlertRateLimit = Annotated[UserContext, Depends(TEST_ALERT_LIMITER)]
 
+# --- Alert message templates (2026-08-20) ------------------------------------
+#
+# Saving the wording of a Slack alert. Engineer-only through the same
+# ``actor_guard`` the test-alert limiter uses, so the gate and the brake are one
+# dependency and the identity stays server-trusted.
+#
+# LOOSER THAN TEST_ALERT_LIMITER, and the difference is the point: a test alert
+# POSTS TO A THIRD PARTY on every call, so six an hour is the right ceiling on a
+# channel-spamming primitive. Saving a template writes one short row in this
+# database and sends nothing at all; the only thing it needs braking is a runaway
+# loop or a compromised engineer token. 30 per ten minutes is far above someone
+# iterating on a sentence and well below anything that could matter.
+#
+# ⚠️ ONLY THE SAVE IS LIMITED. Resetting a template to its built-in default is
+# deliberately NOT, for the same reason the maintenance-mode *disable* route is
+# not (see the block above it): reset is the recovery path from wording that
+# broke the message, and a limiter on the way back is itself the failure. Brake
+# the direction that does the damage.
+ALERT_TEMPLATE_LIMITER = rate_limiter(
+    "admin:alert_template",
+    limit=30,
+    window_seconds=600,
+    actor_guard=require_engineer,
+)
+AlertTemplateRateLimit = Annotated[UserContext, Depends(ALERT_TEMPLATE_LIMITER)]
+
+# --- Delete a login-abuse campaign (#457 follow-up) --------------------------
+#
+# Engineer-only, and the most destructive read-path cleanup in the console: one
+# call deletes a source's whole trail across three tables — the per-attempt
+# failures, the detector's incident row, and the block row, which un-blocks that
+# source. There is no undo and nothing to restore from.
+#
+# Budgeted like the other irreversible engineer actions rather than like a read.
+# Ten per ten minutes is sized for a real cleanup pass — the 2026-08-19 incident
+# had THREE sources, and a test run leaves one — with headroom for a mistyped
+# address, while hard-braking a runaway loop or a compromised engineer token
+# trying to wipe the login telemetry wholesale. Same in-process caveat as every
+# limiter here (see the module docstring): it narrows the blast radius of one
+# warm instance, it is not a global ceiling. The forensic trail is the real
+# control: every call writes an ``engineer_action_log`` row the engineer cannot
+# delete, whether it removed anything or not.
+DELETE_LOGIN_CAMPAIGN_LIMITER = rate_limiter(
+    "admin:delete_login_campaign",
+    limit=10,
+    window_seconds=600,
+    actor_guard=require_engineer,
+)
+DeleteLoginCampaignRateLimit = Annotated[
+    UserContext, Depends(DELETE_LOGIN_CAMPAIGN_LIMITER)
+]
+
 # --- Alumni mutation routes (#112a) ------------------------------------------
 #
 # Per-endpoint brakes on the alumni write routes (interactions / tasks /

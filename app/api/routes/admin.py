@@ -19,7 +19,7 @@ import unicodedata
 import uuid
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,10 +32,11 @@ from app.api.dependencies.auth import (
 )
 from app.api.params import IdPath
 from app.core.database import get_session
-from app.core.errors import ConflictError, NotFoundError
+from app.core.errors import ConflictError, InvalidRequestError, NotFoundError
 from app.core.rate_limit import (
     AssignRoleRateLimit,
     CreateUserRateLimit,
+    DeleteLoginCampaignRateLimit,
     DeleteUserRateLimit,
     ResetPasswordRateLimit,
     RevokeSessionRateLimit,
@@ -50,7 +51,13 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import UserContext
-from app.services import auth_sessions, failure_alert, login_abuse, login_block
+from app.services import (
+    auth_sessions,
+    failure_alert,
+    login_abuse,
+    login_block,
+    login_campaign,
+)
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
 
@@ -390,6 +397,35 @@ class LoginIpBlockLifted(BaseModel):
 
     block_id: int
     ip_address: str
+
+
+class LoginCampaignDeleted(BaseModel):
+    """What deleting one source's campaign ACTUALLY removed, per table.
+
+    Every number is a count of rows Postgres reported deleting (each statement
+    carries ``RETURNING``), never an assumed success — an address that matched
+    nothing comes back as zeros, which is the only way the engineer learns they
+    typed it wrong.
+
+    ``blocks_deleted`` vs ``active_blocks_deleted``: the first is history
+    removed, the second is how many of those were IN FORCE at the moment of
+    deletion, i.e. whether anybody's access actually changed. Deleting a block
+    row un-blocks the source, and the console has to be able to say that plainly
+    rather than leaving the engineer to infer it.
+
+    ⚠️ THERE IS DELIBERATELY NO EMAIL FIELD, and no list of anything. Same rule
+    as the attack table, the block list and the Slack alert: the attempted
+    addresses being deleted are unverified strings a stranger typed, some of them
+    belong to real people, and a list of them is an enumeration oracle for
+    anything that reaches this response. Counts only. ``ip_address`` is the
+    caller's own input echoed back so the UI can name what it removed.
+    """
+
+    ip_address: str
+    failures_deleted: int
+    incidents_deleted: int
+    blocks_deleted: int
+    active_blocks_deleted: int
 
 
 class RoleAssign(BaseModel):
@@ -1136,6 +1172,98 @@ async def lift_login_ip_block(
     return LoginIpBlockLifted(
         block_id=int(lifted["block_id"]), ip_address=str(lifted["ip_address"])
     )
+
+
+@router.delete(
+    "/login-campaigns/{ip_address}", response_model=LoginCampaignDeleted
+)
+async def delete_login_campaign(
+    ip_address: Annotated[str, Path(min_length=1, max_length=64)],
+    actor: DeleteLoginCampaignRateLimit,
+    session: SessionDep,
+) -> LoginCampaignDeleted:
+    """Delete one CAMPAIGN — everything recorded for a single source IP. Engineer
+    only.
+
+    Removes, for that address: its ``login_failures`` rows (the per-attempt log
+    behind this page), its ``login_abuse_incidents`` row(s) (the detector's
+    record of the campaign), and its ``login_ip_blocks`` row(s). One transaction,
+    with the audit row, so the trail can never be missing for rows that are gone.
+
+    WHY IT EXISTS. Proving the automatic block (#457) actually refuses people on
+    production meant driving real failed sign-ins at the real API — the only
+    honest way to test a control that reads a Postgres row — which left synthetic
+    rows in the login telemetry. Clearing them by hand meant a psql session
+    against production, which is precisely what every other control on these
+    screens exists to avoid. The unit is a SOURCE because that is the unit the
+    console already thinks in: the attack table is one row per source and the
+    block table is one row per source.
+
+    ⚠️ DELETING THE BLOCK ROW UN-BLOCKS THAT SOURCE. That is correct and
+    intended — a finished campaign's block is exactly the thing you are cleaning
+    up — but it is a real consequence, so ``blocks_deleted`` and
+    ``active_blocks_deleted`` are both reported and the console states it before
+    the engineer confirms. Note that this is NOT the lift control: DELETE
+    /admin/login-ip-blocks/{id} is the reversible, recorded "this block was
+    wrong", and it suppresses automatic re-blocking for 24 hours. Deleting the
+    row drops that grace with it, so a source that is still misbehaving can be
+    re-blocked by the very next failed sign-in.
+
+    ⚠️ NO ATTEMPTED EMAIL ADDRESSES ARE RETURNED — only counts. Same rule and
+    same reason as /login-attack-sources and /login-ip-blocks: the addresses in
+    the rows being deleted are unverified strings a stranger typed, some belong
+    to real people, and a list of them is an enumeration oracle for anything that
+    reaches this response. The service never selects the column at all.
+
+    Every count is what Postgres reported deleting (``RETURNING``), not an
+    assumed success, and an address that matches nothing is a clean 200 of zeros
+    rather than a 404: the call is idempotent, so a double-click or a retry is a
+    harmless no-op, and zeros are how an engineer learns they mistyped the
+    address. Scoped to the current ``environment`` wherever the table has that
+    column, so a dev deployment can never reach a production row — see
+    ``app/services/login_campaign.py`` for why ``login_failures`` is the one
+    table without one.
+
+    Engineer-gated: the rate-limit dependency resolves the actor through
+    ``require_engineer`` (the same shape POST /admin/alerts/test uses), so the
+    role check and the budget are one dependency and the identity is
+    server-trusted. Rate limited to ten per ten minutes — destructive, and there
+    is no undo.
+
+    AUDITED, and that is the point of the route as much as the deletion is. The
+    ``before_flush`` guard in app/models/audit.py reroutes an engineer's
+    ``AuditLog`` into the append-only ``engineer_action_log``, which has no purge
+    path and which only super_admin can read — so an engineer cannot use this
+    endpoint to erase the record of having used it. The row carries the source
+    address and every count, written whether or not anything matched.
+    """
+    ip = ip_address.strip()
+    if not ip:
+        raise InvalidRequestError("An IP address is required.")
+
+    removed = await login_campaign.delete_campaign(session, ip_address=ip)
+
+    session.add(
+        AuditLog(
+            user_id=actor.user_id,
+            action_type="delete_login_campaign",
+            entity_type="login_campaign",
+            field_name=f"ip={removed['ip_address']}",
+            # What was there, as counts. `old_value` rather than `new_value`
+            # because it describes what the deletion removed; there is no "after"
+            # state to record beyond the fact of the deletion itself.
+            old_value=(
+                f"failures={removed['failures_deleted']};"
+                f"incidents={removed['incidents_deleted']};"
+                f"blocks={removed['blocks_deleted']};"
+                f"active_blocks={removed['active_blocks_deleted']}"
+            ),
+            new_value="deleted",
+        )
+    )
+    await session.commit()
+
+    return LoginCampaignDeleted(**removed)
 
 
 @router.post("/alerts/test", response_model=AlertTestResult)

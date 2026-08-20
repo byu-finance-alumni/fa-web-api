@@ -559,13 +559,32 @@ def test_concurrent_instances_produce_one_block_not_twenty(sim, quiet):
 
 APP_DIR = Path(login_block.__file__).resolve().parent.parent
 
-#: Either import spelling of the block module, anchored at the start of a line so
-#: a mention inside a docstring or comment does not count as a call site.
-_IMPORTS_BLOCK = re.compile(
-    r"^\s*from app\.services import .*\blogin_block\b"
-    r"|^\s*from app\.services\.login_block\b",
-    re.M,
-)
+def _imports_block(source: str) -> bool:
+    """True if this module imports ``login_block``, in either spelling.
+
+    PARSED, NOT PATTERN-MATCHED. This was a line-anchored regex, and a regex over
+    raw text cannot see an import the formatter has wrapped across lines
+    (``from app.services import (`` / ``    login_block,`` / ``)``) — adding one
+    more name to that import in ``admin.py`` is all it takes to make ruff wrap
+    it. The regex then dropped a REAL call site out of the set below and failed
+    this property test for a formatting change, which is the wrong alarm at the
+    wrong time. The AST sees the import however it is spelled and, exactly like
+    the anchored regex it replaces, never counts a mention inside a docstring or
+    a comment.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module = node.module or ""
+        if module == "app.services" and any(
+            alias.name == "login_block" for alias in node.names
+        ):
+            return True
+        if module == "app.services.login_block" or module.startswith(
+            "app.services.login_block."
+        ):
+            return True
+    return False
 
 
 def test_only_the_two_login_routes_consult_the_block_store():
@@ -581,7 +600,7 @@ def test_only_the_two_login_routes_consult_the_block_store():
     importers = {
         path.relative_to(APP_DIR).as_posix()
         for path in APP_DIR.rglob("*.py")
-        if _IMPORTS_BLOCK.search(path.read_text(encoding="utf-8"))
+        if _imports_block(path.read_text(encoding="utf-8"))
     }
     assert importers == {
         "api/routes/auth.py",  # the two pre-login routes: enforcement

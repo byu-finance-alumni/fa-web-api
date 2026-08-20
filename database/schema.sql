@@ -804,6 +804,28 @@ CREATE TABLE maintenance_mode (
     CONSTRAINT fk_maintenance_mode_enabled_by FOREIGN KEY (enabled_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
 
+-- Where an alert goes (#458). Single-row config (id pinned to 1) holding the
+-- engineer's choice between `slack_only` -- Slack is the channel and e-mail is
+-- the BACKSTOP, sent only when the Slack post does not land -- and
+-- `slack_and_email`, both channels every time (the pre-2026-08-19 behaviour). A
+-- table and not an env var because the requirement is to change it WITHOUT a
+-- redeploy, and a fact about the SERVICE rather than about one serverless
+-- invocation. ⚠️ NEITHER MODE CAN PRODUCE SILENCE: in `slack_only` a failed,
+-- rejected or unconfigured Slack post still falls through to e-mail, which is
+-- enforced in app/services/failure_alert.deliver_alert. Reads fail safe to
+-- `slack_only`. See migrations/2026-08-19_alert_delivery_config.sql.
+CREATE TABLE alert_delivery_config (
+    id                  int PRIMARY KEY DEFAULT 1,
+    mode                varchar(20) NOT NULL DEFAULT 'slack_only',
+    updated_by_user_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_alert_delivery_config_singleton CHECK (id = 1),
+    CONSTRAINT ck_alert_delivery_config_mode
+        CHECK (mode IN ('slack_only', 'slack_and_email')),
+    CONSTRAINT fk_alert_delivery_config_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 CREATE TABLE attachments (
     attachment_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id          bigint NOT NULL,
@@ -1222,6 +1244,32 @@ CREATE TABLE login_ip_blocks (
         CHECK (blocked_until <= blocked_at + interval '24 hours')
 );
 
+-- Owner-editable wording for the Slack alerts (2026-08-20). ONE ROW PER MESSAGE
+-- KIND, and a row is an OVERRIDE: every kind also has a built-in default
+-- compiled into app/services/alert_templates.py, so an empty table, an
+-- unreadable one, or no table at all means the alerts say exactly what they said
+-- before this feature existed. `body` is literal text plus named {placeholders}
+-- substituted by an explicit scan in Python (never str.format / f-strings /
+-- eval), and only the names a message kind declares can resolve.
+--
+-- ⚠️ NO PLACEHOLDER CAN REACH AN ATTEMPTED EMAIL ADDRESS, and none may ever be
+-- added. `{addresses}` is the COUNT. Same rule as login_abuse_incidents and
+-- login_ip_blocks: those addresses are unverified strings a stranger typed, some
+-- belong to real people, and a list of them in a Slack channel is an enumeration
+-- oracle. See migrations/2026-08-20_alert_templates.sql.
+CREATE TABLE alert_message_templates (
+    template_id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    template_key       varchar(64)  NOT NULL,
+    body               text         NOT NULL,
+    updated_by_user_id bigint REFERENCES users(user_id) ON DELETE SET NULL,
+    created_at         timestamptz  NOT NULL DEFAULT now(),
+    updated_at         timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT ck_alert_templates_length
+        CHECK (char_length(body) BETWEEN 1 AND 500),
+    CONSTRAINT ck_alert_templates_visible
+        CHECK (body ~ '^[^[:cntrl:]]+$')
+);
+
 -- -----------------------------------------------------------------------------
 -- Indexes on foreign keys / common lookups
 -- -----------------------------------------------------------------------------
@@ -1320,6 +1368,11 @@ CREATE INDEX idx_login_ip_blocks_lifted
 -- block -- on an unauthenticated public route, under exactly the flood it
 -- polices. Without it that is a sequential scan of the whole sign-in history.
 CREATE INDEX idx_login_events_ip_occurred ON login_events (ip_address, occurred_at DESC);
+-- One template row per message kind (2026-08-20). This is the index the
+-- editor's `INSERT ... ON CONFLICT (template_key) DO UPDATE` infers, which is
+-- what makes saving the same kind twice an update rather than a second row.
+CREATE UNIQUE INDEX uq_alert_templates_key
+    ON alert_message_templates (template_key);
 
 -- city_geo lookups: by state for the map's per-state work, by county FIPS for
 -- the county rollups.

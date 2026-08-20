@@ -152,6 +152,15 @@ of them is exactly the scraped-and-guessed material the attacker was probing
 with — putting it in a Slack channel would re-publish it and would also hand the
 reader an enumeration oracle. The counts are what you act on; the addresses stay
 in the database behind the engineer console.
+
+⚠️ THAT RULE SURVIVES THE MESSAGES BECOMING EDITABLE (2026-08-20). The Slack
+wording is now a template the owner edits from the engineer console, and a
+template CANNOT widen what a message may say: it names placeholders, and the only
+names that resolve are the ones :func:`_template_values` puts in the dict.
+``{addresses}`` is ``distinct_email_count``, a COUNT. There is no placeholder that
+reaches an attempted address, adding one would take a code change and a review,
+and ``app/services/alert_templates.py`` carries both a tripwire and tests against
+exactly that edit.
 """
 
 from __future__ import annotations
@@ -165,7 +174,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import database
 from app.core.config import get_settings
-from app.services import failure_alert, login_block
+from app.services import alert_templates, failure_alert, login_block
 
 log = logging.getLogger(__name__)
 
@@ -838,7 +847,61 @@ def render_alert(incident: dict) -> tuple[str, list[tuple[str, str]]]:
 
 
 
-def render_slack_summary(incident: dict) -> str:
+def _slack_action(incident: dict) -> str:
+    """The four-word version of :func:`_action_taken`, for the Slack line.
+
+    Same three outcomes and the same reason they must be told apart; the email
+    spells each one out, this says which it was. Kept as a function rather than
+    inline in the summary because it is now the ``{action}`` PLACEHOLDER value
+    (see ``app/services/alert_templates.py``) — a template may move it, drop it,
+    or wrap it in other words, and it must read the same wherever it lands.
+    """
+    if not login_block.blocking_enabled():
+        return "NOT blocked — automatic blocking is switched off."
+    if not incident.get("block_applied"):
+        return "Not blocked — the address is exempt (see the email)."
+    return "It is blocked and cannot sign in."
+
+
+def _template_values(incident: dict, *, duration: str | None = None) -> dict:
+    """The facts a security template may name, and NOTHING ELSE.
+
+    ⚠️ THIS FUNCTION IS THE BOUNDARY. A stored template can reach exactly what is
+    in this dict (further narrowed by the placeholders its kind declares), so
+    "what can the owner's wording put in a Slack channel" is answerable by
+    reading these twelve lines rather than by auditing every call site.
+
+    ⚠️ IT MUST NEVER CARRY AN ATTEMPTED EMAIL ADDRESS. ``addresses`` is
+    ``distinct_email_count`` — a COUNT. The addresses themselves are unverified
+    strings a stranger typed, some belong to real people, and a list of them is
+    the enumeration oracle this whole feature exists to deny the attacker; they
+    are not in the incident row either (see the PII note in this module's
+    docstring and in the migration). Tests assert that a field planted on the
+    incident cannot reach a rendered message.
+    """
+    where = _location(incident)
+    known = where != "unknown"
+    return {
+        "ip": str(incident.get("ip_address") or "an unknown address"),
+        "location": where,
+        # The two conditional forms carry their own leading space and vanish when
+        # the edge gave us no geolocation, which is what lets one template read
+        # correctly in both cases. See the note in alert_templates.
+        "location_phrase": f" from {where}" if known else "",
+        "location_parenthetical": f" ({where})" if known else "",
+        "attempts": str(incident.get("attempt_count") or 0),
+        "addresses": str(incident.get("distinct_email_count") or 0),
+        "duration": duration
+        or failure_alert._fmt_duration(
+            incident.get("started_at"), incident.get("last_seen_at")
+        ),
+        "pattern": str(incident.get("pattern") or "unknown"),
+        "action": _slack_action(incident),
+        "environment": str(incident.get("environment") or "unknown"),
+    }
+
+
+def render_slack_summary(incident: dict, *, templates: dict | None = None) -> str:
     """The SLACK version of an opening alert: who is attacking, and from where.
 
     One sentence, because that is the whole job. The email carries fourteen
@@ -852,19 +915,23 @@ def render_slack_summary(incident: dict) -> str:
     you need in the first two seconds. The action IS kept, in four words, because
     "and it is already blocked" is the difference between reading this in the
     morning and getting out of bed.
+
+    ``templates`` is the owner's stored wording, from ``alert_templates.load()``.
+    Omitting it — which every unit test and every fallback path does — renders the
+    built-in default, and the built-in default is this paragraph's wording
+    unchanged. This function stays PURE: the read happens at the call site, on the
+    alerting path, so a renderer can still be exercised without a database.
     """
-    ip = str(incident.get("ip_address") or "an unknown address")
-    where = _location(incident)
-    lead = f"You are being attacked by {ip}"
-    lead += "." if where == "unknown" else f" from {where}."
-    if not login_block.blocking_enabled():
-        return lead + " NOT blocked — automatic blocking is switched off."
-    if not incident.get("block_applied"):
-        return lead + " Not blocked — the address is exempt (see the email)."
-    return lead + " It is blocked and cannot sign in."
+    return alert_templates.render(
+        alert_templates.SECURITY_ATTACK_OPENING,
+        _template_values(incident),
+        templates=templates,
+    )
 
 
-def render_resolved(incident: dict) -> tuple[str, list[tuple[str, str]], str]:
+def render_resolved(
+    incident: dict, *, templates: dict | None = None
+) -> tuple[str, list[tuple[str, str]], str]:
     """The "that campaign is over" message: subject, email rows, Slack line.
 
     The counterpart to the opening alert, and the half the owner asked for
@@ -876,6 +943,11 @@ def render_resolved(incident: dict) -> tuple[str, list[tuple[str, str]], str]:
     Sent only for a campaign that was ANNOUNCED (``alert_sent_at`` is set). There
     is nothing to close for a reader who was never told it opened, and a
     "resolved" message for an event nobody saw is pure noise.
+
+    Only the SLACK line is editable (``templates``, from
+    ``alert_templates.load()``). The email's rows are left alone on purpose: they
+    are the forensic artefact, and their stable shape is what makes two reports
+    from different weeks comparable.
     """
     env = str(incident.get("environment") or "unknown")
     ip = str(incident.get("ip_address") or "unknown")
@@ -902,23 +974,25 @@ def render_resolved(incident: dict) -> tuple[str, list[tuple[str, str]], str]:
         ("Outcome", "no sign-in succeeded — these were attempts, not a breach"),
         ("Incident", f"#{incident.get('abuse_incident_id')}"),
     ]
-    summary = (
-        f"The attack from {ip}"
-        + ("" if where == "unknown" else f" ({where})")
-        + f" has stopped. {attempts} attempts across {distinct} addresses "
-        f"over {duration}. Nothing got in."
+    summary = alert_templates.render(
+        alert_templates.SECURITY_ATTACK_RESOLVED,
+        _template_values(incident, duration=duration),
+        templates=templates,
     )
     return subject, rows, summary
 
 
-async def _send_resolved(incident: dict) -> None:
+async def _send_resolved(incident: dict, *, templates: dict | None = None) -> None:
     """Deliver one "campaign over" report. Best-effort; never raises.
 
     Silent for a campaign nobody was told about -- see :func:`render_resolved`.
+
+    ``templates`` is read ONCE by the caller and passed in, not read here: a sweep
+    that closes several campaigns at once would otherwise do one read per report.
     """
     if incident is None or incident.get("alert_sent_at") is None:
         return
-    subject, rows, summary = render_resolved(incident)
+    subject, rows, summary = render_resolved(incident, templates=templates)
     try:
         await asyncio.wait_for(
             failure_alert.deliver_alert(
@@ -1006,8 +1080,14 @@ async def sweep_quiet(session: AsyncSession) -> None:
         except Exception:  # noqa: BLE001
             pass
         return
+    if not closed:
+        # THE COMMON CASE, and the reason the template read is where it is: this
+        # sweep runs on the sampled success path and almost always closes
+        # nothing, so almost always costs no template read at all.
+        return
+    templates = await alert_templates.load()
     for incident in closed:
-        await _send_resolved(dict(incident))
+        await _send_resolved(dict(incident), templates=templates)
 
 # --------------------------------------------------------------- entry point ---
 
@@ -1111,6 +1191,14 @@ async def observe_failure(
         return
 
     subject, rows = render_alert(incident)
+    # THE TEMPLATE READ, and the only one on this path. It happens here — after
+    # `evaluate` returned a CLAIMED incident, i.e. once per campaign — and not
+    # inside the renderer, so that a successful login, a failed login that is
+    # under threshold, and every later attempt in the same campaign all cost
+    # nothing. The one request that does pay is the one already about to spend
+    # seconds on an outbound POST to Slack. Never raises; `{}` means "use the
+    # built-in wording".
+    templates = await alert_templates.load()
     try:
         await asyncio.wait_for(
             # SECURITY, not operational: this routes to #security-alerts
@@ -1125,7 +1213,7 @@ async def observe_failure(
                 purpose=failure_alert.SECURITY,
                 # Slack gets ONE line: who, from where, and whether they are
                 # blocked. The mail keeps every row. See render_slack_summary.
-                slack_summary=render_slack_summary(incident),
+                slack_summary=render_slack_summary(incident, templates=templates),
             ),
             timeout=_DELIVERY_TIMEOUT_SECONDS,
         )

@@ -427,3 +427,41 @@ def test_vocabulary_scope_primary_does_not_affect_other_categories(
 
 def test_vocabulary_rejects_an_unknown_scope(client) -> None:
     assert client.get("/vocabulary/industry", params={"scope": "bogus"}).status_code == 422
+
+
+# ================== THE DASHBOARD'S ROW BUDGET (added 2026-08-21) ============
+
+
+def test_the_wheel_still_fits_the_dashboard_breakdown_panel():
+    """⚠️ THE INDUSTRY COUNT IS A LAYOUT CONSTRAINT, NOT JUST A VOCABULARY.
+
+    The dashboard's Industry breakdown panel does NOT scroll (Jake, 2026-08-20).
+    Its rows compress to fill whatever height is left after the hero and the KPI
+    strip, down to a 14px floor — and that only works because the row COUNT is
+    bounded. The panel draws one row per wheel industry plus the "Other" and
+    "Unknown" buckets; a stored value outside the vocabulary is folded into one
+    of those rather than adding a row, so the list cannot grow as alumni are
+    added.
+
+    It CAN grow if someone edits this tuple, which is what this test is for. At
+    the 14px floor, 17 rows need roughly 240px, which is about what the panel has
+    on a laptop. Another industry or two is probably absorbed; several more and
+    the rows hit the floor and the tail is clipped with NOTHING ON SCREEN SAYING
+    SO — the trade that was accepted when the scrollbar was removed.
+
+    If you have just added an industry and landed here: bumping the number below
+    is not the fix on its own. Open the dashboard at a laptop height and check
+    the last row is still visible. If it is not, the height has to come from
+    somewhere else, the way the hero band and the KPI tiles gave up theirs (see
+    fa-web-app/src/app/(app)/dashboard/page.tsx).
+    """
+    # Fold-in buckets the panel draws alongside the wheel: the "Other" catch-all
+    # and the "Unknown" data-gap row.
+    EXTRA_BUCKETS = 2
+    TUNED_FOR_ROWS = 17
+
+    assert len(WHEEL_INDUSTRIES) + EXTRA_BUCKETS == TUNED_FOR_ROWS, (
+        f"The dashboard breakdown was tuned for {TUNED_FOR_ROWS} rows and this "
+        f"vocabulary now produces {len(WHEEL_INDUSTRIES) + EXTRA_BUCKETS}. "
+        "Check the panel still fits at a laptop height before changing this."
+    )

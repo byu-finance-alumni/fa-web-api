@@ -537,12 +537,73 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         )
     ).all()
 
+    # ⚠️ LAST OF THE `session.scalar` CALLS ON PURPOSE. The dashboard tests stub
+    # `scalar` with a POSITIONAL list and index into `scalar_args`, so inserting
+    # a query anywhere above shifts every later value and fails eleven unrelated
+    # assertions. Ordering is irrelevant to the result — these counts are
+    # independent — so the new one goes on the end where it costs nothing. If
+    # that stub is ever made order-independent, this can move next to the other
+    # employer counts where it reads better.
+    # DISTINCT COMPANIES (#dashboard KPI, 2026-08-20). How many different firms
+    # the active alumni population currently works for.
+    #
+    # ⚠️ COUNTED ON THE SAME TERMS AS THE TOP-EMPLOYERS CHART, deliberately.
+    # `current_employer` is free text with no write validation, so:
+    #
+    #   * names are folded with lower(trim(...)) before DISTINCT — otherwise
+    #     "Goldman Sachs", "goldman sachs" and a trailing space are three
+    #     companies, and the number is quietly inflated by data entry;
+    #   * `_NON_EMPLOYER_VALUES` ("unknown", "n/a", "none", "graduate student")
+    #     are excluded, because the chart already refuses to rank them as firms
+    #     and a KPI that counted them would disagree with the panel directly
+    #     underneath it. A count that does not match its own drill-down is the
+    #     bug class this file keeps getting bitten by.
+    #
+    # CURRENT employment only, not history: the tile answers "where are our
+    # alumni now", which is also what makes it comparable with the employer
+    # numbers elsewhere on this page.
+    _employer_norm = func.lower(func.trim(CurrentEmployment.current_employer))
+    distinct_employers = await session.scalar(
+        select(func.count(func.distinct(_employer_norm)))
+        .select_from(CurrentEmployment)
+        .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
+        .where(
+            active,
+            CurrentEmployment.current_employer.is_not(None),
+            func.trim(CurrentEmployment.current_employer) != "",
+            _employer_norm.not_in(_NON_EMPLOYER_VALUES),
+        )
+    )
+
+    # ...and how many STATES those companies are in — the sub-line under the
+    # Companies tile ("Across N states"), mirroring the industries line under
+    # Total alumni.
+    #
+    # Same address as the geography map and the `by_state` breakdown above: the
+    # employer's, which is the only address this system holds (#287). Folded
+    # with lower(trim(...)) before DISTINCT for the same reason the employer
+    # names are — the column is free text, so "Utah", "utah" and a trailing
+    # space would otherwise be three states.
+    _state_norm = func.lower(func.trim(CurrentEmployment.current_state))
+    employer_states = await session.scalar(
+        select(func.count(func.distinct(_state_norm)))
+        .select_from(CurrentEmployment)
+        .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
+        .where(
+            active,
+            CurrentEmployment.current_state.is_not(None),
+            func.trim(CurrentEmployment.current_state) != "",
+        )
+    )
+
     return {
         "total_alumni": int(total or 0),
         "archived": int(archived or 0),
         "deceased": int(deceased or 0),
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
+        "distinct_employers": int(distinct_employers or 0),
+        "employer_states": int(employer_states or 0),
         "contacted_this_month": int(contacted_this_month or 0),
         "alumni_edited_this_month": int(alumni_edited_this_month or 0),
         "alumni_edited_this_year": int(alumni_edited_this_year or 0),

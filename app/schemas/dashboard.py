@@ -87,6 +87,10 @@ class DashboardSummary(BaseModel):
     #: chart's non-employer placeholders are excluded, so this number and that
     #: chart describe the same set of companies. See the query for why.
     distinct_employers: int
+    #: How many STATES those companies are in — the Companies tile's sub-line.
+    #: The employer's address, the same one the geography map plots, folded the
+    #: same way as the employer names before counting.
+    employer_states: int
     not_contacted_6mo: int
     not_contacted_12mo: int
     not_contacted_24mo: int

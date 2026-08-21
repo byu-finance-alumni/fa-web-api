@@ -976,18 +976,36 @@ def test_graduate_student_and_unknown_buckets_are_unaffected(client):
 # ============================== DISTINCT COMPANIES (2026-08-20) ==============
 
 
+def _scalar_sql_mentioning(session, needle: str) -> str:
+    """The one compiled scalar statement containing ``needle``.
+
+    Positional indexing into `scalar_args` was how these started, and it broke
+    the moment another count was added to the handler — silently, by pointing
+    the assertion at a different query. Asserting there is EXACTLY one match
+    also catches the opposite mistake: two queries that should have been one.
+    """
+    hits = [
+        sql
+        for sql in (_compiled(stmt) for stmt in session.scalar_args)
+        if needle in sql.lower()
+    ]
+    assert len(hits) == 1, f"expected one statement mentioning {needle}, got {len(hits)}"
+    return hits[0].lower()
+
 def test_summary_distinct_employers_in_response_body(client):
-    # The fourth KPI tile. It is the LAST scalar the handler runs — see the note
-    # in the route — so it is the last value in this list.
+    # The fourth KPI tile and its sub-line. Both are appended after the
+    # pre-existing scalars — see the note in the route about the positional stub.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    scalars = [0] * 19 + [147]
+    scalars = [0] * 19 + [147, 12]
     app.dependency_overrides[get_session] = _with_session(
         _FakeSession([], scalars=scalars)
     )
 
     response = client.get("/dashboard/summary")
     assert response.status_code == 200
-    assert response.json()["distinct_employers"] == 147
+    body = response.json()
+    assert body["distinct_employers"] == 147
+    assert body["employer_states"] == 12
 
 
 def test_distinct_employers_folds_case_and_whitespace_before_counting(client):
@@ -999,15 +1017,15 @@ def test_distinct_employers_folds_case_and_whitespace_before_counting(client):
     variety as market breadth.
     """
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 20)
+    session = _FakeSession([], scalars=[0] * 21)
     app.dependency_overrides[get_session] = _with_session(session)
 
     client.get("/dashboard/summary")
-    sql = _compiled(session.scalar_args[-1])
+    sql = _scalar_sql_mentioning(session, "distinct(lower(trim(current_employment.current_employer")
 
-    assert "count(distinct" in sql.lower()
-    assert "lower(" in sql.lower()
-    assert "trim(" in sql.lower()
+    assert "count(distinct" in sql
+    assert "lower(" in sql
+    assert "trim(" in sql
 
 
 def test_distinct_employers_excludes_the_same_placeholders_as_the_chart(client):
@@ -1017,11 +1035,11 @@ def test_distinct_employers_excludes_the_same_placeholders_as_the_chart(client):
     disagree with the panel directly beneath it — the parity bug class this file
     keeps getting bitten by."""
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 20)
+    session = _FakeSession([], scalars=[0] * 21)
     app.dependency_overrides[get_session] = _with_session(session)
 
     client.get("/dashboard/summary")
-    sql = _compiled(session.scalar_args[-1]).lower()
+    sql = _scalar_sql_mentioning(session, "distinct(lower(trim(current_employment.current_employer")
 
     # The values are BOUND, not inlined, so the SQL string only shows the shape.
     assert "not in" in sql
@@ -1032,3 +1050,22 @@ def test_distinct_employers_excludes_the_same_placeholders_as_the_chart(client):
     start = source.index("# DISTINCT COMPANIES")
     block = source[start : source.index("return {", start)]
     assert "_NON_EMPLOYER_VALUES" in block
+
+
+def test_employer_states_folds_case_before_counting(client):
+    """The Companies tile's sub-line: how many states those firms are in.
+
+    Same free-text column the geography map plots, so "Utah", "utah" and a
+    trailing space have to fold to one state before DISTINCT — otherwise the
+    sub-line inflates for the same data-entry reason the company count would.
+    """
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 21)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    client.get("/dashboard/summary")
+    sql = _scalar_sql_mentioning(session, "distinct(lower(trim(current_employment.current_state")
+
+    assert "count(distinct" in sql
+    assert "lower(" in sql
+    assert "trim(" in sql

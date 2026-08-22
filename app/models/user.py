@@ -70,6 +70,13 @@ class User(TimestampMixin, Base):
     active_session_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    # Last authenticated request from that session (#684). Distinct from
+    # active_session_at, which is when the session was CLAIMED at login and
+    # never moves again -- this one moves as the user works, and is what makes
+    # "untouched for 24 hours" answerable. NULL = not yet stamped = fresh.
+    session_last_seen_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     user_roles: Mapped[list[UserRole]] = relationship(
         back_populates="user", cascade="all, delete-orphan"

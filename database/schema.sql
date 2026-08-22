@@ -60,6 +60,12 @@ CREATE TABLE users (
     -- session no longer matches and is rejected (forced logout) on the backend.
     -- NULL until the user's first sign-in after this feature shipped.
     active_session_id  text,
+    -- Last authenticated request made by that session (#684). Written by the
+    -- auth resolver, throttled to one write a minute. NULL means NOT YET
+    -- STAMPED and is treated as fresh -- never as idle, or the first request
+    -- after deploy would sign out every session that predates the column.
+    -- Compared against a 24h limit; see app/services/session_idle.py.
+    session_last_seen_at timestamptz,
     active_session_at  timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()

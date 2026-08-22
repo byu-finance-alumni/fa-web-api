@@ -7,6 +7,7 @@ module) is decided from those database roles resolved against the live,
 engineer-editable permission config — never from the token's claims.
 """
 
+import datetime
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -15,11 +16,13 @@ from typing import Annotated
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import delete
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit_context import set_audit_actor
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
+from app.core.errors import ServiceError
 from app.core.security import (
     AuthError,
     AuthorizationError,
@@ -29,11 +32,13 @@ from app.core.security import (
     SessionSupersededError,
     verify_supabase_jwt,
 )
+from app.models.audit import AuditLog
 from app.models.login_attempt import LoginAttempt
+from app.models.user import User
 from app.repositories.permissions import load_grants
 from app.repositories.user import get_user_with_roles_by_auth_id
 from app.schemas.auth import AuthenticatedUser, UserContext
-from app.services import maintenance
+from app.services import auth_sessions, maintenance, session_idle
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +123,100 @@ async def get_current_db_user_allow_must_change(
     # ``get_current_db_user`` so the claiming call (POST /auth/login) and the
     # status probe can still run.
     context.session_id = current.session_id
+    # Expire a session nobody has touched for 24h (#684). Deliberately on the
+    # BASE resolver, so the /auth/session/active poll sees the expiry too and
+    # the frontend signs itself out; putting it in get_current_db_user would
+    # have left the poll answering "still active" about a session every data
+    # route was refusing.
+    await _enforce_session_idle(session, user, context)
     return context
+
+
+async def _enforce_session_idle(
+    session: AsyncSession,
+    user: User,
+    context: UserContext,
+    now: datetime.datetime | None = None,
+) -> None:
+    """Expire the account's active session once it has gone 24h untouched (#684).
+
+    Only the account's OWN claimed session has an idle clock. A superseded one,
+    or one already stamped with a sentinel, is rejected downstream by
+    ``_enforce_single_session`` regardless of how recently it was seen — giving
+    it a clock as well would just be a second way to say no.
+
+    On expiry this runs the same two halves as an engineer revoke (see
+    ``app/services/auth_sessions.py`` for why one half is not enough) and then
+    lets the request continue: the sentinel is written to the context too, so
+    the single-session guard refuses this very request on a data route, while
+    ``GET /auth/session/active`` reports ``{active: false}`` and the frontend
+    signs the device out on its own.
+
+    ⚠️ NEVER RAISES. A control that logs people out must not become a way to
+    500 their request. If the Supabase half fails, our half still lands (the
+    session is refused immediately, it just is not durable against a refresh),
+    and if the stamp cannot be written the request proceeds unstamped rather
+    than failing — erring toward letting a real user work.
+    """
+    session_id = context.session_id
+    if not session_id or user.active_session_id != session_id:
+        return
+
+    # Injectable so tests can pin a clock; production always passes None.
+    now = now or datetime.datetime.now(datetime.UTC)
+
+    if not session_idle.is_expired(user.session_last_seen_at, now):
+        # The throttle is what makes this affordable on a resolver that runs on
+        # every authenticated request — see the note in session_idle.py.
+        if session_idle.should_touch(user.session_last_seen_at, now):
+            user.session_last_seen_at = now
+            try:
+                await session.commit()
+            except SQLAlchemyError:
+                logger.warning("Could not stamp session_last_seen_at", exc_info=True)
+                await session.rollback()
+        return
+
+    idle_for = session_idle.idle_seconds(user.session_last_seen_at, now)
+    sentinel = auth_sessions.new_sentinel()
+    logger.info(
+        "Expiring a session idle for %ss (limit %ss)",
+        idle_for,
+        session_idle.IDLE_LIMIT_SECONDS,
+    )
+
+    try:
+        await auth_sessions.delete_supabase_session(session, uuid.UUID(session_id))
+    except (ServiceError, ValueError):
+        # ValueError: a sentinel-shaped id is not a UUID. Either way, keep our
+        # half — it is the one that takes effect on this request.
+        await session.rollback()
+        logger.warning(
+            "Idle expiry could not delete the auth.sessions row; applying our half only",
+            exc_info=True,
+        )
+        user = await session.merge(user)
+
+    user.active_session_id = sentinel
+    user.active_session_at = now
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="session_expired_idle",
+            entity_type="auth_session",
+            field_name=f"idle_seconds={idle_for}",
+        )
+    )
+    try:
+        await session.commit()
+    except SQLAlchemyError:
+        logger.error("Could not expire an idle session", exc_info=True)
+        await session.rollback()
+        return
+
+    # The guards read the CONTEXT, not the row, so the rejection only happens
+    # if the sentinel is carried across.
+    context.active_session_id = sentinel
 
 
 async def get_current_db_user(

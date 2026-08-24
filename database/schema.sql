@@ -64,7 +64,7 @@ CREATE TABLE users (
     -- auth resolver, throttled to one write a minute. NULL means NOT YET
     -- STAMPED and is treated as fresh -- never as idle, or the first request
     -- after deploy would sign out every session that predates the column.
-    -- Compared against a 24h limit; see app/services/session_idle.py.
+    -- Unused: the 24h server-side idle expiry it fed was removed (#684).
     session_last_seen_at timestamptz,
     active_session_at  timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),

@@ -70,10 +70,14 @@ class User(TimestampMixin, Base):
     active_session_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
-    # Last authenticated request from that session (#684). Distinct from
-    # active_session_at, which is when the session was CLAIMED at login and
-    # never moves again -- this one moves as the user works, and is what makes
-    # "untouched for 24 hours" answerable. NULL = not yet stamped = fresh.
+    # RETAINED BUT NO LONGER READ OR WRITTEN. This carried the 24h server-side
+    # idle expiry (#684), which was REMOVED -- it locked every user out
+    # permanently, because nothing reset the stamp when a new session was
+    # claimed at login, so the very next request after signing back in
+    # measured the OLD session's idle age and expired the fresh one. The
+    # column stays because dropping it needs its own migration and prod
+    # already has it; the idle bound now lives client-side (the 12h auth
+    # cookie + the persisted idle timer in the app).
     session_last_seen_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )

@@ -163,7 +163,7 @@ jobs:
           if [ "$AUDIT_RESULT" != "success" ]; then
             LINE=":warning: fa-web-api weekly security audit did not finish (scan job: $AUDIT_RESULT). Nothing was checked — open the run."
           else
-            LINE="${VERDICT:-:white_check_mark:} fa-web-api weekly security audit — ${SUMMARY:-no findings}. CodeQL: $CODEQL_RESULT."
+            LINE="${VERDICT:-:white_check_mark:} fa-web-api weekly security audit: ${SUMMARY:-all clear, nothing needs you}. CodeQL: $CODEQL_RESULT."
           fi
           jq -n --arg t "$LINE" --arg u "$RUN_URL" \
             '{text: ($t + " <" + $u + "|Full report>")}' \

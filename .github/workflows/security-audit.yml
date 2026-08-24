@@ -124,23 +124,28 @@ jobs:
       # Cloned and scanned with ITS OWN scripts, so the frontend's checks stay
       # exactly the ones its repo defines. This job runs them; it does not
       # reimplement them, which is what would let the two drift apart.
+      # ⚠️ NOT `app`. This repo already HAS an app/ directory — it is the
+      # FastAPI package — so cloning into it fails with "destination path
+      # already exists", every APP step after it is skipped, and the run reports
+      # INCOMPLETE. The checkout name must not collide with anything at the root
+      # of THIS repo (app, scripts, database, tests, docs).
       - name: APP - clone
         continue-on-error: true
-        run: git clone --quiet https://github.com/byu-finance-alumni/fa-web-app.git app
+        run: git clone --quiet https://github.com/byu-finance-alumni/fa-web-app.git frontend-checkout
 
       - name: APP - install
         continue-on-error: true
-        working-directory: app
+        working-directory: frontend-checkout
         run: npm ci --silent
 
       - name: APP - project tripwires
         continue-on-error: true
-        working-directory: app
+        working-directory: frontend-checkout
         run: node scripts/security-scan.mjs --json tripwires.json
 
       - name: APP - dependency audit (full tree + the prod gate's own verdict)
         continue-on-error: true
-        working-directory: app
+        working-directory: frontend-checkout
         run: |
           npm audit --json > npm-audit.json || true
           npm audit --omit=dev --json > npm-audit-prod.json || true
@@ -158,7 +163,7 @@ jobs:
 
       - name: APP - Semgrep
         continue-on-error: true
-        working-directory: app
+        working-directory: frontend-checkout
         run: |
           semgrep scan --config p/security-audit --config p/owasp-top-ten \
             --config p/typescript --config p/react --json --output semgrep.json \
@@ -166,13 +171,13 @@ jobs:
 
       - name: APP - secrets across full history
         continue-on-error: true
-        working-directory: app
+        working-directory: frontend-checkout
         run: gitleaks detect --redact --no-banner --report-format json --report-path gitleaks.json
 
       - name: APP - build report
         id: report_app
         if: always()
-        working-directory: app
+        working-directory: frontend-checkout
         run: node scripts/security-report.mjs --repo byu-finance-alumni/fa-web-app --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       - name: Upload both reports
@@ -186,12 +191,12 @@ jobs:
             pip-audit.json
             semgrep.json
             gitleaks.json
-            app/security-report.md
-            app/tripwires.json
-            app/npm-audit.json
-            app/audit-prod.txt
-            app/semgrep.json
-            app/gitleaks.json
+            frontend-checkout/security-report.md
+            frontend-checkout/tripwires.json
+            frontend-checkout/npm-audit.json
+            frontend-checkout/audit-prod.txt
+            frontend-checkout/semgrep.json
+            frontend-checkout/gitleaks.json
           retention-days: 90
           if-no-files-found: warn
 

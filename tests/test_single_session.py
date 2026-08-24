@@ -8,7 +8,6 @@ can detect it and sign out cleanly. All exercised with fakes — no DB.
 """
 
 import asyncio
-import datetime
 import uuid
 from types import SimpleNamespace
 
@@ -72,7 +71,6 @@ class _NoWriteSession:
     def __init__(self):
         self.executed: list = []
         self.commits = 0
-        self.added: list = []
 
     async def execute(self, stmt):
         self.executed.append(stmt)
@@ -80,15 +78,8 @@ class _NoWriteSession:
     async def commit(self):
         self.commits += 1
 
-    def add(self, obj):
-        self.added.append(obj)
 
-
-def _db_user(active_session_id, session_last_seen_at=None):
-    # `session_last_seen_at` defaults to a moment ago so the idle-expiry hook
-    # (#684) treats the session as fresh AND inside its write throttle — these
-    # tests are about single-active-session, and a session that also happens to
-    # be due a stamp would make them assert on an unrelated write.
+def _db_user(active_session_id):
     return SimpleNamespace(
         user_id=1,
         auth_user_id=uuid.UUID(_AUTH_UUID),
@@ -98,12 +89,6 @@ def _db_user(active_session_id, session_last_seen_at=None):
         active=True,
         must_change_password=False,
         active_session_id=active_session_id,
-        active_session_at=None,
-        session_last_seen_at=(
-            session_last_seen_at
-            if session_last_seen_at is not None
-            else datetime.datetime.now(datetime.UTC)
-        ),
         roles=[SimpleNamespace(role_name="view_only")],
     )
 
@@ -128,12 +113,6 @@ def test_get_current_db_user_allows_active_session(monkeypatch):
     ctx = asyncio.run(auth_deps.get_current_db_user(current, session))
     assert ctx.user_id == 1
     # #182: the matching-session read path issues no DELETE/commit.
-    #
-    # ⚠️ #684 put ONE conditional write back on this path — the idle stamp — and
-    # it is throttled to once a minute, which is why this session (last seen a
-    # moment ago) still writes nothing. If this ever starts failing, check
-    # `session_idle.TOUCH_THROTTLE_SECONDS` before relaxing the assertion: a
-    # write on EVERY request is exactly what #182 removed.
     assert session.executed == []
     assert session.commits == 0
 

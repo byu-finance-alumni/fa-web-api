@@ -188,7 +188,7 @@ def main() -> int:
     if unknown:
         # Not "all clear": part of the sweep did not happen, and saying so is
         # the whole reason a missing report is tracked separately from a clean one.
-        verdict = ":warning:"
+        verdict = "INCOMPLETE"
         summary = (
             f"INCOMPLETE - {', '.join(unknown)} did not run, so this week is "
             f"only a partial check"
@@ -196,10 +196,10 @@ def main() -> int:
         if bits:
             summary += f" (and {', '.join(bits)} in what did run)"
     elif not needs_attention:
-        verdict = ":white_check_mark:"
+        verdict = "ALL CLEAR"
         summary = "all clear, nothing needs you"
     else:
-        verdict = ":rotating_light:" if (critical or high) else ":large_yellow_circle:"
+        verdict = "NEEDS A LOOK"
         thing = "thing needs" if needs_attention == 1 else "things need"
         summary = f"{needs_attention} {thing} a look - {', '.join(bits)}"
 

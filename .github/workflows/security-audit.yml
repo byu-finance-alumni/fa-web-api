@@ -1,29 +1,33 @@
-# Weekly deep security audit (fa-web-api).
+# Weekly deep security audit — BOTH repositories, ONE Slack message.
 #
-# WHY THIS EXISTS SEPARATELY FROM ci.yml. CI runs on every push and has to stay
-# fast, so it carries only the checks worth blocking a merge on. This one is
-# allowed to be slow and thorough: it runs the heavy analysers, audits the FULL
-# dependency tree rather than just what ships, scans the whole git HISTORY for
-# secrets, and re-asserts the project's own security invariants. It reports
-# rather than blocks — a weekly red X is a weekly notification people learn to
-# ignore, and this is meant to be read.
+# WHY ONE WORKFLOW COVERS TWO REPOS. It used to be a copy in each repo, which
+# meant two Slack messages every Sunday answering one question ("are we OK?").
+# The scanning still happens per codebase — this job clones fa-web-app and runs
+# ITS OWN scripts against it, so neither repo's checks were weakened — but the
+# answer arrives as a single message.
 #
-# ⚠️ A SCHEDULED WORKFLOW ONLY RUNS FROM THE DEFAULT BRANCH. This repo's default
-# branch is `prod`, so this file does nothing on `dev` until it is merged to
-# prod. Use the "Run workflow" button (workflow_dispatch) to test it anywhere.
+# fa-web-app keeps a workflow of its own for CodeQL ALONE. CodeQL results must
+# be uploaded from the repository they describe or they cannot appear in that
+# repo's Security tab. That workflow does not post to Slack.
 #
-# ⚠️ SLACK NEEDS A REPO SECRET: SLACK_SECURITY_WEBHOOK_URL. There is no GitHub
-# secret today (the webhook lives on the Vercel project, which Actions cannot
-# read), so until one is added the audit still runs and still uploads its report
-# — it just says so in the log instead of posting. It never fails for want of a
-# webhook.
+# WHY THIS IS SEPARATE FROM ci.yml. CI runs on every push and has to stay fast,
+# so it carries only what is worth blocking a merge on. This is allowed to be
+# slow: the full dependency tree, the whole git history, CodeQL with
+# security-extended, Semgrep, and each project's own tripwires. It reports
+# rather than blocks — a weekly red X is a weekly notification people mute.
+#
+# ⚠️ A SCHEDULED WORKFLOW ONLY RUNS FROM THE DEFAULT BRANCH, which here is
+# `prod`. This file does nothing on `dev`; use the Run workflow button to test.
+#
+# ⚠️ Cloning fa-web-app needs no credentials — it is public. Do not "fix" that
+# by adding a token: the day it needs one is the day the repo went private, and
+# that deserves a decision rather than a quietly added PAT.
 name: Weekly security audit
 
 on:
   schedule:
     # Monday 04:00 UTC = Sunday 22:00 in Utah on daylight time, 21:00 on
-    # standard time. Sunday night either way, which is the ask; the audit is
-    # sitting there on Monday morning.
+    # standard time. Sunday night either way; it is waiting on Monday morning.
     - cron: "0 4 * * 1"
   workflow_dispatch:
 
@@ -55,12 +59,14 @@ jobs:
           category: "/language:python"
 
   audit:
-    name: Deep scan
+    name: Deep scan (both repos)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     outputs:
-      summary: ${{ steps.report.outputs.summary }}
-      verdict: ${{ steps.report.outputs.verdict }}
+      api_summary: ${{ steps.report_api.outputs.summary }}
+      api_verdict: ${{ steps.report_api.outputs.verdict }}
+      app_summary: ${{ steps.report_app.outputs.summary }}
+      app_verdict: ${{ steps.report_app.outputs.verdict }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,59 +77,105 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-      - name: Install project + analysers
+      - name: Install analysers
         run: |
           python -m pip install --upgrade pip
           pip install -e . 2>/dev/null || pip install -r requirements.txt
           pip install pip-audit semgrep
-
-      # --- 1. Our own invariants ------------------------------------------
-      # The most valuable check here, because it is the only one that knows what
-      # this app is: which routes may be reached without a session, that every
-      # cron route verifies CRON_SECRET, and that no SQL is built by string
-      # interpolation. See scripts/security_scan.py.
-      - name: Project security tripwires
-        id: tripwires
-        continue-on-error: true
-        run: python -m scripts.security_scan --json tripwires.json
-
-      # --- 2. Dependencies, ALL of them ------------------------------------
-      # ci.yml audits prod dependencies only, deliberately — a dev-only advisory
-      # should not block a merge. Weekly, we want to see them anyway.
-      - name: Dependency audit (full tree)
-        id: deps
-        continue-on-error: true
-        run: pip-audit --format json --output pip-audit.json --progress-spinner off
-
-      # --- 3. SAST ---------------------------------------------------------
-      - name: Semgrep
-        id: semgrep
-        continue-on-error: true
-        run: |
-          semgrep scan \
-            --config p/security-audit \
-            --config p/owasp-top-ten \
-            --config p/python \
-            --json --output semgrep.json --quiet --no-git-ignore --metrics=off
-
-      # --- 4. Secrets, across the whole history ----------------------------
-      - name: Secret scan (full history)
-        id: secrets
-        continue-on-error: true
-        run: |
           curl -sSfL -o gitleaks.tar.gz \
             https://github.com/gitleaks/gitleaks/releases/download/v8.24.0/gitleaks_8.24.0_linux_x64.tar.gz
           tar -xzf gitleaks.tar.gz gitleaks
-          ./gitleaks detect --redact --no-banner --report-format json --report-path gitleaks.json
+          sudo mv gitleaks /usr/local/bin/
 
-      # --- 5. One report ----------------------------------------------------
-      - name: Build report
-        id: report
+      # ---------------------------------------------------------------- API --
+      # The tripwires are the most valuable check here, because they are the only
+      # ones that know what this app IS: which routes may be reached without a
+      # session, that every cron route verifies CRON_SECRET, that no SQL is built
+      # by interpolation. See scripts/security_scan.py.
+      - name: API - project tripwires
+        continue-on-error: true
+        run: python -m scripts.security_scan --json tripwires.json
+
+      - name: API - dependency audit (full tree)
+        continue-on-error: true
+        run: pip-audit --format json --output pip-audit.json --progress-spinner off
+
+      - name: API - Semgrep
+        continue-on-error: true
+        run: |
+          semgrep scan --config p/security-audit --config p/owasp-top-ten \
+            --config p/python --json --output semgrep.json --quiet \
+            --no-git-ignore --metrics=off
+
+      - name: API - secrets across full history
+        continue-on-error: true
+        run: gitleaks detect --redact --no-banner --report-format json --report-path gitleaks.json
+
+      - name: API - build report
+        id: report_api
         if: always()
         run: python scripts/security_report.py --repo "$GITHUB_REPOSITORY" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
-      - name: Upload full report
+      # ---------------------------------------------------------------- APP --
+      # Cloned and scanned with ITS OWN scripts, so the frontend's checks stay
+      # exactly the ones its repo defines. This job runs them; it does not
+      # reimplement them, which is what would let the two drift apart.
+      - name: APP - clone
+        continue-on-error: true
+        run: git clone --quiet https://github.com/byu-finance-alumni/fa-web-app.git app
+
+      - name: APP - install
+        continue-on-error: true
+        working-directory: app
+        run: npm ci --silent
+
+      - name: APP - project tripwires
+        continue-on-error: true
+        working-directory: app
+        run: node scripts/security-scan.mjs --json tripwires.json
+
+      - name: APP - dependency audit (full tree + the prod gate's own verdict)
+        continue-on-error: true
+        working-directory: app
+        run: |
+          npm audit --json > npm-audit.json || true
+          npm audit --omit=dev --json > npm-audit-prod.json || true
+          # ⚠️ THE VERDICT ON SHIPPING DEPENDENCIES IS THAT SCRIPT'S, NOT OURS.
+          # It already encodes which advisories are accepted and why, and it is
+          # what gates a merge. Re-deriving the answer here got it WRONG: `next`
+          # and `postcss` are flagged only BECAUSE of transitively accepted
+          # advisories, so a naive GHSA comparison invented two problems.
+          if node scripts/audit-prod.mjs > audit-prod.txt 2>&1; then
+            echo '{"ok": true}' > audit-prod-gate.json
+          else
+            echo '{"ok": false}' > audit-prod-gate.json
+          fi
+          cat audit-prod.txt
+
+      - name: APP - Semgrep
+        continue-on-error: true
+        working-directory: app
+        run: |
+          semgrep scan --config p/security-audit --config p/owasp-top-ten \
+            --config p/typescript --config p/react --json --output semgrep.json \
+            --quiet --metrics=off src
+
+      - name: APP - secrets across full history
+        continue-on-error: true
+        working-directory: app
+        run: gitleaks detect --redact --no-banner --report-format json --report-path gitleaks.json
+
+      - name: APP - build report
+        id: report_app
+        if: always()
+        working-directory: app
+        run: node scripts/security-report.mjs --repo byu-finance-alumni/fa-web-app --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Upload both reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -134,6 +186,12 @@ jobs:
             pip-audit.json
             semgrep.json
             gitleaks.json
+            app/security-report.md
+            app/tripwires.json
+            app/npm-audit.json
+            app/audit-prod.txt
+            app/semgrep.json
+            app/gitleaks.json
           retention-days: 90
           if-no-files-found: warn
 
@@ -145,11 +203,13 @@ jobs:
     # silent week must never be indistinguishable from a clean one.
     if: always()
     steps:
-      - name: Post the summary
+      - name: Post one summary for both repos
         env:
           WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL }}
-          SUMMARY: ${{ needs.audit.outputs.summary }}
-          VERDICT: ${{ needs.audit.outputs.verdict }}
+          API_SUMMARY: ${{ needs.audit.outputs.api_summary }}
+          API_VERDICT: ${{ needs.audit.outputs.api_verdict }}
+          APP_SUMMARY: ${{ needs.audit.outputs.app_summary }}
+          APP_VERDICT: ${{ needs.audit.outputs.app_verdict }}
           AUDIT_RESULT: ${{ needs.audit.result }}
           CODEQL_RESULT: ${{ needs.codeql.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -158,13 +218,30 @@ jobs:
             echo "::warning title=Slack not configured::Set the SLACK_SECURITY_WEBHOOK_URL repo secret to get this weekly summary in Slack. The full report is attached to this run as an artifact."
             exit 0
           fi
-          # One glanceable line, the way the app's own security alerts are
-          # written — the detail lives in the artifact, not in the channel.
+          # Plain text, no emoji: the verdict is a word, not a colour.
+          #
+          # ⚠️ jq DOES THE LINE ASSEMBLY, NOT THE SHELL. A multi-line "BODY=..."
+          # string here has to start its continuation lines at column 0, which
+          # terminates YAML's literal block early and makes the whole workflow
+          # unparseable. Passing each piece as a --arg keeps every line indented
+          # and sidesteps shell quoting into JSON as well.
           if [ "$AUDIT_RESULT" != "success" ]; then
-            LINE=":warning: fa-web-api weekly security audit did not finish (scan job: $AUDIT_RESULT). Nothing was checked — open the run."
-          else
-            LINE="${VERDICT:-:white_check_mark:} fa-web-api weekly security audit: ${SUMMARY:-all clear, nothing needs you}. CodeQL: $CODEQL_RESULT."
+            jq -n --arg r "$AUDIT_RESULT" --arg u "$RUN_URL" \
+              '{text: ("INCOMPLETE - the weekly security audit did not finish (scan job: " + $r + "). Nothing was checked.\n<" + $u + "|Open the run>")}' \
+              | curl -sS -X POST -H "Content-Type: application/json" -d @- "$WEBHOOK"
+            exit 0
           fi
-          jq -n --arg t "$LINE" --arg u "$RUN_URL" \
-            '{text: ($t + " <" + $u + "|Full report>")}' \
+          if [ "$API_VERDICT" = "ALL CLEAR" ] && [ "$APP_VERDICT" = "ALL CLEAR" ]; then
+            HEAD="ALL CLEAR - weekly security audit. Nothing needs you."
+          else
+            HEAD="NEEDS A LOOK - weekly security audit."
+          fi
+          jq -n --arg h "$HEAD" --arg api "${API_SUMMARY:-no result}" \
+                --arg app "${APP_SUMMARY:-no result}" --arg cq "$CODEQL_RESULT" \
+                --arg u "$RUN_URL" \
+            '{text: ($h
+                     + "\nBackend (fa-web-api): " + $api
+                     + "\nFrontend (fa-web-app): " + $app
+                     + "\nCodeQL: " + $cq + " - results in each repo Security tab"
+                     + "\n<" + $u + "|Full report>")}' \
             | curl -sS -X POST -H "Content-Type: application/json" -d @- "$WEBHOOK"

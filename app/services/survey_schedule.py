@@ -279,10 +279,10 @@ def _qualifying_reply(status_filter: tuple[str, ...]):
     the 365-day window and the reset rule — is fixed, so every count derived from
     this function is scoped identically and the numbers are comparable. Passing
     :data:`survey_email.RESPONDED_STATUSES` is the "have they replied?" question.
-    Passing a single outcome (``applied``, ``rejected``) asks a NARROWER one —
-    what became of a submission — and in the ``rejected`` case that is not a
-    reply at all. Widening ``RESPONDED_STATUSES`` to reach the rejected ones
-    would be the drift this shared helper exists to prevent.
+    Passing a single status (``applied``, ``rejected``, ``confirmed``) asks a
+    NARROWER one — what KIND of reply it was — and in the ``rejected`` case that
+    is not a reply at all. Widening ``RESPONDED_STATUSES`` to reach the rejected
+    ones would be the drift this shared helper exists to prevent.
     """
     return (
         select(SurveyResponse.survey_response_id)
@@ -298,7 +298,7 @@ def _qualifying_reply(status_filter: tuple[str, ...]):
 
 def _cycle_progress():
     """``(graduation_year, recipients, replied, awaiting_review, applied,
-    rejected)`` per year, for the campaign each year is on RIGHT NOW.
+    rejected, confirmed)`` per year, for the campaign each year is on RIGHT NOW.
 
     This is the "how is it actually going" question, which the existing counts
     could not answer between the first email and the last. ``sent_initial`` and
@@ -317,11 +317,20 @@ def _cycle_progress():
 
     ``applied`` and ``rejected`` (#497) break the review outcome down: how much
     of what came back was actually USABLE. With ``awaiting_review`` (= `pending`)
-    they cover all three ``survey_responses.status`` values, but they are NOT a
-    partition. Every column here counts DISTINCT ALUMNI — the only way any of
-    them is comparable with ``recipients`` — and one alum can have submitted
-    twice and had one applied and the other rejected, so they appear under both.
-    These are counts of people, and they do not have to sum to ``replied``.
+    and ``confirmed`` they cover all four ``survey_responses.status`` values, but
+    they are NOT a partition. Every column here counts DISTINCT ALUMNI — the only
+    way any of them is comparable with ``recipients`` — and one alum can have
+    submitted twice and had one applied and the other rejected, so they appear
+    under both. These are counts of people, and they do not have to sum to
+    ``replied``.
+
+    ``confirmed`` (#755) is the alumni who answered "yes, everything is correct":
+    a REPLY (it is inside ``replied``, unlike ``rejected``) that changed nothing,
+    so it never enters the review queue and never becomes an applied change. It
+    is reported for one reason — before it existed, adding this column's people
+    to ``replied`` and to none of the outcome columns would have looked like an
+    arithmetic bug in the console rather than the best outcome a campaign can
+    have: an alum whose record was already correct.
 
     ``rejected`` IS NOT A REPLY, and adding it to ``replied`` would be a bug, not
     a rounding difference. Staff discarded that submission, nothing reached the
@@ -335,6 +344,7 @@ def _cycle_progress():
     pending = _qualifying_reply((survey_email.STATUS_PENDING,))
     applied = _qualifying_reply((survey_email.STATUS_APPLIED,))
     rejected = _qualifying_reply((survey_email.STATUS_REJECTED,))
+    confirmed = _qualifying_reply((survey_email.STATUS_CONFIRMED,))
     return (
         select(
             SurveySendLog.graduation_year,
@@ -350,6 +360,9 @@ def _cycle_progress():
             ),
             func.count(func.distinct(case((rejected, SurveySendLog.alumni_id)))).label(
                 "rejected"
+            ),
+            func.count(func.distinct(case((confirmed, SurveySendLog.alumni_id)))).label(
+                "confirmed"
             ),
         )
         # The cycle scope, identical to `_cycle_non_responders`. Without this join
@@ -367,10 +380,10 @@ def _cycle_progress():
 
 async def _progress_counts(
     session: AsyncSession,
-) -> dict[int, tuple[int, int, int, int, int]]:
-    """``{year: (recipients, replied, awaiting_review, applied, rejected)}`` in
-    ONE query, so the console's table costs a fixed number of round trips however
-    many years exist."""
+) -> dict[int, tuple[int, int, int, int, int, int]]:
+    """``{year: (recipients, replied, awaiting_review, applied, rejected,
+    confirmed)}`` in ONE query, so the console's table costs a fixed number of
+    round trips however many years exist."""
     rows = (await session.execute(_cycle_progress())).all()
     return {
         year: (
@@ -379,8 +392,9 @@ async def _progress_counts(
             int(awaiting or 0),
             int(applied or 0),
             int(rejected or 0),
+            int(confirmed or 0),
         )
-        for year, recipients, replied, awaiting, applied, rejected in rows
+        for year, recipients, replied, awaiting, applied, rejected, confirmed in rows
     }
 
 
@@ -527,13 +541,18 @@ def _to_item(
     creators: dict[int, str],
     non_responders: dict[int, int] | None = None,
     all_time_sent: dict[int, int] | None = None,
-    progress: dict[int, tuple[int, int, int, int, int]] | None = None,
+    progress: dict[int, tuple[int, int, int, int, int, int]] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     created_by_id = getattr(sched, "created_by_user_id", None)
-    recipients, replied, awaiting_review, applied, rejected = (progress or {}).get(
-        year, (0, 0, 0, 0, 0)
-    )
+    (
+        recipients,
+        replied,
+        awaiting_review,
+        applied,
+        rejected,
+        confirmed,
+    ) = (progress or {}).get(year, (0, 0, 0, 0, 0, 0))
     return SurveyScheduleItem(
         survey_schedule_id=sched.survey_schedule_id,
         graduation_year=year,
@@ -554,6 +573,7 @@ def _to_item(
         awaiting_review=awaiting_review,
         applied=applied,
         rejected=rejected,
+        confirmed=confirmed,
     )
 
 

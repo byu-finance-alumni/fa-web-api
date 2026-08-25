@@ -18,6 +18,15 @@ class SurveySubmitRequest(BaseModel):
     # submission (empty `fields`) must still create a response row so the page has
     # an id to attach the photo to — see `submit_response`.
     has_photo: bool = False
+    # "Yes, everything is correct" (#755) — a reply that changes NOTHING. Send it
+    # with `fields: {}` and `has_photo: false`; it records a `confirmed` response
+    # so the alum counts toward the response rate and stops getting reminders,
+    # which pressing that button previously did not do at all.
+    #
+    # IGNORED when the submission carries anything else. A body with real fields
+    # or a photo describes a submission WITH changes, and honouring the flag
+    # would throw them away — so content always wins. Send the flag on its own.
+    confirmed_only: bool = False
 
 
 class SurveySubmitResult(BaseModel):
@@ -30,6 +39,13 @@ class SurveySubmitResult(BaseModel):
     staged: bool
     change_count: int
     survey_response_id: int | None = None
+    # True when the row this result points at is a CONFIRMATION (#755) — a reply
+    # that changed nothing. It answers "is the alum's reply on record as a
+    # confirmation?", not "did this call create a row": a repeated confirm is
+    # idempotent and reports the reply that already existed. So it is False when
+    # the alum had already submitted real changes and a stale tab confirmed
+    # afterwards — that submission stands and is NOT overwritten.
+    confirmed: bool = False
 
 
 class SurveyChange(BaseModel):
@@ -99,7 +115,8 @@ class GraduationYearCount(BaseModel):
     graduation_year: int
     total_alumni: int
     # Distinct alumni in this grad year who have really replied within the last
-    # 365 days — `pending` or `applied` (`survey_email.RESPONDED_STATUSES`).
+    # 365 days — `pending`, `applied` or `confirmed`
+    # (`survey_email.RESPONDED_STATUSES`).
     # Drives the console's "N replied" count. A `rejected` response is NOT a
     # reply: staff threw that submission away, nothing reached the record, so the
     # alum stays surveyable and still counts as a non-responder.
@@ -405,9 +422,10 @@ class SurveyScheduleItem(BaseModel):
     # All three are scoped to the year's CURRENT cycle and counted over the send
     # log, so they share one denominator: nobody can reply to a survey they were
     # never sent, and a stray response from outside the cycle cannot push the
-    # rate past 100%. "Replied" is the sender's own definition — a pending or
-    # applied response inside the re-survey window, not superseded by a reset —
-    # so a cohort never reads as answered while the sender still owes it email.
+    # rate past 100%. "Replied" is the sender's own definition — a pending,
+    # applied or confirmed response inside the re-survey window, not superseded
+    # by a reset — so a cohort never reads as answered while the sender still
+    # owes it email.
     #
     # The response RATE is deliberately not a field: it is replied/recipients,
     # and a stored copy is one more thing that can disagree with its own inputs.
@@ -432,12 +450,20 @@ class SurveyScheduleItem(BaseModel):
     # person legitimately appears under `rejected` AND under `non_responders`,
     # and that is not a contradiction.
     #
-    # All five are counts of DISTINCT ALUMNI, not of submissions, so that they
+    # All six are counts of DISTINCT ALUMNI, not of submissions, so that they
     # are comparable with `recipients`. One alum who submitted twice and had one
     # applied and one rejected is counted in both columns — so
     # `awaiting_review + applied + rejected` need not equal `replied`, and none
     # of them is a partition of anything. Do not compute a rate from them.
     rejected: int = 0
+    # `confirmed` (#755): alumni who answered "yes, everything is correct" —
+    # a reply that changed nothing, so there is no submission to review and
+    # nothing was written to the record. They ARE part of `replied` (unlike
+    # `rejected`), and this column is what explains the gap: without it a cohort
+    # reads as "40 replied, 3 awaiting review, 5 applied" with 32 unaccounted
+    # for, which looks like a bug in the table rather than the best possible
+    # outcome — an alum whose record was already right.
+    confirmed: int = 0
 
 
 class SurveySchedulePauseAllResult(BaseModel):
@@ -607,8 +633,10 @@ class SurveyAlumniResponse(BaseModel):
 
     survey_response_id: int
     submitted_at: datetime.datetime
-    # 'pending' (awaiting review), 'applied' (written to the record), or
-    # 'rejected' (thrown away by staff).
+    # 'pending' (awaiting review), 'applied' (written to the record),
+    # 'rejected' (thrown away by staff), or 'confirmed' (#755 — "yes, everything
+    # is correct": a reply that changed nothing, so `field_count` is 0 by
+    # definition and there is nothing to review).
     status: str
     # How many fields the submission carried, and whether a photo came with it.
     field_count: int

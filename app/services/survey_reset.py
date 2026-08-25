@@ -30,10 +30,13 @@ SQL:
   cycle_seq, reset_seq)``. A row means "we already emailed them at this stage of
   this campaign", so the sender skips them. See
   :class:`app.models.survey_schedule.SurveySendLog`.
-* ``survey_responses`` — the 365-day re-survey window. A ``pending`` or
-  ``applied`` row inside the window makes them "already replied" and excludes
-  them from the send (:data:`app.services.survey_email.RESPONDED_STATUSES`, via
-  ``_replied_recently_exists``).
+* ``survey_responses`` — the 365-day re-survey window. A ``pending``,
+  ``applied`` or ``confirmed`` row inside the window makes them "already
+  replied" and excludes them from the send
+  (:data:`app.services.survey_email.RESPONDED_STATUSES`, via
+  ``_replied_recently_exists``). A ``confirmed`` row (#755) is an alum who
+  answered "yes, everything is correct" — it holds them out exactly like a
+  submission does, so it is exactly as resettable.
 
 The reset supersedes BOTH, for that one ``alumni_id`` and nothing else.
 Deliberately NOT scoped to a year or a cycle: the operator's question is "make

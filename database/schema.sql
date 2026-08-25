@@ -636,6 +636,16 @@ CREATE TABLE surveys (
 -- campaign starting in late December sends its reminders in January, so a
 -- date-derived cycle splits one campaign in two (see the `survey_schedule` note
 -- below). See migrations/2026-08-17_survey_response_cycle_stamp.sql.
+-- `status` has FOUR values (#755). Three describe a submission that carried
+-- CHANGES: `pending` (queued for review), `applied` (staff wrote it to the
+-- record), `rejected` (staff threw it away, so it is NOT a reply and the alum
+-- stays surveyable). The fourth, `confirmed`, is "yes, everything is correct" --
+-- a REPLY that changed nothing, with an empty `payload` and nothing to review.
+-- It counts toward the response rate and holds the alum out of reminders
+-- (`survey_email.RESPONDED_STATUSES`) but never enters the review queue or the
+-- applied/rejected outcome columns. A confirmation the alum later follows with
+-- real edits is UPGRADED IN PLACE to `pending` -- one reply, one row. See
+-- migrations/2026-08-25_survey_response_confirmed_status.sql.
 CREATE TABLE survey_responses (
     survey_response_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alumni_id           bigint NOT NULL,
@@ -655,7 +665,7 @@ CREATE TABLE survey_responses (
     reviewed_at         timestamptz,
     CONSTRAINT fk_survey_responses_alumni_id FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT fk_survey_responses_reviewer FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
-    CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected')),
+    CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected', 'confirmed')),
     CONSTRAINT ck_survey_responses_cycle_seq CHECK (cycle_seq IS NULL OR cycle_seq >= 1),
     CONSTRAINT ck_survey_responses_stage CHECK (stage IS NULL OR stage BETWEEN 0 AND 2)
 );

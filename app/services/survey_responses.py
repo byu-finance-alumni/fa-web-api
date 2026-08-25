@@ -44,7 +44,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit_context import (
@@ -88,6 +88,11 @@ from app.services.alumni import (
 from app.services.images import normalise_headshot
 from app.services.survey_email import (
     LINK_DEAD_MESSAGE,
+    RESPONDED_STATUSES,
+    STATUS_CONFIRMED,
+    STATUS_PENDING,
+    _resurvey_cutoff,
+    response_not_superseded,
     sent_cycle_and_stage,
     verify_survey_token,
 )
@@ -1186,15 +1191,165 @@ async def _sent_cycle_and_stage(
         return (None, None)
 
 
+async def _live_reply(
+    session: AsyncSession,
+    alumni_id: int,
+    statuses: tuple[str, ...],
+    *,
+    for_update: bool = False,
+) -> SurveyResponse | None:
+    """The alum's most recent reply that STILL COUNTS, in one of ``statuses`` --
+    or ``None``.
+
+    "Still counts" is the project's one definition of a live reply, not a looser
+    local one: inside the 365-day re-survey window, and not superseded by an
+    engineer reset (#395). It is the same pair of predicates the sender's
+    exclusion (:func:`survey_email._replied_recently_exists`) and every console
+    tally apply, imported rather than restated -- if this drifted, an alum could
+    be "already replied" to the submit path and "never responded" to the sender
+    on the same day.
+
+    Used for exactly two questions on the public submit path:
+
+      * *has this alum already replied?* -- the idempotency guard for a repeated
+        confirmation (``RESPONDED_STATUSES``);
+      * *is there a confirmation to UPGRADE?* -- when real edits arrive after one
+        (``(STATUS_CONFIRMED,)``).
+
+    A reset between the confirmation and the edit makes the confirmation stop
+    counting, so it is deliberately NOT found here and the edit stages a fresh
+    row: the alum was re-asked, and this is a new answer.
+
+    ``limit(1)`` is what makes ``scalar_one_or_none`` safe -- an alum legitimately
+    has several rows in the window (a submission, then another after spotting a
+    typo), and the NEWEST is the one both questions are about.
+
+    ``for_update`` LOCKS the row it returns, and the caller that is going to
+    MUTATE what it finds must pass it. This is the same reasoning, and the same
+    fix, as :func:`_get_pending` on the staff review path: without the lock, two
+    requests on one token -- a double-click, a mobile retry, or two submissions
+    fired before the first response comes back -- both read the row, both decide
+    to upgrade it, and the second commit silently overwrites the first alum's
+    answers with no error to either caller. That is data loss on the one write
+    path with no login and no reviewer ahead of it.
+
+    Under READ COMMITTED the second request blocks on the lock until the first
+    commits, and then Postgres RE-CHECKS the locked row against this WHERE. The
+    row it was waiting for is no longer ``confirmed`` by then, so it drops out
+    and this returns ``None`` -- the caller falls through and stages a SECOND
+    row, which is exactly what two concurrent submissions did before
+    confirmations existed, and both answers reach the reviewer. That re-check is
+    the point of taking the lock here rather than re-reading the status by hand.
+
+    The lock only helps a caller that mutates an EXISTING row. A row-level lock
+    cannot stop a concurrent INSERT, so two confirmations racing each other can
+    still both be recorded (see :func:`_record_confirmation`); that one is
+    cosmetic and deliberately not worth serialising every submit over.
+    """
+    stmt = (
+        select(SurveyResponse)
+        .where(
+            SurveyResponse.alumni_id == alumni_id,
+            SurveyResponse.submitted_at >= _resurvey_cutoff(),
+            SurveyResponse.status.in_(statuses),
+            response_not_superseded(),
+        )
+        .order_by(SurveyResponse.submitted_at.desc())
+        .limit(1)
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _record_confirmation(
+    session: AsyncSession, alum: Alumni, alumni_id: int
+) -> SurveySubmitResult:
+    """Record "yes, everything is correct" (#755) -- a REPLY that changed nothing.
+
+    Before this, pressing that button was a client-side state change that posted
+    NOTHING, so the alumni who answer fastest -- the ones with nothing to correct
+    -- were the only ones invisible to every reply tally, kept getting both
+    reminders, and stayed on the manual-follow-up call sheet for good.
+
+    The row is an ordinary ``survey_responses`` row with an EMPTY payload and
+    ``status='confirmed'``. That status is a reply
+    (:data:`survey_email.RESPONDED_STATUSES`) and is not a review outcome, so the
+    confirmation counts toward the response rate and stops the reminders while
+    never entering the staff review queue with nothing to review. It carries the
+    same ``cycle_seq``/``stage`` stamp a field submission does -- read from the
+    send log, NEVER derived from a date (#357).
+
+    IDEMPOTENT, and deliberately blind to which kind of reply already exists: if
+    the alum has ANY live reply, this records nothing further and reports that
+    one. A double-click, a reload, or a stale tab confirming after real edits
+    were already submitted must not manufacture a second row -- and must
+    ABSOLUTELY not overwrite a pending submission with an empty one, which is the
+    one way this could destroy an alum's answers. ``staged`` is still True: a
+    reply is on record, which is what the caller asked about.
+
+    NOTHING HERE MUTATES AN EXISTING ROW, which is why this read takes no lock
+    (unlike the upgrade branch in :func:`submit_response`). The residual race is
+    therefore benign in the only way that matters: two confirmations landing at
+    the same instant can both insert, leaving a duplicate row that reads as two
+    "Confirmed" entries on the profile's Surveys tab. It cannot lose an answer,
+    it cannot double-count anything -- every console figure counts DISTINCT
+    ALUMNI -- and the submit limiter bounds it. Serialising every public submit
+    behind a per-alumnus lock to tidy that up would cost more than it buys.
+    """
+    existing = await _live_reply(session, alumni_id, RESPONDED_STATUSES)
+    if existing is not None:
+        return SurveySubmitResult(
+            staged=True,
+            change_count=0,
+            survey_response_id=existing.survey_response_id,
+            confirmed=existing.status == STATUS_CONFIRMED,
+        )
+
+    cycle_seq, stage = await _sent_cycle_and_stage(session, alum, alumni_id)
+    response = SurveyResponse(
+        alumni_id=alumni_id,
+        graduation_year=alum.graduation_year,
+        payload={},
+        status=STATUS_CONFIRMED,
+        cycle_seq=cycle_seq,
+        stage=stage,
+    )
+    session.add(response)
+    # Capture the identity BEFORE the commit expires the row, exactly as the
+    # field-submit path does.
+    await session.flush()
+    new_id = response.survey_response_id
+    await session.commit()
+    return SurveySubmitResult(
+        staged=True, change_count=0, survey_response_id=new_id, confirmed=True
+    )
+
+
 async def submit_response(
-    session: AsyncSession, token: str, fields: dict[str, str], has_photo: bool = False
+    session: AsyncSession,
+    token: str,
+    fields: dict[str, str],
+    has_photo: bool = False,
+    confirmed_only: bool = False,
 ) -> SurveySubmitResult:
     """Stage an alum's submission (token-gated, public). Keeps only recognized
     fields; nothing is applied to the record here.
 
     A photo-only submission (empty `fields` but `has_photo=True`) still creates a
     pending response so the page has an id to attach the photo to. Only a true
-    no-op (no recognized fields AND no photo) returns early with a null id."""
+    no-op (no recognized fields AND no photo) returns early with a null id.
+
+    ``confirmed_only`` (#755) records "yes, everything is correct" -- see
+    :func:`_record_confirmation`. It is honoured ONLY for a submission that
+    carries nothing else: real content always wins, because a client that sends
+    both is describing a submission WITH changes and treating it as a
+    confirmation would discard them. It is not a separate endpoint on purpose --
+    the confirm press and the edit submit are the same alum answering the same
+    survey through the same signed token, so they share the token check, the
+    abuse budget (``SURVEY_SUBMIT_LIMITER``) and the payload caps by construction
+    rather than through a second copy that can drift.
+    """
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
         raise NotFoundError(LINK_DEAD_MESSAGE)
@@ -1218,9 +1373,62 @@ async def submit_response(
         if k in _FIELD_BY_KEY and _coerce(_FIELD_BY_KEY[k], v) is not _IGNORE
     }
     if not payload and not has_photo:
+        if confirmed_only:
+            return await _record_confirmation(session, alum, alumni_id)
         return SurveySubmitResult(staged=False, change_count=0)
 
     cycle_seq, stage = await _sent_cycle_and_stage(session, alum, alumni_id)
+
+    # CONFIRM, THEN CHANGE YOUR MIND (#755). An alum can press "Yes, everything
+    # is correct", then "I need to make changes", then submit real edits -- or
+    # answer the involvement questions on the page the confirmation leads to,
+    # which are ordinary survey fields. They must NEVER be blocked by having
+    # confirmed first, and the two acts are ONE reply, so the confirmation is
+    # UPGRADED IN PLACE rather than joined by a second row.
+    #
+    # Upgrading beats the alternatives. A duplicate row would read as two answers
+    # on the profile's Surveys tab -- the cycle counts are DISTINCT ALUMNI, so
+    # the response rate would stay right while the history looked wrong -- and
+    # refusing the edit would lock an alum out of correcting their own record for
+    # having pressed the wrong button first, which is unacceptable on a public
+    # page they reached from an email.
+    #
+    # Only a `confirmed` row is ever touched. A live `pending` submission is left
+    # alone and a second one is staged beside it, exactly as before: those are
+    # two real submissions and a reviewer must see both.
+    # LOCKED, because this branch WRITES to the row it finds. Two submissions
+    # racing on one token would otherwise both upgrade the same confirmation and
+    # the second would silently discard the first alum's answers -- see
+    # `_live_reply`, and `_get_pending` for the same fix on the review path. The
+    # lock is held to the commit at the end of this function.
+    upgrade = await _live_reply(
+        session, alumni_id, (STATUS_CONFIRMED,), for_update=True
+    )
+    if upgrade is not None:
+        upgrade.payload = payload
+        upgrade.status = STATUS_PENDING
+        # Re-stamped to when the FIELDS were submitted, not when the alum first
+        # confirmed. The row is now a pending submission, and `submitted_at` is
+        # the date the review queue shows and the 365-day window measures. It can
+        # only move FORWARD, so it cannot resurrect a reply a reset superseded --
+        # and it could not have been one anyway, `_live_reply` excludes those.
+        # `func.now()` keeps the stamp Postgres-clocked like the column default;
+        # the reset comparison is against an API-stamped `reset_at`, so mixing
+        # clocks here is exactly what every existing row already does.
+        upgrade.submitted_at = func.now()
+        # The stamp records WHICH campaign email prompted the reply, and the
+        # confirmation already answered that. Only fill a gap -- never overwrite
+        # an observed value with a freshly-resolved one (#497).
+        if upgrade.cycle_seq is None:
+            upgrade.cycle_seq = cycle_seq
+        if upgrade.stage is None:
+            upgrade.stage = stage
+        # Read the id BEFORE the commit expires the row.
+        upgraded_id = upgrade.survey_response_id
+        await session.commit()
+        return SurveySubmitResult(
+            staged=True, change_count=len(payload), survey_response_id=upgraded_id
+        )
 
     response = SurveyResponse(
         alumni_id=alumni_id,

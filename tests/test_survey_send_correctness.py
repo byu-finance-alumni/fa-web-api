@@ -598,10 +598,18 @@ def test_a_rejected_response_does_not_suppress_the_alum():
     """A rejected response is one staff THREW AWAY — nothing was written to the
     record — so the alum has effectively not replied and must stay surveyable.
     Counting it silenced them for 365 days."""
-    assert survey_email.RESPONDED_STATUSES == ("pending", "applied")
+    assert survey_email.RESPONDED_STATUSES == ("pending", "applied", "confirmed")
     sql = _sql(survey_email.eligible_alumni_query(_YEAR))
     assert "'pending'" in sql and "'applied'" in sql
     assert "rejected" not in sql
+
+
+def test_a_confirmation_does_suppress_the_alum():
+    """The mirror image, and the whole of #755. "Yes, everything is correct" IS
+    an answer, so the sender must stop emailing them — before this it recorded
+    nothing at all, so the fastest responders kept getting both reminders."""
+    sql = _sql(survey_email.eligible_alumni_query(_YEAR))
+    assert "'confirmed'" in sql
 
 
 class _CaptureSession:
@@ -622,6 +630,9 @@ def test_responded_count_uses_the_identical_status_filter():
     asyncio.run(survey_email.list_graduation_years(session))
     responded_sql = _sql(session.stmts[1])
     assert "'pending'" in responded_sql and "'applied'" in responded_sql
+    # #755 — and a confirmation is a reply, so the console's "N replied" counts
+    # it too. Same tuple, so the count and the send exclusion cannot disagree.
+    assert "'confirmed'" in responded_sql
     assert "rejected" not in responded_sql
 
 

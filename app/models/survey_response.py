@@ -35,6 +35,15 @@ class SurveyResponse(Base):
     )
     graduation_year: Mapped[int | None] = mapped_column(Integer)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # FOUR values, and the DB CHECK is the authority (see `schema.sql`). Three
+    # describe a submission that carried CHANGES — `pending` / `applied` /
+    # `rejected`. The fourth, `confirmed` (#755), is "yes, everything is correct":
+    # a reply that changed nothing, with an EMPTY `payload` and nothing for staff
+    # to review. It counts as a reply everywhere the sender and the console ask
+    # "have they answered?" (`survey_email.RESPONDED_STATUSES`) and appears in
+    # NONE of the review-outcome columns, which keep meaning exactly what they
+    # meant. `survey_email` names all four; no query should spell one as a bare
+    # string.
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     # Staging key of a NEW profile photo uploaded with this response (headshots
     # bucket, `survey-pending/<id>`), pending admin review. None when no photo.

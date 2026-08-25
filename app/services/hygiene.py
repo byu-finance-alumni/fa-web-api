@@ -32,6 +32,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dropdowns import employer_applies
+from app.core.us_states import is_us_country as _is_us_country
 from app.core.us_states import to_full_name as _state_full_name
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
@@ -240,28 +241,14 @@ def _clean_state(value: str | None) -> str | None:
     return _state_full_name(cleaned)
 
 
-# Country values that mean "the United States". Country is free text on the
-# intake sheet, so we accept the spellings we actually see rather than requiring
-# a canonical form. Anything else counts as non-US.
-_US_COUNTRIES = frozenset(
-    {
-        "us",
-        "u.s.",
-        "u.s.a.",
-        "usa",
-        "united states",
-        "united states of america",
-    }
-)
-
-
-def _is_us_country(value: object) -> bool:
-    """True when a free-text country value names the United States."""
-    if not isinstance(value, str):
-        return False
-    return value.strip().lower().rstrip(".") in {
-        c.rstrip(".") for c in _US_COUNTRIES
-    }
+# Country values that mean "the United States" now live in app.core.us_states
+# (``US_COUNTRY_ALIASES`` / ``is_us_country``, imported above as
+# ``_is_us_country``) alongside the state crosswalk, because the dashboard's
+# country KPI and the world map need the same answer to "is this person abroad?".
+# This module used to keep its own copy of the list; the shared one adds the
+# spelling "America", so a record whose country reads "America" is now recognized
+# as domestic and can derive a US region, where before it was treated as abroad
+# and left the region untouched.
 
 
 # "The caller has no stored work state to compare against." Distinct from None,

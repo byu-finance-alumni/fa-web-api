@@ -18,6 +18,7 @@ from app.api.dependencies.auth import RequireReportsAdvanced, RequireViewAccess
 from app.core import email_reach
 from app.core.database import get_session
 from app.core.dropdowns import WHEEL_INDUSTRIES
+from app.core.us_states import US_COUNTRY_ALIASES, us_state_full_name_expr
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -47,6 +48,13 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 # employers chart so placeholders don't rank as firms. Compared against
 # lower(trim(current_employer)).
 _NON_EMPLOYER_VALUES = ("graduate student", "unknown", "n/a", "na", "none")
+
+# Every spelling of "the United States", upper-cased for comparison against
+# upper(trim(current_country)) — excluded from the "and M countries" KPI so the
+# states half of the sub-line isn't double-counted as a country. Derived from the
+# shared list so this and the world map agree on who is abroad; a tuple because
+# SQLAlchemy's not_in() wants a sequence.
+_USA_COUNTRY_VALUES = tuple(sorted(a.upper() for a in US_COUNTRY_ALIASES))
 
 # Canonical finance industries for the dashboard breakdown (#353) — the full
 # controlled vocab MINUS the "Other" catch-all, which is reported as its own
@@ -526,12 +534,39 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     # address this system holds, and it is what the geography map plots (#287).
     # current_employment is unique per alum, so a plain count is a per-alumnus
     # count and matches app/services/geography.py's by-state aggregation.
+    #
+    # ⚠️ GROUPED ON THE FOLDED NAME, NOT THE RAW COLUMN (#754). This used to
+    # `GROUP BY current_state` verbatim, which had two consequences, both wrong
+    # and both invisible in the output:
+    #
+    #   * "UT" and "Utah" were two different bars competing for the same top-8
+    #     slots, so a real state could be pushed off the list by its own
+    #     alternate spelling;
+    #   * non-US regions ("Ontario", "London") ranked as states.
+    #
+    # `us_state_full_name_expr` folds both spellings to "Utah" and yields NULL
+    # for anything that is not one of the 50 states + DC — the SAME expression
+    # the "Across N states" KPI below counts, so the tile and this drill-down
+    # can never disagree about what a state is. The LIMIT is applied AFTER the
+    # fold (it is a GROUP BY key, not a post-filter), which is the whole point:
+    # ranking raw spellings and then truncating to 8 is what produced the wrong
+    # list. Non-US alumni are represented by the country KPI, not here.
+    #
+    # ONE expression object, built once and reused by all three geography
+    # queries in this handler (this breakdown, the "N states" count, and the
+    # "M countries" count's abroad test). Not a style choice: the tile, its
+    # drill-down and its complement have to share a single definition of "a
+    # state", and two copies of a call is exactly how they would drift apart.
+    _state_name = us_state_full_name_expr(CurrentEmployment.current_state)
     by_state = (
         await session.execute(
-            select(CurrentEmployment.current_state, func.count())
+            select(_state_name.label("state"), func.count())
+            # Explicit: the leading column is now a CASE, so the FROM can no
+            # longer be inferred from it the way a bare column did.
+            .select_from(CurrentEmployment)
             .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
-            .where(active, CurrentEmployment.current_state.is_not(None))
-            .group_by(CurrentEmployment.current_state)
+            .where(active, _state_name.is_not(None))
+            .group_by(_state_name)
             .order_by(func.count().desc())
             .limit(8)
         )
@@ -576,23 +611,71 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     )
 
     # ...and how many STATES those companies are in — the sub-line under the
-    # Companies tile ("Across N states"), mirroring the industries line under
-    # Total alumni.
+    # Companies tile ("Across N states and M countries"), mirroring the
+    # industries line under Total alumni.
     #
     # Same address as the geography map and the `by_state` breakdown above: the
-    # employer's, which is the only address this system holds (#287). Folded
-    # with lower(trim(...)) before DISTINCT for the same reason the employer
-    # names are — the column is free text, so "Utah", "utah" and a trailing
-    # space would otherwise be three states.
-    _state_norm = func.lower(func.trim(CurrentEmployment.current_state))
+    # employer's, which is the only address this system holds (#287).
+    #
+    # ⚠️ #754 — THIS TILE READ "Across 70 states". There are 51 possible values.
+    # The old query was `COUNT(DISTINCT lower(trim(current_state)))` with no US
+    # restriction, which is two bugs wearing one query:
+    #
+    #   * lower(trim(...)) folds casing and whitespace and NOTHING ELSE, so "UT"
+    #     and "Utah" — both of which the free-text column holds — counted twice;
+    #   * nothing said "US state", so "Ontario" and "London" counted as states.
+    #
+    # `us_state_full_name_expr` fixes both at once: it folds a code OR a full
+    # name in any casing to the canonical full name, and yields NULL for
+    # anything that is not one of the 50 states + DC. COUNT(DISTINCT ...) skips
+    # NULLs, so the number is now structurally incapable of exceeding 51 — no
+    # amount of bad data entry can inflate it again. It is the SAME expression
+    # `by_state` groups on (the `_state_name` built there), so the count and the
+    # list beneath it agree by construction rather than by two authors
+    # remembering to match.
     employer_states = await session.scalar(
-        select(func.count(func.distinct(_state_norm)))
+        select(func.count(func.distinct(_state_name)))
+        .select_from(CurrentEmployment)
+        .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
+        .where(active)
+    )
+
+    # ...and the other half of that sub-line: how many COUNTRIES the alumni
+    # working outside the US are in (#754, Jake's call — "Across N states and M
+    # countries"). Excluding international alumni entirely was the alternative
+    # and it hides real reach, so both numbers ship.
+    #
+    # WHO COUNTS AS ABROAD: an alumnus whose work state does not resolve to a US
+    # state — the same NULL from the same expression the state count uses. That
+    # is the discriminator, NOT the country column, because state is the field
+    # that is actually populated. So the two numbers partition the population
+    # instead of overlapping: nobody is both a state and a country.
+    #
+    # WHAT IS COUNTED: DISTINCT upper(trim(current_country)). US spellings are
+    # excluded (`US_COUNTRY_ALIASES`, shared with the world map) so a domestic
+    # record with a junk state can't make "United States" the 1 in "and 1
+    # country" — the states half already speaks for the US.
+    #
+    # ⚠️ DELIBERATE UNDERCOUNT, AND THE HONEST BEHAVIOUR: an alum abroad whose
+    # `current_country` is blank contributes NOTHING to this number. There is no
+    # way to name a country we were never told, and inventing an "unknown"
+    # bucket would put a number on the tile that is not a country. `current_country`
+    # is free text with no vocab and no default, filled only when the intake
+    # sheet's "Current country" column or the survey's "Employment country"
+    # answer was, so this reads LOW rather than wrong. It also does not fold
+    # spellings ("UK" vs "United Kingdom" are two countries) — there is no
+    # country crosswalk in this codebase to fold them with, only the US aliases.
+    _country_norm = func.upper(func.trim(CurrentEmployment.current_country))
+    employer_countries = await session.scalar(
+        select(func.count(func.distinct(_country_norm)))
         .select_from(CurrentEmployment)
         .join(Alumni, Alumni.alumni_id == CurrentEmployment.alumni_id)
         .where(
             active,
-            CurrentEmployment.current_state.is_not(None),
-            func.trim(CurrentEmployment.current_state) != "",
+            _state_name.is_(None),
+            CurrentEmployment.current_country.is_not(None),
+            func.trim(CurrentEmployment.current_country) != "",
+            _country_norm.not_in(_USA_COUNTRY_VALUES),
         )
     )
 
@@ -604,6 +687,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "missing_employer": int(missing_employer or 0),
         "distinct_employers": int(distinct_employers or 0),
         "employer_states": int(employer_states or 0),
+        "employer_countries": int(employer_countries or 0),
         "contacted_this_month": int(contacted_this_month or 0),
         "alumni_edited_this_month": int(alumni_edited_this_month or 0),
         "alumni_edited_this_year": int(alumni_edited_this_year or 0),

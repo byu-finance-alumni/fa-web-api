@@ -594,7 +594,15 @@ def test_get_send_usage_applies_baseline(monkeypatch):
     import datetime
 
     now = datetime.datetime.now(datetime.UTC)
-    anchor = now - datetime.timedelta(minutes=5)  # earlier the same day/month
+    # ⚠️ MIDNIGHT TODAY, not "now minus five minutes". The baseline is only added
+    # while we are still inside the anchor's UTC day (get_send_usage compares
+    # now.date() == anchor.date()), and five minutes before 00:03 UTC is
+    # YESTERDAY — so the old anchor silently moved the test out of the case it
+    # was written to cover and asserted 17 == 3. It failed a real merge at
+    # 00:01 UTC on 2026-08-25, and would have failed for the same five minutes
+    # every night. Deriving the anchor from now.date() keeps it in today's
+    # window at every hour, including the ones nobody runs CI in on purpose.
+    anchor = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=datetime.UTC)
 
     class _S:
         survey_usage_baseline_at = anchor

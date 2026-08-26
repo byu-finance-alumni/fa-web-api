@@ -2,7 +2,11 @@
 
 Backend API and database layer for the **BYU Finance Alumni Database**.
 
-Stack: FastAPI · PostgreSQL · SQLAlchemy 2.x (async) · Pydantic · Alembic · Supabase (auth/storage).
+Stack: FastAPI · PostgreSQL · SQLAlchemy 2.x (async) · Pydantic · Supabase (auth/storage).
+
+⚠️ **There is no Alembic.** Migrations are hand-written `.sql` files applied in
+lexical order by `database/migrate.sh` and recorded in `schema_migrations` — see
+[`database/migrations/README.md`](database/migrations/README.md).
 
 ## Setup
 
@@ -24,28 +28,52 @@ uvicorn app.main:app --reload
 - API root: http://127.0.0.1:8000/
 - Swagger docs: http://127.0.0.1:8000/docs
 
-## Endpoints (current)
+## Endpoints
 
-| Method | Path         | Description                                   |
-|--------|--------------|-----------------------------------------------|
-| GET    | `/`          | Service identification                        |
-| GET    | `/health`    | Liveness check (process is up)                |
-| GET    | `/health/db` | Readiness check (verifies DB connection)      |
+The surface is far too large to mirror by hand here and a hand-kept list goes
+stale immediately. **Read the generated schema instead** — it is the contract the
+frontend's types are built from:
 
-`/health/db` returns `200 {"status":"ok","database":"connected"}` on success, or
-`503` with the structured error envelope if the database is unconfigured/unreachable.
+- Local: <http://127.0.0.1:8000/docs>
+- Dev: <https://dev-fa-web-api.vercel.app/docs>
+- ⚠️ **Prod returns 404 for `/docs`, `/redoc` and `/openapi.json` — by design**
+  (`DEBUG=false`). That is not an outage; don't chase it, and don't point the
+  frontend's type generator at prod.
+
+Routers live in `app/api/routes/` (~19 of them: alumni, survey, dashboard, events,
+audit, engineer, storage, notes, geography, vocabulary, …).
+
+**Health checks**, which are stable and worth knowing:
+
+| Method | Path         | Description                                        |
+|--------|--------------|----------------------------------------------------|
+| GET    | `/`          | Service identification                             |
+| GET    | `/health`    | Liveness — also reports `environment` and `version` |
+| GET    | `/health/db` | Readiness — verifies the DB connection             |
+
+`/health/db` returns `200 {"status":"ok","database":"connected"}`, or `503` with
+the structured error envelope if the database is unconfigured/unreachable.
+
+⚠️ **`/health` reporting `200` proves the process is up, nothing more.** Read its
+`environment` field before assuming which deployment you are talking to.
 
 ## Tests
 
 ```bash
-pytest
+DATABASE_URL="" pytest
 ```
+
+⚠️ **Clear `DATABASE_URL` when running locally.** The repo `.env` supplies a real
+connection string, and ~17 survey tests then talk to an actual database and fail
+for reasons that have nothing to do with your change. CI has no `.env`, so it
+never sees this — which is why "passes in CI, fails locally" is usually this.
 
 ## CI Checks
 
 Every **pull request into** and **push to** `dev` and `prod` runs a set of checks
-across three GitHub Actions workflows — `ci.yml`, `ferpa-audit.yml`,
-`board-in-review.yml` — plus Vercel's own deployment check. This section
+across the GitHub Actions workflows in `.github/workflows/` — `ci.yml`,
+`ferpa-audit.yml` and `security-audit.yml` — plus Vercel's own deployment check.
+(`board-in-review.yml` is **gone**, deleted 2026-07-03; see the board note below.) This section
 documents **every check**: what it does, why it exists, when it runs, and whether
 it's a **required** status check (a required check that isn't green blocks the
 merge; required checks are configured in the repo's branch **rulesets**, not in
@@ -81,8 +109,26 @@ Two principles drive the design:
 
 | Check / job | When | What it does |
 |-------------|------|--------------|
-| **Migrate database** | only on **push to `prod`**, after the base+audit checks pass | Applies pending `database/migrations/*.sql` to the **prod** Supabase DB via `migrate.sh`, **held for manual approval** by the `production` Environment's required reviewers (secret `MIGRATIONS_DATABASE_URL`). The **dev** DB is migrated separately, by hand. Skipped on PRs and on dev pushes. |
-| **Move linked issues to In Review** | when a PR is opened / marked ready | Moves the PR's linked board issues into **In Review** on org Project #4. Needs the `PROJECTS_TOKEN` secret; a graceful no-op without it (never fails a PR). |
+| **Migrate database** | only on **push to `prod`**, after the base+audit checks pass | Applies pending `database/migrations/*.sql` to the **prod** Supabase DB via `migrate.sh` (secret `MIGRATIONS_DATABASE_URL`). Runs **automatically — there is no approval gate**, see below. Skipped on PRs. |
+| **Migrate database (dev)** | only on **push to `dev`** | Same, against the **dev** database. |
+
+> ⚠️ **Never put a manual-approval gate on these jobs.** There used to be one
+> (`production` Environment required reviewers). It did not make prod safer — it
+> made it worse: the approval held the *migration* while **Vercel deployed the
+> code independently**, so new code ran against the old schema and took prod
+> down. It was removed and must not come back.
+>
+> ⚠️ **The job trails the Vercel deploy by minutes.** So sequence the *deploy*,
+> not the migration: for any schema-dependent change, push a **migration-only
+> commit to `prod` first** (cut it from `prod`, not `dev`), let it apply, and
+> only then promote the code. Old code against a new schema is safe; new code
+> against an old schema fails on every write that needs it.
+
+> ⚠️ **Board cards are moved BY HAND.** The `board-in-review.yml` workflow that
+> used to do it was **deleted from both repos on 2026-07-03**: it regex-matched
+> bare `#NNN` in PR text, so a number that meant an issue in *this* repo moved the
+> same-numbered issue in the *other* one. When writing PR bodies, avoid bare
+> `#NNN` for cross-repo references — write "fa-web-app PR 762".
 
 ### External — Vercel deployment check (required)
 
@@ -120,18 +166,25 @@ Day-to-day flow:
 3. Merge to `dev`.
 4. Release by opening a PR `dev → prod`; the prod-only dependency audit also runs,
    and on merge `finance-alumni-database-api` deploys production.
-5. **Back-merge `prod → dev` after every release** (end-of-day routine). A
+5. **Back-merge `prod → dev` after every release.** A
    `dev → prod` merge creates a merge commit that lives only on `prod`, so `dev`
    immediately reads as "N commits behind prod" even though the code is identical
    — one commit per release. Sync it back so the count resets to 0:
 
+   ⚠️ **Direct pushes to `dev` are blocked by the ruleset** —
+   `git push origin origin/prod:dev` is rejected ("repository rule violations").
+   Open a PR; the content is identical so its checks pass quickly:
+
    ```bash
    git fetch origin
-   git push origin origin/prod:dev   # fast-forward dev up to prod (works while dev has no unmerged work)
+   gh pr create --base dev --head prod --title "chore: back-merge prod into dev"
    ```
 
-   If branch protection blocks the direct push, open a quick `prod → dev` PR
-   instead. Do this at the end of each working day so `dev` never drifts.
+   That leaves `dev` 1 ahead (the back-merge commit) and `prod` 0 ahead — the
+   correct synced state. Verify `git rev-list --count origin/dev..origin/prod`
+   is `0` and `git diff origin/dev origin/prod` is empty.
+
+   Do this **immediately after every promotion**, not only at end of day.
 
 Both branches reject direct pushes — all changes go through pull requests.
 
@@ -151,17 +204,25 @@ database, Auth users, and keys. They no longer share one database:
 
 | Environment (Vercel)          | Supabase project           | Data                              |
 |-------------------------------|----------------------------|-----------------------------------|
-| `dev` (`dev-fa-web-api`)      | the original project       | mock/seed data — safe to test on  |
-| `prod` (`finance-alumni-database-api`) | a new, dedicated project | clean; real alumni data later     |
+| `dev` (`dev-fa-web-api`)      | the original project       | mock/seed data — safe to test on |
+| `prod` (`finance-alumni-database-api`) | a dedicated project | **real alumni data** |
 
 Each deployment gets its own `DATABASE_URL` / `SUPABASE_*` (pointing at its
-project). Schema migrations are applied to each database — see
+project). Each database is migrated by its own CI job — see
 [`database/migrations/README.md`](database/migrations/README.md).
 
-> ⏳ The dedicated **prod** project is provisioned during the database split.
-> Until then prod still points at the original project; the prod Vercel env vars
-> and the `production` Environment's `MIGRATIONS_DATABASE_URL` are repointed as
-> part of that step.
+> ✅ **The database split completed 2026-07-09.** prod has its own Supabase
+> project, its own Vercel env vars, and its own `MIGRATIONS_DATABASE_URL` on the
+> `production` Environment.
+>
+> ⚠️ **prod is real alumni data. Never run scratch queries or destructive work
+> against it** — dev is the sandbox. `curl <api-url>/health` reports which
+> `environment` you are talking to; check before assuming.
+>
+> ⚠️ **The Vercel project names do not match the repo names** — prod API is
+> `finance-alumni-database-api`, prod app is `finance-alumni-database`. A
+> deployment poll filtered on the repo name waits forever on a deploy that
+> already succeeded.
 
 ## Project structure
 
@@ -186,4 +247,8 @@ database/
 ```
 
 > The PostgreSQL schema in `database/schema.sql` is the source of truth. Schema
-> changes go through Alembic migrations — never modify production directly.
+> changes go through **hand-written SQL migrations** in `database/migrations/`
+> (there is no Alembic) — never modify production directly.
+>
+> Every **new table** must get deny-all RLS to match `database/rls_lockdown.sql`;
+> the FERPA static check fails the build if one doesn't.

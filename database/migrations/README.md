@@ -38,33 +38,44 @@ DATABASE_URL="postgresql://postgres:PASSWORD@db.PROJECT_REF.supabase.co:5432/pos
    ```
 5. Update `../schema.sql` to reflect the new end state.
 
-## CI: manual-gated on prod promotion
+## CI: automatic on both branches
 
-`dev` and `prod` now have **separate Supabase databases** (dev = the original
-project, which keeps the mock/seed data; prod = a new, dedicated project).
-Migrations must be applied to **each** database to keep them in sync.
+`dev` and `prod` have **separate Supabase databases** (dev = the original
+project, which keeps the mock/seed data; prod = a dedicated project, stood up
+2026-07-09). Migrations are applied to **each** by its own CI job, automatically:
 
-The CI `migrate` job applies pending migrations to the **prod** database on a
-**push to `prod`**, and only **after a human approves** (the `production`
-Environment's required reviewer):
+| Branch pushed | Job                       | Target DB       | Approval |
+| ------------- | ------------------------- | --------------- | -------- |
+| `dev`         | `Migrate database (dev)`  | the **dev** DB  | none     |
+| `prod`        | `Migrate database`        | the **prod** DB | none     |
 
-| Branch pushed | Job       | Target DB        | Approval                       |
-| ------------- | --------- | ---------------- | ------------------------------ |
-| `dev`         | —         | —                | (CI does not migrate dev)      |
-| `prod`        | `migrate` | the **prod** DB  | **manual** (required reviewer) |
+`.github/workflows/ci.yml` runs them after the gating checks pass on the
+post-merge push. Migrations do **not** run on pull requests.
 
-`.github/workflows/ci.yml` runs `migrate` after the gating checks pass on the
-post-merge push to `prod`. Migrations do **not** run on pull requests.
+### ⚠️ There is no approval gate, and one must never be added
 
-**Applying migrations to the dev database:** run `../migrate.sh` by hand against
-the dev project's direct connection string (see "How it runs" above), or add a
-dev `migrate` job mirroring the prod one. Keep both databases in sync so a change
-tested on dev matches what lands on prod.
+There used to be one (the `production` Environment's required reviewers). It did
+not make prod safer — **it caused an outage**. The approval held the *migration*
+while **Vercel deployed the code independently**, so new code ran against the old
+schema. It was removed deliberately.
 
-> ⏳ **Provisioned during the database split (in progress):** the dedicated prod
-> project and its `MIGRATIONS_DATABASE_URL` (the `production` Environment secret)
-> are created / repointed as part of that step. Until the split completes, the
-> `migrate` job still targets the original database.
+### ⚠️ Sequence the DEPLOY, not the migration
+
+The migrate job trails the Vercel deploy by **minutes**. That gap only hurts in
+one direction:
+
+| Combination            | Result                                                  |
+| ---------------------- | ------------------------------------------------------- |
+| old code + new schema  | **safe** — a widened constraint admits everything the narrow one did |
+| new code + old schema  | **broken** — every write needing the change is rejected for the length of the gap |
+
+So for any schema-dependent change: **push a migration-only commit to `prod`
+first, let it apply, then promote the code.** Cut that commit from `prod` rather
+than `dev` so it carries the `.sql` file and nothing else.
+
+Prefer **widening** changes for this reason (add a nullable column, extend a
+CHECK / enum) — they are safe in the gap. A narrowing or destructive change is
+not, and needs the code retired first.
 
 ### One-time GitHub setup
 
@@ -73,8 +84,11 @@ environment:
 
 - Add secret `MIGRATIONS_DATABASE_URL` = your Supabase project's **direct**
   (port 5432) connection string.
-- Under **Deployment protection rules**, enable **Required reviewers** and add
-  yourself / the team. This is the manual approval gate.
+- ⚠️ **Do NOT enable "Required reviewers" / any deployment protection rule on
+  this environment.** There was once an approval gate here and it caused a
+  production outage: the approval held the **migration** while Vercel deployed
+  the **code** independently, so new code ran against the old schema. The gate
+  was removed deliberately. The environment exists only to hold the secret.
 
 Find the connection string in Supabase → **Project Settings → Database →
 Connection string → Direct connection** (URI). Use the direct connection, not the

@@ -26,18 +26,24 @@ public deploy, rotate them in Supabase and use the new values below:
 
 ## 1. Environment variables (set these in Vercel)
 
-> 🔁 **`dev` and `prod` use separate Supabase projects.** The values below are for
-> the **prod** project (a new, dedicated project created in the database split);
-> the `dev-fa-web-api` deployment uses the **original** project's values (mock
-> data). ⏳ Until the split completes, prod still uses the original project shown
-> here (`tnnhhnzglyfqolxdojyb`) — swap in the new prod project's URL / keys /
-> `DATABASE_URL` (and the `production` Environment's `MIGRATIONS_DATABASE_URL`)
-> when it's provisioned.
+> 🔁 **`dev` and `prod` use separate Supabase projects. The split COMPLETED
+> 2026-07-09.**
+>
+> ⚠️ **The project ref shown in the table below (`tnnhhnzglyfqolxdojyb`) is the
+> DEV project.** It was correct only while the split was in progress. Setting a
+> prod variable to it points **production at the dev database**. Substitute the
+> dedicated prod project's own ref, URL, keys and `DATABASE_URL` — read them from
+> the prod Supabase project, not from this file.
+>
+> The same applies to the `production` Environment's `MIGRATIONS_DATABASE_URL`.
+>
+> ⚠️ **prod holds real alumni data; dev is the sandbox.** Confirm which you are
+> touching before any write: `curl <api-url>/health` reports the `environment`.
 
 | Variable | Value |
 |---|---|
-| `DATABASE_URL` | **Transaction pooler** URL — same host, **port 6543**: `postgresql://postgres.tnnhhnzglyfqolxdojyb:[NEW_PASSWORD]@aws-1-us-east-1.pooler.supabase.com:6543/postgres` |
-| `SUPABASE_URL` | `https://tnnhhnzglyfqolxdojyb.supabase.co` |
+| `DATABASE_URL` | **Transaction pooler** URL, **port 6543**: `postgresql://postgres.<PROD_PROJECT_REF>:[PASSWORD]@aws-1-us-east-1.pooler.supabase.com:6543/postgres` — ⚠️ the **prod** ref, not the dev one. Migrations use the **session** pooler (**:5432**) instead. |
+| `SUPABASE_URL` | `https://<PROD_PROJECT_REF>.supabase.co` — ⚠️ the **prod** project |
 | `SUPABASE_ANON_KEY` | publishable key (`sb_publishable_…`) |
 | `SUPABASE_SERVICE_ROLE_KEY` | the **rotated** service-role key |
 | `JWT_SECRET` | project JWT secret (HS256 project) — Settings → API → JWT Secret |

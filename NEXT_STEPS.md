@@ -1,5 +1,13 @@
 # Next Steps — fa-web-api
 
+> ⚠️ **HISTORICAL — not the tracker.** Work is tracked on the GitHub Project board
+> (https://github.com/orgs/byu-finance-alumni/projects/4), which replaced the local checklists on
+> 2026-06-15. This file stopped being updated well before launch; prod has been
+> live since July 2026.
+>
+> Kept for the "Done so far" narrative. **Anything below reading as outstanding is
+> probably shipped** — check the board before acting on it.
+
 Running checklist of outstanding work and the build roadmap. Update as items
 are completed.
 

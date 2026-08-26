@@ -9,13 +9,20 @@ name: CI
 # separately via branch protection — not duplicated here.
 #
 # `dev` and `prod` have SEPARATE Supabase databases (dev = the original project
-# with mock data; prod = a new, dedicated project). After checks pass on a push to
-# prod, the `migrate` job applies pending SQL migrations to the PROD database —
-# but only after a human approves it via the `production` GitHub Environment's
-# required reviewers. The connection string is the Environment secret
-# MIGRATIONS_DATABASE_URL (see database/migrations/README.md). The dev database is
-# migrated separately (by hand or a dev job). ⏳ Until the prod-DB split finishes,
-# MIGRATIONS_DATABASE_URL still points at the original database.
+# with mock data; prod = a dedicated project, stood up 2026-07-09). Each branch
+# migrates its own database automatically after checks pass: `migrate-dev` on a
+# push to dev, `migrate` on a push to prod. The connection string is the
+# Environment secret MIGRATIONS_DATABASE_URL, set on BOTH Environments (see
+# database/migrations/README.md).
+#
+# ⚠️ There is NO approval gate on either job, and none may be added. One existed
+# and caused a prod outage: the approval held the MIGRATION while Vercel deployed
+# the CODE independently, so new code ran against the old schema.
+#
+# ⚠️ These jobs trail the Vercel deploy by minutes. Sequence the DEPLOY instead:
+# for a schema-dependent change, push a migration-only commit to prod first, let
+# it apply, then promote the code. Old code + new schema is safe; the reverse is
+# not.
 on:
   push:
     branches: [prod, dev]
@@ -209,7 +216,10 @@ jobs:
     if: github.event_name == 'push' && github.ref_name == 'prod'
     needs: [lint, test, secret-scan, audit]
     runs-on: ubuntu-latest
-    environment: production # required reviewers here = manual approval gate
+    # The Environment exists ONLY to scope MIGRATIONS_DATABASE_URL to the prod
+    # database. ⚠️ Do NOT enable required reviewers / deployment protection on
+    # it — that gate caused a prod outage and was removed deliberately.
+    environment: production
     steps:
       - uses: actions/checkout@v4
       - name: Install PostgreSQL client

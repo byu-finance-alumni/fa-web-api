@@ -69,7 +69,20 @@ class _Session:
         self.added = []
         self.committed = 0
 
-    async def execute(self, _stmt):
+    async def execute(self, stmt):
+        # `survey_responses` reads are answered separately from everything else
+        # (#755): the submit path now asks whether this alum already has a live
+        # reply to UPGRADE, and serving it the canned Alumni row would send the
+        # submit down the upgrade branch and mutate the alum. The canned row is
+        # served only when it IS a response — which is what the apply/review
+        # tests hand in.
+        try:
+            froms = {getattr(f, "name", None) for f in stmt.get_final_froms()}
+        except Exception:  # noqa: BLE001 - a fake; an unreadable statement is not that one
+            froms = set()
+        if "survey_responses" in froms:
+            response = self._obj if hasattr(self._obj, "survey_response_id") else None
+            return _Result(response, [])
         return _Result(self._obj, self._rows)
 
     def add(self, obj):

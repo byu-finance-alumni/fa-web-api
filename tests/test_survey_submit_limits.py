@@ -47,7 +47,7 @@ def staged(monkeypatch):
     """Stub the stage-it service and record what the route passed through."""
     calls = []
 
-    async def _submit(session, token, fields, has_photo):
+    async def _submit(session, token, fields, has_photo, confirmed_only=False):
         calls.append({"token": token, "fields": fields, "has_photo": has_photo})
         return SurveySubmitResult(staged=True, change_count=len(fields), survey_response_id=7)
 
@@ -133,6 +133,7 @@ def test_a_realistic_submission_passes_through_untouched(client, staged):
         "staged": True,
         "change_count": len(fields),
         "survey_response_id": 7,
+        "confirmed": False,
     }
     assert staged == [{"token": "tok-ok", "fields": fields, "has_photo": True}]
 

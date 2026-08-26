@@ -31,7 +31,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.us_states import CODE_BY_NAME, to_code
+from app.core.us_states import CODE_BY_NAME, US_COUNTRY_ALIASES, to_code
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
@@ -105,10 +105,10 @@ _CITY_PRESENT = (
 # the world view plots INTERNATIONAL alumni only, so the US is excluded (the US
 # view already covers domestic alumni by state/county).
 _COUNTRY = func.upper(func.trim(cast(CurrentEmployment.current_country, String)))
-_USA_ALIASES = {
-    "USA", "US", "U.S.", "U.S.A.", "UNITED STATES",
-    "UNITED STATES OF AMERICA", "AMERICA",
-}
+# Upper-cased for the SQL comparison against ``_COUNTRY``. Derived from the shared
+# list in app.core.us_states so this map and the dashboard's country KPI cannot
+# drift on which spellings mean "domestic".
+_USA_ALIASES = frozenset(alias.upper() for alias in US_COUNTRY_ALIASES)
 
 
 def _filter_conditions(filters: dict, *, require_state: bool = True) -> list:

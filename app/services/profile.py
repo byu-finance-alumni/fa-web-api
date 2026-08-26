@@ -70,6 +70,7 @@ from app.schemas.profile import (
     TaskCreate,
     TaskRead,
 )
+from app.services import survey_email
 
 
 def _now() -> datetime.datetime:
@@ -165,6 +166,10 @@ _RESPONSE_STATUS_LABELS = {
     "applied": "Completed",
     "pending": "Completed - awaiting review",
     "rejected": "Completed - not applied",
+    # #755 — "yes, everything is correct". A real reply with nothing to review,
+    # so it must not read as "awaiting review" (nobody is waiting on anything)
+    # nor as a bare "Completed", which would suggest staff applied changes.
+    "confirmed": "Completed - confirmed, no changes",
 }
 
 def _as_utc(value: datetime.datetime) -> datetime.datetime:
@@ -255,7 +260,13 @@ async def _derive_survey_history(
         # rather than borrowing a deadline it was never measured against.
         answered_campaign = campaign_start is not None and submitted.date() >= campaign_start
         field_count = len(r.payload or {})
-        notes = f"{field_count} field{'' if field_count == 1 else 's'} submitted"
+        if r.status == survey_email.STATUS_CONFIRMED:
+            # #755 — a confirmation carries an empty payload BY DEFINITION, so
+            # the field count is a true statement that reads as a failed
+            # submission ("0 fields submitted"). Say what actually happened.
+            notes = "Confirmed their details were correct - no changes"
+        else:
+            notes = f"{field_count} field{'' if field_count == 1 else 's'} submitted"
         if r.staged_photo_path:
             notes += " + photo"
         if last_reset_at is not None and _as_utc(last_reset_at) >= _as_utc(submitted):

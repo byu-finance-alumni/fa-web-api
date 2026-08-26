@@ -308,7 +308,7 @@ def test_apply_forbidden_for_view_only(client):
 def test_submit_route_is_public(client, monkeypatch):
     from app.schemas.survey import SurveySubmitResult
 
-    async def fake_submit(session, token, fields, has_photo=False):
+    async def fake_submit(session, token, fields, has_photo=False, confirmed_only=False):
         return SurveySubmitResult(staged=True, change_count=len(fields))
 
     monkeypatch.setattr(sr, "submit_response", fake_submit)
@@ -320,6 +320,7 @@ def test_submit_route_is_public(client, monkeypatch):
         "staged": True,
         "change_count": 1,
         "survey_response_id": None,
+        "confirmed": False,
     }
 
 
@@ -340,18 +341,48 @@ class _Scalar:
         return self._obj
 
 
+def _reads_survey_responses(stmt) -> bool:
+    """Is this statement a read of ``survey_responses``?
+
+    The fake used to answer EVERY ``execute`` with the same canned row, which
+    stopped being expressible once the submit path grew a second read of its own
+    (#755: "does this alum already have a live reply to upgrade?"). Without the
+    split, a test handing it an Alumni row got that Alumni row back as if it were
+    a survey response, and the upgrade branch then mutated the alum.
+    """
+    try:
+        return any(
+            getattr(f, "name", None) == "survey_responses"
+            for f in stmt.get_final_froms()
+        )
+    except Exception:  # noqa: BLE001 - a fake, and any statement it cannot read is "not that one"
+        return False
+
+
 class _Session:
     """Minimal AsyncSession stand-in: every ``execute`` returns the same canned
     row, ``flush`` assigns an identity to a newly-added SurveyResponse (mirroring
-    a real PK assignment), and add/commit are recorded."""
+    a real PK assignment), and add/commit are recorded.
 
-    def __init__(self, obj=None):
+    ``survey_responses`` reads are answered SEPARATELY (see
+    :func:`_reads_survey_responses`) from ``response``, which defaults to the
+    canned row when that row is itself a response — so ``_Session(_fake_resp())``
+    keeps serving the photo-staging and review tests, while ``_Session(alum)``
+    answers "no live reply", which is what an alum submitting for the first time
+    actually has."""
+
+    def __init__(self, obj=None, *, response="__unset__"):
         self._obj = obj
+        if response == "__unset__":
+            response = obj if hasattr(obj, "survey_response_id") else None
+        self._response = response
         self.added = []
         self.committed = 0
         self.flushed = 0
 
-    async def execute(self, _stmt):
+    async def execute(self, stmt):
+        if _reads_survey_responses(stmt):
+            return _Scalar(self._response)
         return _Scalar(self._obj)
 
     def add(self, obj):

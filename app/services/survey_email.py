@@ -89,16 +89,21 @@ _RESEND_BATCH_URL = mailer.RESEND_BATCH_URL
 # cycle" — used both to exclude them from a send and to count real replies.
 _RESURVEY_INTERVAL_DAYS = 365
 
-# The three `survey_responses.status` values (the DB CHECK constraint is the
+# The four `survey_responses.status` values (the DB CHECK constraint is the
 # authority; these name them so no query has to spell one as a bare string).
 #
-#   * `pending`  — submitted, nobody has reviewed it yet.
-#   * `applied`  — staff accepted it and it was written to the alum's record.
-#   * `rejected` — staff THREW IT AWAY (spam, junk, someone else's data).
+#   * `pending`   — submitted WITH CHANGES, nobody has reviewed it yet.
+#   * `applied`   — staff accepted it and it was written to the alum's record.
+#   * `rejected`  — staff THREW IT AWAY (spam, junk, someone else's data).
 #     Nothing reached the record, so the alum has effectively not replied.
+#   * `confirmed` — "yes, everything is correct" (#755): a reply that changed
+#     NOTHING. Empty payload, no review queue, no record write. It is a REPLY
+#     (see below) and it is NOT a review outcome, which is precisely why it
+#     could not be expressed as any of the other three.
 STATUS_PENDING = "pending"
 STATUS_APPLIED = "applied"
 STATUS_REJECTED = "rejected"
+STATUS_CONFIRMED = "confirmed"
 
 # Which `survey_responses.status` values count as "they replied this cycle".
 #
@@ -110,12 +115,19 @@ STATUS_REJECTED = "rejected"
 # (:func:`_load_recipients`) and the console's responded tally
 # (:func:`list_graduation_years`) — they must never drift.
 #
+# `confirmed` IS here, and adding it is the whole point of #755. An alum who
+# pressed "Yes, everything is correct" has answered: they must stop receiving
+# reminders, drop off the manual-follow-up call sheet, and count toward the
+# response rate. Before this they recorded nothing at all, so the FASTEST
+# responders were the only ones the console could not see — and the sender kept
+# emailing them.
+#
 # Reporting that wants to BREAK a reply down by outcome (the console's
-# applied/rejected columns, `survey_schedule._cycle_progress`) uses the three
-# names above and must never widen this tuple to do it: the moment `rejected`
-# counts as a reply, the same alum reads as "replied" here and "never responded"
-# in the follow-up list.
-RESPONDED_STATUSES: tuple[str, ...] = (STATUS_PENDING, STATUS_APPLIED)
+# applied/rejected columns, `survey_schedule._cycle_progress`) uses the names
+# above and must never widen this tuple to do it: the moment `rejected` counts as
+# a reply, the same alum reads as "replied" here and "never responded" in the
+# follow-up list.
+RESPONDED_STATUSES: tuple[str, ...] = (STATUS_PENDING, STATUS_APPLIED, STATUS_CONFIRMED)
 
 
 # --------------------------------------------------- engineer reset (#395) ----

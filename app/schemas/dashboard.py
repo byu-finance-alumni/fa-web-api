@@ -27,7 +27,13 @@ class DashboardEmployerCount(BaseModel):
 
 
 class DashboardStateCount(BaseModel):
-    """One state bucket in the by-state distribution."""
+    """One state bucket in the by-state distribution.
+
+    ``state`` is the CANONICAL FULL state name ("Utah", "District of Columbia") —
+    never a 2-letter code and never a non-US region. The stored column is free
+    text; the query folds it before grouping (#754), so a record entered as "UT"
+    and one entered as "Utah" land in this one bucket.
+    """
 
     state: str
     count: int
@@ -87,10 +93,22 @@ class DashboardSummary(BaseModel):
     #: chart's non-employer placeholders are excluded, so this number and that
     #: chart describe the same set of companies. See the query for why.
     distinct_employers: int
-    #: How many STATES those companies are in — the Companies tile's sub-line.
-    #: The employer's address, the same one the geography map plots, folded the
-    #: same way as the employer names before counting.
+    #: How many US STATES those companies are in — the first half of the
+    #: Companies tile's sub-line, "Across N states and M countries" (#754).
+    #: The employer's address, the same one the geography map plots. Free-text
+    #: values are folded to a canonical state name ("UT" and "Utah" are one
+    #: state) and anything that is not one of the 50 states + DC is dropped, so
+    #: this is BOUNDED AT 51 — a larger number is a bug, which is how the tile
+    #: came to read "Across 70 states".
     employer_states: int
+    #: How many COUNTRIES the alumni working OUTSIDE the US are in — the second
+    #: half of the same sub-line. Counts distinct ``current_country`` values for
+    #: alumni whose work state does not resolve to a US state, with US spellings
+    #: excluded, so this and ``employer_states`` partition the population rather
+    #: than overlap. ⚠️ READS LOW BY DESIGN: an alum abroad with a blank country
+    #: cannot be attributed to one and is simply not counted, and the column has
+    #: no controlled vocab, so "UK" and "United Kingdom" count separately.
+    employer_countries: int
     not_contacted_6mo: int
     not_contacted_12mo: int
     not_contacted_24mo: int

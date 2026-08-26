@@ -993,10 +993,10 @@ def _scalar_sql_mentioning(session, needle: str) -> str:
     return hits[0].lower()
 
 def test_summary_distinct_employers_in_response_body(client):
-    # The fourth KPI tile and its sub-line. Both are appended after the
+    # The fourth KPI tile and its sub-line. All three are appended after the
     # pre-existing scalars — see the note in the route about the positional stub.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    scalars = [0] * 19 + [147, 12]
+    scalars = [0] * 19 + [147, 12, 6]
     app.dependency_overrides[get_session] = _with_session(
         _FakeSession([], scalars=scalars)
     )
@@ -1006,6 +1006,9 @@ def test_summary_distinct_employers_in_response_body(client):
     body = response.json()
     assert body["distinct_employers"] == 147
     assert body["employer_states"] == 12
+    # #754: the sub-line is "Across N states and M countries" — BOTH halves come
+    # from this response, so the frontend never has to invent the second number.
+    assert body["employer_countries"] == 6
 
 
 def test_distinct_employers_folds_case_and_whitespace_before_counting(client):
@@ -1052,20 +1055,82 @@ def test_distinct_employers_excludes_the_same_placeholders_as_the_chart(client):
     assert "_NON_EMPLOYER_VALUES" in block
 
 
-def test_employer_states_folds_case_before_counting(client):
+def test_employer_states_counts_only_resolvable_us_states(client):
     """The Companies tile's sub-line: how many states those firms are in.
 
-    Same free-text column the geography map plots, so "Utah", "utah" and a
-    trailing space have to fold to one state before DISTINCT — otherwise the
-    sub-line inflates for the same data-entry reason the company count would.
+    ⚠️ THIS TILE SHIPPED READING "Across 70 states" (#754). There are 51 possible
+    values. `lower(trim(...))` before DISTINCT — which is all it used to do —
+    folds casing and whitespace and NOTHING ELSE, so "UT" and "Utah" counted
+    twice, and nothing at all restricted the free-text column to the US, so
+    "Ontario" counted as a state. The count must now go through the crosswalk
+    expression, which yields NULL for anything that is not a US state and is
+    therefore incapable of exceeding 51. (What the expression actually returns
+    for real rows is pinned against a real database in tests/test_us_states.py —
+    a compiled-SQL assertion like this one could never have caught the bug.)
     """
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
-    session = _FakeSession([], scalars=[0] * 21)
+    session = _FakeSession([], scalars=[0] * 22)
     app.dependency_overrides[get_session] = _with_session(session)
 
     client.get("/dashboard/summary")
-    sql = _scalar_sql_mentioning(session, "distinct(lower(trim(current_employment.current_state")
+    sql = _scalar_sql_mentioning(session, "count(distinct(case when")
 
-    assert "count(distinct" in sql
-    assert "lower(" in sql
-    assert "trim(" in sql
+    assert "current_employment.current_state" in sql
+    # The old, broken shape: a bare case/whitespace fold with no US restriction.
+    assert "distinct(lower(trim(current_employment.current_state" not in sql
+    # The state names are BOUND, not inlined, so assert on the count of branches
+    # instead: one WHEN per code AND one per full name, for all 51.
+    assert sql.count("when") == 102
+
+    # Parity with the drill-down beneath the tile is structural, not a
+    # coincidence of two authors matching: the handler must build the fold ONCE
+    # and share the one object between the count, the by-state breakdown, and
+    # the "is this alumnus abroad" test. A second call site is the drift.
+    source = Path(dashboard_routes.__file__).read_text(encoding="utf-8")
+    assert source.count("us_state_full_name_expr(CurrentEmployment.current_state)") == 1
+
+
+def test_by_state_groups_on_the_folded_state_not_the_raw_column(client):
+    """The panel under the tile reads the SAME free-text column, so it had the
+    SAME bug: grouping on the raw value ranked "UT" and "Utah" as separate bars
+    and let "Ontario" onto a list of states — and because the LIMIT 8 was applied
+    to those raw groups, a real state could be pushed off the list by its own
+    alternate spelling. Folding has to happen in the GROUP BY key, before the
+    ranking, not after it."""
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 22)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    client.get("/dashboard/summary")
+    # cohort, top_employers, industry_rows, by_state — by_state is the last.
+    sql = _compiled(session.execute_args[3]).lower()
+
+    assert "group by case when" in sql
+    assert "group by current_employment.current_state" not in sql
+    # Folded to NULL == not a US state == not a bar on a chart of states.
+    assert "is not null" in sql
+    assert "limit" in sql
+
+
+def test_employer_countries_counts_only_alumni_outside_the_us(client):
+    """The second half of the sub-line (#754).
+
+    Two things make the number mean what the label says. It is keyed off the
+    STATE not resolving (the same expression, yielding NULL) — so the states and
+    countries halves partition the population instead of double-counting an
+    alumnus. And US spellings are excluded, so a domestic record with a junk
+    state cannot make "United States" the 1 in "and 1 country"."""
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    session = _FakeSession([], scalars=[0] * 22)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    client.get("/dashboard/summary")
+    sql = _scalar_sql_mentioning(
+        session, "count(distinct(upper(trim(current_employment.current_country"
+    )
+
+    # Only alumni whose work state is NOT a US state.
+    assert "case when" in sql
+    assert "is null" in sql
+    # US spellings excluded (values are bound, so only the shape shows).
+    assert "not in" in sql

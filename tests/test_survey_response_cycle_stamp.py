@@ -72,6 +72,12 @@ class _Session:
             # Newest row wins, id as the tie-break -- what the ORDER BY says.
             rows.sort(key=lambda r: (r["sent_at"], r["id"]), reverse=True)
             return _Result([(r["cycle_seq"], r["stage"]) for r in rows[:1]])
+        # The submit path also asks `survey_responses` whether this alum has a
+        # live reply to upgrade (#755). No test here seeds one, and answering
+        # with the canned Alumni row would send the submit down the upgrade
+        # branch and mutate it.
+        if "survey_responses" in froms:
+            return _Result([])
         return _Result([self.alum] if self.alum is not None else [])
 
     def add(self, obj):

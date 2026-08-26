@@ -245,12 +245,20 @@ async def survey_submit(
     Nothing is applied to the record here.
 
     An over-cap payload is a 413 and stages nothing — see `_oversized_submission`.
+
+    ALSO records a "yes, everything is correct" confirmation (#755): post
+    `{"fields": {}, "confirmed_only": true}` and the alum's reply goes on record
+    with nothing to review. Deliberately the SAME endpoint rather than a sibling
+    of `/links` and `/photo`: those two carry a different KIND of thing (rows in
+    another table, bytes in a bucket), while a confirmation is the same survey
+    reply with an empty payload — same token check, same limiter budget, same
+    caps, no second public write path to keep in step with this one.
     """
     too_large = _oversized_submission(body.fields)
     if too_large is not None:
         return too_large
     return await survey_responses.submit_response(
-        session, token, body.fields, body.has_photo
+        session, token, body.fields, body.has_photo, body.confirmed_only
     )
 
 

@@ -24,8 +24,23 @@ SIEM log drain; those are deferred (see [§4](#4-deferred-future-work)).
     `auth_failed` (401), `not_provisioned` (403), `forbidden` (403),
     `account_deactivated` (403), `password_change_required` (403),
     `upstream_service_error` (502), `unhandled_error` (500).
-  - Vercel WAF rate-limit rules on all 4 projects (app projects 300/60s excluding
-    `/_next/*`; api projects 100/60s); automatic DDoS mitigation always on.
+  - Vercel WAF rate-limit rules on all 4 projects, all keyed on `ip` with `deny`
+    on exceed. **Verified against the live config 2026-08-29**: prod app and prod
+    api **1000/60s**; `dev-fa-web-app` 300/60s; `dev-fa-web-api` 100/60s. Only the
+    app rules exclude `/_next/*`. Automatic DDoS mitigation always on.
+    - ⚠️ **Do not trust this line — or a rule's name — over a read-back.** From
+      2026-06-18 to 2026-08-29 this document asserted "app projects 300/60s" as an
+      infrastructure fact while prod was **live at 60/60s**, denying ordinary staff
+      paging with a bare edge 403 (app #796). The rule's own name and description
+      also said 300, and its id still reads `rule_rate_limit_100_...`. Dev was
+      correct at 300 the whole time, so every test on dev passed.
+      **A firewall change applied to dev is not applied to prod.** Read the value
+      back per project: `vercel firewall rules list --expand`.
+    - ⚠️ Per-IP keying is a shared bucket in practice — staff share BYU's campus
+      NAT egress, so the effective ceiling is the limit divided by however many
+      people are working at once.
+    - Canonical inventory: **`fa-web-app/docs/FIREWALL.md`**. Update it in the same
+      change as any firewall edit.
 
 > **All SQL here is read-only (SELECT only). Never run mutating SQL from this
 > routine.** Run via `fa-web-api/.env` `DATABASE_URL` (session pooler `:5432`,
@@ -112,7 +127,7 @@ reset) and review what changed.
 Use a temp dir so the repo's `.vercel` link is never touched:
 ```bash
 tmp="$TEMP/wf-check"; mkdir -p "$tmp"
-vercel link --yes --project finance-alumni-database-api --scope gunnjakes-projects --cwd "$tmp"
+vercel link --yes --project finance-alumni-database-api --scope byu-finance-db --cwd "$tmp"
 vercel firewall overview --cwd "$tmp"        # repeat per project slug
 ```
 Look at blocked/challenged totals, top offending IPs, which rule fired, and confirm

@@ -798,6 +798,7 @@ def _unconfigured(*, blocking: bool):
         alert_from_name="x",
         slack_webhook=None,
         slack_security_webhook=None,
+        slack_submission_webhook=None,
         login_auto_block_enabled=blocking,
     )
 

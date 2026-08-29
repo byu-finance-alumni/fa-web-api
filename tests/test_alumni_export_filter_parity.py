@@ -15,6 +15,13 @@ would pass even if the field were dropped on the way to the query builder.
 The list side is captured from the REAL route (``service.list_alumni`` is stubbed
 and its kwargs recorded), so a route that forgets to forward a param fails here
 too — the parity is asserted end-to-end, not between two hand-written calls.
+
+#775 adds ``missing_linkedin`` and ``missing_photo`` to the same regime.
+``missing_photo`` is the interesting one: a headshot is an object in the
+``headshots`` bucket rather than a column, so BOTH sides must resolve it through
+``headshot_index`` (the ``near`` pattern) instead of one side quietly dropping
+the flag — which would export every alumnus for a report the operator scoped to
+the ones with no photo.
 """
 
 import asyncio
@@ -28,11 +35,13 @@ from sqlalchemy.dialects import postgresql
 from app.api.dependencies.auth import get_current_db_user
 from app.api.routes.alumni import list_alumni
 from app.core.database import get_session
+from app.core.errors import ServiceError
 from app.main import app
 from app.repositories.alumni import build_alumni_query
 from app.schemas.alumni_export import AlumniExportFilters
 from app.schemas.auth import UserContext
 from app.services import alumni as alumni_service
+from app.services import headshot_index
 from app.services.alumni_export import build_export_query
 
 
@@ -100,6 +109,37 @@ def client(session):
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+class _FakeBucket:
+    """One page of headshot keys, shared by both sides of every parity check."""
+
+    def __init__(self):
+        self.error: Exception | None = None
+
+    async def list_objects(self, bucket, *, prefix="", limit=100, offset=0):
+        if self.error is not None:
+            raise self.error
+        if offset:
+            return []
+        return [
+            {"name": key, "metadata": {"size": 1234, "mimetype": "image/jpeg"}}
+            for key in ("jdoe12", "asmith3")
+        ]
+
+
+@pytest.fixture
+def bucket(monkeypatch):
+    """Fake the headshots listing and start every test from a cold cache.
+
+    The cache is dropped afterwards too: a key set left behind would leak into
+    an unrelated test as a filter that "mysteriously" matches.
+    """
+    fake = _FakeBucket()
+    monkeypatch.setattr(headshot_index.storage, "list_objects", fake.list_objects)
+    headshot_index.reset_cache()
+    yield fake
+    headshot_index.reset_cache()
 
 
 @pytest.fixture
@@ -208,6 +248,45 @@ def test_missing_phone_parity(client, captured, session):
     _assert_same_population(
         client, captured, session, "missing_phone=true", missing_phone=True
     )
+
+
+def test_missing_linkedin_parity(client, captured, session):
+    _assert_same_population(
+        client, captured, session, "missing_linkedin=true", missing_linkedin=True
+    )
+
+
+def test_missing_photo_parity(client, captured, session, bucket):
+    # The one that cannot be answered from a column. Both sides must reach the
+    # SAME resolved key set; the compiled statements are compared, so a side
+    # that dropped the flag (or re-derived it differently) fails here.
+    _assert_same_population(
+        client, captured, session, "missing_photo=true", missing_photo=True
+    )
+
+
+def test_missing_photo_export_does_not_widen_to_everyone(client, captured, session, bucket):
+    # The trap this file exists for, in its newest shape: a flag the export
+    # model accepts but never turns into a predicate produces a CSV of the whole
+    # roster that looks like a successful "no photo" report.
+    filtered, _ = _export_sql(session, missing_photo=True)
+    unfiltered, _ = _export_sql(session)
+    assert filtered != unfiltered
+    assert "net_id" in filtered
+
+
+def test_missing_photo_export_fails_closed_when_storage_is_down(client, bucket):
+    # An unreachable bucket must not degrade into "no predicate". The list and
+    # the export both surface it (502) rather than handing over every alumnus.
+    bucket.error = ServiceError("storage down")
+    headshot_index.reset_cache()
+    response = client.post(
+        "/alumni/export",
+        json={"columns": ["first_name"], "filters": {"missing_photo": True}},
+    )
+    assert response.status_code == 502
+    list_response = client.get("/alumni?missing_photo=true")
+    assert list_response.status_code == 502
 
 
 def test_near_parity(client, captured, session):

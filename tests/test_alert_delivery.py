@@ -75,6 +75,11 @@ def _settings(monkeypatch, *, webhook=WEBHOOK, email=True):
         alert_sender="alerts@example.edu" if email else None,
         slack_webhook=webhook,
         slack_security_webhook=webhook,
+        # The third alert channel (#771). Present so this fake keeps matching
+        # the real Settings object -- ``slack_alerting_enabled`` reads every
+        # channel, and a fake missing one is an AttributeError on the alerting
+        # path rather than an assertion failure that says what is wrong.
+        slack_submission_webhook=webhook,
     )
     monkeypatch.setattr(failure_alert, "get_settings", lambda: fake)
 

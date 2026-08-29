@@ -108,6 +108,24 @@ def has_employer_or_not_applicable():
     return or_(has_employer, not_applicable)
 
 
+# --- missing LinkedIn (#775) --------------------------------------------------
+
+
+def has_linkedin_url():
+    """Predicate: a non-blank LinkedIn URL is on file.
+
+    THE shared definition, used by the alumni-list / export ``missing_linkedin``
+    filter AND (imported) by the Data-quality count, so the headline number and
+    the list it deep-links to can never describe different populations.
+
+    ``coalesce`` + ``trim`` rather than ``IS NOT NULL``: the column is imported
+    from spreadsheets, where an empty cell arrives as ``''`` and would otherwise
+    count as a URL on file — understating the gap exactly as it did for email
+    (#392). NULL and '' and '   ' are all MISSING.
+    """
+    return func.trim(func.coalesce(Alumni.linkedin_url, "")) != ""
+
+
 # Free-text ``q`` (#281, #404, #620). Tokenization, filler removal, preposition
 # routing and normalization live in ``app.core.search_terms``; the matching and
 # ranking SQL lives in ``app.repositories.alumni_search``. Both are pure, so
@@ -446,6 +464,15 @@ def build_alumni_query(
     missing_email: bool = False,
     missing_employer: bool = False,
     missing_phone: bool = False,
+    missing_linkedin: bool = False,
+    # "No photo" (#775) is NOT a boolean here, because a headshot is an object in
+    # the ``headshots`` bucket rather than a column: the caller resolves the
+    # bucket listing ONCE (``services.headshot_index.resolve_missing_photo``) and
+    # passes the resulting predicate, exactly like ``location_filter`` above.
+    # ``None`` -> no photo filter. Keeping the IO out here is what lets this
+    # function stay pure and the export compile it without a session — and what
+    # stops the list from going N+1 against storage.
+    photo_filter=None,
     duplicate: bool = False,
     # Friends of the finance program (#218). ``True`` -> alumni only, ``False``
     # -> friends only, ``None`` -> both. The list route defaults this to ``True``
@@ -464,6 +491,11 @@ def build_alumni_query(
         Force / Graduate Student) are NOT missing one (#608). Military IS still
         counted — a branch of service is an employer.
       * ``missing_phone``    — no contact-info row with a phone number
+      * ``missing_linkedin`` — no LinkedIn URL on the core record; blank and
+        whitespace-only values count as MISSING (#775), the same rule
+        ``missing_email`` learned in #392
+      * ``photo_filter``     — the resolved "no headshot in the bucket" predicate
+        (#775); see the parameter comment above and ``services.headshot_index``
       * ``duplicate``        — the alumnus appears on either side of a
         ``duplicate_candidates`` pair
     All conditions are correlated EXISTS subqueries so filtering stays in
@@ -1074,6 +1106,17 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(~has_phone)
+    if missing_linkedin:
+        # Same shared predicate the Data-quality count negates, so the tile and
+        # this drill-down (and the CSV it exports) are one population (#775).
+        conditions.append(~has_linkedin_url())
+    if photo_filter is not None:
+        # Already the "has no headshot" predicate — resolved from ONE bucket
+        # listing by the route / export before we got here (#775). Nothing is
+        # re-derived on this side, so the list and the export cannot disagree,
+        # and an unset filter is ``None`` (no predicate) rather than a silent
+        # match-everything.
+        conditions.append(photo_filter)
     if duplicate:
         is_duplicate = (
             select(DuplicateCandidate.duplicate_candidate_id)

@@ -580,6 +580,14 @@ LOGIN_PRECHECK_LIMIT = 600
 # deliberately not tighter.
 LOGIN_RECORD_LIMIT = 300
 
+# The PUBLIC, un-tokened contact lookup for the demo survey. There is no token
+# to key on, so it is IP-only. Read-only and it returns one row of two fields,
+# so it is generous -- but bounded, because unlike its token-gated sibling
+# anyone can call it.
+SURVEY_CONTACT_LIMITER = client_ip_rate_limiter(
+    "survey:contact", limit=300, window_seconds=_SURVEY_WINDOW
+)
+
 LOGIN_PRECHECK_LIMITER = client_ip_rate_limiter(
     "auth:login_precheck", limit=LOGIN_PRECHECK_LIMIT, window_seconds=_LOGIN_WINDOW
 )

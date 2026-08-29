@@ -94,6 +94,7 @@ def _settings(monkeypatch, *, webhook=WEBHOOK, security=None, email=True):
         alert_sender="alerts@example.edu" if email else None,
         slack_webhook=derived.slack_webhook,
         slack_security_webhook=derived.slack_security_webhook,
+        slack_submission_webhook=derived.slack_submission_webhook,
     )
     monkeypatch.setattr(failure_alert, "get_settings", lambda: fake)
 

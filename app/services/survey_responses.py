@@ -77,7 +77,7 @@ from app.schemas.survey import (
     SurveyResponseItem,
     SurveySubmitResult,
 )
-from app.services import hygiene, supabase_storage
+from app.services import headshot_index, hygiene, supabase_storage
 from app.services.alumni import (
     _unchanged,
     archive_current_role,
@@ -1757,6 +1757,11 @@ async def apply_response(
             await supabase_storage.upload_object(
                 _HEADSHOT_BUCKET, _headshot_key(alum), data, _PROMOTED_CONTENT_TYPE
             )
+            # This alumnus HAS a headshot as of now — the "no photo" report
+            # (#775) answers from a cached listing of the bucket, so drop it.
+            # Best-effort: it clears this instance only, and the index's TTL
+            # remains the real staleness bound.
+            headshot_index.reset_cache()
             await supabase_storage.delete_object(
                 _HEADSHOT_BUCKET, resp.staged_photo_path
             )

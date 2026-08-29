@@ -43,8 +43,9 @@ import datetime
 import hashlib
 import hmac
 import logging
+import re
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from html import escape
 
@@ -62,6 +63,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
+from app.models.support_contact import SupportContact
 from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
 from app.models.survey_retirement import SurveyCampaignRetirement
@@ -75,6 +77,7 @@ from app.schemas.survey import (
     SurveyRespondInfo,
     SurveySendResult,
     SurveySendSample,
+    SurveySupportContact,
     SurveyUnreachableAlum,
     SurveyUsage,
 )
@@ -781,6 +784,82 @@ def _held(value: str | None) -> str | None:
     return "Yes" if holds_designation(value) else None
 
 
+# --------------------------------------------- survey "email us" contact -----
+
+# WHICH support-contact row the public survey points at (#774).
+#
+# `support_contacts.role_label` is free text the engineer types into
+# `/engineer/support-contacts`, so this is matched LOOSELY and case-insensitively
+# rather than compared: "Survey", "survey contact" and "Survey (Tanya)" are all
+# the same intent, and a near-miss must not silently fall through to no contact.
+# Same rule the frontend's `engineerSupportContact` already uses to find the
+# engineer, so the two labels behave the same way for whoever is editing them.
+#
+# ⚠️ THIS IS ALSO THE CONTROL SURFACE. To change who the survey says to email,
+# edit that row's name/email in the engineer console; to point it at someone
+# else, relabel a row (or add one) so its role label contains "survey". To take
+# the button off the survey entirely, remove the label. No deploy, no env var.
+#
+# Not the "Engineer" or "Super Admin" rows: those exist for the in-app error
+# screen, are seeded automatically from the role holders, and putting an
+# engineer's mailbox on a public page is precisely what the support-contacts
+# privacy rule forbids. Nothing is exposed until someone opts a row in.
+SURVEY_CONTACT_LABEL = "survey"
+
+# A literal with no `%`/`_` of its own, so there is nothing for the project's
+# LIKE-escaping rule to escape — it is a module constant, never user input.
+_SURVEY_CONTACT_PATTERN = f"%{SURVEY_CONTACT_LABEL}%"
+
+# Deliberately strict, and stricter than the RFC — it mirrors the frontend's
+# `isPlausibleEmail`, which decides whether the `mailto:` renders at all. The row
+# passed `SupportContactCreate` validation on the way in, but the seeded rows came
+# from `users.email` via SQL and nothing re-checks a hand-edited one, so an
+# address is re-checked here before it is put on a public page. A reject costs us
+# the button; it never costs us a link to nowhere.
+_SURVEY_CONTACT_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$"
+)
+
+
+async def survey_support_contact(
+    session: AsyncSession,
+) -> SurveySupportContact | None:
+    """The one support contact the public survey may name, or None.
+
+    Picks the lowest-`sort_order` row whose `role_label` contains
+    ``SURVEY_CONTACT_LABEL`` (ties break on id, so the choice never depends on
+    how the rows happened to come back), and returns ONLY its name and address.
+
+    ⚠️ Selects the two columns rather than the ORM entity ON PURPOSE. This feeds
+    the app's one genuinely public endpoint, and a query that never loads
+    `support_contact_id`, `role_label` or `sort_order` cannot leak them by a later
+    careless `model_validate(row)`. See `SurveySupportContact` for why exposing
+    one contact here is a deliberate exception to the support-contacts rule.
+
+    Returns None when nothing is labelled for the survey, and also when the row
+    that IS labelled has an unusable address — never a fallback address.
+    """
+    row = (
+        await session.execute(
+            select(SupportContact.name, SupportContact.email)
+            .where(
+                func.lower(SupportContact.role_label).like(_SURVEY_CONTACT_PATTERN)
+            )
+            .order_by(SupportContact.sort_order, SupportContact.support_contact_id)
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return None
+    name = (row[0] or "").strip()
+    email = (row[1] or "").strip().lower()
+    if len(email) > 254 or not _SURVEY_CONTACT_EMAIL_RE.match(email):
+        return None
+    # Name is presentation only; with none stored the address is its own label,
+    # which still reads as a real destination (and matches `surveyContactFrom`).
+    return SurveySupportContact(name=name or email, email=email)
+
+
 async def get_respondent(
     session: AsyncSession, token: str
 ) -> SurveyRespondInfo | None:
@@ -884,7 +963,26 @@ async def get_respondent(
 
     first = (alum.preferred_first_name or alum.first_name or "there").strip()
     full = " ".join(p for p in (alum.first_name, alum.last_name) if p).strip() or first
-    return SurveyRespondInfo(first_name=first, full_name=full, fields=fields)
+
+    # The "email us directly" contact (#774). BEST EFFORT, and last on purpose:
+    # every field the alum came here to confirm is already resolved above, so a
+    # support-contacts table that is missing, empty or unreadable costs the page
+    # a link and nothing else. A stranger holding a valid token must always be
+    # able to fill the survey in — failing the whole load over the contact would
+    # turn a cosmetic misconfiguration into a dead survey for a whole cohort.
+    try:
+        support = await survey_support_contact(session)
+    except Exception:  # noqa: BLE001 - a contact must never break the survey load
+        log.warning("Survey support-contact lookup failed", exc_info=True)
+        support = None
+        # The failed statement leaves the transaction unusable; nothing after
+        # this reads or writes, but roll back so the session is returned clean.
+        with suppress(Exception):
+            await session.rollback()
+
+    return SurveyRespondInfo(
+        first_name=first, full_name=full, fields=fields, support_contact=support
+    )
 
 
 # --------------------------------------------------------- graduation years --

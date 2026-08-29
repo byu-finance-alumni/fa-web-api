@@ -40,6 +40,7 @@ from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.core.rate_limit import (
     OPPORTUNITY_LINK_SUBMIT_LIMITER,
+    SURVEY_CONTACT_LIMITER,
     SURVEY_PHOTO_LIMITER,
     SURVEY_RESPOND_READ_LIMITER,
     SURVEY_SUBMIT_LIMITER,
@@ -73,6 +74,7 @@ from app.schemas.survey import (
     SurveySendResult,
     SurveySubmitRequest,
     SurveySubmitResult,
+    SurveySupportContact,
     SurveyUnreachableAlum,
     SurveyUsage,
 )
@@ -148,6 +150,40 @@ async def _log_survey_read(
     except Exception:  # noqa: BLE001 - audit is best-effort
         with contextlib.suppress(Exception):
             await session.rollback()
+
+
+@router.get(
+    "/contact",
+    response_model=SurveySupportContact | None,
+    dependencies=[Depends(SURVEY_CONTACT_LIMITER)],
+)
+async def survey_contact(session: SessionDep) -> SurveySupportContact | None:
+    """PUBLIC, and unlike everything else here NOT token-gated: the one support
+    contact the survey may name, or ``null``.
+
+    ⚠️ WHY THIS EXISTS AT ALL. The same two fields already ride on
+    ``GET /respond/{token}``, and that is what the real survey screens read. This
+    endpoint exists for the DEMO survey (``/survey/demo``), which renders sample
+    data without a token and so can never call that one. Without it the demo
+    silently omits a control the real survey shows, which is the sample-survey
+    drift we keep having to fix: staff sign off on a survey the alum does not get.
+
+    ⚠️ WHY IT IS ACCEPTABLE TO SERVE THIS WITHOUT A TOKEN. It is one row, two
+    fields, and only for a row somebody deliberately labelled for the survey --
+    never the seeded Engineer / Super Admin rows. The same address is already
+    handed to every alumnus holding a survey link, and its whole purpose is to be
+    written to. Jake made this call explicitly (2026-08-29) so the public demo
+    matches what alumni see.
+
+    ⚠️ WHAT IT MUST NEVER BECOME. Not a list, not any other contact, and not any
+    other field. ``GET /support-contacts`` stays authenticated: this is a narrow,
+    named exception, not the start of a public directory of staff addresses.
+
+    Rate-limited by CLIENT IP, not by token -- there is no token here to key on,
+    which is exactly what makes this route different from every other public one
+    in this file.
+    """
+    return await survey_email.survey_support_contact(session)
 
 
 @router.get(

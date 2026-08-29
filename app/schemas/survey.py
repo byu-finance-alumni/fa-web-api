@@ -98,6 +98,35 @@ class SurveyApplyResult(BaseModel):
     photo_dropped: bool = False
 
 
+class SurveySupportContact(BaseModel):
+    """Who a survey respondent may email directly (#774) — a NAME and an ADDRESS,
+    and deliberately nothing else.
+
+    ⚠️ THIS IS A NARROW, DELIBERATE EXCEPTION to the support-contacts privacy
+    rule, not an oversight. `app/api/routes/support.py` says there is
+    "deliberately NO unauthenticated endpoint, so these names/emails are never
+    exposed on the public login page", and that still holds: the rule protects a
+    surface anyone on the internet can load. This one rides on
+    `GET /survey/respond/{token}`, which needs a valid HMAC-signed survey token
+    we mailed to one alum, and it carries exactly ONE contact — the row the
+    engineer labelled for the survey — never the list.
+
+    So the exposure is one chosen person's work name and work address, to someone
+    already holding a link addressed to them, on the page that asks them to reply.
+    Keep it that way: no `support_contact_id`, no `role_label`, no `sort_order`,
+    no second contact. Those would turn a mailbox we are advertising back into
+    the staff directory the rule exists to protect.
+    """
+
+    #: Display name for the link text ("Email Tanya Harmon"). Never empty — the
+    #: resolver falls back to the address itself, so the frontend never renders
+    #: "Email " with nothing after it.
+    name: str
+    #: The address the `mailto:` opens. Shape-checked by the resolver; a row whose
+    #: email does not look like an address yields `null` for the whole contact.
+    email: str
+
+
 class SurveyRespondInfo(BaseModel):
     """The alum's current on-file info for the public confirm page, resolved from
     a survey token. `fields` is keyed by the frontend's SURVEY_FIELDS keys
@@ -106,6 +135,17 @@ class SurveyRespondInfo(BaseModel):
     first_name: str
     full_name: str
     fields: dict[str, str]
+    # The "email us directly" contact at the foot of the survey (#774), resolved
+    # from the engineer-managed `support_contacts` table by role label — see
+    # `survey_email.survey_support_contact`.
+    #
+    # ⚠️ `None` IS A REAL ANSWER, not a failure. It means no contact is
+    # configured (or the configured one is unusable), and the frontend renders
+    # NOTHING for it. There is deliberately no fallback address: a `mailto:` that
+    # opens a message to the wrong mailbox is worse than no button at all,
+    # because the respondent believes they have reached a human and stops looking
+    # for another way. The survey itself must still load either way.
+    support_contact: SurveySupportContact | None = None
 
 
 class GraduationYearCount(BaseModel):

@@ -424,6 +424,7 @@ def test_alerting_is_off_unless_it_is_configured(monkeypatch, table):
             alert_from_name="x",
             slack_webhook=None,
             slack_security_webhook=None,
+            slack_submission_webhook=None,
         ),
     )
     asyncio.run(_fail(table, times=20, gap=15))

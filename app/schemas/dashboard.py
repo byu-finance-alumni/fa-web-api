@@ -185,6 +185,11 @@ class DataQuality(BaseModel):
     missing_email: int
     missing_employer: int
     missing_phone: int
+    missing_linkedin: int
+    #: ``None`` when the headshots bucket could not be listed — "we could not
+    #: find out", not "zero". Every other count on this page is still served, so
+    #: one storage outage cannot blank the whole data-quality view (#775).
+    missing_photo: int | None = None
     duplicate_count: int
 
 

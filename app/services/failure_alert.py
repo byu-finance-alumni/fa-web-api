@@ -113,6 +113,9 @@ they are read in two different moods:
                        ``SLACK_ALERT_WEBHOOK_URL`` — #error-alerts.
   :data:`SECURITY`     login brute-force and credential guessing (#456). Goes to
                        ``SLACK_SECURITY_WEBHOOK_URL`` — #security-alerts.
+  :data:`SUBMISSION`   an alumnus sent us something a human must action (#771:
+                       a job posting arriving through the survey). Goes to
+                       ``SLACK_SUBMISSION_WEBHOOK_URL``.
 
 The routing is deliberately ASYMMETRIC, and the asymmetry lives in
 ``app/core/config.py`` where the two properties are defined:
@@ -121,9 +124,12 @@ The routing is deliberately ASYMMETRIC, and the asymmetry lives in
     because a forgotten env var must never become silence about an attack; and
   * an OPERATIONAL alert NEVER falls into the security channel, because a channel
     someone opens to answer "are we under attack?" must not fill up with 500s.
+  * a SUBMISSION alert falls back the same way a SECURITY one does, for the same
+    reason: #771 exists because nothing notified anybody, so the one thing this
+    channel may never do is go quietly dark when an env var is missing.
 
-Because of that fallback the two can share a channel, so each Slack message is
-tagged ``SECURITY`` or ``OUTAGE`` up front — see :func:`render_slack`.
+Because of that fallback the three can share a channel, so each Slack message is
+tagged ``SECURITY``, ``OUTAGE`` or ``POSTING`` up front — see :func:`render_slack`.
 
 Neither channel can raise into the caller — see the amplification rule below,
 which covers two third parties instead of one. Both helpers swallow everything
@@ -227,6 +233,13 @@ _SLACK_TIMEOUT_SECONDS = 4.0
 # module whose whole contract is "never do anything clever on a failing request".
 OPERATIONAL = "operational"
 SECURITY = "security"
+# Something an ALUMNUS SENT US that a human has to look at (#771). Not a failure
+# and not an attack: nothing is wrong, there is just work waiting in a queue.
+# It gets its own purpose (and so its own channel) because a channel someone
+# opens to answer "is the API up?" must not fill up with routine inbound work,
+# and because the reader's mood is different -- an outage is read now, a job
+# posting is read today.
+SUBMISSION = "submission"
 
 # The word each kind wears at the front of its Slack message.
 #
@@ -239,7 +252,7 @@ SECURITY = "security"
 # notification preview, and needs no exception to this project's text-only
 # instinct. It is also the first thing rendered in a large bold header block, so
 # it is read at a glance rather than read carefully — which was the requirement.
-_SLACK_TAG = {OPERATIONAL: "OUTAGE", SECURITY: "SECURITY"}
+_SLACK_TAG = {OPERATIONAL: "OUTAGE", SECURITY: "SECURITY", SUBMISSION: "POSTING"}
 
 # DEGRADED path only: minimum gap between two per-process alerts when the
 # database (the real dedup store) is unreachable. 30 minutes bounds the worst
@@ -690,6 +703,8 @@ def slack_target(purpose: str) -> str | None:
     settings = get_settings()
     if purpose == SECURITY:
         return settings.slack_security_webhook
+    if purpose == SUBMISSION:
+        return settings.slack_submission_webhook
     return settings.slack_webhook
 
 
@@ -928,7 +943,11 @@ def slack_alerting_enabled() -> bool:
     falls back to ``slack_webhook`` and so subsumes it: this must keep reading as
     "any channel at all" if that fallback is ever narrowed."""
     settings = get_settings()
-    return bool(settings.slack_webhook or settings.slack_security_webhook)
+    return bool(
+        settings.slack_webhook
+        or settings.slack_security_webhook
+        or settings.slack_submission_webhook
+    )
 
 
 def alerting_enabled() -> bool:

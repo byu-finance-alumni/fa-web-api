@@ -59,7 +59,9 @@ row IS the record of the submission, and there is no actor to attribute it to.
 
 from __future__ import annotations
 
+import csv
 import datetime
+import io
 import logging
 from types import SimpleNamespace
 
@@ -80,6 +82,7 @@ from app.models.opportunity_link import (
 from app.models.user import User
 from app.schemas.opportunity_link import (
     OpportunityLinkCreate,
+    OpportunityLinkFilters,
     OpportunityLinkPage,
     OpportunityLinkRead,
     OpportunityLinkSubmitRequest,
@@ -90,6 +93,13 @@ from app.schemas.opportunity_link import (
     validate_details,
     validate_opportunity_url,
 )
+from app.services import opportunity_link_alert
+
+# The spreadsheet-formula lead characters, IMPORTED rather than redeclared:
+# ``alumni_export`` already owns that list (#169) and a second copy is a second
+# thing to remember to update. ``app/api/routes/events.py`` reaches into the
+# same module for the same reason.
+from app.services.alumni_export import _FORMULA_LEAD
 from app.services.survey_email import LINK_DEAD_MESSAGE, verify_survey_token
 
 log = logging.getLogger(__name__)
@@ -351,15 +361,15 @@ def _summary(link: OpportunityLink) -> str:
 # ------------------------------------------------------------------- reads ----
 
 
-def _filtered(
-    stmt: Select,
-    *,
-    status: str | None,
-    role_type: str | None,
-    company: str | None,
-    search: str | None,
-) -> Select:
-    """Apply the staff list's filters to a SELECT over ``opportunity_links``.
+def _filtered(stmt: Select, filters: OpportunityLinkFilters) -> Select:
+    """Apply the Links list's filters to a SELECT over ``opportunity_links``.
+
+    ⚠️ THE ONLY PLACE THESE PREDICATES ARE WRITTEN. The list, its count, and the
+    CSV export all reach SQL through here, via :func:`build_population_query`,
+    because this repo's recurring export bug is precisely a second copy of these
+    predicates that drifts from the first. Adding a filter means adding a field to
+    ``OpportunityLinkFilters`` and a branch here — never a ``where`` clause at a
+    call site.
 
     ``company`` and ``search`` are LIKE predicates over caller text, so both go
     through ``_like_term`` — a bare ``%`` in the box must not turn into a
@@ -368,22 +378,22 @@ def _filtered(
 
     ``company`` matches the STORED name only. A row whose name is derived from
     the alum's employer is matched through the joined employment column instead —
-    see ``list_links``, which adds that leg.
+    see :func:`build_population_query`, which adds that leg.
     """
-    if status:
-        stmt = stmt.where(OpportunityLink.status == status)
-    if role_type:
-        stmt = stmt.where(OpportunityLink.role_type == role_type)
-    if company:
-        term = _like_term(company)
+    if filters.status:
+        stmt = stmt.where(OpportunityLink.status == filters.status)
+    if filters.role_type:
+        stmt = stmt.where(OpportunityLink.role_type == filters.role_type)
+    if filters.company:
+        term = _like_term(filters.company)
         stmt = stmt.where(
             or_(
                 OpportunityLink.company_name.ilike(term, escape="\\"),
                 CurrentEmployment.current_employer.ilike(term, escape="\\"),
             )
         )
-    if search:
-        term = _like_term(search)
+    if filters.search:
+        term = _like_term(filters.search)
         stmt = stmt.where(
             or_(
                 OpportunityLink.company_name.ilike(term, escape="\\"),
@@ -398,7 +408,79 @@ def _filtered(
                 OpportunityLink.url.ilike(term, escape="\\"),
             )
         )
+    # DATE RECEIVED (#771). Bounded against ``submitted_at``, the timestamp the
+    # row was written with — NOT ``application_deadline``, which is a fact about
+    # the job and not about when they gave it to us.
+    #
+    # ⚠️ THE END BOUND IS WIDENED TO THE END OF THE DAY. ``submitted_at`` is a
+    # timestamptz and the filter is a bare date, so a naive
+    # ``submitted_at <= 2026-08-28`` compares against midnight and silently drops
+    # everything that arrived during the day the user asked for — the report would
+    # be missing its most recent postings, which is the exact failure #771 is
+    # about. Same widening ``GET /audit`` already does.
+    if filters.submitted_from is not None:
+        stmt = stmt.where(OpportunityLink.submitted_at >= _day_start(filters.submitted_from))
+    if filters.submitted_to is not None:
+        stmt = stmt.where(OpportunityLink.submitted_at <= _day_end(filters.submitted_to))
     return stmt
+
+
+def _day_start(day: datetime.date) -> datetime.datetime:
+    """The first instant of ``day`` in UTC."""
+    return datetime.datetime.combine(day, datetime.time.min, tzinfo=datetime.UTC)
+
+
+def _day_end(day: datetime.date) -> datetime.datetime:
+    """The last instant of ``day`` in UTC — see the note in :func:`_filtered`."""
+    return datetime.datetime.combine(day, datetime.time.max, tzinfo=datetime.UTC)
+
+
+def build_population_query(filters: OpportunityLinkFilters) -> Select:
+    """The SELECT that defines WHICH LINKS a filter set matches. Unordered,
+    unpaginated, no projection — just the population.
+
+    ⚠️ THE LIST AND THE EXPORT BOTH START HERE, and that is what makes them
+    provably the same set rather than two implementations that agree today. The
+    list adds ``ORDER BY``/``LIMIT``/``OFFSET`` and a COUNT over the same
+    predicates; the export adds only the ordering. Neither adds a predicate.
+    ``tests/test_opportunity_link_export_parity.py`` compiles both and asserts
+    identical SQL and identical binds.
+
+    LEFT JOINs ``current_employment`` so an ``is_own_company`` row is filterable
+    and searchable by the employer name it displays under — otherwise "filter by
+    company" would silently miss exactly the rows the feature is named after. The
+    join is part of the population definition, not of the list's presentation, so
+    it lives here: an export that dropped it would return a different set for the
+    same ``company=`` box.
+    """
+    return _filtered(
+        select(OpportunityLink).outerjoin(
+            CurrentEmployment,
+            CurrentEmployment.alumni_id == OpportunityLink.alumni_id,
+        ),
+        filters,
+    )
+
+
+def build_population_count(filters: OpportunityLinkFilters) -> Select:
+    """The COUNT matching :func:`build_population_query`, same predicates."""
+    return _filtered(
+        select(func.count(OpportunityLink.opportunity_link_id)).outerjoin(
+            CurrentEmployment,
+            CurrentEmployment.alumni_id == OpportunityLink.alumni_id,
+        ),
+        filters,
+    )
+
+
+# The list's ordering, applied identically by the export so a CSV reads in the
+# same order as the screen it was launched from. Newest first, id as the
+# tie-break so a page boundary is deterministic when two rows share a timestamp.
+def _ordered(stmt: Select) -> Select:
+    return stmt.order_by(
+        OpportunityLink.submitted_at.desc(),
+        OpportunityLink.opportunity_link_id.desc(),
+    )
 
 
 def _like_term(value: str) -> str:
@@ -409,49 +491,22 @@ def _like_term(value: str) -> str:
 
 async def list_links(
     session: AsyncSession,
+    filters: OpportunityLinkFilters,
     *,
-    status: str | None = None,
-    role_type: str | None = None,
-    company: str | None = None,
-    search: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> OpportunityLinkPage:
     """The staff Links tab: a filtered, paginated page of links, newest first.
 
-    LEFT JOINs ``current_employment`` so an ``is_own_company`` row is filterable
-    and searchable by the employer name it displays under — otherwise "filter by
-    company" would silently miss exactly the rows the feature is named after.
+    Takes the SAME ``OpportunityLinkFilters`` the CSV export takes and runs the
+    SAME :func:`build_population_query` over it. Paging is the only difference
+    between what this returns and what the export writes.
     """
-    join = (
-        CurrentEmployment,
-        CurrentEmployment.alumni_id == OpportunityLink.alumni_id,
-    )
-    count_stmt = _filtered(
-        select(func.count(OpportunityLink.opportunity_link_id)).outerjoin(*join),
-        status=status,
-        role_type=role_type,
-        company=company,
-        search=search,
-    )
-    total = await session.scalar(count_stmt) or 0
-
-    page_stmt = _filtered(
-        select(OpportunityLink).outerjoin(*join),
-        status=status,
-        role_type=role_type,
-        company=company,
-        search=search,
-    )
+    total = await session.scalar(build_population_count(filters)) or 0
     rows = (
         (
             await session.execute(
-                page_stmt.order_by(
-                    OpportunityLink.submitted_at.desc(),
-                    OpportunityLink.opportunity_link_id.desc(),
-                )
-                .limit(limit)
-                .offset(offset)
+                _ordered(build_population_query(filters)).limit(limit).offset(offset)
             )
         )
         .scalars()
@@ -463,6 +518,172 @@ async def list_links(
         limit=limit,
         offset=offset,
     )
+
+
+# ------------------------------------------------------------------ export ----
+
+#: Ceiling on one CSV. The table is small today, but an export builds the whole
+#: file in memory before the response is written and this runs on a serverless
+#: function with a hard body cap (the 4.5 MB limit the memory index records as
+#: "the fake CORS error"). Over the cap the route asks the caller to narrow the
+#: dates rather than truncating — a report silently missing its tail is worse
+#: than a report that refuses.
+MAX_EXPORT_ROWS = 10_000
+
+#: The CSV header, in order. ONE definition, used to write the file and asserted
+#: by the parity test, so "the export grew a column" cannot happen by accident.
+EXPORT_COLUMNS: tuple[str, ...] = (
+    "Link ID",
+    "Date received",
+    "Submitted by",
+    "Alumni ID",
+    "Company",
+    "Own company",
+    "Role type",
+    "URL",
+    "City",
+    "State",
+    "Country",
+    "Application deadline",
+    "Details",
+    "Status",
+    "Source",
+    "Reviewed by",
+    "Reviewed at",
+)
+
+def _cell(value: object) -> str:
+    """Render one CSV cell, neutralising spreadsheet formula injection.
+
+    ⚠️ EVERY free-text column in this export is PUBLIC INPUT — company,
+    details, url and location all arrive on the token-gated survey path, and
+    a pending row has not been moderated yet. A cell opening with ``=`` is
+    executed by Excel and Sheets when the file is opened, so the value is
+    prefixed with a tab, exactly as ``alumni_export._fmt`` does. Same threat,
+    same fix, deliberately not a second cleverer one.
+
+    Timestamps are rendered in UTC with the zone spelled out rather than as a
+    bare ISO string: this is the "date received" column the whole report is
+    named after, and a reader comparing it to a screenshot needs to know which
+    clock it is on.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, datetime.datetime):
+        return value.astimezone(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    text = str(value)
+    if text and text[0] in _FORMULA_LEAD:
+        return "\t" + text
+    return text
+
+
+def _export_row(link: OpportunityLinkRead) -> list[str]:
+    """One CSV line, built from the SAME ``OpportunityLinkRead`` projection the
+    list renders — so a resolved "my company" employer name, and a NULL that
+    shows as a dash on screen, mean the same thing in the file."""
+    return [
+        _cell(link.opportunity_link_id),
+        _cell(link.submitted_at),
+        _cell(link.submitted_by),
+        _cell(link.alumni_id),
+        _cell(link.company_name),
+        _cell(link.is_own_company),
+        _cell(link.role_type),
+        _cell(link.url),
+        _cell(link.location_city),
+        _cell(link.location_state),
+        _cell(link.location_country),
+        _cell(link.application_deadline),
+        _cell(link.details),
+        _cell(link.status),
+        _cell(link.source),
+        _cell(link.reviewed_by),
+        _cell(link.reviewed_at),
+    ]
+
+
+async def count_links(
+    session: AsyncSession, filters: OpportunityLinkFilters
+) -> int:
+    """How many links a filter set matches. The export's pre-flight, and the same
+    count the list's ``total`` reports."""
+    return int(await session.scalar(build_population_count(filters)) or 0)
+
+
+async def export_csv(
+    session: AsyncSession,
+    filters: OpportunityLinkFilters,
+    *,
+    actor_user_id: int,
+) -> str:
+    """The dated report (#771): EXACTLY the filtered list, as CSV.
+
+    ⚠️ SAME OBJECT, SAME QUERY, NO PAGING. It takes the identical
+    ``OpportunityLinkFilters`` the list took, runs the identical
+    :func:`build_population_query`, applies the identical ordering, and projects
+    each row through the identical ``_project``/``OpportunityLinkRead`` the list
+    renders. The only thing it drops is ``LIMIT``/``OFFSET``, because a report is
+    the whole set and a page is not. There is no second predicate anywhere in
+    this function, which is the property
+    ``tests/test_opportunity_link_export_parity.py`` pins.
+
+    Audit-logged as ``export_opportunity_links`` with the row count and the
+    filters that produced it — WHAT left the system and under which selection,
+    never the rows themselves. Mirrors the event-attendee and alumni exports.
+    """
+    rows = (
+        (await session.execute(_ordered(build_population_query(filters))))
+        .scalars()
+        .all()
+    )
+    items = await _project(session, list(rows))
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(list(EXPORT_COLUMNS))
+    for item in items:
+        writer.writerow(_export_row(item))
+
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="export_opportunity_links",
+            entity_type="opportunity_link",
+            entity_id=None,
+            new_value=f"rows={len(items)}; {describe_filters(filters)}",
+        )
+    )
+    await session.commit()
+    return buffer.getvalue()
+
+
+def describe_filters(filters: OpportunityLinkFilters) -> str:
+    """The applied filters as one audit-safe string.
+
+    Every set value, none of the unset ones — so the trail records the SELECTION
+    that produced a disclosure and can be replayed, which is the whole reason the
+    read is audited. Free-text values (``company``, ``search``) are included:
+    they are what the staff member typed, not alumni data.
+    """
+    pairs = (
+        ("status", filters.status),
+        ("role_type", filters.role_type),
+        ("company", filters.company),
+        ("q", filters.search),
+        (
+            "submitted_from",
+            filters.submitted_from.isoformat() if filters.submitted_from else None,
+        ),
+        (
+            "submitted_to",
+            filters.submitted_to.isoformat() if filters.submitted_to else None,
+        ),
+    )
+    return ";".join(f"{k}={v}" for k, v in pairs if v is not None)
 
 
 async def get_link(session: AsyncSession, link_id: int) -> OpportunityLinkRead:
@@ -763,19 +984,36 @@ async def submit_links(
         raise NotFoundError(LINK_DEAD_MESSAGE)
 
     validated = [_validated_fields(item) for item in payload.links]
+    staged: list[OpportunityLink] = []
     for fields in validated:
-        session.add(
-            OpportunityLink(
-                alumni_id=alumni_id,
-                status="pending",
-                source="survey",
-                # No actor: the public path has no logged-in user. `created_by_user_id`
-                # stays NULL and `source='survey'` is what says the text came from
-                # outside — do not backfill either with the alum's user record
-                # (alumni do not have one).
-                created_by_user_id=None,
-                **fields,
-            )
+        row = OpportunityLink(
+            alumni_id=alumni_id,
+            status="pending",
+            source="survey",
+            # No actor: the public path has no logged-in user. `created_by_user_id`
+            # stays NULL and `source='survey'` is what says the text came from
+            # outside — do not backfill either with the alum's user record
+            # (alumni do not have one).
+            created_by_user_id=None,
+            **fields,
         )
+        staged.append(row)
+        session.add(row)
     await session.commit()
+
+    # ------------------------------------------------------------------ #771 --
+    # TELL SOMEBODY. Before this, a survey posting landed pending and waited for a
+    # staff member to think to open the Links tab; the owner's ask was "so we
+    # never miss".
+    #
+    # ⚠️ AFTER THE COMMIT, AND IT CANNOT FAIL THE SUBMISSION. The rows above are
+    # already durable, and `notify_new_links` swallows every exception, is
+    # time-boxed, and returns immediately when no alerting channel is configured
+    # (which is the case in tests, CI and every preview deployment). A Slack
+    # outage or a Resend rejection costs one missed message; it must never cost an
+    # alum their posting, and it must never turn a 200 into a 500 on a public,
+    # token-gated endpoint. See app/services/opportunity_link_alert.py, including
+    # why this is awaited rather than fired and forgotten, and why the message
+    # deliberately carries no name, no company and no URL.
+    await opportunity_link_alert.notify_new_links(staged)
     return OpportunityLinkSubmitResult(staged=True, link_count=len(validated))

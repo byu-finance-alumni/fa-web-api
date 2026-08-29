@@ -46,6 +46,7 @@ from app.schemas.auth import UserContext
 from app.schemas.opportunity_link import (
     MAX_LINKS_PER_SUBMIT,
     OpportunityLinkCreate,
+    OpportunityLinkFilters,
     OpportunityLinkSubmitRequest,
     OpportunityLinkUpdate,
     OpportunitySurveyLinkSubmit,
@@ -202,6 +203,18 @@ def _link(**kw) -> OpportunityLink:
     )
     base.update(kw)
     return OpportunityLink(**base)
+
+
+def _filters(**kw) -> OpportunityLinkFilters:
+    """The list's filter object, defaulted the way the route defaults it.
+
+    ``status`` is REQUIRED on the model on purpose (see
+    ``OpportunityLinkFilters``) — ``None`` on the wire is resolved to
+    ``approved`` once, in the route, so neither the list nor the export can
+    forget it. The helper mirrors that so a test reads like a request.
+    """
+    kw.setdefault("status", "approved")
+    return OpportunityLinkFilters(**kw)
 
 
 def _ctx(*roles: str) -> UserContext:
@@ -712,7 +725,7 @@ def test_own_company_name_is_resolved_from_the_employment_record():
             link_rows=[link],
             count=1,
         )
-        page = await service.list_links(session)
+        page = await service.list_links(session, _filters())
         assert page.items[0].company_name == "Sorenson Capital"
         assert page.items[0].submitted_by == "Dana Whitcomb"
 
@@ -732,7 +745,7 @@ def test_own_company_with_no_employment_row_shows_no_name():
             link_rows=[link],
             count=1,
         )
-        page = await service.list_links(session)
+        page = await service.list_links(session, _filters())
         assert page.items[0].company_name is None
 
     _run(_body())
@@ -804,10 +817,12 @@ def test_filters_reach_the_query():
         session = _FakeSession(count=0)
         await service.list_links(
             session,
-            status="pending",
-            role_type="internship",
-            company="Acme",
-            search="analyst",
+            _filters(
+                status="pending",
+                role_type="internship",
+                company="Acme",
+                search="analyst",
+            ),
             limit=25,
             offset=50,
         )
@@ -826,7 +841,7 @@ def test_search_wildcards_are_escaped():
     async def _body():
         """A bare `%` in the search box must not become match-everything."""
         session = _FakeSession(count=0)
-        await service.list_links(session, search="100%")
+        await service.list_links(session, _filters(search="100%"))
         params = [
             v
             for s in session.statements
@@ -845,7 +860,7 @@ def test_the_page_envelope_reports_the_unpaged_total():
         session = _FakeSession(
             alumni_rows=[alum], employment_rows=[], link_rows=[link], count=137
         )
-        page = await service.list_links(session, limit=10, offset=20)
+        page = await service.list_links(session, _filters(), limit=10, offset=20)
         assert page.total == 137
         assert page.limit == 10
         assert page.offset == 20
@@ -917,7 +932,8 @@ def test_the_default_read_is_approved_only(monkeypatch, client):
     rows never gets them, whatever their role."""
     seen = {}
 
-    async def _list(session, **kwargs):
+    async def _list(session, filters, **kwargs):
+        seen["filters"] = filters
         seen.update(kwargs)
         from app.schemas.opportunity_link import OpportunityLinkPage
 
@@ -926,13 +942,14 @@ def test_the_default_read_is_approved_only(monkeypatch, client):
     monkeypatch.setattr("app.services.opportunity_links.list_links", _list)
     _as("view_only")
     assert client.get("/opportunity-links").status_code == 200
-    assert seen["status"] == "approved"
+    assert seen["filters"].status == "approved"
 
 
 def test_a_moderator_may_read_the_pending_queue(monkeypatch, client):
     seen = {}
 
-    async def _list(session, **kwargs):
+    async def _list(session, filters, **kwargs):
+        seen["filters"] = filters
         seen.update(kwargs)
         from app.schemas.opportunity_link import OpportunityLinkPage
 
@@ -941,7 +958,7 @@ def test_a_moderator_may_read_the_pending_queue(monkeypatch, client):
     monkeypatch.setattr("app.services.opportunity_links.list_links", _list)
     _as("full_access")
     assert client.get("/opportunity-links?status=pending").status_code == 200
-    assert seen["status"] == "pending"
+    assert seen["filters"].status == "pending"
 
 
 def test_a_direct_id_fetch_is_not_a_way_round_the_status_gate(monkeypatch, client):
@@ -1124,7 +1141,7 @@ def test_country_reaches_the_read_projection_from_the_list():
         session = _FakeSession(
             alumni_rows=[alum], employment_rows=[], link_rows=[link], count=1
         )
-        page = await service.list_links(session)
+        page = await service.list_links(session, _filters())
         assert page.items[0].location_country == "Singapore"
 
     _run(_body())
@@ -1136,7 +1153,7 @@ def test_country_is_searchable_like_the_other_location_columns():
         would make a non-US posting unfindable by the one word that says where it
         is — the export/list parity trap this codebase keeps re-learning."""
         session = _FakeSession(count=0)
-        await service.list_links(session, search="Japan")
+        await service.list_links(session, _filters(search="Japan"))
         sql = " ".join(str(s) for s in session.statements)
         assert "opportunity_links.location_country" in sql
 
@@ -1479,7 +1496,7 @@ def test_an_expired_row_can_be_read():
         session = _FakeSession(
             alumni_rows=[alum], employment_rows=[], link_rows=[expired], count=1
         )
-        page = await service.list_links(session)
+        page = await service.list_links(session, _filters())
         assert page.items[0].application_deadline == _past(days=45)
 
     _run(_body())

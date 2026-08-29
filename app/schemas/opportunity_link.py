@@ -511,6 +511,62 @@ class OpportunityLinkRead(BaseModel):
     reviewed_at: datetime.datetime | None = None
 
 
+class OpportunityLinkFilters(BaseModel):
+    """THE population selector for the Links list — and for its CSV export.
+
+    ⚠️ ONE OBJECT, TWO ENDPOINTS, AND THAT IS THE ENTIRE POINT. This repo has a
+    recurring, expensive bug class: an export that returns a WIDER or differently
+    populated set than the list the user was looking at. It has been shipped more
+    than once (see ``tests/test_alumni_export_filter_parity.py`` and #366, where
+    a "near Provo" screen exported every alumnus nationwide) and it is never
+    caught by typechecking, because both sides compile perfectly while one of
+    them quietly drops a predicate.
+
+    So the two routes do not each build a query. ``GET /opportunity-links`` and
+    ``GET /opportunity-links/export`` each build ONE of these, and
+    ``opportunity_links.build_population_query`` turns it into SQL. A filter
+    added here reaches both surfaces or neither; a filter forgotten on the export
+    route is a missing FIELD, not a silently wider result set.
+    ``tests/test_opportunity_link_export_parity.py`` pins that the two routes
+    build the same object and that it compiles to the same SQL with the same
+    binds.
+
+    ⚠️ ``status`` IS RESOLVED, NOT OPTIONAL. ``None`` on the wire means "the
+    caller did not ask", which the list turns into ``approved`` — the safe read
+    (an unfiltered read never hands back unmoderated, attacker-supplied rows,
+    whatever the caller's role). That defaulting happens ONCE, in
+    ``resolve_status``, before this object is built, so the export cannot forget
+    it and export the pending queue to someone who could not see it in the list.
+    This is the ``null``-counts-as-SET trap from the memory index, closed by
+    construction: by the time a value is in here it is a real value, and a
+    predicate is applied for it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: LinkStatus
+    role_type: RoleType | None = None
+    company: str | None = None
+    search: str | None = None
+    #: Date RECEIVED, inclusive, on the alum's/staff member's submission
+    #: timestamp (``submitted_at``) — NOT ``application_deadline``. Bare dates:
+    #: the service widens ``submitted_to`` to the last instant of that day in
+    #: UTC, so "2026-08-28 to 2026-08-28" returns everything that arrived that
+    #: day rather than only what arrived at midnight.
+    submitted_from: datetime.date | None = None
+    submitted_to: datetime.date | None = None
+
+
+def resolve_status(requested: str | None) -> str:
+    """The status a read actually runs with: what was asked for, else ``approved``.
+
+    The ONE place the default lives, shared by the list route and the export
+    route. See :class:`OpportunityLinkFilters` for why it must not be re-derived
+    at either call site.
+    """
+    return requested or "approved"
+
+
 class OpportunityLinkPage(BaseModel):
     """A page of links: the ``{items, total, limit, offset}`` envelope the other
     paginated list endpoints return."""

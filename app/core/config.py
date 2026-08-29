@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     # one; the alerter logs the failure, never the target.
     slack_alert_webhook_url: str | None = Field(default=None)  # SLACK_ALERT_WEBHOOK_URL
     slack_security_webhook_url: str | None = Field(default=None)  # SLACK_SECURITY_WEBHOOK_URL
+    # SLACK_SUBMISSION_WEBHOOK_URL -> the channel that hears about things ALUMNI
+    # SENT US that need a human (#771: a job posting arriving through the survey).
+    # Third channel, same on/off rule, and it FALLS BACK to the operational
+    # webhook for the same reason the security one does -- see
+    # :attr:`slack_submission_webhook`.
+    slack_submission_webhook_url: str | None = Field(default=None)  # SLACK_SUBMISSION_WEBHOOK_URL
 
     # Automatic login blocking (#457). The kill switch for the feature: false
     # stops blocks being CREATED and stops existing ones being ENFORCED, so
@@ -181,6 +187,24 @@ class Settings(BaseSettings):
         ``render_slack`` in app/services/failure_alert.py.
         """
         return self._clean_webhook(self.slack_security_webhook_url) or self.slack_webhook
+
+    @property
+    def slack_submission_webhook(self) -> str | None:
+        """The SUBMISSION Slack channel (alumni sent us something), or None.
+
+        ⚠️ FALLS BACK TO :attr:`slack_webhook`, exactly like
+        :attr:`slack_security_webhook` and for the same argument: forgetting a
+        second env var is an ordinary mistake, and the cost of the fallback is a
+        message landing in a slightly wrong channel where it is still read, while
+        the cost of not having it is silence.
+
+        Silence is the entire defect #771 exists to fix — the owner's words were
+        "so we never miss when a job posting is included in someone's survey" —
+        so this channel must never be the one that can quietly go dark. The
+        message is tagged ``POSTING`` (see ``render_slack``) so a shared channel
+        still reads correctly at a glance.
+        """
+        return self._clean_webhook(self.slack_submission_webhook_url) or self.slack_webhook
 
     @property
     def alert_recipients(self) -> list[str]:

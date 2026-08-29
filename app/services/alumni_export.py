@@ -39,7 +39,7 @@ from app.schemas.alumni_export import (
     ExportColumn,
     ExportColumnCatalog,
 )
-from app.services import geo_search
+from app.services import geo_search, headshot_index
 
 log = logging.getLogger(__name__)
 
@@ -396,8 +396,15 @@ def _filters_dict(filters: AlumniExportFilters) -> dict:
     that builds the export statement must go through that function, never
     ``build_alumni_query(**_filters_dict(...))`` directly, or the location filter
     is silently lost.
+
+    ``missing_photo`` (#775) is EXCLUDED for exactly the same reason: a headshot
+    is an object in the ``headshots`` bucket, not a column, so the flag needs an
+    async listing of that bucket before it can become a predicate.
+    :func:`build_export_query` resolves it into ``photo_filter``.
     """
-    out = filters.model_dump(exclude_unset=True, exclude={"sort", "near", "radius"})
+    out = filters.model_dump(
+        exclude_unset=True, exclude={"sort", "near", "radius", "missing_photo"}
+    )
     if out.get("needs_survey"):
         out["survey_due_before"] = datetime.datetime.now(datetime.UTC) - SURVEY_CADENCE
     if out.get("designations") is not None:
@@ -434,6 +441,15 @@ async def build_export_query(
         )
     if location_filter is not None:
         kwargs["location_filter"] = location_filter
+    # "No photo" (#775): resolved through the SAME shared function the list route
+    # calls, from the same cached bucket listing, so the CSV is exactly the rows
+    # the operator was looking at. Storage being unreachable raises (502) rather
+    # than dropping the predicate — a "no photo" export that quietly contained
+    # every alumnus is the same disclosure shape as the nationwide "near Provo"
+    # CSV above.
+    photo_filter = await headshot_index.resolve_missing_photo(filters.missing_photo)
+    if photo_filter is not None:
+        kwargs["photo_filter"] = photo_filter
     return build_alumni_query(**kwargs)
 
 

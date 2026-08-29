@@ -357,3 +357,55 @@ def test_support_contacts_list_route_still_requires_a_login(client):
     assert uuid  # (imported for parity with the suite's other route modules)
     resp = client.get("/support-contacts")
     assert resp.status_code in (401, 403)
+
+
+# --- the PUBLIC, un-tokened contact endpoint (for /survey/demo) --------------
+
+
+def test_public_contact_endpoint_serves_the_configured_row(client, monkeypatch):
+    """`GET /survey/contact` answers WITHOUT a token, for the demo survey.
+
+    The demo renders sample data and never calls `/respond/{token}`, so without
+    this it silently omits a control the real survey shows -- the sample-survey
+    drift that keeps costing us.
+    """
+
+    from app.schemas.survey import SurveySupportContact
+
+    async def _contact(_session):
+        return SurveySupportContact(name="Tanya Harmon", email="tanya@byu.edu")
+
+    monkeypatch.setattr(survey_email, "survey_support_contact", _contact)
+    response = client.get("/survey/contact")
+    assert response.status_code == 200
+    assert response.json() == {"name": "Tanya Harmon", "email": "tanya@byu.edu"}
+
+
+def test_public_contact_endpoint_serves_null_when_unconfigured(client, monkeypatch):
+    async def _none(_session):
+        return None
+
+    monkeypatch.setattr(survey_email, "survey_support_contact", _none)
+    response = client.get("/survey/contact")
+    assert response.status_code == 200
+    assert response.json() is None
+
+
+def test_public_contact_endpoint_exposes_nothing_but_name_and_email(
+    client, monkeypatch
+):
+    """One row, two fields. This must never widen into a staff directory."""
+
+    from app.schemas.survey import SurveySupportContact
+
+    async def _contact(_session):
+        return SurveySupportContact(name="Tanya Harmon", email="tanya@byu.edu")
+
+    monkeypatch.setattr(survey_email, "survey_support_contact", _contact)
+    body = client.get("/survey/contact").json()
+    assert set(body) == {"name", "email"}
+
+
+def test_the_authenticated_contact_list_is_still_gated(client):
+    """The narrow exception above must not have opened the list route."""
+    assert client.get("/support-contacts").status_code in (401, 403)

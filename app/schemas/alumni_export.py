@@ -126,6 +126,16 @@ class AlumniExportFilters(BaseModel):
     missing_email: bool = False
     missing_employer: bool = False
     missing_phone: bool = False
+    # Missing-data reports (#775). ``missing_linkedin`` is an ordinary column
+    # predicate. ``missing_photo`` is NOT: a headshot is an object in the
+    # ``headshots`` bucket keyed by net ID, so ``build_export_query`` resolves it
+    # through the SAME ``headshot_index.resolve_missing_photo`` the list route
+    # uses — the ``near`` pattern — and it is EXCLUDED from ``_filters_dict``
+    # because ``build_alumni_query`` takes the resolved predicate, not the flag.
+    # Without both halves an export of a "no photo" view would silently widen to
+    # every alumnus, which is the #366 failure this file's parity tests exist for.
+    missing_linkedin: bool = False
+    missing_photo: bool = False
     duplicate: bool = False
     # Friends/alumni split (#218). Unset -> the query builder's default
     # (alumni only), so an export mirrors the default Alumni list view. Send

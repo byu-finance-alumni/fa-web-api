@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from app.api.dependencies.auth import get_current_db_user
 from app.api.routes import dashboard as dashboard_routes
 from app.core.database import get_session
+from app.core.errors import ServiceError
 from app.main import app
 from app.schemas.auth import UserContext
 
@@ -237,9 +238,11 @@ def test_data_quality_returns_counts(client, role):
     # Data-quality is full-access only (matches the sidebar gate), like /tasks.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
     # Scalars consumed in handler order: total, missing_email,
-    # missing_employer, missing_phone, complete_alumni, duplicate_count.
+    # missing_employer, missing_phone, missing_linkedin, complete_alumni,
+    # duplicate_count. ``missing_photo`` consumes none here — storage is not
+    # configured in tests, so it takes the documented fail-soft path below.
     app.dependency_overrides[get_session] = _with_session(
-        _FakeSession([], scalars=[100, 12, 9, 7, 80, 3])
+        _FakeSession([], scalars=[100, 12, 9, 7, 4, 80, 3])
     )
 
     response = client.get("/dashboard/data-quality")
@@ -250,8 +253,57 @@ def test_data_quality_returns_counts(client, role):
         "missing_email": 12,
         "missing_employer": 9,
         "missing_phone": 7,
+        "missing_linkedin": 4,
+        # null, NOT 0: the headshots bucket could not be listed, and "we could
+        # not find out" must not read as "everybody has a photo" (#775).
+        "missing_photo": None,
         "duplicate_count": 3,
     }
+
+
+def test_data_quality_missing_photo_counts_from_the_bucket_listing(client, monkeypatch):
+    # #775: the photo count comes from ONE cached listing of the headshots
+    # bucket — never a per-row storage check — and it is the SAME predicate
+    # ``/alumni?missing_photo=1`` filters on, so the tile and the list it opens
+    # cannot report different populations.
+    async def _keys():
+        return frozenset({"jdoe12"})
+
+    monkeypatch.setattr(dashboard_routes.headshot_index, "stored_headshot_keys", _keys)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _FakeSession([], scalars=[100, 12, 9, 7, 4, 42, 80, 3])
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/data-quality")
+    assert response.status_code == 200
+    assert response.json()["missing_photo"] == 42
+    # The count is one aggregate over the alumni table with the key set inlined,
+    # not a storage round-trip per row.
+    sql = _compiled(session.scalar_args[5])
+    assert "net_id" in sql
+    assert "count" in sql.lower()
+
+
+def test_data_quality_survives_an_unreachable_headshot_bucket(client, monkeypatch):
+    # #775: a storage outage nulls the photo count ONLY. Blanking the email,
+    # phone and duplicate numbers because image storage is down would be the
+    # tail wagging the dog — and unlike the list/export, a null count discloses
+    # nothing, so this endpoint degrades where those two refuse (502).
+    async def _boom():
+        raise ServiceError("storage down")
+
+    monkeypatch.setattr(dashboard_routes.headshot_index, "stored_headshot_keys", _boom)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(
+        _FakeSession([], scalars=[100, 12, 9, 7, 4, 80, 3])
+    )
+
+    response = client.get("/dashboard/data-quality")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["missing_photo"] is None
+    assert body["missing_email"] == 12
+    assert body["duplicate_count"] == 3
 
 
 def test_data_quality_forbidden_for_view_only(client):
@@ -879,9 +931,10 @@ def test_data_quality_response_validates_against_model(client):
     from app.schemas.dashboard import DataQuality
 
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
-    # Six scalars: total, missing_email, missing_employer, missing_phone,
-    # complete_alumni, duplicate_count.
-    session = _FakeSession([], scalars=[10, 3, 2, 5, 6, 1])
+    # Seven scalars: total, missing_email, missing_employer, missing_phone,
+    # missing_linkedin, complete_alumni, duplicate_count. missing_photo takes
+    # none — storage is unconfigured in tests, so it serves null (#775).
+    session = _FakeSession([], scalars=[10, 3, 2, 5, 4, 6, 1])
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/data-quality")

@@ -117,6 +117,7 @@ from app.services import alumni as service
 from app.services import (
     alumni_export,
     geo_search,
+    headshot_index,
     hygiene,
     images,
     import_csv,
@@ -403,6 +404,30 @@ async def list_alumni(
         bool,
         Query(description="Only alumni with no phone number on file."),
     ] = False,
+    missing_linkedin: Annotated[
+        bool,
+        Query(
+            description=(
+                "Only alumni with no LinkedIn URL on file (#775). A blank or "
+                "whitespace-only value counts as missing."
+            )
+        ),
+    ] = False,
+    missing_photo: Annotated[
+        bool,
+        Query(
+            description=(
+                "Only alumni with no headshot stored (#775). A headshot is an "
+                "object in the private 'headshots' bucket keyed by the "
+                "alumnus's net ID, so this is answered from ONE cached bucket "
+                "listing (up to 5 minutes stale), never a per-row storage "
+                "check. NOTE: alumni with NO net ID are INCLUDED - there is "
+                "no key to store a photo under, so they cannot have one. "
+                "Staged survey "
+                "photos awaiting review do not count as a headshot."
+            )
+        ),
+    ] = False,
     duplicate: Annotated[
         bool,
         Query(description="Only alumni flagged as duplicate candidates."),
@@ -509,6 +534,15 @@ async def list_alumni(
     location_filter, location_envelope = await geo_search.resolve_near(
         session, near, radius
     )
+    # "No photo" (#775): a headshot lives in object storage, not in a column, so
+    # the predicate is resolved from ONE cached listing of the bucket here and
+    # handed to the query builder — the same shape as ``near`` above, and the
+    # same shared resolver the export calls, so a list and the CSV taken from it
+    # cannot describe different populations. Storage being unreachable raises
+    # (502) rather than dropping the predicate: a "no photo" list that quietly
+    # returned every alumnus is the export/list-parity failure this repo keeps
+    # re-learning.
+    photo_filter = await headshot_index.resolve_missing_photo(missing_photo)
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -565,6 +599,8 @@ async def list_alumni(
         missing_email=missing_email,
         missing_employer=missing_employer,
         missing_phone=missing_phone,
+        missing_linkedin=missing_linkedin,
+        photo_filter=photo_filter,
         duplicate=duplicate,
         is_alumni=is_alumni_filter,
         include_archived=effective_include_archived,
@@ -824,6 +860,7 @@ async def _purge_rejected_headshot(
     reasons the same way)."""
     with contextlib.suppress(ServiceError):
         await supabase_storage.delete_object(_HEADSHOT_BUCKET, key)
+    headshot_index.reset_cache()  # membership changed — see upload_headshot (#775)
     service._audit(
         session,
         actor_user_id,
@@ -974,6 +1011,11 @@ async def upload_headshot(
         raise InvalidRequestError(content_error)
     net_id = await _alumnus_net_id(session, alumni_id)
     await supabase_storage.upload_object(_HEADSHOT_BUCKET, net_id, data, content_type)
+    # The "who has no photo" report (#775) answers from a cached listing of this
+    # bucket; a write just changed the answer. Best-effort by nature — it clears
+    # THIS serverless instance only, so the report's real staleness bound stays
+    # the index's TTL. Every membership-changing headshot path does this.
+    headshot_index.reset_cache()
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
     await session.commit()
     return Response(status_code=204)
@@ -1104,6 +1146,7 @@ async def confirm_headshot_upload(
     # check: the stored object is replaced by our own re-encode of it, or it is
     # deleted and we never reach the success audit below.
     await _normalise_stored_headshot(session, user.user_id, alumni_id, net_id)
+    headshot_index.reset_cache()  # membership changed — see upload_headshot (#775)
     service._audit(session, user.user_id, "upload_headshot", alumni_id, new_value=net_id)
     await session.commit()
     return Response(status_code=204)
@@ -1197,6 +1240,7 @@ async def delete_headshot(
     no-op (still 204)."""
     net_id = await _alumnus_net_id(session, alumni_id)
     await supabase_storage.delete_object(_HEADSHOT_BUCKET, net_id)
+    headshot_index.reset_cache()  # membership changed — see upload_headshot (#775)
     service._audit(session, user.user_id, "delete_headshot", alumni_id, old_value=net_id)
     await session.commit()
     return Response(status_code=204)
@@ -1563,6 +1607,14 @@ async def confirm_bulk_headshot_upload(
             new_value=key,
         )
         audited += 1
+
+    # The browser PUT every accepted object STRAIGHT to storage, and the loop
+    # above deleted the rejected ones, so the bucket changed in both directions
+    # without any single-upload path running. Drop the cached listing behind the
+    # "no photo" report (#775) — a bulk import is exactly when that report is
+    # most likely to be read and most likely to be wrong. Placed after the purges
+    # so a rejected object can't be re-cached as present.
+    headshot_index.reset_cache()
 
     items: list[HeadshotBulkItem] = []
     for photo, claim in zip(photos, claims, strict=True):

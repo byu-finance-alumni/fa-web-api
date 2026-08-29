@@ -18,6 +18,7 @@ from app.api.dependencies.auth import RequireReportsAdvanced, RequireViewAccess
 from app.core import email_reach
 from app.core.database import get_session
 from app.core.dropdowns import WHEEL_INDUSTRIES
+from app.core.errors import ServiceError
 from app.core.us_states import US_COUNTRY_ALIASES, us_state_full_name_expr
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -27,7 +28,7 @@ from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
-from app.repositories.alumni import has_employer_or_not_applicable
+from app.repositories.alumni import has_employer_or_not_applicable, has_linkedin_url
 from app.schemas.auth import UserContext
 from app.schemas.dashboard import (
     ActivityFeed,
@@ -38,6 +39,7 @@ from app.schemas.dashboard import (
     FollowUpRow,
     InteractionActivity,
 )
+from app.services import headshot_index
 from app.utils.sql import escape_like
 
 logger = logging.getLogger(__name__)
@@ -159,6 +161,17 @@ def _has_employer_exists():
     bug class here. Named for what it feeds (the negation is "missing employer").
     """
     return has_employer_or_not_applicable()
+
+
+def _has_linkedin_exists():
+    """The alumnus has a non-blank LinkedIn URL on file.
+
+    Imported from the repository (#775) for the same reason as
+    :func:`_has_employer_exists`: this KPI, the Data-quality tile and the
+    ``/alumni?missing_linkedin=1`` drill-down it deep-links to must be the SAME
+    predicate. Named for what it feeds; the negation is "missing LinkedIn".
+    """
+    return has_linkedin_url()
 
 
 def _contacted_since_exists(cutoff: datetime.datetime):
@@ -1021,6 +1034,45 @@ async def data_quality(_: RequireReportsAdvanced, session: SessionDep) -> dict:
         .select_from(Alumni)
         .where(active, ~_has_phone_exists())
     )
+    missing_linkedin = await session.scalar(
+        select(func.count())
+        .select_from(Alumni)
+        .where(active, ~_has_linkedin_exists())
+    )
+    # "No photo" (#775). A headshot is an object in the ``headshots`` bucket
+    # keyed by net ID, so this count comes from ONE cached listing of that bucket
+    # (never a per-row storage check) — the SAME resolver that backs
+    # ``/alumni?missing_photo=1`` and its CSV, so the tile and the list it opens
+    # cannot disagree. It can be up to the index's TTL (5 minutes) stale.
+    #
+    # ⚠️ Alumni with NO net ID are counted as missing a photo: no key exists to
+    # store one under, so they cannot have one. See ``services.headshot_index``.
+    #
+    # Storage being unreachable yields ``None`` HERE, deliberately unlike the
+    # list and the export, which fail (502). This endpoint serves a page of
+    # unrelated numbers; letting an image-storage outage blank out the email,
+    # phone and duplicate counts too would be the tail wagging the dog. A null
+    # means "we could not find out", which the UI can render as such — whereas a
+    # wrong POPULATION on a list or a CSV is a disclosure, so those refuse.
+    missing_photo: int | None = None
+    try:
+        missing_photo = await session.scalar(
+            select(func.count())
+            .select_from(Alumni)
+            .where(
+                active,
+                headshot_index.missing_photo_condition(
+                    await headshot_index.stored_headshot_keys()
+                ),
+            )
+        )
+        missing_photo = int(missing_photo or 0)
+    except ServiceError:
+        logger.warning(
+            "data-quality: could not list the headshots bucket; reporting the "
+            "missing-photo count as unavailable",
+            exc_info=True,
+        )
     # "Complete" = an active alumnus with all three tracked contact/career fields
     # on file (email AND phone AND current employer).
     complete_alumni = await session.scalar(
@@ -1042,6 +1094,9 @@ async def data_quality(_: RequireReportsAdvanced, session: SessionDep) -> dict:
         "missing_email": int(missing_email or 0),
         "missing_employer": int(missing_employer or 0),
         "missing_phone": int(missing_phone or 0),
+        "missing_linkedin": int(missing_linkedin or 0),
+        # None (JSON null) only when the headshots bucket could not be listed.
+        "missing_photo": missing_photo,
         "duplicate_count": int(duplicate_count or 0),
     }
 

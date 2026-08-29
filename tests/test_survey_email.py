@@ -321,17 +321,26 @@ def test_get_respondent_invalid_token_is_none(fake_settings):
 
 
 class _RespondentSession:
-    """Serves get_respondent's four lookups in order: alum, contact, job,
-    engagement."""
+    """Serves get_respondent's lookups in order: alum, contact, job, engagement,
+    then the survey support contact (#774, a ``(name, email)`` row).
+
+    Anything past the end of ``rows`` reads as "no row" rather than raising, so a
+    test that only cares about the alum's fields does not have to spell out a
+    support contact — it just gets ``support_contact: None``, which is the real
+    behaviour when none is configured. Serves both ``scalar_one_or_none`` (the
+    entity lookups) and ``first`` (the two-column contact select)."""
 
     def __init__(self, rows):
         self._rows = list(rows)
 
     async def execute(self, _stmt):
-        row = self._rows.pop(0)
+        row = self._rows.pop(0) if self._rows else None
 
         class _R:
             def scalar_one_or_none(self_inner):
+                return row
+
+            def first(self_inner):
                 return row
 
         return _R()

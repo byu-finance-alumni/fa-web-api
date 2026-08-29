@@ -33,6 +33,37 @@ async def _no_db_session():
     yield None
 
 
+@pytest.fixture(autouse=True)
+def _no_live_headshot_bucket(monkeypatch):
+    """Never let this module touch real object storage.
+
+    ``/dashboard/data-quality`` counts "no photo" by LISTING the headshots
+    bucket (#775), so without this the result depends on whether the machine
+    running the tests happens to have Supabase credentials in ``.env``:
+
+      * CI has none -> the listing raises, the count serves ``null``, and the
+        handler consumes NO scalar.
+      * A developer's machine has them -> the listing SUCCEEDS against the real
+        dev bucket, the handler consumes an extra scalar, every later scalar
+        shifts by one, and unrelated assertions (``duplicate_count``) fail.
+
+    That is a test whose outcome is decided by ambient configuration, which is
+    the worst kind: green in CI, red locally, and it makes a live network call
+    to dev storage on every unit-test run.
+
+    Default to the unreachable path, which is what the plain-scalar tests below
+    are written against. The two tests that exercise a REACHABLE bucket
+    re-patch this themselves, and their patch wins.
+    """
+
+    async def _unconfigured():
+        raise ServiceError("headshots bucket not configured (test default)")
+
+    monkeypatch.setattr(
+        dashboard_routes.headshot_index, "stored_headshot_keys", _unconfigured
+    )
+
+
 @pytest.fixture
 def client():
     app.dependency_overrides[get_session] = _no_db_session

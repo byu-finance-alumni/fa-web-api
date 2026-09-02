@@ -109,11 +109,14 @@ def test_overlong_phrase_returns_none_without_backtracking():
     r"""The second ReDoS layer (CodeQL py/polynomial-redos).
 
     The three prefix patterns USED to end in ``(?P<place>.+?)\s*$`` -- a lazy
-    group that backtracks quadratically on a long interior run of spaces. They
-    are now plain greedy ``(?P<place>.+)$`` and ``_interpret_place`` does the
-    trimming, so the construct is gone rather than merely bounded. ⚠️ CodeQL
-    reports the PATTERN, not its reachability: a length check in front did NOT
-    close the alerts, which is why the patterns themselves had to change.
+    group that backtracks quadratically on a long run of spaces followed by a
+    non-space. They now use ``(?P<place>\S.*)$``, which cannot overlap with the
+    ``\s+`` before it, and ``_interpret_place`` does the trimming the lazy group
+    used to do. See that function for the full three-attempt history.
+
+    ⚠️ A length check in front of the regex did NOT close the alerts --
+    py/polynomial-redos reports the pattern, not its reachability. That is why
+    the patterns themselves had to change.
 
     This length bound stays as the second layer, capping what one request can
     ask of the greedy scan and the geocoder behind it. An over-long phrase must

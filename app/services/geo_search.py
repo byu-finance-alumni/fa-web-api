@@ -61,13 +61,14 @@ _EARTH_MI = 3958.8
 
 #: Longest phrase we will even try to read as a location.
 #:
-#: ⚠️ THIS IS A SECURITY BOUND, NOT A UX ONE. The three prefix patterns below
-#: all end in ``(?P<place>.+?)\s*$`` — a lazy group followed by optional
-#: trailing whitespace, which backtracks QUADRATICALLY on a long run of spaces.
-#: CodeQL flags all three (py/polynomial-redos). ``near`` is unbounded at both
-#: entry points (``GET /alumni?near=`` and the export body), so without this a
-#: signed-in user could spend real API CPU on one request. Both routes are
-#: staff-only, so this was a slow-down lever rather than a leak.
+#: ⚠️ THIS IS A SECURITY BOUND, NOT A UX ONE. It is the SECOND of two layers,
+#: and it stays even though the first now carries the weight: the three prefix
+#: patterns below no longer end in a lazy ``(?P<place>.+?)\s*$``, so there is no
+#: quadratic backtracking left to trigger (see ``_interpret_place``). This bound
+#: still caps the work a single request can ask of the greedy scan and the
+#: geocoder behind it. ``near`` is unbounded at both entry points
+#: (``GET /alumni?near=`` and the export body), and both are staff-only, so this
+#: was a slow-down lever rather than a leak.
 #:
 #: 120 characters is far past the longest real phrase ("within 50 miles of
 #: San Francisco, CA" is 36). Anything longer is not a place name, so it takes
@@ -78,18 +79,18 @@ MAX_LOCATION_PHRASE_CHARS = 120
 
 # "within <N> miles of <place>"  (mi | mile | miles, integer or decimal).
 _WITHIN_RE = re.compile(
-    r"^\s*within\s+(?P<num>\d+(?:\.\d+)?)\s*(?:mi|mile|miles)\s+of\s+(?P<place>.+?)\s*$",
+    r"^\s*within\s+(?P<num>\d+(?:\.\d+)?)\s*(?:mi|mile|miles)\s+of\s+(?P<place>.+)$",
     re.IGNORECASE,
 )
 # STRONG locational prefixes — an unambiguous "this is a place" intent, so a
 # bare city name (no state) is accepted.
 _STRONG_NEAR_RE = re.compile(
-    r"^\s*(?:near|around|close to|nearby)\s+(?P<place>.+?)\s*$", re.IGNORECASE
+    r"^\s*(?:near|around|close to|nearby)\s+(?P<place>.+)$", re.IGNORECASE
 )
 # WEAK locational prefix — "in <x>" is too ambiguous ("in finance") to treat a
 # bare word as a city, so it only resolves when the place is a region alias or
 # carries an explicit state.
-_WEAK_IN_RE = re.compile(r"^\s*in\s+(?P<place>.+?)\s*$", re.IGNORECASE)
+_WEAK_IN_RE = re.compile(r"^\s*in\s+(?P<place>.+)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -167,12 +168,22 @@ def _split_city_state(place: str) -> tuple[str, str] | None:
 def _interpret_place(
     place: str, *, radius: float | None, strong: bool
 ) -> LocationMatch | None:
-    """Resolve an extracted place phrase into a ``LocationMatch``.
+    r"""Resolve an extracted place phrase into a ``LocationMatch``.
 
     ``radius`` is an explicit override (from "within N miles of ...") or ``None``
     to apply a default. ``strong`` marks an unambiguous locational context in
     which a bare city (no state) is accepted.
+
+    ⚠️ THE ``strip()`` BELOW IS LOAD-BEARING. The three prefix patterns used to
+    end in ``(?P<place>.+?)\s*$`` -- a lazy group whose only job was to hand
+    back a place with no trailing whitespace. That construct backtracks
+    quadratically, so CodeQL flagged all three (py/polynomial-redos) and kept
+    flagging them even with a length bound in front, because the query reports
+    the PATTERN, not its reachability. The patterns are now plain greedy
+    ``(?P<place>.+)$`` and the trimming happens here instead -- same result,
+    no backtracking. Do not put the ``\s*$`` back.
     """
+    place = place.strip()
     place = place.strip()
     if not place:
         return None

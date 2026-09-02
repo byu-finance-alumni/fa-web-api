@@ -60,6 +60,13 @@ EXPECTED_PUBLIC_ROUTES = {
     ("GET", "/survey/cron/run"),
     ("POST", "/storage/cron/headshot-sweep"),
     ("GET", "/storage/cron/headshot-sweep"),
+    # The #771 daily-digest half of the opportunity-link notification switch.
+    # Same shared-secret contract as the two above, and NOT WIRED BY DEFAULT --
+    # it is a no-op until OPPORTUNITY_LINK_NOTIFY_MODE=daily_digest. It carries
+    # Authorization: Bearer <CRON_SECRET>; check_cron_auth proves that below.
+    # Vercel Cron invokes the path with a GET, so both verbs exist.
+    ("POST", "/opportunity-links/cron/digest"),
+    ("GET", "/opportunity-links/cron/digest"),
     # The survey. Authenticated by a stateless HMAC token in the path, with the
     # 7-day expiry signed INTO it. This is the one public surface that reads and
     # writes real alumni PII, so it is also the one that has produced the most
@@ -68,6 +75,18 @@ EXPECTED_PUBLIC_ROUTES = {
     ("POST", "/survey/respond/{token}"),
     ("POST", "/survey/respond/{token}/links"),
     ("POST", "/survey/respond/{token}/photo"),
+    # The ONE survey route with no token. Jake's explicit call (2026-08-29): the
+    # DEMO survey (/survey/demo) renders without a token and so cannot read the
+    # same two fields off GET /respond/{token}, and a demo that omits a control
+    # the real survey shows is the sample-survey drift we keep having to fix.
+    # It returns ONE row and TWO fields -- a support contact somebody
+    # deliberately labelled for the survey, never a seeded Engineer/Super Admin
+    # row -- and the same address already goes to every alumnus holding a link.
+    # Rate limited by CLIENT IP, since there is no token here to key on.
+    # ⚠️ This must never become a list, another contact, or another field.
+    # GET /support-contacts stays authenticated: this is a named exception, not
+    # the start of a public directory of staff addresses.
+    ("GET", "/survey/contact"),
     # Public on purpose: the maintenance page has to render for signed-out
     # visitors, and the readiness probe has to answer before anyone is signed in.
     # /health/db opens a database connection per call and returns no detail on
@@ -310,11 +329,16 @@ def check_cron_auth(_routes) -> list[dict]:
             )
             continue
         body = src[src.find(f"async def {fn}(") :][:4000]
-        # The handler may delegate to a shared helper (_run_cron); accept either
-        # the check inline or a call to a helper that contains it.
+        # The handler may delegate: to a shared helper (_run_cron), or -- as the
+        # GET twin of a cron route does -- straight to the POST handler that
+        # holds the check. ⚠️ The name is NOT always _underscored; requiring
+        # that reported the opportunity-link GET digest as an unguarded cron
+        # route for a week when it verifies the secret via its POST twin.
+        # A helper we cannot find in this file leaves guarded False, so an
+        # unresolvable delegation still fails CLOSED.
         guarded = "cron_secret" in body and "compare_digest" in body
         if not guarded:
-            helper = re.search(r"return await (_\w+)\(", body)
+            helper = re.search(r"return await (\w+)\(", body)
             if helper:
                 h = src[src.find(f"async def {helper.group(1)}(") :][:4000]
                 guarded = "cron_secret" in h and "compare_digest" in h

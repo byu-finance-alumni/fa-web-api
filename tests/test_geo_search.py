@@ -106,19 +106,22 @@ def test_empty_and_blank_return_none():
 
 
 def test_overlong_phrase_returns_none_without_backtracking():
-    r"""The ReDoS bound, not a UX rule (CodeQL py/polynomial-redos).
+    r"""The second ReDoS layer (CodeQL py/polynomial-redos).
 
-    The three prefix patterns end in ``(?P<place>.+?)\s*$``, which backtracks
-    quadratically on a long interior run of spaces. ``near`` is unbounded at
-    both entry points (``GET /alumni?near=`` and the export body), so the
-    length check in the parser is the only thing standing between a signed-in
-    user and real API CPU. An over-long phrase must take the ordinary
-    unresolvable path (``None``), not raise.
+    The three prefix patterns USED to end in ``(?P<place>.+?)\s*$`` -- a lazy
+    group that backtracks quadratically on a long interior run of spaces. They
+    are now plain greedy ``(?P<place>.+)$`` and ``_interpret_place`` does the
+    trimming, so the construct is gone rather than merely bounded. ⚠️ CodeQL
+    reports the PATTERN, not its reachability: a length check in front did NOT
+    close the alerts, which is why the patterns themselves had to change.
+
+    This length bound stays as the second layer, capping what one request can
+    ask of the greedy scan and the geocoder behind it. An over-long phrase must
+    take the ordinary unresolvable path (``None``), not raise.
 
     ⚠️ The bound is measured on the STRIPPED text, so padding a short phrase
-    with trailing spaces does not trip it -- and does not need to, because
-    ``strip()`` has already removed the backtracking. The shapes that actually
-    hurt keep a non-space at the END, which is what the hostile inputs below do.
+    with trailing spaces does not trip it -- and does not need to. The shapes
+    that used to hurt keep a non-space at the END, which the inputs below do.
     """
     limit = gs.MAX_LOCATION_PHRASE_CHARS
 
@@ -126,6 +129,9 @@ def test_overlong_phrase_returns_none_without_backtracking():
     # caller sends it padded, since the bound is applied after strip().
     assert gs.parse_location_query("near Provo, UT").state == "UT"
     assert gs.parse_location_query("   near Provo, UT   ").state == "UT"
+    # The place itself is still trimmed now that _interpret_place does it
+    # rather than the lazy group -- padding INSIDE the prefix must not leak in.
+    assert gs.parse_location_query("near    Provo, UT").label == "Provo, UT"
 
     # Past the bound the same prefix is simply not a location.
     assert gs.parse_location_query("near " + "a" * limit) is None

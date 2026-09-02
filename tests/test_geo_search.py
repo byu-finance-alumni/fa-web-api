@@ -6,6 +6,7 @@ Covers the pure parser (``parse_location_query``), the pure distance helper
 """
 
 import asyncio
+import time
 
 from sqlalchemy.dialects import postgresql
 
@@ -102,6 +103,43 @@ def test_empty_and_blank_return_none():
     assert gs.parse_location_query("") is None
     assert gs.parse_location_query("   ") is None
     assert gs.parse_location_query(None) is None
+
+
+def test_overlong_phrase_returns_none_without_backtracking():
+    r"""The ReDoS bound, not a UX rule (CodeQL py/polynomial-redos).
+
+    The three prefix patterns end in ``(?P<place>.+?)\s*$``, which backtracks
+    quadratically on a long interior run of spaces. ``near`` is unbounded at
+    both entry points (``GET /alumni?near=`` and the export body), so the
+    length check in the parser is the only thing standing between a signed-in
+    user and real API CPU. An over-long phrase must take the ordinary
+    unresolvable path (``None``), not raise.
+
+    ⚠️ The bound is measured on the STRIPPED text, so padding a short phrase
+    with trailing spaces does not trip it -- and does not need to, because
+    ``strip()`` has already removed the backtracking. The shapes that actually
+    hurt keep a non-space at the END, which is what the hostile inputs below do.
+    """
+    limit = gs.MAX_LOCATION_PHRASE_CHARS
+
+    # A real phrase, well inside the bound, still resolves -- including when the
+    # caller sends it padded, since the bound is applied after strip().
+    assert gs.parse_location_query("near Provo, UT").state == "UT"
+    assert gs.parse_location_query("   near Provo, UT   ").state == "UT"
+
+    # Past the bound the same prefix is simply not a location.
+    assert gs.parse_location_query("near " + "a" * limit) is None
+
+    # The shapes that make each pattern backtrack -- interior spaces with a
+    # non-space at the end -- at a size that would be visibly slow if the guard
+    # were moved BELOW the first .match(), which is the one edit that would
+    # silently restore the blowup while every other test still passed.
+    for prefix in ("in ", "near ", "within 9mi of "):
+        hostile = prefix + "a" + " " * 200_000 + "b"
+        started = time.perf_counter()
+        assert gs.parse_location_query(hostile) is None
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, f"{prefix!r} was not short-circuited ({elapsed:.1f}s)"
 
 
 # --- parser: region aliases --------------------------------------------------

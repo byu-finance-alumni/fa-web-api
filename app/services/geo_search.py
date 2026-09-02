@@ -59,6 +59,23 @@ BARE_CITY_RADIUS_MILES = 50.0
 # Mean earth radius in miles (matches app.services.geography._EARTH_MI).
 _EARTH_MI = 3958.8
 
+#: Longest phrase we will even try to read as a location.
+#:
+#: ⚠️ THIS IS A SECURITY BOUND, NOT A UX ONE. The three prefix patterns below
+#: all end in ``(?P<place>.+?)\s*$`` — a lazy group followed by optional
+#: trailing whitespace, which backtracks QUADRATICALLY on a long run of spaces.
+#: CodeQL flags all three (py/polynomial-redos). ``near`` is unbounded at both
+#: entry points (``GET /alumni?near=`` and the export body), so without this a
+#: signed-in user could spend real API CPU on one request. Both routes are
+#: staff-only, so this was a slow-down lever rather than a leak.
+#:
+#: 120 characters is far past the longest real phrase ("within 50 miles of
+#: San Francisco, CA" is 36). Anything longer is not a place name, so it takes
+#: the SAME path as any other unresolvable phrase: ``None``, and the caller
+#: falls back to a normal non-location search with ``location.resolved``
+#: false. That is the documented behaviour, so nothing new can 422 here.
+MAX_LOCATION_PHRASE_CHARS = 120
+
 # "within <N> miles of <place>"  (mi | mile | miles, integer or decimal).
 _WITHIN_RE = re.compile(
     r"^\s*within\s+(?P<num>\d+(?:\.\d+)?)\s*(?:mi|mile|miles)\s+of\s+(?P<place>.+?)\s*$",
@@ -204,11 +221,17 @@ def parse_location_query(text: str) -> LocationMatch | None:
     ``near/around/close to <place>`` (strong intent, default radius); ``in
     <place>`` (weak — only region aliases or explicit "City, State"); a region
     alias standing alone ("Bay Area", "DMV"); and a bare ``City, State``.
-    Returns ``None`` when nothing locational is detected.
+    Returns ``None`` when nothing locational is detected — which includes any
+    phrase over :data:`MAX_LOCATION_PHRASE_CHARS`, the bound that keeps the
+    patterns below from backtracking quadratically on attacker-chosen input.
     """
     if not text or not text.strip():
         return None
     t = text.strip()
+    # ⚠️ Must come BEFORE the first .match(): it is what bounds the quadratic
+    # backtracking in the three patterns. See MAX_LOCATION_PHRASE_CHARS.
+    if len(t) > MAX_LOCATION_PHRASE_CHARS:
+        return None
 
     m = _WITHIN_RE.match(t)
     if m:

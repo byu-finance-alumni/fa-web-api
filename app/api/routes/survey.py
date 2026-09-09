@@ -55,6 +55,8 @@ from app.schemas.survey import (
     SurveyAlumniState,
     SurveyApplyResult,
     SurveyHeldOutPage,
+    SurveyMessageRead,
+    SurveyMessageUpdate,
     SurveyNewCyclePreview,
     SurveyNewCycleRequest,
     SurveyNonResponder,
@@ -81,6 +83,7 @@ from app.schemas.survey import (
 from app.services import (
     opportunity_links,
     survey_email,
+    survey_message,
     survey_reset,
     survey_responses,
     survey_schedule,
@@ -491,6 +494,119 @@ async def update_survey_send_config(
         monthly_limit=body.monthly_limit,
         actor_user_id=user.user_id,
     )
+
+
+# ----------------------------------------------- the survey email's copy -----
+#
+# The wording the alumni survey email is built from (#524). Before this, the
+# "Edit email message" box on the Needs Surveying page wrote to the browser's
+# localStorage and the send used constants in `services/survey_email.py`, so an
+# edit was per-browser, per-machine, invisible to the other Career Director and
+# reached NO alum. These three routes are the whole of the fix on this side:
+# they are what the editor now reads and writes, and `send_survey_stage` reads
+# the same row at send time.
+#
+# Gated with `RequireSurveysManage`, the same capability as every other Needs
+# Surveying control (the year picker, the send config, "Send now"). That is
+# deliberate on the GET as well as the writes: this is console copy for an
+# outbound campaign, not public content, and a view-only user has no business
+# either reading or rewriting what alumni are about to be emailed.
+
+
+@router.get("/message", response_model=SurveyMessageRead)
+async def get_survey_message(
+    user: RequireSurveysManage, session: SessionDep
+) -> SurveyMessageRead:
+    """The survey email's current copy — subject, intro, closing, and which
+    "here's what we have on file" rows it shows.
+
+    Never blank: a missing row or an empty column resolves to the built-in
+    default field by field, so what comes back is always exactly what the next
+    send would use. `is_customized` compares the resolved copy against those
+    defaults rather than asking whether a row exists, which is what lets the
+    editor decide whether "Reset to default" would do anything.
+
+    Read UNCACHED, like the alert-template console read: staff must see what is
+    stored right now, or an edit appears not to have taken.
+    """
+    return await survey_message.get_message(session)
+
+
+@router.put("/message", response_model=SurveyMessageRead)
+async def update_survey_message(
+    body: SurveyMessageUpdate,
+    user: RequireSurveysManage,
+    session: SessionDep,
+) -> SurveyMessageRead:
+    """Rewrite the survey email's copy. A whole-message save, not a patch.
+
+    422 with a message staff can act on if a field is empty after trimming, is
+    over its length cap, carries a control or invisible character (the subject
+    additionally may not contain a line break — that is header injection, not
+    formatting), or if `on_file_fields` names a row the email cannot build.
+
+    ⚠️ WHAT THIS CANNOT DO. It cannot add an on-file field: the selection is
+    validated against, and stored in the order of, `survey_message.ON_FILE_FIELDS`
+    and intersected with it again at render time, so it can only ever HIDE rows
+    the email already knew how to fill. It also cannot inject markup — the copy
+    is HTML-escaped before the paragraph breaks are added, exactly like the
+    on-file values beside it.
+
+    Audited (`update_survey_message`). The audit row records THAT the outbound
+    copy changed and by whom, not the prose: the wording itself is one SELECT
+    away, and an audit row is not the place to keep a copy of an email body. A
+    staff actor's row lands in `audit_logs`; an engineer's is rerouted into
+    `engineer_action_log` by the `before_flush` guard (#199), which is the
+    correct destination for either.
+    """
+    await survey_message.set_message(
+        session,
+        subject=body.subject,
+        intro=body.intro,
+        closing=body.closing,
+        on_file_fields=body.on_file_fields,
+        actor_user_id=user.user_id,
+    )
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="update_survey_message",
+            entity_type="survey_message",
+            new_value=f"fields={len(body.on_file_fields)}",
+        )
+    )
+    # ONE commit for the copy and the record of who wrote it, so they land
+    # together or not at all — `set_message` deliberately does not commit.
+    await session.commit()
+    return await survey_message.get_message(session)
+
+
+@router.post("/message/reset", response_model=SurveyMessageRead)
+async def reset_survey_message(
+    user: RequireSurveysManage, session: SessionDep
+) -> SurveyMessageRead:
+    """Put the survey email's copy back to the Career Directors' original text.
+
+    Deletes the override row, after which the email says exactly what it said
+    before anybody edited it.
+
+    Answers a reset of already-default copy with a clean 200, not a 404: this is
+    the recovery path from wording that reads badly, and a second click landing
+    as an error is the same lockout-shaped mistake as rate-limiting the
+    maintenance-mode *disable* route. The audit row records whether anything was
+    actually cleared, so the trail still distinguishes the two.
+    """
+    cleared = await survey_message.reset_message(session)
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="reset_survey_message",
+            entity_type="survey_message",
+            new_value="default" if cleared else "already_default",
+        )
+    )
+    await session.commit()
+    return await survey_message.get_message(session)
 
 
 @router.post("/campaigns/{grad_year}/send", response_model=SurveySendResult)

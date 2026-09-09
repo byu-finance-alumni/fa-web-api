@@ -799,6 +799,33 @@ CREATE TABLE survey_send_config (
     CONSTRAINT fk_survey_send_config_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
 );
 
+-- Staff-editable copy of the alumni survey email (#524). Single-row config (id
+-- pinned to 1): subject / intro / closing, plus which "here's what we have on
+-- file" rows the email shows. A ROW IS AN OVERRIDE, NOT THE SOURCE OF TRUTH —
+-- the Career Directors' authored text is compiled into
+-- app/services/survey_message.py, and no row / a blank column / an unreadable
+-- table all resolve to it field by field, so this feature can change what the
+-- email says and can never make it empty or stop a send. Deliberately NOT
+-- seeded. `on_file_fields` is always a subset of survey_message.ON_FILE_FIELDS in
+-- that canonical order (validated on write, re-filtered at render time), so it
+-- can only hide rows, never add one. See
+-- migrations/2026-09-09_survey_email_message.sql.
+CREATE TABLE survey_email_message (
+    id                  int PRIMARY KEY DEFAULT 1,
+    subject             text NOT NULL,
+    intro               text NOT NULL,
+    closing             text NOT NULL,
+    on_file_fields      text[] NOT NULL DEFAULT '{}',
+    updated_by_user_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_survey_email_message_singleton CHECK (id = 1),
+    CONSTRAINT ck_survey_email_message_subject_len CHECK (char_length(subject) BETWEEN 1 AND 200),
+    CONSTRAINT ck_survey_email_message_intro_len   CHECK (char_length(intro)   BETWEEN 1 AND 5000),
+    CONSTRAINT ck_survey_email_message_closing_len CHECK (char_length(closing) BETWEEN 1 AND 5000),
+    CONSTRAINT fk_survey_email_message_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
 -- Site-wide maintenance mode. Single-row config (id pinned to 1) holding the
 -- engineer's pause switch: while `enabled`, non-engineers cannot sign in or call
 -- the API (503 / maintenance_mode) and the frontend shows a maintenance page.

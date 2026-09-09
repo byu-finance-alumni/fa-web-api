@@ -81,7 +81,8 @@ from app.schemas.survey import (
     SurveyUnreachableAlum,
     SurveyUsage,
 )
-from app.services import mailer
+from app.services import mailer, survey_message
+from app.services.survey_message import ON_FILE_FIELDS, SurveyMessage
 
 log = logging.getLogger(__name__)
 
@@ -479,26 +480,19 @@ _TIMEOUT_SECONDS = 20.0
 # Resend caps a batch call at 100 messages.
 _BATCH_MAX = 100
 
-_SUBJECT = "Your BYU Finance alumni information — a quick update"
-
-_INTRO = (
-    "Our BYU Finance alumni are one of the greatest strengths of our program. "
-    "We are working to strengthen our alumni community by staying connected with "
-    "you throughout your career. To do that, we're reaching out to ensure we have "
-    "your most current information.\n\n"
-    "Please take a moment to review the information below and update or replace "
-    "any information in our alumni survey that is wrong or missing."
-)
-_CLOSING = (
-    "If everything above is correct, please confirm that your information is up "
-    "to date at the bottom of the survey. If anything has changed, please update "
-    "the applicable questions in the survey. We have also included a few optional "
-    "questions that will help us better connect with and support our alumni "
-    "community.\n\n"
-    "Thank you for being an important part of the BYU Finance family. We look "
-    "forward to staying connected with you in the years ahead!\n\n"
-    "Warmest regards,\nTanya Harmon & Amy Densley\nBYU Finance Career Directors"
-)
+# ⚠️ THE EMAIL'S COPY IS NO LONGER IN THIS MODULE (#524).
+#
+# The subject, the intro, the closing and which on-file rows are shown are now
+# STAFF-EDITABLE data, read from `survey_email_message` by
+# `survey_message.get_for_send` and threaded through the render as a
+# `SurveyMessage`. The Career Directors' authored text moved verbatim into
+# `app/services/survey_message.py` as DEFAULT_SUBJECT / DEFAULT_INTRO /
+# DEFAULT_CLOSING, where it is still what an unedited (or unreadable) store
+# resolves to — so nothing about what an untouched deployment sends has changed.
+#
+# Do NOT reintroduce module constants here: a second copy of the wording is
+# exactly the bug this fixed, where the editor showed one thing and the send used
+# another.
 
 _BTN_STYLE = (
     "display:inline-block;background:#1e2a4a;color:#ffffff;text-decoration:none;"
@@ -676,8 +670,27 @@ class Recipient:
     reset_seq: int = 0
 
 
-def _on_file_rows(r: Recipient) -> list[tuple[str, str]]:
-    return list(r.on_file)
+def _on_file_rows(
+    r: Recipient, fields: tuple[str, ...] | None = None
+) -> list[tuple[str, str]]:
+    """The on-file rows this email shows, filtered to the staff selection (#524).
+
+    Filtering happens HERE, at render time, and never at load time. ``Recipient``
+    always carries the FULL field list, because the cron pre-loads its recipients
+    (``survey_schedule.run_due_schedules``) and hands them to
+    :func:`send_survey_stage` — a selection applied during the load would be the
+    one the cron happened to read, not the one in force when the email is built.
+    Rendering from the full list means there is exactly one place the selection
+    is applied, for both callers.
+
+    Order comes from the recipient's tuple (i.e. from :data:`ON_FILE_FIELDS`),
+    never from the selection, so the box always reads in the order the survey
+    asks its questions.
+    """
+    if fields is None:
+        return list(r.on_file)
+    chosen = set(fields)
+    return [(label, value) for label, value in r.on_file if label in chosen]
 
 
 def _dash(value: object) -> str:
@@ -686,47 +699,79 @@ def _dash(value: object) -> str:
     return text or "—"
 
 
-def _build_on_file(alum, contact, job) -> tuple[tuple[str, str], ...]:
-    """The Career Directors' full field list, in order, for the email preview."""
-    spouse = " ".join(
+def _g(o, n):
+    return getattr(o, n, None)
+
+
+#: How each on-file row is filled, KEYED BY THE CANONICAL LABEL. Keyed rather
+#: than listed so the label list has exactly one home — `survey_message`'s
+#: :data:`ON_FILE_FIELDS`, which is also what the staff picker validates against
+#: and what the stored selection is intersected with. A label in one and not the
+#: other cannot silently drop a row from the email: `_build_on_file` iterates
+#: ON_FILE_FIELDS and would raise, and a test pins the two sets equal.
+_ON_FILE_BUILDERS = {
+    "Current employment status": lambda alum, contact, job: alum.employment_status,
+    "Company": lambda alum, contact, job: _g(job, "current_employer"),
+    "Title": lambda alum, contact, job: _g(job, "current_title"),
+    "Industry": lambda alum, contact, job: _g(job, "current_industry"),
+    "Secondary industry": lambda alum, contact, job: _g(
+        job, "current_industry_secondary"
+    ),
+    "Employment city": lambda alum, contact, job: _g(job, "current_city"),
+    "Employment state": lambda alum, contact, job: _g(job, "current_state"),
+    "Employment country": lambda alum, contact, job: _g(job, "current_country"),
+    "Residence city": lambda alum, contact, job: _g(contact, "city"),
+    "Residence state": lambda alum, contact, job: _g(contact, "state"),
+    "Residence country": lambda alum, contact, job: _g(contact, "country"),
+    "Spouse name": lambda alum, contact, job: " ".join(
         p for p in (alum.spouse_first_name, alum.spouse_last_name) if p
-    ).strip()
-    g = lambda o, n: getattr(o, n, None)  # noqa: E731
-    return (
-        ("Current employment status", _dash(alum.employment_status)),
-        ("Company", _dash(g(job, "current_employer"))),
-        ("Title", _dash(g(job, "current_title"))),
-        ("Industry", _dash(g(job, "current_industry"))),
-        ("Secondary industry", _dash(g(job, "current_industry_secondary"))),
-        ("Employment city", _dash(g(job, "current_city"))),
-        ("Employment state", _dash(g(job, "current_state"))),
-        ("Employment country", _dash(g(job, "current_country"))),
-        ("Residence city", _dash(g(contact, "city"))),
-        ("Residence state", _dash(g(contact, "state"))),
-        ("Residence country", _dash(g(contact, "country"))),
-        ("Spouse name", _dash(spouse)),
-        # "Personal email" everywhere (#392) — see survey_responses._FIELDS.
-        ("Personal email", _dash(g(contact, "personal_email"))),
-        ("Work email", _dash(g(contact, "work_email"))),
-        ("LinkedIn profile", _dash(alum.linkedin_url)),
-        ("Graduate school program", _dash(alum.graduate_degree)),
-        ("Graduate school name", _dash(alum.graduate_school)),
-        ("Projected graduation year", _dash(alum.graduate_graduation_year)),
-        ("Finance designations", _dash(alum.other_designations)),
+    ).strip(),
+    # "Personal email" everywhere (#392) — see survey_responses._FIELDS.
+    "Personal email": lambda alum, contact, job: _g(contact, "personal_email"),
+    "Work email": lambda alum, contact, job: _g(contact, "work_email"),
+    "LinkedIn profile": lambda alum, contact, job: alum.linkedin_url,
+    "Graduate school program": lambda alum, contact, job: alum.graduate_degree,
+    "Graduate school name": lambda alum, contact, job: alum.graduate_school,
+    "Projected graduation year": (
+        lambda alum, contact, job: alum.graduate_graduation_year
+    ),
+    "Finance designations": lambda alum, contact, job: alum.other_designations,
+}
+
+
+def _build_on_file(alum, contact, job) -> tuple[tuple[str, str], ...]:
+    """The Career Directors' FULL field list, in canonical order.
+
+    Always complete, never filtered: which of these rows an email actually shows
+    is a render-time decision (:func:`_on_file_rows`), because the cron pre-loads
+    its recipients and the selection must be read at send time, not load time.
+    """
+    return tuple(
+        (label, _dash(_ON_FILE_BUILDERS[label](alum, contact, job)))
+        for label in ON_FILE_FIELDS
     )
 
 
-def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
-    """Return (subject, html, text) for one recipient."""
-    rows = _on_file_rows(r)
+def render_survey_email(
+    r: Recipient, link: str, message: SurveyMessage | None = None
+) -> tuple[str, str, str]:
+    """Return (subject, html, text) for one recipient.
+
+    ``message`` is the staff-edited copy (#524), resolved once per send by
+    ``survey_message.get_for_send`` and passed down; omitting it renders the
+    built-in defaults, which is what an unedited deployment sends and what makes
+    this callable from a test without a database.
+    """
+    message = message or survey_message.DEFAULT_MESSAGE
+    rows = _on_file_rows(r, message.on_file_fields)
 
     # Plain-text part.
-    text_lines = [f"Hello {r.first_name},", "", _INTRO, ""]
+    text_lines = [f"Hello {r.first_name},", "", message.intro, ""]
     if rows:
         text_lines.append("Here's what we have on file:")
         text_lines += [f"  {label}: {value}" for label, value in rows]
         text_lines.append("")
-    text_lines += [f"Confirm or update your info: {link}", "", _CLOSING]
+    text_lines += [f"Confirm or update your info: {link}", "", message.closing]
     text = "\n".join(text_lines)
 
     # HTML part (inline styles for email clients).
@@ -747,8 +792,15 @@ def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
             f'<table style="border-collapse:collapse;">{cells}</table></div>'
         )
 
-    intro_html = escape(_INTRO).replace("\n\n", "</p><p style=\"margin:0 0 12px;\">")
-    closing_html = escape(_CLOSING).replace("\n", "<br>")
+    # ⚠️ ESCAPE FIRST, THEN ADD MARKUP — and only ever this markup. The copy is
+    # now staff-authored input rendered into an email, so it is escaped exactly
+    # as the on-file values above are; the two `replace` calls run on the ALREADY
+    # ESCAPED text and can only introduce paragraph and line breaks. Anything
+    # that looks like a tag in what someone typed stays visible text.
+    intro_html = escape(message.intro).replace(
+        "\n\n", "</p><p style=\"margin:0 0 12px;\">"
+    )
+    closing_html = escape(message.closing).replace("\n", "<br>")
     html = f"""\
 <div style="margin:0;padding:0;background:#f3f4f6;">
   <div style="max-width:600px;margin:0 auto;background:#ffffff;">
@@ -768,7 +820,7 @@ def render_survey_email(r: Recipient, link: str) -> tuple[str, str, str]:
          font-size:12px;color:#9ca3af;">BYU Marriott School of Business</div>
   </div>
 </div>"""
-    return _SUBJECT, html, text
+    return message.subject, html, text
 
 
 # ----------------------------------------------------- respondent (public) ---
@@ -1843,11 +1895,21 @@ def _survey_link(base_url: str, alumni_id: int, graduation_year: int) -> str:
 
 
 def _build_survey_email(
-    r: Recipient, *, graduation_year: int, base_url: str, from_field: str
+    r: Recipient,
+    *,
+    graduation_year: int,
+    base_url: str,
+    from_field: str,
+    message: SurveyMessage | None = None,
 ) -> dict:
-    """One Resend batch entry for a recipient (unique link + rendered content)."""
+    """One Resend batch entry for a recipient (unique link + rendered content).
+
+    ``message`` is the staff-edited copy (#524). It is REQUIRED in practice — the
+    only caller reads it once per send and passes it — and defaults to the
+    built-in wording so a direct call still produces a valid email rather than a
+    blank one."""
     link = _survey_link(base_url, r.alumni_id, graduation_year)
-    subject, html, text = render_survey_email(r, link)
+    subject, html, text = render_survey_email(r, link, message)
     return {
         "from": from_field,
         "to": [r.email],
@@ -2147,6 +2209,7 @@ async def _send_and_log(
     cycle_seq: int,
     base_url: str,
     from_field: str,
+    message: SurveyMessage,
 ) -> tuple[int, int | None, ServiceError | None]:
     """Claim, send and durably record ``recipients`` in ``_BATCH_MAX`` chunks.
 
@@ -2182,6 +2245,7 @@ async def _send_and_log(
                 graduation_year=graduation_year,
                 base_url=base_url,
                 from_field=from_field,
+                message=message,
             )
             for r in claimed
         ]
@@ -2457,6 +2521,14 @@ async def send_survey_stage(
     retry_after: int | None = None
     error: ServiceError | None = None
     if not dry_run and prepared and stage is not None:
+        # THE STAFF-EDITED COPY (#524), read ONCE for the whole send and threaded
+        # down to every recipient's render. Once, so an edit saved while a cohort
+        # is going out cannot make the first batch read differently from the last;
+        # and here rather than at the top of this function so a dry run, a
+        # completed campaign or a zero budget does not pay for a read it will not
+        # use. `get_for_send` is total — an unreadable store means the built-in
+        # wording, never a failed send.
+        message = await survey_message.get_for_send(session)
         sent, retry_after, error = await _send_and_log(
             session,
             prepared,
@@ -2465,6 +2537,7 @@ async def send_survey_stage(
             cycle_seq=cycle_seq,
             base_url=base_url,
             from_field=from_field,
+            message=message,
         )
 
     # The audit row is the TRAIL, not the ledger — usage is counted from

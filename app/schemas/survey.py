@@ -635,6 +635,64 @@ class SurveySendConfigUpdateRequest(BaseModel):
     monthly_limit: int = Field(ge=0)
 
 
+# ------------------------------------------------------- editable email copy ---
+#
+# The wording of the alumni survey email, editable from the Needs Surveying page
+# (#524). Until this existed the "Edit email message" box wrote to the browser's
+# localStorage and the send used hardcoded constants, so an edit reached nobody.
+#
+# The DEFAULTS are compiled into `app/services/survey_message.py` and a stored row
+# is an override of them: nothing here can be blank on the way out, and
+# `is_customized` is decided by comparing the resolved copy against those
+# defaults rather than by asking whether a row exists.
+
+
+class SurveyMessageRead(BaseModel):
+    """The survey email's current copy, as the editor shows it.
+
+    Never blank: a missing row or an empty column resolves to the built-in
+    default field by field, so `subject` / `intro` / `closing` here are always
+    exactly what the next send would use."""
+
+    subject: str
+    intro: str
+    closing: str
+    # Which "here's what we have on file" rows the email shows, by label, in the
+    # order the email shows them. Always a subset of
+    # `survey_message.ON_FILE_FIELDS`; an empty list means the on-file box is
+    # omitted from the email entirely.
+    on_file_fields: list[str]
+    # False while the copy still matches the built-in default — which is how the
+    # editor decides whether to offer "Reset to default". Compared against the
+    # DEFAULTS, not against the existence of a row.
+    is_customized: bool
+    # When the stored copy was last written, and by whom. Both None while nothing
+    # is stored (and after a reset). The email is the durable record of who
+    # edited the copy only insofar as the audit trail says so — these two are the
+    # convenience the editor displays.
+    updated_at: datetime.datetime | None = None
+    updated_by_email: str | None = None
+
+
+class SurveyMessageUpdate(BaseModel):
+    """Rewrite the survey email's copy (staff control, surveys-manage gated).
+
+    Every field is required and replaces what is stored — this is a whole-message
+    save, not a patch, because the editor always submits the whole message and a
+    partial save is indistinguishable from a field the user cleared.
+
+    Validated in `app/services/survey_message.py`: non-empty after trimming,
+    within the length caps, no control or invisible characters (the subject is
+    additionally single-line — a newline in a header is injection, not
+    formatting), and every `on_file_fields` label must be one the email knows how
+    to build. An unknown label is a 422 rather than a silently missing row."""
+
+    subject: str
+    intro: str
+    closing: str
+    on_file_fields: list[str]
+
+
 # ----------------------------------------------- per-alumnus campaign reset ----
 #
 # The engineer's replacement for hand-running SQL to re-survey ONE person (#395).

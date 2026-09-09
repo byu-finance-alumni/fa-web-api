@@ -1,0 +1,131 @@
+# Keeps both Supabase projects out of the free-tier auto-pause.
+#
+# WHY THIS EXISTS. Supabase pauses a free-tier project after ~7 days with no
+# activity. A paused project can be resumed from the dashboard for 90 days and
+# after that only the data can be downloaded. Supabase warned us about the DEV
+# project (tnnhhnzglyfqolxdojyb) on 2026-09-09. Losing dev takes the whole dev
+# environment with it. PROD (njobhhdopwdodvzosrns) is free-tier today too, and
+# with ~15 staff users it can easily go quiet over a holiday, so it is covered
+# here as well rather than being left to luck until it moves to Pro.
+#
+# ⚠️ A STATIC 200 FROM A WEB SERVER IS NOT ACTIVITY. Supabase counts database
+# and project-API traffic, not "did the frontend render". That is why this pings
+# `/health/db` and not `/health`: `/health` returns a hardcoded object and never
+# touches Postgres, while `/health/db` opens a connection through the pooler and
+# executes `SELECT 1` (app/api/routes/health.py -> check_database_connection).
+# Each deployment is wired to its own Supabase project, so pinging the two
+# deployments is what reaches the two databases.
+#
+# ⚠️ A SCHEDULED WORKFLOW ONLY RUNS FROM THE DEFAULT BRANCH, which here is
+# `prod`. This file does nothing on `dev` — it must be merged to `prod` before a
+# single ping ever fires. Until then, use the Run workflow button.
+#
+# ⚠️ THE ENVIRONMENT IS ASSERTED BEFORE THE PING. Base URLs in this project are
+# easy to get backwards (the app's .env NEXT_PUBLIC_API_URL points at PROD), and
+# a keepalive aimed twice at the same database would look perfectly green while
+# the other project quietly paused. So each target reads `/health` first and
+# fails if `environment` is not the one expected.
+#
+# NO SECRETS. Both health routes are public by design (see the module docstring
+# in app/api/routes/health.py) and expose no alumni data. Nothing here needs a
+# token, and nothing here should be given one.
+#
+# NOT A VERCEL CRON. A Vercel cron only runs on production deployments and every
+# push to add or change one burns builds against the 100-per-24h account cap.
+name: Supabase keepalive
+
+on:
+  schedule:
+    # Daily at 09:00 UTC (~03:00 in Utah). Daily, not weekly: the pause window
+    # is 7 days, GitHub drops or delays scheduled runs under load, and a single
+    # weekly attempt would spend the whole margin on one roll of the dice. Seven
+    # attempts per window means six can be missed and the project still lives.
+    # fa-web-app's keepalive runs at 21:00 UTC, so each database is touched
+    # twice a day by two independent paths.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-keepalive-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    # One job per target so a red X names the project that went quiet, instead
+    # of "the keepalive failed" for a pair of databases.
+    name: Ping ${{ matrix.name }} database
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # ⚠️ Never fail-fast. If dev is down, prod still needs its ping — the
+      # point of the job is that the OTHER database does not pause while we are
+      # busy with this one.
+      fail-fast: false
+      matrix:
+        include:
+          - name: dev
+            base_url: https://dev-fa-web-api.vercel.app
+            expect_env: development
+            project_ref: tnnhhnzglyfqolxdojyb
+          - name: prod
+            base_url: https://fa-web-api.vercel.app
+            expect_env: production
+            project_ref: njobhhdopwdodvzosrns
+    steps:
+      - name: Confirm the target is the expected environment
+        env:
+          BASE_URL: ${{ matrix.base_url }}
+          EXPECT_ENV: ${{ matrix.expect_env }}
+        run: |
+          # ⚠️ `set +e`: the default shell is `bash -e`, which would abort this
+          # step on the first non-zero command and skip the ::error lines that
+          # say WHICH database is unprotected. Every failure here is reported
+          # deliberately instead.
+          set -u
+          set +e
+          body=$(curl -sS --max-time 30 --retry 3 --retry-delay 10 \
+            --retry-all-errors "$BASE_URL/health")
+          if [ -z "$body" ]; then
+            echo "::error title=Keepalive unreachable::$BASE_URL/health did not respond."
+            exit 1
+          fi
+          echo "$body"
+          seen=$(printf '%s' "$body" | jq -r '.environment // empty' 2>/dev/null)
+          if [ "$seen" != "$EXPECT_ENV" ]; then
+            echo "::error title=Wrong keepalive target::$BASE_URL reports environment='$seen' but this job expects '$EXPECT_ENV'. The URL is pointing at the wrong deployment, so one Supabase project is not being kept alive."
+            exit 1
+          fi
+
+      - name: Query the database via /health/db
+        env:
+          BASE_URL: ${{ matrix.base_url }}
+          PROJECT_REF: ${{ matrix.project_ref }}
+        run: |
+          # ⚠️ `set +e` — see the note in the previous step.
+          set -u
+          set +e
+          # Retried by hand rather than with curl --retry: a cold Vercel Python
+          # function plus a pooler connect can legitimately 503 on the first
+          # attempt, and curl only retries transport errors and its own idea of
+          # transient statuses. This retries on ANY non-200 and still fails hard
+          # at the end, so a genuinely unreachable database is loud.
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -sS --max-time 60 -o response.json \
+              -w '%{http_code}' "$BASE_URL/health/db" || echo "000")
+            echo "attempt $attempt: HTTP $code"
+            cat response.json 2>/dev/null || true
+            echo
+            state=$(jq -r '.database // empty' response.json 2>/dev/null)
+            if [ "$code" = "200" ] && [ "$state" = "connected" ]; then
+              echo "Supabase project $PROJECT_REF answered SELECT 1 - activity recorded."
+              exit 0
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              sleep 20
+            fi
+          done
+          echo "::error title=Keepalive FAILED::$BASE_URL/health/db never returned a live database connection. Supabase project $PROJECT_REF is NOT being kept alive and will pause after ~7 quiet days."
+          exit 1

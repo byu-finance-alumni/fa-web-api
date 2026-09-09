@@ -126,6 +126,16 @@ def repo_dir(name: str) -> pathlib.Path:
     return workspace_root() / name
 
 
+def worktree_dir(request_id: str) -> pathlib.Path:
+    """Where a request's isolated checkout lives.
+
+    ``<workspace root>/.worktrees/cr-<ID>``, matching the convention both repos
+    already use. Kept out of the repos themselves so a request's checkout is
+    never mistaken for tracked content.
+    """
+    return workspace_root() / ".worktrees" / f"cr-{request_id}"
+
+
 def ensure_layout(root: pathlib.Path) -> list[pathlib.Path]:
     """Create the folder skeleton. Idempotent; never overwrites anything."""
     created: list[pathlib.Path] = []

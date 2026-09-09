@@ -363,24 +363,58 @@ def branch_name(request_id: str, path: pathlib.Path) -> str:
     return f"cr/{request_id}-{slug}"
 
 
-def _create_branch(repo: pathlib.Path, branch: str) -> tuple[bool, str]:
+def _create_branch(
+    repo: pathlib.Path, branch: str, worktree: pathlib.Path
+) -> tuple[bool, str]:
+    """Create an isolated WORKTREE for the branch — never touch the main checkout.
+
+    This deliberately does NOT run ``git checkout -b`` in the repo itself. HEAD
+    is repo-global: a checkout here would switch the branch under whatever Jake
+    (or another agent) has open in that repo. The evening run happens while
+    nobody is watching, so that would surface the next morning as work stranded
+    on the wrong branch. Both repos already use ``.worktrees/`` for this reason.
+
+    Returns ``(ok, message)``. The worktree is where the implementing session
+    must do its work.
+    """
     if not (repo / ".git").exists():
         return False, f"{repo} is not a git checkout"
+
+    if worktree.exists():
+        return True, f"reusing worktree {worktree}"
+
     existing = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", branch],
         capture_output=True,
         text=True,
     )
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+
     if existing.returncode == 0:
-        return True, f"branch {branch} already exists in {repo.name}"
-    result = subprocess.run(
-        ["git", "-C", str(repo), "checkout", "-b", branch],
-        capture_output=True,
-        text=True,
-    )
+        cmd = ["git", "-C", str(repo), "worktree", "add", str(worktree), branch]
+        note = f"attached worktree to existing branch {branch}"
+    else:
+        base = _default_base(repo)
+        cmd = ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), base]
+        note = f"created worktree on {branch} from {base}"
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        return False, result.stderr.strip() or "git checkout -b failed"
-    return True, f"created branch {branch} in {repo.name}"
+        return False, result.stderr.strip() or "git worktree add failed"
+    return True, note
+
+
+def _default_base(repo: pathlib.Path) -> str:
+    """Base new work on ``dev``; never on ``prod``, which is the deploy branch."""
+    for candidate in ("origin/dev", "dev"):
+        found = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", candidate],
+            capture_output=True,
+            text=True,
+        )
+        if found.returncode == 0:
+            return candidate
+    return "HEAD"
 
 
 def _start_request(
@@ -403,7 +437,8 @@ def _start_request(
     if no_branch:
         message = f"branch not created (--no-branch); recording {branch}"
     else:
-        ok, message = _create_branch(paths.repo_dir(repo), branch)
+        worktree = paths.worktree_dir(request_id)
+        ok, message = _create_branch(paths.repo_dir(repo), branch, worktree)
         if not ok:
             return False, branch, message
 
@@ -411,7 +446,9 @@ def _start_request(
     text = render.replace_section(
         text,
         "Claude Implementation",
-        f"Branch: `{branch}` in `{repo}`\nStarted: {started}\n\nIn progress.",
+        f"Branch: `{branch}` in `{repo}`\n"
+        f"Worktree: `{paths.worktree_dir(request_id)}`\n"
+        f"Started: {started}\n\nIn progress.",
     )
     text = render.set_time_log(text, "Claude started", started)
     path.write_text(text, encoding="utf-8")

@@ -110,9 +110,18 @@ structurally intact. Section 6 lists every refusal.
 ### `start <ID> --repo fa-web-api|fa-web-app [--no-branch]`
 
 Validates first and **refuses to do anything** if validation fails. On success
-it creates the git branch `cr/CR-2026-001-short-title` in the named repo,
-records `claude_started`, the status and the branch in the CSV, and writes the
-branch into the request's `## Claude Implementation` section.
+it creates an isolated **worktree** at `.worktrees/cr-<ID>` in the named repo,
+on the branch `cr/CR-2026-001-short-title` cut from `dev`. It records
+`claude_started`, the status and the branch in the CSV, and writes both the
+branch and the worktree path into the request's `## Claude Implementation`
+section.
+
+> **Why a worktree and not `git checkout -b`.** HEAD is repo-global. A checkout
+> would switch the branch under whatever you have open in that repo, carrying
+> any uncommitted work with it. The 20:00 run happens while nobody is watching,
+> so you would find out the next morning. Work for a request therefore always
+> happens in its own worktree, and your checkout is never touched. Both repos
+> already use `.worktrees/` for exactly this reason.
 
 The `--repo` flag is how the target repository is recorded. The template has no
 `Target Repo` field on purpose — the flag carries it, so the request file stays

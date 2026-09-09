@@ -8,7 +8,7 @@ processing an approved request, and the trust boundary — lives in
 [`docs/CHANGE-REQUESTS.md`](../../docs/CHANGE-REQUESTS.md). This file is the
 map of the code.
 
-## The one rule
+## The two rules
 
 **Importing an email must never approve anything.** `import` writes
 `Status: Ready for Review` and `Approved for Claude: No` as literal template
@@ -16,11 +16,17 @@ text. There is no argument, no parsed field, and no email body that can change
 either one. Approval is Jake editing the file and moving it into `approved/`,
 and `validate` refuses everything else.
 
+**The batch command reads `approved/` and nothing else.** `request next` is
+what a scheduled, unattended run invokes. It never looks at `inbox-msg/` or
+`ready/`, it never writes code, and when it cannot finish a request cleanly the
+answer is `request park`, never a half-implementation. See
+[`docs/CHANGE-REQUESTS.md`](../../docs/CHANGE-REQUESTS.md) section 5.
+
 ## Modules
 
 | Module | What it owns |
 | --- | --- |
-| `cli.py` | argparse entry point: `setup import list validate start complete log-time` |
+| `cli.py` | argparse entry point: `setup import list validate start complete log-time next park unpark` |
 | `paths.py` | where the DATA folder is, and why it is outside both repos |
 | `msg_reader.py` | `.msg` -> dataclass; the **lazy** `extract_msg` import lives here |
 | `sanitize.py` | invisible/bidi stripping, newline normalisation, fence sizing, slugs, truncation |
@@ -30,7 +36,19 @@ and `validate` refuses everything else.
 | `validate.py` | the approval gate — every check is a refusal |
 | `ledger.py` | `.imported.json`, so a re-drag of the same email is a no-op |
 | `worklog.py` | `work-log.csv`: formula-injection guard, and the blank-not-zero rule |
+| `digest.py` | `runs/YYYY-MM-DD-HHMM.md` — the unattended-run record, PII-scrubbed |
 | `templates/change-request.md.tmpl` | Jake's specification, field for field |
+
+## The scheduled half
+
+Two PowerShell scripts sit beside this package, not in it:
+
+| Script | What it does |
+| --- | --- |
+| `scripts/change-requests-scheduled.ps1` | one unattended run: `import` then `next`, a log under `runs/`, and a silent exit when there is nothing to do |
+| `scripts/change-requests-install-task.ps1` | registers/removes the twice-daily Windows Scheduled Task; `-WhatIf`-friendly |
+
+Both default to a dry run. Neither ever pushes.
 
 ## Data lives outside the repo
 
@@ -59,10 +77,11 @@ test suite runs on a machine that has never installed it.
 ## Tests
 
 - `tests/test_change_requests.py` — rendering, fence escaping, id allocation,
-  dedupe, work-log arithmetic, validator refusals.
+  dedupe, work-log arithmetic, validator refusals, and the batch command
+  (`next` selection, `--limit`, the park/unpark round trip).
 - `tests/test_change_request_security.py` — attachment blocklist, path
-  traversal, injection quarantine, CSV formula injection, and a source-level
-  invariant that no module here imports a network library.
+  traversal, injection quarantine, CSV formula injection, digest scrubbing,
+  and a source-level invariant that no module here imports a network library.
 
 ## Commit convention
 

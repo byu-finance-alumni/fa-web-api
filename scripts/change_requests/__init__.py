@@ -25,6 +25,7 @@ a source-level invariant test.
 
 __all__ = [
     "attachments",
+    "digest",
     "injection",
     "ledger",
     "msg_reader",

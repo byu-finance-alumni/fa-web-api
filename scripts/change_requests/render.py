@@ -53,6 +53,10 @@ PLACEHOLDER = "Waiting for Jake's review."
 
 STATUS_READY = "Ready for Review"
 STATUS_APPROVED = "Approved"
+#: A request that could not be completed cleanly and is waiting on an answer.
+#: The validator does not know this value and does not need to: anything that
+#: is not exactly ``Approved`` is refused, which is the correct treatment.
+STATUS_PARKED = "Parked"
 
 _TOKEN = re.compile(r"\{\{([A-Z_]+)\}\}")
 
@@ -62,6 +66,12 @@ STATUS_KEY = re.compile(r"^[-*]?\s*Status:[ \t]*(.*)$", re.MULTILINE)
 APPROVED_KEY = re.compile(r"^[-*]?\s*Approved for Claude:[ \t]*(.*)$", re.MULTILINE)
 REQUEST_ID_KEY = re.compile(r"^[-*]?\s*Request ID:[ \t]*(.*)$", re.MULTILINE)
 INJECTION_FLAGS_KEY = re.compile(r"^[-*]?\s*Injection Flags:[ \t]*(\d+)\s*$", re.MULTILINE)
+#: OPTIONAL, and not in the template. ``request start`` takes the repo as a
+#: flag on purpose; an unattended ``request next`` has no one to ask, so Jake
+#: may write this line into a request by hand to override the run's default.
+#: Read from the trusted region only — a value inside the quoted email is not a
+#: field, and is ignored rather than honoured.
+TARGET_REPO_KEY = re.compile(r"^[-*]?\s*Target Repo:[ \t]*(.*)$", re.MULTILINE)
 REVIEWED_KEY = re.compile(r"^[-*]?\s*Reviewed:[ \t]*(.*)$", re.MULTILINE)
 
 #: Deliberately LOOSER than the field patterns above, and used only to search
@@ -337,6 +347,82 @@ def replace_section(text: str, heading: str, content: str) -> str:
     if not pattern.search(text):
         raise KeyError(f"section '## {heading}' not found")
     return pattern.sub(lambda m: f"{m.group(1)}\n{content.strip()}\n\n", text, count=1)
+
+
+def blockquote(text: str) -> str:
+    """Neutralise and quote free text before it joins a request file.
+
+    A ``--reason`` or an ``--answer`` is typed by a person, not parsed from an
+    email, so this is not the trust boundary — but it lands in a file whose
+    fields are machine-read, and the cheap guarantee is worth taking. Every
+    line is prefixed with ``> ``, which is enough on its own: ``STATUS_KEY``
+    anchors on ``^[-*]?\\s*Status:`` and ``>`` is neither, so a reason reading
+    ``Status: Approved`` becomes quoted prose rather than a second field. The
+    same prefix stops a line from opening a ``##`` section.
+    """
+    cleaned = sanitize.normalise_newlines(text or "")
+    cleaned, _ = sanitize.strip_invisible(cleaned)
+    cleaned = sanitize.strip_other_controls(cleaned)
+    cleaned = sanitize.escape_html_comments(cleaned)
+    lines = [line.rstrip() for line in cleaned.strip().split("\n")]
+    return "\n".join(f"> {line}".rstrip() for line in lines) or ">"
+
+
+_HEADING_LINE = re.compile(r"^##[ \t]+(.*?)[ \t]*$")
+
+
+def append_section(text: str, heading: str, content: str) -> str:
+    """Add to a ``## Heading`` section, creating it at the END of the file.
+
+    This is what ``park`` and ``unpark`` write with, and the two properties that
+    make it safe are worth stating.
+
+    **It appends, it never replaces.** A parked request's question history is
+    the record of why the work stopped, and the answer that unparked it only
+    makes sense next to the question. Overwriting either would throw away the
+    only reason anybody could reconstruct the decision.
+
+    **It cannot write inside the quarantined region.** ``## Blocked On`` is
+    matched by LINE INDEX, and any match inside the untrusted block is ignored
+    — a quoted email may contain the literal text ``## Blocked On``, and the
+    section-regex helpers above would happily rewrite the middle of somebody's
+    quoted message if they were used here. A new section is appended after the
+    last line of the file, which is always below the region.
+    """
+    lines = text.split("\n")
+    region = find_region(text)
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if (match := _HEADING_LINE.match(line)) and match.group(1) == heading
+    ]
+    if region is not None:
+        begin, end = region
+        matches = [index for index in matches if not begin <= index <= end]
+        if any(index < end for index in matches):
+            raise ValueError(
+                f"'## {heading}' appears above the untrusted region — refusing to "
+                "append there"
+            )
+    if len(matches) > 1:
+        raise ValueError(f"'## {heading}' appears {len(matches)} times — which one?")
+
+    block = content.strip("\n")
+    if not matches:
+        return text.rstrip("\n") + f"\n\n## {heading}\n\n{block}\n"
+
+    start = matches[0]
+    stop = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if _HEADING_LINE.match(lines[index])
+        ),
+        len(lines),
+    )
+    existing = "\n".join(lines[start + 1:stop]).strip("\n")
+    body = f"{existing}\n\n{block}" if existing else block
+    return "\n".join(lines[:start + 1] + ["", body, ""] + lines[stop:])
 
 
 def set_time_log(text: str, label: str, value: str) -> str:

@@ -22,7 +22,16 @@ import pathlib
 
 import pytest
 
-from scripts.change_requests import cli, injection, ledger, paths, render, sanitize, worklog
+from scripts.change_requests import (
+    cli,
+    digest,
+    injection,
+    ledger,
+    paths,
+    render,
+    sanitize,
+    worklog,
+)
 from scripts.change_requests import validate as cr_validate
 from scripts.change_requests.attachments import AttachmentRecord
 
@@ -490,3 +499,390 @@ def test_a_re_saved_copy_of_the_same_email_is_deduped_by_content(tmp_path):
 
     assert cli.main(["--home", str(root), "import"]) == 0
     assert len(sorted((root / "ready").glob("CR-*.md"))) == 1
+
+
+# --- the batch command: next -------------------------------------------------
+#
+# Every test below is really the same test asked five ways: does an UNATTENDED
+# run only ever touch work a human approved, and does it stop rather than guess.
+
+
+def approved_request(root: pathlib.Path, request_id: str, title: str, **kwargs) -> pathlib.Path:
+    """One properly approved request in approved/, ready to be picked up."""
+    text = approve(render_text(request_id=request_id, title=title), **kwargs)
+    return write_request(root, text, name=f"{request_id}-{sanitize.slugify(title)}.md")
+
+
+def run_next(root: pathlib.Path, *flags: str) -> int:
+    return cli.main(["--home", str(root), "next", *flags])
+
+
+def test_next_picks_up_a_properly_approved_request(tmp_path, capsys):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    assert run_next(root) == 0
+    out = capsys.readouterr().out
+    assert "PICKED    CR-2026-001" in out
+    assert "cr/CR-2026-001-add-a-filter" in out
+
+
+def test_next_skips_an_unapproved_request_and_says_why(tmp_path, capsys):
+    """The whole point. An unapproved request in approved/ is still refused."""
+    root = make_home(tmp_path)
+    text = render_text(request_id="CR-2026-001", title="not approved")
+    text = render.replace_section(text, "Acceptance Criteria", ACCEPTANCE)
+    write_request(root, text, name="CR-2026-001-not-approved.md")
+
+    assert run_next(root) == 0
+    out = capsys.readouterr().out
+    assert "SKIPPED   CR-2026-001" in out
+    assert "Status is 'Ready for Review', not exactly 'Approved'" in out
+    assert "PICKED" not in out
+    assert "nothing to work" in out
+
+
+def test_next_never_looks_at_ready_or_the_inbox(tmp_path, capsys):
+    """⚠️ The safety property. A file in ready/ has not been through a human."""
+    root = make_home(tmp_path)
+    # Perfectly approved in every respect EXCEPT that nobody moved it.
+    write_request(
+        root,
+        approve(render_text(request_id="CR-2026-001", title="waiting")),
+        folder="ready",
+        name="CR-2026-001-waiting.md",
+    )
+    (root / "inbox-msg" / "dropped.msg").write_bytes(b"not parsed")
+
+    assert run_next(root) == 0
+    out = capsys.readouterr().out
+    assert "approved/ is empty" in out
+    assert "CR-2026-001" not in out
+
+
+def test_limit_caps_the_batch_and_a_skip_does_not_consume_it(tmp_path, capsys):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "one")
+    write_request(  # unapproved, and in the middle of the run
+        root,
+        render.replace_section(
+            render_text(request_id="CR-2026-002", title="two"),
+            "Acceptance Criteria",
+            ACCEPTANCE,
+        ),
+        name="CR-2026-002-two.md",
+    )
+    approved_request(root, "CR-2026-003", "three")
+    approved_request(root, "CR-2026-004", "four")
+
+    assert run_next(root, "--limit", "2") == 0
+    out = capsys.readouterr().out
+    assert out.count("PICKED  ") == 2
+    assert "PICKED    CR-2026-001" in out
+    assert "SKIPPED   CR-2026-002" in out
+    assert "PICKED    CR-2026-003" in out
+    assert "DEFERRED  CR-2026-004" in out
+    assert "--limit 2 reached" in out
+
+
+def test_limit_must_be_at_least_one(tmp_path):
+    root = make_home(tmp_path)
+    with pytest.raises(SystemExit):
+        run_next(root, "--limit", "0")
+
+
+def test_a_dry_run_changes_nothing(tmp_path):
+    root = make_home(tmp_path)
+    path = approved_request(root, "CR-2026-001", "add a filter")
+    worklog.append(
+        paths.work_log_path(root=root), worklog.blank_row() | {"request_id": "CR-2026-001"}
+    )
+    before = path.read_text(encoding="utf-8")
+
+    assert run_next(root) == 0
+
+    assert path.read_text(encoding="utf-8") == before
+    assert worklog.read(paths.work_log_path(root=root))[0]["claude_started"] == ""
+    assert not list((root / "runs").glob("*.md"))
+
+
+def test_execute_clocks_in_and_writes_a_digest(tmp_path):
+    root = make_home(tmp_path)
+    path = approved_request(root, "CR-2026-001", "add a filter")
+    log = paths.work_log_path(root=root)
+    worklog.append(log, worklog.blank_row() | {"request_id": "CR-2026-001"})
+
+    assert run_next(root, "--execute", "--no-branch") == 0
+
+    row = worklog.read(log)[0]
+    assert row["claude_started"]
+    assert row["status"] == "In Progress"
+    assert row["branch"] == "cr/CR-2026-001-add-a-filter"
+    assert "Branch: `cr/CR-2026-001-add-a-filter`" in path.read_text(encoding="utf-8")
+
+    digests = list((root / "runs").glob("*.md"))
+    assert len(digests) == 1
+    text = digests[0].read_text(encoding="utf-8")
+    assert "## Picked up" in text
+    assert "CR-2026-001" in text
+
+
+def test_a_started_request_is_not_picked_up_again(tmp_path, capsys):
+    """``complete`` leaves the file in approved/, so a twice-daily run must not
+    restart the same work every twelve hours."""
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    worklog.append(
+        paths.work_log_path(root=root), worklog.blank_row() | {"request_id": "CR-2026-001"}
+    )
+    assert run_next(root, "--execute", "--no-branch") == 0
+    capsys.readouterr()
+
+    assert run_next(root) == 0
+    out = capsys.readouterr().out
+    assert "SKIPPED   CR-2026-001" in out
+    assert "already started at" in out
+
+
+def test_a_started_request_is_recognised_without_a_csv_row(tmp_path, capsys):
+    """Belt and braces: the request file itself records the branch too."""
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    assert run_next(root, "--execute", "--no-branch") == 0
+    capsys.readouterr()
+
+    assert run_next(root) == 0
+    out = capsys.readouterr().out
+    assert "SKIPPED   CR-2026-001" in out
+    assert "Claude Implementation" in out
+
+
+def test_an_empty_approved_folder_exits_quietly_and_writes_no_digest(tmp_path, capsys):
+    root = make_home(tmp_path)
+    assert run_next(root, "--execute") == 0
+    out = capsys.readouterr().out
+    assert out.strip().startswith("approved/ is empty")
+    assert len(out.strip().splitlines()) == 1
+    assert not list((root / "runs").glob("*"))
+
+
+def test_a_target_repo_line_overrides_the_run_default(tmp_path, capsys):
+    root = make_home(tmp_path)
+    text = approve(render_text(request_id="CR-2026-001", title="a frontend fix"))
+    text = text.replace("Priority: Normal", "Priority: Normal\nTarget Repo: fa-web-app", 1)
+    write_request(root, text, name="CR-2026-001-a-frontend-fix.md")
+
+    assert run_next(root) == 0
+    assert "repo fa-web-app" in capsys.readouterr().out
+
+
+def test_an_unknown_target_repo_is_a_skip_not_a_guess(tmp_path, capsys):
+    root = make_home(tmp_path)
+    text = approve(render_text(request_id="CR-2026-001", title="somewhere else"))
+    text = text.replace("Priority: Normal", "Priority: Normal\nTarget Repo: fa-web-mobile", 1)
+    write_request(root, text, name="CR-2026-001-somewhere-else.md")
+
+    assert run_next(root) == 0
+    out = capsys.readouterr().out
+    assert "SKIPPED   CR-2026-001" in out
+    assert "does not guess a repo" in out
+
+
+# --- park / unpark -----------------------------------------------------------
+
+
+def test_park_moves_the_file_and_records_the_question(tmp_path, capsys):
+    root = make_home(tmp_path)
+    path = approved_request(root, "CR-2026-001", "add a filter")
+    worklog.append(
+        paths.work_log_path(root=root), worklog.blank_row() | {"request_id": "CR-2026-001"}
+    )
+    question = "Which grad-year field: graduation_year or class_year?"
+
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", question]) == 0
+
+    assert not path.exists()
+    parked = root / "parked" / "CR-2026-001-add-a-filter.md"
+    text = parked.read_text(encoding="utf-8")
+    assert render.STATUS_KEY.findall(render.split_trusted(text)) == ["Parked"]
+    assert "## Blocked On" in text
+    assert f"> {question}" in text
+    assert "- Previous status: Approved" in text
+
+    row = worklog.read(paths.work_log_path(root=root))[0]
+    assert row["status"] == "Parked"
+    assert row["notes"] == question
+    assert "left untouched" in capsys.readouterr().out
+
+
+def test_a_parked_request_is_not_picked_up(tmp_path, capsys):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    approved_request(root, "CR-2026-002", "another")
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", "?"]) == 0
+    capsys.readouterr()
+
+    assert run_next(root, "--limit", "5") == 0
+    out = capsys.readouterr().out
+    assert "CR-2026-001" not in out
+    assert "PICKED    CR-2026-002" in out
+
+
+def test_park_then_unpark_round_trips_without_losing_the_question(tmp_path):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    question = "Which grad-year field should it use?"
+    answer = "graduation_year — class_year is not always set."
+
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", question]) == 0
+    assert cli.main(["--home", str(root), "unpark", "CR-2026-001", "--answer", answer]) == 0
+
+    restored = root / "approved" / "CR-2026-001-add-a-filter.md"
+    assert restored.is_file()
+    assert not list((root / "parked").glob("*.md"))
+    text = restored.read_text(encoding="utf-8")
+
+    # Both halves survive, in order, and the status is the one Jake had set.
+    assert text.index(f"> {question}") < text.index(f"> {answer}")
+    assert render.STATUS_KEY.findall(render.split_trusted(text)) == ["Approved"]
+
+    # And the quarantine came through the round trip intact.
+    assert render.find_region(text) is not None
+    assert not render.fence_problems(text)
+    assert not render.stray_html_comments(text)
+    assert render.extract_body(text) == CLEAN_BODY
+
+
+def test_an_unparked_request_validates_again(tmp_path):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", "?"]) == 0
+    assert cli.main(["--home", str(root), "unpark", "CR-2026-001", "--answer", "yes"]) == 0
+    result = cr_validate.validate("CR-2026-001", root=root)
+    assert result.ok, result.render()
+
+
+def test_a_second_park_appends_rather_than_replacing(tmp_path):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", "first"]) == 0
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", "second"]) == 0
+
+    text = (root / "parked" / "CR-2026-001-add-a-filter.md").read_text(encoding="utf-8")
+    assert "> first" in text and "> second" in text
+    assert text.count("## Blocked On") == 1
+
+
+def test_unpark_refuses_a_request_that_is_not_parked(tmp_path):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a filter")
+    assert cli.main(["--home", str(root), "unpark", "CR-2026-001", "--answer", "x"]) == 2
+
+
+def test_setup_repairs_an_older_install_without_touching_anything_else(tmp_path):
+    """parked/ and runs/ arrived after the first installs existed."""
+    root = tmp_path / "change-requests"
+    for name in (
+        "inbox-msg",
+        "ready",
+        "approved",
+        "completed",
+        "rejected",
+        "attachments",
+        "templates",
+    ):
+        (root / name).mkdir(parents=True)
+    log = paths.work_log_path(root=root)
+    log.write_text("kept\n", encoding="utf-8")
+
+    assert cli.main(["--home", str(root), "setup"]) == 0
+
+    assert (root / "parked").is_dir()
+    assert (root / "runs").is_dir()
+    assert log.read_text(encoding="utf-8") == "kept\n"
+
+
+# --- the digest has to survive being the only thing anybody reads ------------
+#
+# The evening run finishes hours before Jake sees it. These tests are the
+# standard: read cold, over coffee, with no memory of what was approved.
+
+
+def test_the_digest_opens_with_a_verdict_naming_every_request(tmp_path):
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a year filter")
+    write_request(
+        root,
+        render.replace_section(
+            render_text(request_id="CR-2026-002", title="not approved yet"),
+            "Acceptance Criteria",
+            ACCEPTANCE,
+        ),
+        name="CR-2026-002-not-approved-yet.md",
+    )
+    approved_request(root, "CR-2026-003", "the second one")
+    approved_request(root, "CR-2026-004", "later one")
+
+    assert run_next(root, "--execute", "--no-branch", "--limit", "2") == 0
+    text = next(iter((root / "runs").glob("*.md"))).read_text(encoding="utf-8")
+
+    verdict = next(
+        line for line in text.split("\n") if line.startswith(digest.VERDICT_PREFIX)
+    )
+    assert "2 picked up (CR-2026-001, CR-2026-003)" in verdict
+    assert "0 parked" in verdict
+    assert "1 skipped (CR-2026-002)" in verdict
+    assert "1 deferred (CR-2026-004)" in verdict
+
+    # An id alone means nothing at 8am, so every request carries its title.
+    for title in ("add a year filter", "not approved yet", "the second one", "later one"):
+        assert title in text
+    assert "Nothing was pushed" in text
+
+
+def test_parking_amends_the_verdict_and_quotes_the_question(tmp_path):
+    """``park`` runs minutes AFTER the digest was written."""
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a year filter")
+    assert run_next(root, "--execute", "--no-branch") == 0
+
+    question = "graduation_year or class_year? They disagree for about 40 alumni."
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", question]) == 0
+
+    text = next(iter((root / "runs").glob("*.md"))).read_text(encoding="utf-8")
+    verdict = next(
+        line for line in text.split("\n") if line.startswith(digest.VERDICT_PREFIX)
+    )
+    assert "1 parked (CR-2026-001)" in verdict
+    assert "0 parked" not in verdict
+
+    parked_section = text.split("## Parked", 1)[1]
+    assert "add a year filter" in parked_section
+    assert question in parked_section
+    assert 'request unpark CR-2026-001 --answer "..."' in parked_section
+
+
+def test_amend_verdict_accumulates_ids():
+    line = digest.VERDICT_PREFIX + "1 picked up (CR-2026-001), 0 parked, 0 skipped, 0 deferred.**"
+    once = digest.amend_verdict(line, "CR-2026-001")
+    twice = digest.amend_verdict(once, "CR-2026-004")
+    assert "1 parked (CR-2026-001)" in once
+    assert "2 parked (CR-2026-001, CR-2026-004)" in twice
+    # The rest of the line is untouched.
+    assert "1 picked up (CR-2026-001)" in twice
+    assert twice.endswith("0 skipped, 0 deferred.**")
+
+
+def test_amend_verdict_leaves_a_digest_without_a_verdict_alone():
+    assert digest.amend_verdict("# hand-edited\n\nno verdict here", "CR-2026-001") == (
+        "# hand-edited\n\nno verdict here"
+    )
+
+
+def test_a_park_with_no_digest_yet_is_not_an_error(tmp_path, capsys):
+    """Jake parks by hand too, outside any run. Inventing a run digest for that
+    would put a run in the log that never happened."""
+    root = make_home(tmp_path)
+    approved_request(root, "CR-2026-001", "add a year filter")
+    assert cli.main(["--home", str(root), "park", "CR-2026-001", "--reason", "?"]) == 0
+    assert not list((root / "runs").glob("*.md"))
+    assert "parked CR-2026-001" in capsys.readouterr().out

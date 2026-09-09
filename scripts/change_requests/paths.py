@@ -46,14 +46,21 @@ WORKSPACE_MARKER = "fa-web-app"
 KNOWN_REPOS = ("fa-web-api", "fa-web-app")
 
 #: Every folder ``request setup`` creates. Order is the lifecycle order.
+#:
+#: ``parked`` and ``runs`` were added after the first installs existed, which is
+#: why :func:`ensure_layout` has to stay additive: ``setup`` is the documented
+#: way to repair a folder, and re-running it on an older install is how those
+#: two appear. It creates what is missing and touches nothing else.
 DATA_FOLDERS = (
     "inbox-msg",
     "ready",
     "approved",
+    "parked",
     "completed",
     "rejected",
     "attachments",
     "templates",
+    "runs",
 )
 
 WORK_LOG_NAME = "work-log.csv"

@@ -69,7 +69,7 @@ class Result:
 
 def find_request(request_id: str, *, root: pathlib.Path) -> pathlib.Path | None:
     """Locate a request file anywhere in the lifecycle folders."""
-    for folder_name in ("approved", "ready", "completed", "rejected"):
+    for folder_name in ("approved", "ready", "parked", "completed", "rejected"):
         folder = root / folder_name
         if not folder.is_dir():
             continue

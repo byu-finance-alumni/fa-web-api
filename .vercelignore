@@ -21,5 +21,7 @@ README.md
 scripts/change_requests/
 scripts/request.ps1
 scripts/request.sh
+scripts/change-requests-scheduled.ps1
+scripts/change-requests-install-task.ps1
 # Belt and braces — the request DATA lives at the workspace root, not here.
 change-requests/

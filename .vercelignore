@@ -14,3 +14,12 @@ database/*.pdf
 NEXT_STEPS.md
 README.md
 .claude/
+
+# Local change-request intake. scripts/ is otherwise uploaded to Vercel, and
+# none of this runs in the deployed function: the CLI is an offline tool and
+# its only non-stdlib dependency (extract-msg) is dev-only on purpose.
+scripts/change_requests/
+scripts/request.ps1
+scripts/request.sh
+# Belt and braces — the request DATA lives at the workspace root, not here.
+change-requests/

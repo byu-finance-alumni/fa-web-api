@@ -213,8 +213,10 @@ jobs:
         # lists first keeps a migration from being blocked by an outage in a
         # repository that has nothing to do with Postgres.
         run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          # Match by CONTENT, not filename: the runner image defines these in
+          # deb822 `.sources` files, so deleting `*.list` missed them entirely
+          # and the job failed three times in a row on the same Chrome index.
+          sudo grep -rlE 'dl[.]google[.]com|packages[.]microsoft[.]com' /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql-client
       - name: Apply pending migrations
@@ -242,8 +244,10 @@ jobs:
         # lists first keeps a migration from being blocked by an outage in a
         # repository that has nothing to do with Postgres.
         run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          # Match by CONTENT, not filename: the runner image defines these in
+          # deb822 `.sources` files, so deleting `*.list` missed them entirely
+          # and the job failed three times in a row on the same Chrome index.
+          sudo grep -rlE 'dl[.]google[.]com|packages[.]microsoft[.]com' /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql-client
       - name: Apply pending migrations

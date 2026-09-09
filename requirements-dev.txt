@@ -4,3 +4,15 @@
 pytest>=8.0
 httpx>=0.27
 ruff>=0.4
+
+# Outlook .msg parsing for the local change-request intake
+# (scripts/change_requests/). DEV-ONLY, DELIBERATELY.
+#
+# ⚠️ NEVER move this into pyproject.toml. Vercel's Python builder installs only
+# [project.dependencies], and the CI "deploy-deps" job installs exactly that
+# list and imports app.main to catch drift. Adding extract-msg there would ship
+# an unused GPLv3 MAPI parser into the production function and force a uv.lock
+# regeneration whose failure mode is a 500 on every request. The app never
+# imports it; scripts/change_requests/msg_reader.py imports it lazily, inside
+# the one function that parses a message.
+extract-msg>=0.54

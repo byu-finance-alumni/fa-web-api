@@ -205,7 +205,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install PostgreSQL client
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+        # The runner image ships third-party apt sources (Google Chrome, etc.)
+        # that we do not use. When one of them serves a bad index -- as
+        # dl.google.com did on 2026-09-09 with a persistent Hash Sum mismatch --
+        # `apt-get update` exits non-zero and takes this job down with it, even
+        # though the Ubuntu archive we actually need is fine. Dropping those
+        # lists first keeps a migration from being blocked by an outage in a
+        # repository that has nothing to do with Postgres.
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
       - name: Apply pending migrations
         env:
           DATABASE_URL: ${{ secrets.MIGRATIONS_DATABASE_URL }}
@@ -223,7 +234,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install PostgreSQL client
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+        # The runner image ships third-party apt sources (Google Chrome, etc.)
+        # that we do not use. When one of them serves a bad index -- as
+        # dl.google.com did on 2026-09-09 with a persistent Hash Sum mismatch --
+        # `apt-get update` exits non-zero and takes this job down with it, even
+        # though the Ubuntu archive we actually need is fine. Dropping those
+        # lists first keeps a migration from being blocked by an outage in a
+        # repository that has nothing to do with Postgres.
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
       - name: Apply pending migrations
         env:
           # Session-pooler (:5432) connection — set as a secret on the

@@ -16,6 +16,7 @@ from sqlalchemy.orm import aliased
 
 from app.api.dependencies.auth import RequireReportsAdvanced, RequireViewAccess
 from app.core import email_reach
+from app.core.audit_context import AUDIT_SOURCE_IMPORT
 from app.core.database import get_session
 from app.core.dropdowns import WHEEL_INDUSTRIES
 from app.core.errors import ServiceError
@@ -43,6 +44,13 @@ from app.services import headshot_index
 from app.utils.sql import escape_like
 
 logger = logging.getLogger(__name__)
+
+#: audit_logs.action_type values that mean "this alumnus's profile was edited":
+#: a hand save (`update`), retiring a current role from the profile
+#: (`archive_current_role`), and an applied survey response (also `update`,
+#: with source='survey'). Not `create`/`archive`/`restore` (lifecycle, not an
+#: edit) and never the read-only `search`/`preview`/`view` rows.
+ALUMNI_EDIT_ACTIONS: tuple[str, ...] = ("update", "archive_current_role")
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -205,9 +213,7 @@ def _serialize_interaction(i, a, u) -> dict:
         "alumni_name": _full_name(a.first_name, a.last_name, None, a.preferred_first_name)
         or f"Alumni #{a.alumni_id}",
         "type": i.interaction_type,
-        "when": (
-            i.interaction_date_time.isoformat() if i.interaction_date_time else None
-        ),
+        "when": (i.interaction_date_time.isoformat() if i.interaction_date_time else None),
         # The actor who logged the interaction ("edited by"). ``by`` is the
         # display name (email fallback), resolved exactly like profile.py's
         # _actor_name; ``by_user_id`` is the actor's user_id so the frontend
@@ -246,32 +252,24 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         else month_start.replace(month=month_start.month + 1)
     ) - datetime.timedelta(days=1)
 
-    total = await session.scalar(
-        select(func.count()).select_from(Alumni).where(active)
-    )
+    total = await session.scalar(select(func.count()).select_from(Alumni).where(active))
     archived = await session.scalar(
         select(func.count())
         .select_from(Alumni)
         .where(Alumni.archived.is_(True), Alumni.is_alumni.is_(True))
     )
     deceased = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, Alumni.deceased.is_(True))
+        select(func.count()).select_from(Alumni).where(active, Alumni.deceased.is_(True))
     )
 
     # Missing-data KPIs (active alumni lacking an email / a current employer).
     # NOT EXISTS (correlated) keeps a stable query plan at scale and avoids the
     # NULL pitfalls of NOT IN.
     missing_email = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, ~_has_email_exists())
+        select(func.count()).select_from(Alumni).where(active, ~_has_email_exists())
     )
     missing_employer = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, ~_has_employer_exists())
+        select(func.count()).select_from(Alumni).where(active, ~_has_employer_exists())
     )
 
     contacted_this_month = await session.scalar(
@@ -291,18 +289,14 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             _months_before(today, months), datetime.time.min, tzinfo=datetime.UTC
         )
         not_contacted[months] = await session.scalar(
-            select(func.count())
-            .select_from(Alumni)
-            .where(active, ~_contacted_since_exists(cutoff))
+            select(func.count()).select_from(Alumni).where(active, ~_contacted_since_exists(cutoff))
         )
     upcoming_follow_ups = await session.scalar(
         select(func.count())
         .select_from(FollowUpTask)
         .where(FollowUpTask.completed.is_(False), FollowUpTask.due_date >= today)
     )
-    duplicate_count = await session.scalar(
-        text("SELECT count(*) FROM duplicate_candidates")
-    )
+    duplicate_count = await session.scalar(text("SELECT count(*) FROM duplicate_candidates"))
 
     # Distinct alumni who attended an event held in the last 30 days (past
     # events only — a future event hasn't been "attended" yet). Joins Alumni and
@@ -320,9 +314,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     )
     # Events scheduled today or later.
     upcoming_events = await session.scalar(
-        select(func.count())
-        .select_from(Event)
-        .where(Event.event_date >= today)
+        select(func.count()).select_from(Event).where(Event.event_date >= today)
     )
     # Events held in the current calendar month (any day this month — past or
     # still upcoming within the month). Calendar-month scoped, not rolling-30d.
@@ -383,46 +375,49 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     # collapses to near zero every 1 January. Do NOT "fix" that by switching to
     # a trailing 12 months — Amy asked for a year-to-date running total.
     #
-    # SIGNAL: alumni.updated_at (TimestampMixin, auto-bumped on every write).
-    # This COUNTS DISTINCT ALUMNI RECORDS, NOT CHANGES — ten edits to one person
-    # is one record. That property is structural, not something we enforce here:
-    # we count rows in the `alumni` table filtered on updated_at, and there is
-    # exactly one such row per alumnus. Do NOT rebuild either count on top of
-    # audit_logs to get "who changed what" — that table holds one row per
-    # changed FIELD, and it also carries action_type='search'/'preview' rows with
-    # entity_type='alumni', so a naive count there would be inflated twice over.
-    # (Section-only edits — contact, employment, education — do bump
-    # alumni.updated_at, because update_alumni touches the Alumni row whenever a
-    # section was actually written, and a no-op save doesn't move it.)
+    # SIGNAL (changed 2026-09-16, Jake): audit_logs rows that record a PROFILE
+    # EDIT — a staff hand edit or an applied survey response — and NOT a bulk
+    # import. The tile used to read alumni.updated_at, which every CSV import
+    # bumps, so the first real import of the year pinned "edited this year" at
+    # the whole record set. Jake asked for it to count only survey updates and
+    # profile edits, so the signal is now the audit trail, which carries the
+    # provenance the timestamp cannot: ``source`` is 'import' inside the import
+    # loop and 'manual' / 'survey' otherwise (app/core/audit_context.py, #45).
     #
-    # Bulk imports DO count, DELIBERATELY: the tile measures DATA FRESHNESS
-    # ("how much of the record set has changed recently"), not staff effort, so a
-    # large CSV import or an automated survey-response apply legitimately
-    # dominates the month it lands in. An audit-trail-based "staff hand-edits
-    # only" version was considered and explicitly declined.
-    #
-    # Single aggregate COUNT with a WHERE on updated_at — never fetch rows and
-    # count in Python (8,000+ alumni). Same `active` predicate as every other
+    # It still COUNTS DISTINCT ALUMNI RECORDS, NOT CHANGES: audit_logs holds one
+    # row per changed FIELD, so it is COUNT(DISTINCT entity_id). Only the edit
+    # actions count — 'search' / 'preview' / 'view' rows also carry
+    # entity_type='alumni' and would inflate a naive count. ``source`` is
+    # matched with IS DISTINCT FROM 'import' rather than IN ('manual','survey')
+    # so rows written before provenance existed (source NULL) count as the hand
+    # edits they were. Joined to the same `active` predicate as every other
     # alumni KPI so archived / friend-of-program records can't inflate either.
-    # The year bound is 1 Jan 00:00 UTC (all date filters in this app are UTC),
-    # and since it is strictly earlier than the month bound over an otherwise
-    # identical query, the year count is always >= the month count.
-    month_start_ts = datetime.datetime.combine(
-        month_start, datetime.time.min, tzinfo=datetime.UTC
-    )
+    #
+    # Single aggregate COUNT — never fetch rows and count in Python. The year
+    # bound is 1 Jan 00:00 UTC (all date filters in this app are UTC), and since
+    # it is strictly earlier than the month bound over an otherwise identical
+    # query, the year count is always >= the month count.
+    month_start_ts = datetime.datetime.combine(month_start, datetime.time.min, tzinfo=datetime.UTC)
     year_start_ts = datetime.datetime.combine(
         today.replace(month=1, day=1), datetime.time.min, tzinfo=datetime.UTC
     )
-    alumni_edited_this_month = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, Alumni.updated_at >= month_start_ts)
-    )
-    alumni_edited_this_year = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, Alumni.updated_at >= year_start_ts)
-    )
+
+    def _edited_since(bound: datetime.datetime):
+        return (
+            select(func.count(func.distinct(AuditLog.entity_id)))
+            .select_from(AuditLog)
+            .join(Alumni, Alumni.alumni_id == AuditLog.entity_id)
+            .where(
+                active,
+                AuditLog.entity_type == "alumni",
+                AuditLog.action_type.in_(ALUMNI_EDIT_ACTIONS),
+                AuditLog.source.is_distinct_from(AUDIT_SOURCE_IMPORT),
+                AuditLog.created_at >= bound,
+            )
+        )
+
+    alumni_edited_this_month = await session.scalar(_edited_since(month_start_ts))
+    alumni_edited_this_year = await session.scalar(_edited_since(year_start_ts))
 
     cohort = (
         await session.execute(
@@ -475,11 +470,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
     top_employers = (
         await session.execute(
             select(active_employment.c.employer, _emp_count)
-            .where(
-                func.lower(active_employment.c.employer).not_in(
-                    _NON_EMPLOYER_VALUES
-                )
-            )
+            .where(func.lower(active_employment.c.employer).not_in(_NON_EMPLOYER_VALUES))
             .group_by(active_employment.c.employer)
             .order_by(_emp_count.desc())
             .limit(8)
@@ -716,14 +707,11 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
         "piff_donors": int(piff_donors or 0),
         "willing_mentors": int(willing_mentors or 0),
         "by_graduation_year": [{"year": r[0], "count": int(r[1])} for r in cohort],
-        "top_employers": [
-            {"employer": r[0], "count": int(r[1])} for r in top_employers
-        ],
+        "top_employers": [{"employer": r[0], "count": int(r[1])} for r in top_employers],
         "by_state": [{"state": r[0], "count": int(r[1])} for r in by_state],
         "industry_breakdown": {
             "industries": [
-                {"industry": name, "count": industry_counts[name]}
-                for name in _FINANCE_INDUSTRIES
+                {"industry": name, "count": industry_counts[name]} for name in _FINANCE_INDUSTRIES
             ],
             "other": other_count,
             "unknown": unknown_count,
@@ -733,9 +721,7 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
 
 
 @router.get("/birthdays", response_model=list[BirthdayRow])
-async def birthdays(
-    actor: RequireViewAccess, session: SessionDep
-) -> list[dict]:
+async def birthdays(actor: RequireViewAccess, session: SessionDep) -> list[dict]:
     """Active alumni whose birthday falls in the current calendar month, ordered
     by day-of-month ascending (earliest in the month first). Each row carries
     the alumnus's current/most-recent employer via the same correlated scalar
@@ -782,9 +768,7 @@ async def birthdays(
             )
         )
     ).all()
-    await _audit_view(
-        session, actor, action_type="view", entity_type="dashboard:birthdays"
-    )
+    await _audit_view(session, actor, action_type="view", entity_type="dashboard:birthdays")
     return [
         {
             "id": a.alumni_id,
@@ -801,9 +785,7 @@ async def birthdays(
 
 
 @router.get("/event-participation", response_model=list[EventParticipationRow])
-async def event_participation(
-    _: RequireViewAccess, session: SessionDep
-) -> list[dict]:
+async def event_participation(_: RequireViewAccess, session: SessionDep) -> list[dict]:
     """Per-event participation for the ~last 12 months (past/current events —
     these are what have "participation"). One row per event with its attendee
     count, aggregated in PostgreSQL (LEFT JOIN so an event with 0 attendees
@@ -838,9 +820,7 @@ async def event_participation(
                 func.count(EventAttendance.event_attendance_id).label("participant_count"),
             )
             .select_from(Event)
-            .outerjoin(
-                EventAttendance, EventAttendance.event_id == Event.event_id
-            )
+            .outerjoin(EventAttendance, EventAttendance.event_id == Event.event_id)
             .where(Event.event_date >= window_start, Event.event_date <= today)
             .group_by(
                 Event.event_id,
@@ -929,25 +909,19 @@ async def activity_feed(
         )
     if type and type.strip():
         conditions.append(
-            Interaction.interaction_type.ilike(
-                escape_like(type.strip()), escape="\\"
-            )
+            Interaction.interaction_type.ilike(escape_like(type.strip()), escape="\\")
         )
     # A bare date covers the whole day: expand to full-day UTC bounds so
     # same-day interactions are included regardless of their time.
     if date_from is not None:
         conditions.append(
             Interaction.interaction_date_time
-            >= datetime.datetime.combine(
-                date_from, datetime.time.min, tzinfo=datetime.UTC
-            )
+            >= datetime.datetime.combine(date_from, datetime.time.min, tzinfo=datetime.UTC)
         )
     if date_to is not None:
         conditions.append(
             Interaction.interaction_date_time
-            <= datetime.datetime.combine(
-                date_to, datetime.time.max, tzinfo=datetime.UTC
-            )
+            <= datetime.datetime.combine(date_to, datetime.time.max, tzinfo=datetime.UTC)
         )
     # "Interacted by me": only rows whose actor is the current user. Applied as
     # just another predicate so it composes with q / type / date range / sort,
@@ -1016,28 +990,18 @@ async def data_quality(_: RequireReportsAdvanced, session: SessionDep) -> dict:
     # Alumni-only: exclude "friends of the program" (is_alumni=false) from every
     # alumni KPI so friends never inflate alumni counts (#218 follow-up).
     active = and_(Alumni.archived.is_(False), Alumni.is_alumni.is_(True))
-    total = await session.scalar(
-        select(func.count()).select_from(Alumni).where(active)
-    )
+    total = await session.scalar(select(func.count()).select_from(Alumni).where(active))
     missing_email = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, ~_has_email_exists())
+        select(func.count()).select_from(Alumni).where(active, ~_has_email_exists())
     )
     missing_employer = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, ~_has_employer_exists())
+        select(func.count()).select_from(Alumni).where(active, ~_has_employer_exists())
     )
     missing_phone = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, ~_has_phone_exists())
+        select(func.count()).select_from(Alumni).where(active, ~_has_phone_exists())
     )
     missing_linkedin = await session.scalar(
-        select(func.count())
-        .select_from(Alumni)
-        .where(active, ~_has_linkedin_exists())
+        select(func.count()).select_from(Alumni).where(active, ~_has_linkedin_exists())
     )
     # "No photo" (#775). A headshot is an object in the ``headshots`` bucket
     # keyed by net ID, so this count comes from ONE cached listing of that bucket
@@ -1061,9 +1025,7 @@ async def data_quality(_: RequireReportsAdvanced, session: SessionDep) -> dict:
             .select_from(Alumni)
             .where(
                 active,
-                headshot_index.missing_photo_condition(
-                    await headshot_index.stored_headshot_keys()
-                ),
+                headshot_index.missing_photo_condition(await headshot_index.stored_headshot_keys()),
             )
         )
         missing_photo = int(missing_photo or 0)
@@ -1085,9 +1047,7 @@ async def data_quality(_: RequireReportsAdvanced, session: SessionDep) -> dict:
             _has_employer_exists(),
         )
     )
-    duplicate_count = await session.scalar(
-        text("SELECT count(*) FROM duplicate_candidates")
-    )
+    duplicate_count = await session.scalar(text("SELECT count(*) FROM duplicate_candidates"))
     return {
         "total_alumni": int(total or 0),
         "complete_alumni": int(complete_alumni or 0),
@@ -1125,9 +1085,7 @@ async def contacted_this_month_list(
         select(Interaction)
         .where(Interaction.interaction_date_time >= month_ago)
         .distinct(Interaction.alumni_id)
-        .order_by(
-            Interaction.alumni_id, Interaction.interaction_date_time.desc()
-        )
+        .order_by(Interaction.alumni_id, Interaction.interaction_date_time.desc())
         .subquery()
     )
     li = aliased(Interaction, latest)
@@ -1176,9 +1134,7 @@ async def upcoming_follow_ups_list(
             .limit(200)
         )
     ).all()
-    await _audit_view(
-        session, actor, action_type="view", entity_type="dashboard:follow-ups"
-    )
+    await _audit_view(session, actor, action_type="view", entity_type="dashboard:follow-ups")
     return [
         {
             "task_id": t.follow_up_task_id,
@@ -1187,9 +1143,7 @@ async def upcoming_follow_ups_list(
             or f"Alumni #{a.alumni_id}",
             "title": t.task_title,
             "due_date": t.due_date.isoformat() if t.due_date else None,
-            "assigned_to": (
-                _full_name(u.first_name, u.last_name, u.email) if u else None
-            ),
+            "assigned_to": (_full_name(u.first_name, u.last_name, u.email) if u else None),
         }
         for t, a, u in rows
     ]

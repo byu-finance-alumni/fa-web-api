@@ -59,9 +59,7 @@ def _no_live_headshot_bucket(monkeypatch):
     async def _unconfigured():
         raise ServiceError("headshots bucket not configured (test default)")
 
-    monkeypatch.setattr(
-        dashboard_routes.headshot_index, "stored_headshot_keys", _unconfigured
-    )
+    monkeypatch.setattr(dashboard_routes.headshot_index, "stored_headshot_keys", _unconfigured)
 
 
 @pytest.fixture
@@ -156,9 +154,7 @@ def _alumni(preferred_first_name=None):
 
 
 def _user():
-    return SimpleNamespace(
-        user_id=2, first_name="Tanya", last_name="Harmon", email="th@byu.edu"
-    )
+    return SimpleNamespace(user_id=2, first_name="Tanya", last_name="Harmon", email="th@byu.edu")
 
 
 def test_contacted_this_month_serializes_rows(client):
@@ -239,9 +235,7 @@ def test_activity_feed_paginates_and_serializes(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     # execute() is called twice: the page rows, then the distinct-types query.
     app.dependency_overrides[get_session] = _with_session(
-        _FakeSession(
-            rows, scalars=[37], executes=[rows, [("Call",), ("Email",)]]
-        )
+        _FakeSession(rows, scalars=[37], executes=[rows, [("Call",), ("Email",)]])
     )
 
     response = client.get("/dashboard/activity?limit=25&offset=25")
@@ -401,9 +395,7 @@ def test_activity_date_range_bounds_full_day(client):
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
     app.dependency_overrides[get_session] = _with_session(session)
 
-    response = client.get(
-        "/dashboard/activity?date_from=2026-01-01&date_to=2026-01-31"
-    )
+    response = client.get("/dashboard/activity?date_from=2026-01-01&date_to=2026-01-31")
     assert response.status_code == 200
     sql = _compiled(session.execute_args[0])
     assert "interaction_date_time >=" in sql
@@ -455,9 +447,7 @@ def test_activity_mine_returns_only_current_user_rows(client):
             user_id=1,
         ),
         _alumni(),
-        SimpleNamespace(
-            user_id=1, first_name="Me", last_name="Self", email="me@byu.edu"
-        ),
+        SimpleNamespace(user_id=1, first_name="Me", last_name="Self", email="me@byu.edu"),
     )
     session = _FakeSession([], scalars=[1], executes=[[mine_row], [("Call",)]])
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
@@ -499,9 +489,7 @@ def test_summary_includes_this_month_kpis(client):
     # alumni_edited_this_year. The three execute() calls (cohort /
     # top_employers / by_state) fall back to the empty rows list.
     scalars = [100, 5, 2, 12, 9, 8, 60, 30, 10, 4, 3, 6, 7, 11, 2, 1, 0, 23, 91]
-    app.dependency_overrides[get_session] = _with_session(
-        _FakeSession([], scalars=scalars)
-    )
+    app.dependency_overrides[get_session] = _with_session(_FakeSession([], scalars=scalars))
 
     response = client.get("/dashboard/summary")
     assert response.status_code == 200
@@ -517,13 +505,14 @@ def test_summary_includes_this_month_kpis(client):
 # --- #606: "alumni edited this month" KPI ------------------------------------
 
 
-def test_summary_alumni_edited_this_month_counts_updated_at_in_calendar_month(
+def test_summary_alumni_edited_this_month_counts_non_import_edits_in_calendar_month(
     client,
 ):
-    # #606: the KPI must be a single aggregate COUNT with a WHERE on
-    # alumni.updated_at — never a fetch-rows-and-count-in-Python (8,000+
-    # records) — and it must apply the same active-alumni predicate as every
-    # other alumni KPI so archived / friend-of-program rows can't inflate it.
+    # #606, re-signalled 2026-09-16: the KPI is a single aggregate COUNT of
+    # DISTINCT alumni over audit_logs EDIT rows in the calendar month — never a
+    # fetch-rows-and-count-in-Python — excluding bulk imports (source='import')
+    # and the read-only search/preview/view rows, and joined to the same
+    # active-alumni predicate as every other alumni KPI.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     session = _FakeSession([], scalars=[0] * 18)
     app.dependency_overrides[get_session] = _with_session(session)
@@ -532,12 +521,31 @@ def test_summary_alumni_edited_this_month_counts_updated_at_in_calendar_month(
     assert response.status_code == 200
     # Scalar #18 (index 17) — appended after willing_mentors in the handler.
     sql = _compiled(session.scalar_args[17])
-    assert "count(*)" in sql
-    assert "alumni.updated_at >=" in sql
+    assert "count(distinct(audit_logs.entity_id))" in sql
+    assert "audit_logs.created_at >=" in sql
+    assert "audit_logs.source IS DISTINCT FROM" in sql
+    assert "audit_logs.action_type IN" in sql
+    assert "alumni.updated_at" not in sql
     assert "archived" in sql
     assert "is_alumni" in sql
     # Aggregate only: no row selection / limit sneaking in.
     assert "LIMIT" not in sql
+
+
+def test_summary_alumni_edited_excludes_imports_and_read_only_rows(client):
+    # Jake, 2026-09-16: "make it so the KPI doesn't count when they were
+    # imported, just when the survey updates them or their profile did". The
+    # bind params carry the exact exclusions.
+    from sqlalchemy.dialects import postgresql
+
+    session, _ = _summary_session(client)
+    for index in (17, 18):
+        params = session.scalar_args[index].compile(dialect=postgresql.dialect()).params
+        assert params["source_1"] == "import"
+        # The IN () list is one expanding bind param holding the whole tuple.
+        actions = set(params["action_type_1"])
+        assert actions == {"update", "archive_current_role"}
+        assert not actions & {"search", "preview", "view", "create", "archive", "restore"}
 
 
 def test_summary_alumni_edited_month_boundary_is_first_of_month_utc(client):
@@ -629,9 +637,7 @@ def _summary_session(client, monkeypatch=None, when=None):
     return session, response
 
 
-def test_summary_edited_previous_month_counts_for_year_not_month(
-    client, monkeypatch
-):
+def test_summary_edited_previous_month_counts_for_year_not_month(client, monkeypatch):
     # #645: an alumnus edited EARLIER THIS YEAR but in a previous month belongs
     # to the year running total and must NOT appear in the month figure — the
     # tile stacks "this month" over "this year" and they'd contradict each other
@@ -665,9 +671,7 @@ def test_summary_alumni_edited_year_boundary_is_jan_1_utc(client, monkeypatch):
     assert year_bound.tzinfo is not None
     assert year_bound.utcoffset() == datetime.timedelta(0)
     # A rolling-12-month window would have swept this in; year-to-date must not.
-    assert (
-        datetime.datetime(2025, 12, 31, 23, 59, tzinfo=datetime.UTC) < year_bound
-    )
+    assert datetime.datetime(2025, 12, 31, 23, 59, tzinfo=datetime.UTC) < year_bound
 
 
 def test_summary_alumni_edited_year_boundary_tracks_live_clock(client):
@@ -681,9 +685,7 @@ def test_summary_alumni_edited_year_boundary_tracks_live_clock(client):
     )
 
 
-def test_summary_alumni_edited_year_is_always_at_least_the_month(
-    client, monkeypatch
-):
+def test_summary_alumni_edited_year_is_always_at_least_the_month(client, monkeypatch):
     # The year count is a strict SUPERSET of the month count. That is guaranteed
     # structurally rather than by arithmetic: both counts run the SAME query over
     # the SAME population and differ only in the updated_at lower bound, and the
@@ -701,7 +703,7 @@ def test_summary_alumni_edited_year_is_always_at_least_the_month(
     # Identical SQL (same table, same `active` predicate, same >= comparison) —
     # only the bound parameter's value differs.
     assert month_sql == year_sql
-    assert "alumni.updated_at >=" in year_sql
+    assert "audit_logs.created_at >=" in year_sql
     assert "archived" in year_sql
     assert "is_alumni" in year_sql
 
@@ -713,26 +715,21 @@ def test_summary_alumni_edited_year_is_always_at_least_the_month(
         datetime.datetime(2026, 1, 9, 12, 0, tzinfo=datetime.UTC),
     )
     jan_month_bound, jan_year_bound = _edited_bounds(session_jan)
-    assert jan_year_bound == jan_month_bound == datetime.datetime(
-        2026, 1, 1, tzinfo=datetime.UTC
-    )
+    assert jan_year_bound == jan_month_bound == datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
 
 
 def test_summary_alumni_edited_year_counts_records_not_changes(client):
-    # THE key requirement: ten edits to one alumnus is ONE record. This holds by
-    # construction — the KPI counts rows in the `alumni` table (one row per
-    # alumnus) filtered on updated_at, so repeated writes only move that one
-    # row's timestamp. Guard the shape so nobody rebuilds it on audit_logs,
-    # which stores one row per changed FIELD and also carries
-    # action_type='search'/'preview' rows (double inflation).
+    # THE key requirement: ten edits to one alumnus is ONE record. audit_logs
+    # stores one row per changed FIELD, so the count MUST be over DISTINCT
+    # entity_id, joined to alumni so the active predicate applies, and it must
+    # never be a bare count(*) over the audit rows.
     session, _ = _summary_session(client)
     for index in (17, 18):
         sql = _compiled(session.scalar_args[index])
-        assert "count(*)" in sql
-        assert "FROM alumni" in sql
-        assert "audit_logs" not in sql
-        assert "action_type" not in sql
-        assert "JOIN" not in sql
+        assert "count(distinct(audit_logs.entity_id))" in sql
+        assert "count(*)" not in sql
+        assert "JOIN alumni ON alumni.alumni_id = audit_logs.entity_id" in sql
+        assert "audit_logs.entity_type =" in sql
         # Aggregate only — never fetch rows and count in Python (8,000+ alumni).
         assert "LIMIT" not in sql
 
@@ -741,9 +738,7 @@ def test_summary_alumni_edited_year_in_response_body(client):
     # The exact field name the frontend tile reads, alongside the month figure.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     scalars = [0] * 17 + [23, 91]
-    app.dependency_overrides[get_session] = _with_session(
-        _FakeSession([], scalars=scalars)
-    )
+    app.dependency_overrides[get_session] = _with_session(_FakeSession([], scalars=scalars))
 
     response = client.get("/dashboard/summary")
     assert response.status_code == 200
@@ -770,18 +765,14 @@ def test_summary_industry_breakdown_separates_other_and_unknown(client):
         ("Other", 10),  # literal catch-all -> "other" bucket
         ("Underwater Basket Weaving", 3),  # non-vocab value -> "other" bucket
     ]
-    session = _FakeSession(
-        [], scalars=scalars, executes=[[], [], industry_rows, []]
-    )
+    session = _FakeSession([], scalars=scalars, executes=[[], [], industry_rows, []])
     app.dependency_overrides[get_session] = _with_session(session)
 
     response = client.get("/dashboard/summary")
     assert response.status_code == 200
     breakdown = response.json()["industry_breakdown"]
     # Every canonical finance industry appears, in canonical order.
-    assert [r["industry"] for r in breakdown["industries"]] == list(
-        _FINANCE_INDUSTRIES
-    )
+    assert [r["industry"] for r in breakdown["industries"]] == list(_FINANCE_INDUSTRIES)
     counts = {r["industry"]: r["count"] for r in breakdown["industries"]}
     assert counts["Investment Banking"] == 35  # 30 + 5 folded together
     assert counts["Asset Management"] == 0  # zero-count industry still listed
@@ -1069,21 +1060,18 @@ def _scalar_sql_mentioning(session, needle: str) -> str:
     also catches the opposite mistake: two queries that should have been one.
     """
     hits = [
-        sql
-        for sql in (_compiled(stmt) for stmt in session.scalar_args)
-        if needle in sql.lower()
+        sql for sql in (_compiled(stmt) for stmt in session.scalar_args) if needle in sql.lower()
     ]
     assert len(hits) == 1, f"expected one statement mentioning {needle}, got {len(hits)}"
     return hits[0].lower()
+
 
 def test_summary_distinct_employers_in_response_body(client):
     # The fourth KPI tile and its sub-line. All three are appended after the
     # pre-existing scalars — see the note in the route about the positional stub.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     scalars = [0] * 19 + [147, 12, 6]
-    app.dependency_overrides[get_session] = _with_session(
-        _FakeSession([], scalars=scalars)
-    )
+    app.dependency_overrides[get_session] = _with_session(_FakeSession([], scalars=scalars))
 
     response = client.get("/dashboard/summary")
     assert response.status_code == 200

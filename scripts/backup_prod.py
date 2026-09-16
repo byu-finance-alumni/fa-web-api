@@ -281,6 +281,15 @@ def check_database_url(database_url: str) -> None:
         )
 
 
+def _has_ref_segment(value: str, ref: str) -> bool:
+    """True when ``ref`` is a whole dot-separated segment of ``value``.
+
+    Whole-segment, not substring: ``abc`` must not accept ``abcdef`` as its
+    host, and this check is the one the script's safety model leans on.
+    """
+    return ref.lower() in value.lower().split(".")
+
+
 def assert_project_ref(cfg: BackupConfig) -> None:
     """Both the DB host and the Supabase URL must name the expected project.
 
@@ -294,13 +303,13 @@ def assert_project_ref(cfg: BackupConfig) -> None:
     # Supavisor pooler hosts look like aws-0-us-east-1.pooler.supabase.com and
     # carry the ref in the USERNAME (postgres.<ref>); direct hosts look like
     # db.<ref>.supabase.co and carry it in the host. Accept either place.
-    if ref.lower() not in db_host and ref.lower() not in db_user.lower():
+    if not _has_ref_segment(db_host, ref) and not _has_ref_segment(db_user, ref):
         raise ConfigError(
             f"BACKUP_DATABASE_URL does not reference project {ref!r} (checked the host and "
             "the username). Wrong project, wrong variable, or a stale connection string."
         )
     supa_host = (urllib.parse.urlsplit(cfg.supabase_url).hostname or "").lower()
-    if ref.lower() not in supa_host:
+    if not _has_ref_segment(supa_host, ref):
         raise ConfigError(
             f"BACKUP_SUPABASE_URL host does not contain project ref {ref!r}. Expected "
             f"https://{ref}.supabase.co."

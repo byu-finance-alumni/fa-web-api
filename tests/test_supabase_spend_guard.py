@@ -230,6 +230,35 @@ def test_org_projects_pagination_is_followed():
     assert "bbbbbbbbbbbbbbbbbbbb" in membership.detail
 
 
+def test_a_full_page_is_followed_even_when_count_says_we_are_done():
+    """A stale `pagination.count` must not end the walk while pages are full."""
+    bodies = healthy_bodies()
+    page1 = [org_project()] + [
+        org_project(ref=f"{i:020d}"[-20:], name=f"filler-{i}") for i in range(99)
+    ]
+    bodies[f"/v1/organizations/{ORG}/projects?limit=100&offset=0"] = {
+        "projects": page1,
+        "pagination": {"count": 1, "limit": 100, "offset": 0},
+    }
+    bodies[f"/v1/organizations/{ORG}/projects?limit=100&offset=100"] = {
+        "projects": [org_project(ref="bbbbbbbbbbbbbbbbbbbb", name="surprise")],
+        "pagination": {"count": 1, "limit": 100, "offset": 100},
+    }
+    snapshot = snapshot_for(bodies)
+    assert len(snapshot.org_projects) == 101
+    assert results_by_name(snapshot)["org-membership"].status == guard.FAIL
+
+
+def test_non_numeric_price_amount_is_a_guard_failure_not_a_traceback():
+    with pytest.raises(guard.GuardError) as exc:
+        guard.monthly_usd({"amount": "not-a-number", "interval": "hourly"})
+    assert "not a number" in str(exc.value)
+    assert guard.monthly_usd({"amount": "", "interval": "hourly"}) == 0.0
+    assert guard.monthly_usd({"amount": "0.01344", "interval": "hourly"}) == pytest.approx(
+        0.01344 * guard.HOURS_PER_MONTH
+    )
+
+
 # ----------------------------------------------------------------------------
 # (e) plan
 # ----------------------------------------------------------------------------

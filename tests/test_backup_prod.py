@@ -133,6 +133,23 @@ def test_supabase_url_must_be_https(tmp_path):
         bp.load_config(env, repo_root=REPO_ROOT)
 
 
+def test_project_ref_must_be_a_whole_segment_not_a_substring(tmp_path):
+    longer = REF + "x"
+    env = good_env(
+        tmp_path,
+        BACKUP_DATABASE_URL=(
+            f"postgresql://postgres.{longer}:{PASSWORD}@aws-0-us-east-1.pooler.supabase.com"
+            ":5432/postgres"
+        ),
+        BACKUP_SUPABASE_URL=f"https://{longer}.supabase.co",
+    )
+    with pytest.raises(bp.ConfigError):
+        bp.load_config(env, repo_root=REPO_ROOT)
+    assert bp._has_ref_segment(f"postgres.{REF}", REF)
+    assert bp._has_ref_segment(f"db.{REF}.supabase.co", REF.upper())
+    assert not bp._has_ref_segment(f"db.{REF}x.supabase.co", REF)
+
+
 def test_backup_dir_inside_the_repo_is_refused(tmp_path):
     env = good_env(tmp_path, BACKUP_DIR=str(REPO_ROOT / "backups"))
     with pytest.raises(bp.ConfigError) as exc:

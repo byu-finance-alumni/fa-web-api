@@ -351,6 +351,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--allow-no-references",
+        action="store_true",
+        help=(
+            "with --delete: proceed even when survey_responses references no staged "
+            "photo at all (every object is then an orphan). Needed right after a "
+            "campaign reset; refused otherwise because a wrong database looks the same"
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
@@ -425,6 +434,19 @@ async def _run(args: argparse.Namespace, out=sys.stdout) -> int:
     if not diff.orphans:
         print("Nothing to delete.", file=out)
         return 0
+    if not referenced and not args.allow_no_references:
+        # Zero rows referencing a photo means EVERY staged object is an orphan.
+        # That is exactly right after the #445 reset — and exactly what a wrong
+        # database, a botched migration or a renamed column would also look
+        # like. Make the operator say which one it is.
+        print(
+            "REFUSING TO DELETE: survey_responses references NO staged photo, so this "
+            f"run would remove every one of the {len(diff.orphans)} object(s) under "
+            f"{STAGED_PREFIX}. If that is intended (e.g. right after a campaign reset "
+            "deleted the responses), re-run with --allow-no-references.",
+            file=out,
+        )
+        return 1
 
     print(f"Deleting {len(diff.orphans)} orphan object(s)...", file=out)
     deleted, failed = await delete_orphans(

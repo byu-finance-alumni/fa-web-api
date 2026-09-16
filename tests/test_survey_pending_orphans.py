@@ -351,6 +351,26 @@ def test_delete_removes_only_the_orphans(monkeypatch):
     assert "Deleted 2; failed 0." in text
 
 
+def test_delete_refuses_when_no_row_references_any_photo(monkeypatch):
+    objects = {"survey-pending/1": 100, "survey-pending/2": 200}
+    _, deleter = _wire(monkeypatch, objects=objects, referenced=[])
+    code, text = _main(monkeypatch, ["--delete", "--expect-project-ref", "prodrefprodrefprodre"])
+    assert code == 1
+    assert deleter.deleted == []
+    assert "REFUSING TO DELETE" in text and "--allow-no-references" in text
+
+
+def test_allow_no_references_lets_a_post_reset_sweep_delete_everything(monkeypatch):
+    objects = {"survey-pending/1": 100, "survey-pending/2": 200}
+    _, deleter = _wire(monkeypatch, objects=objects, referenced=[])
+    code, text = _main(
+        monkeypatch,
+        ["--delete", "--expect-project-ref", "prodrefprodrefprodre", "--allow-no-references"],
+    )
+    assert code == 0
+    assert sorted(deleter.deleted) == ["survey-pending/1", "survey-pending/2"]
+
+
 def test_delete_refuses_on_a_partial_listing(monkeypatch):
     objects = {f"survey-pending/{i}": 1 for i in range(250)}
     _, deleter = _wire(monkeypatch, objects=objects, referenced=[], fail_at=2)

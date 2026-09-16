@@ -167,8 +167,11 @@ year with no campaign creates one anchored to today (#405).
 - **Orphaned staged photos.** Deleted responses leave their `survey-pending/`
   blobs in the headshots bucket; the nightly headshot sweep deliberately skips
   that prefix, so they never age out. A separate storage-API script,
-  `scripts/survey_pending_orphans.py` (written in parallel), removes them
-  **after** the reset has committed. It is not SQL and not part of the script.
+  `scripts/survey_pending_orphans.py`, removes them **after** the reset has
+  committed. It is not SQL and not part of the script. Dry-run first, then:
+  `python -m scripts.survey_pending_orphans --expect-project-ref njobhhdopwdodvzosrns --delete --allow-no-references`
+  — the last flag is needed precisely because the reset left no response
+  referencing a photo; without it the tool refuses to delete everything.
 - **Applied test responses** already wrote into `alumni` and left
   `audit_logs.source = 'survey'` rows. The script does not revert those; 1.6
   says whether any exist.

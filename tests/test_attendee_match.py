@@ -1,4 +1,4 @@
-"""Conference-attendee matching (#612).
+"""Conference-attendee matching (#612, #537).
 
 Covers the rules the issue calls non-negotiable, plus Jake's four scoping
 answers (2026-08-04):
@@ -8,6 +8,18 @@ answers (2026-08-04):
   * preferred names, nicknames and maiden / birth names all match;
   * unmappable columns are IGNORED, never a row or file error;
   * re-running the same file does not double-add attendance.
+
+And the Net ID tier (#537, Jake 2026-09-15 -- "if the Net ID matches then no
+need to approve; if emails match but no Net ID then ask for approval"):
+
+  * an exact Net ID hit is matched AND auto_confirmed;
+  * a Net ID we don't know is NOT a silent name fallback -- the row falls
+    through to email / name as a proposal with the reason on the row;
+  * Net ID -> A but email / name -> B is ambiguous with both listed;
+  * casing and whitespace variants normalise to one key;
+  * an empty Net ID column behaves exactly as a file without one;
+  * the apply path applies an auto_confirmed row without approval and does NOT
+    apply a merely proposed email row.
 
 No real DATABASE_URL is required: the propose() tests drive a hand-rolled
 in-memory session (CI has no DB), and the parsing / scoring rules are pure
@@ -381,8 +393,10 @@ def test_two_john_smiths_come_back_as_a_choice_never_a_silent_pick():
 
 
 def test_no_confidence_threshold_can_auto_apply():
-    """There is deliberately no knob that turns a score into a write: the
-    scoring surface exposes proposals only."""
+    """There is deliberately no knob that turns a SCORE into a write: the
+    scoring surface exposes proposals only. (#537's Net ID confirmation is an
+    exact identifier, not a threshold, and is still written only by /approve
+    -- see the tier-0 section below.)"""
     import inspect
 
     source = inspect.getsource(attendee_match)
@@ -478,6 +492,7 @@ async def test_propose_reports_matched_ambiguous_and_no_match():
         "no_match": 1,
         "not_reviewed": 0,
         "already_attending": 0,
+        "auto_confirmed": 0,
     }
     assert report["event"]["event_id"] == 7
 
@@ -555,6 +570,7 @@ def _alumnus(alumni_id: int, **kwargs):
     return SimpleNamespace(
         alumni_id=alumni_id,
         archived=False,
+        net_id=kwargs.get("net_id"),
         first_name=kwargs.get("first_name", "Michael"),
         preferred_first_name=kwargs.get("preferred_first_name"),
         last_name=kwargs.get("last_name", "Smith"),
@@ -683,6 +699,11 @@ def test_template_downloads_a_starting_point_csv(approve_client):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
     assert "Maiden name" in response.text
+    # #537: the template documents the Net ID column and its example row
+    # carries one, so staff know to supply it.
+    header, example, *_rest = response.text.splitlines()
+    assert header.split(",")[0] == "Net ID"
+    assert example.split(",")[0] == "msmith07"
 
 
 # --- Disclosure budget (security review, 2026-08-04) -------------------------
@@ -837,3 +858,497 @@ def test_rerunning_the_file_does_not_create_a_second_friend(approve_client):
     assert body["created"] == 0
     assert body["skipped"] == 1
     assert body["items"][0]["status"] == "skipped"
+
+
+# --- Tier 0: Net ID (#537) ----------------------------------------------------
+#
+# Jake, 2026-09-15: "if the Net ID matches then no need to approve; if emails
+# match but no Net ID then ask for approval."
+
+
+def test_exact_net_id_hit_is_tier_zero_certain_and_drops_homonyms():
+    row = _row(first_name="John", last_name="Smith", net_id="jsmith12")
+    by_net_id = _candidate(
+        alumni_id=1, first_name="John", last_name="Smith", net_id="jsmith12"
+    )
+    homonym = _candidate(alumni_id=2, first_name="John", last_name="Smith")
+    ranked = attendee_match.rank_candidates(row, [homonym, by_net_id])
+    assert [c["alumni_id"] for c in ranked] == [1]
+    assert ranked[0]["tier"] == attendee_match.TIER_NETID
+    assert ranked[0]["confidence"] == attendee_match.CONFIDENCE_CERTAIN
+    assert ranked[0]["corroborated"] is True
+    assert ranked[0]["evidence"][0] == "Net ID matches (jsmith12)"
+
+
+@pytest.mark.parametrize(
+    "cell", ["jsmith12", "JSMITH12", " jsmith12 ", "JSmith12", "\tJSMITH12\t"]
+)
+def test_net_id_casing_and_whitespace_variants_normalise(cell):
+    rows, header_errors, _ignored = attendee_match.parse_and_map(
+        _csv(f"Net ID,First name,Last name\n{cell},John,Smith\n")
+    )
+    assert header_errors == []
+    assert rows[0]["net_id"] == "jsmith12"
+    # ...and a stored value in any casing still hits (the DB column is
+    # validated lower-case, but the comparison does not rely on it).
+    candidate = _candidate(alumni_id=1, first_name="John", last_name="Smith",
+                           net_id="JSmith12 ")
+    ranked = attendee_match.rank_candidates(rows[0], [candidate])
+    assert ranked and ranked[0]["tier"] == attendee_match.TIER_NETID
+
+
+def test_net_id_header_aliases_map_onto_the_column():
+    for header in ("Net ID", "net id", "NetID", "netid", "NET_ID"):
+        rows, header_errors, ignored = attendee_match.parse_and_map(
+            _csv(f"{header},First name,Last name\nabc12,John,Smith\n")
+        )
+        assert header_errors == [] and ignored == [], header
+        assert rows[0]["net_id"] == "abc12", header
+
+
+@pytest.mark.anyio
+async def test_net_id_hit_is_matched_and_auto_confirmed():
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name,Email\n"
+             "JSMITH12,John,Smith,john@example.com\n")
+    )
+    session = _FakeSession(
+        [
+            _db_row(alumni_id=1, first_name="John", last_name="Smith",
+                    net_id="jsmith12", personal_email="john@example.com"),
+            _db_row(alumni_id=2, first_name="John", last_name="Smith"),
+        ]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "matched"
+    assert row["auto_confirmed"] is True
+    assert row["match_key"] == "netid"
+    assert row["attendee"]["net_id"] == "jsmith12"
+    assert [c["alumni_id"] for c in row["candidates"]] == [1]
+    assert row["reason"] == "Net ID matches John Smith; no approval needed."
+    assert row["friend_eligible"] is False
+    assert row["warnings"] == []
+    assert report["summary"]["matched"] == 1
+    assert report["summary"]["auto_confirmed"] == 1
+
+
+@pytest.mark.anyio
+async def test_unknown_net_id_is_not_a_silent_name_fallback():
+    """A Net ID we don't know does NOT become a no-match (our own record may
+    simply lack one, and a no-match would invite a duplicate friend record),
+    and it does NOT quietly turn into a name match: the row falls through to
+    email / name as a PROPOSAL and the reason is on the row."""
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name\nnobody99,John,Smith\n")
+    )
+    session = _FakeSession(
+        [_db_row(alumni_id=1, first_name="John", last_name="Smith",
+                 net_id="jsmith12")]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "matched"
+    assert row["auto_confirmed"] is False  # proposed, needs approval
+    assert row["match_key"] == "name"
+    assert row["reason"].startswith("Net ID 'nobody99' is not on any record")
+    assert row["reason"] in row["warnings"]
+    assert row["candidates"][0]["tier"] == attendee_match.TIER_NAME
+    assert "Net ID differs (file: nobody99; record: jsmith12)" in (
+        row["candidates"][0]["evidence"]
+    )
+    assert row["friend_eligible"] is False
+    assert report["summary"]["auto_confirmed"] == 0
+
+
+@pytest.mark.anyio
+async def test_unknown_net_id_with_no_email_or_name_match_is_a_no_match():
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name\nnobody99,Zelda,Nonexistent\n")
+    )
+    session = _FakeSession(
+        [_db_row(alumni_id=1, first_name="John", last_name="Smith",
+                 net_id="jsmith12")]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "no_match"
+    assert row["candidates"] == []
+    assert row["auto_confirmed"] is False
+    assert row["friend_eligible"] is True  # failed EVERY tier
+    assert "nobody99" in row["reason"]
+
+
+@pytest.mark.anyio
+async def test_malformed_net_id_is_reported_and_falls_through():
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name\njohn.smith@byu.edu,John,Smith\n")
+    )
+    session = _FakeSession(
+        [_db_row(alumni_id=1, first_name="John", last_name="Smith")]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "matched" and row["auto_confirmed"] is False
+    assert "is not a valid Net ID" in row["reason"]
+    # A malformed value never reaches SQL as a Net ID key.
+    assert session.queries <= 3
+
+
+@pytest.mark.anyio
+async def test_net_id_to_a_but_email_to_b_is_ambiguous_with_both_listed():
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name,Email\n"
+             "asmith01,Alice,Smith,shared@example.com\n")
+    )
+    a = _db_row(alumni_id=1, first_name="Alice", last_name="Smith",
+                net_id="asmith01")
+    b = _db_row(alumni_id=2, first_name="Bob", last_name="Jones",
+                net_id="bjones02", personal_email="shared@example.com")
+    report = await attendee_match.propose(_FakeSession([a, b]), _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "ambiguous"
+    assert row["auto_confirmed"] is False
+    assert row["match_key"] == "netid"
+    assert [c["alumni_id"] for c in row["candidates"]] == [1, 2]
+    assert row["candidates"][0]["tier"] == attendee_match.TIER_NETID
+    assert row["candidates"][1]["tier"] == attendee_match.TIER_EMAIL
+    assert row["reason"] == (
+        "Net ID matches Alice Smith but the email matches Bob Jones. Choose one."
+    )
+    assert row["friend_eligible"] is False
+    assert report["summary"] == {
+        "total_rows": 1,
+        "matched": 0,
+        "auto_confirmed": 0,
+        "ambiguous": 1,
+        "no_match": 0,
+        "not_reviewed": 0,
+        "already_attending": 0,
+    }
+
+
+@pytest.mark.anyio
+async def test_net_id_to_a_but_name_to_b_is_ambiguous_with_both_listed():
+    """The file says Net ID -> Bob Jones but the name on the row is Kate
+    Nielsen, and we HAVE a Kate Nielsen: two candidates, no silent pick."""
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name\nbjones02,Kate,Nielsen\n")
+    )
+    a = _db_row(alumni_id=1, first_name="Bob", last_name="Jones",
+                net_id="bjones02")
+    b = _db_row(alumni_id=2, first_name="Katherine", last_name="Nielsen")
+    report = await attendee_match.propose(_FakeSession([a, b]), _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "ambiguous"
+    assert row["auto_confirmed"] is False
+    assert [c["alumni_id"] for c in row["candidates"]] == [1, 2]
+    assert row["reason"] == (
+        "Net ID matches Bob Jones but the name matches Katherine Nielsen. "
+        "Choose one."
+    )
+
+
+@pytest.mark.anyio
+async def test_a_homonym_does_not_contradict_a_corroborated_net_id():
+    """Net ID -> John Smith #1 whose name agrees with the file; John Smith #2
+    is just another John Smith. The exact identifier already told them apart,
+    so this is confirmed, not ambiguous -- otherwise every common name would
+    need a click and the Net ID column would be pointless."""
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name\njsmith12,John,Smith\n")
+    )
+    session = _FakeSession(
+        [
+            _db_row(alumni_id=1, first_name="John", last_name="Smith",
+                    net_id="jsmith12"),
+            _db_row(alumni_id=2, first_name="John", last_name="Smith",
+                    net_id="jsmith99"),
+        ]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "matched" and row["auto_confirmed"] is True
+    assert [c["alumni_id"] for c in row["candidates"]] == [1]
+
+
+@pytest.mark.anyio
+async def test_net_id_hit_with_a_disagreeing_name_is_confirmed_but_warned():
+    """Nothing else in the file agrees with the record (a married surname we
+    never stored, or a typo in the Net ID). Jake's rule stands -- the exact
+    identifier confirms -- but the reviewer is told the name did not agree."""
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv("Net ID,First name,Last name\nbjones02,Kate,Nielsen\n")
+    )
+    session = _FakeSession(
+        [_db_row(alumni_id=1, first_name="Bob", last_name="Jones",
+                 net_id="bjones02")]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    row = report["rows"][0]
+    assert row["status"] == "matched" and row["auto_confirmed"] is True
+    assert row["candidates"][0]["corroborated"] is False
+    assert any(w.startswith("Only the Net ID matches") for w in row["warnings"])
+    assert any("does NOT agree" in e for e in row["candidates"][0]["evidence"])
+
+
+_TODAY_FIXTURE_ROWS = (
+    "Michael,Smith,Goldman Sachs,mike@goldman.com\n"
+    "John,Doe,Vanguard,\n"
+    "Kate,Nielsen,Deseret Trust,\n"
+    "Zelda,Nonexistent,Nowhere Ltd,\n"
+)
+_TODAY_FIXTURE_DB = [
+    _db_row(alumni_id=1, first_name="Michael", last_name="Andersen",
+            personal_email="mike@goldman.com", net_id="mand01"),
+    _db_row(alumni_id=2, first_name="John", last_name="Doe", graduation_year=2001),
+    _db_row(alumni_id=3, first_name="John", last_name="Doe", graduation_year=2014),
+    _db_row(alumni_id=4, first_name="Katherine", last_name="Nielsen",
+            net_id="knielsen"),
+]
+
+
+@pytest.mark.anyio
+async def test_an_empty_net_id_column_behaves_exactly_like_no_column():
+    """Jake: "empty Net ID column -> behaviour is exactly as today (email, then
+    name)". Proven by running the same fixtures with no Net ID column, with an
+    all-blank one, and with a blank cell per row, and comparing the reports."""
+    without_column, _e, _i = attendee_match.parse_and_map(
+        _csv("First name,Last name,Company,Email\n" + _TODAY_FIXTURE_ROWS)
+    )
+    with_blank_column, _e, _i = attendee_match.parse_and_map(
+        _csv(
+            "Net ID,First name,Last name,Company,Email\n"
+            + "".join(f",{line}\n" for line in _TODAY_FIXTURE_ROWS.splitlines())
+        )
+    )
+    with_whitespace_cells, _e, _i = attendee_match.parse_and_map(
+        _csv(
+            "First name,Last name,Company,Email,netid\n"
+            + "".join(f"{line},   \n" for line in _TODAY_FIXTURE_ROWS.splitlines())
+        )
+    )
+    reports = [
+        await attendee_match.propose(_FakeSession(_TODAY_FIXTURE_DB), _event(), r)
+        for r in (without_column, with_blank_column, with_whitespace_cells)
+    ]
+    assert reports[0] == reports[1] == reports[2]
+    baseline = reports[0]
+    statuses = [r["status"] for r in baseline["rows"]]
+    assert statuses == ["matched", "ambiguous", "matched", "no_match"]
+    assert all(r["auto_confirmed"] is False for r in baseline["rows"])
+    assert all(r["reason"] is None for r in baseline["rows"])
+    assert all(r["attendee"]["net_id"] is None for r in baseline["rows"])
+    assert [r["match_key"] for r in baseline["rows"]] == [
+        "email", "name", "name", "name"
+    ]
+    assert baseline["summary"]["auto_confirmed"] == 0
+    # Nothing in the email / name path reaches for a Net ID.
+    assert all(
+        c["tier"] != attendee_match.TIER_NETID
+        for r in baseline["rows"]
+        for c in r["candidates"]
+    )
+
+
+@pytest.mark.anyio
+async def test_a_file_with_net_ids_still_resolves_in_a_bounded_number_of_queries():
+    body = "Net ID,First name,Last name,Company\n" + "".join(
+        f"user{i:04d},Person{i},Surname{i},Firm{i}\n" for i in range(200)
+    )
+    rows, _errors, _ignored = attendee_match.parse_and_map(_csv(body))
+    session = _FakeSession([])
+    await attendee_match.propose(session, _event(), rows)
+    assert session.queries <= 5, session.queries
+
+
+@pytest.mark.anyio
+async def test_friend_offer_only_for_rows_that_failed_every_tier():
+    """Jake did not answer which category drives the friend prompt, so the
+    SAFER default: only a row that failed every tier, never a row that merely
+    lacks a Net ID -- that would create a duplicate profile for an alum we
+    matched on email or name."""
+    rows, _e, _i = attendee_match.parse_and_map(
+        _csv(
+            "Net ID,First name,Last name,Email\n"
+            "jsmith12,John,Smith,\n"            # confirmed on Net ID
+            ",Michael,Andersen,mike@goldman.com\n"  # no Net ID, email hit
+            "nobody99,Kate,Nielsen,\n"          # unknown Net ID, name hit
+            ",Zelda,Nonexistent,\n"             # nothing at all
+        )
+    )
+    session = _FakeSession(
+        [
+            _db_row(alumni_id=1, first_name="John", last_name="Smith",
+                    net_id="jsmith12"),
+            _db_row(alumni_id=2, first_name="Michael", last_name="Andersen",
+                    personal_email="mike@goldman.com"),
+            _db_row(alumni_id=4, first_name="Katherine", last_name="Nielsen"),
+        ]
+    )
+    report = await attendee_match.propose(session, _event(), rows)
+    assert [(r["status"], r["friend_eligible"]) for r in report["rows"]] == [
+        ("matched", False),
+        ("matched", False),
+        ("matched", False),
+        ("no_match", True),
+    ]
+
+
+# --- Tier 0 through the routes: the SAME apply path --------------------------
+
+
+class _PreviewSession(_FakeSession):
+    """The preview route on top of the propose() fake: an event lookup, the
+    audit-log add and the commit."""
+
+    def __init__(self, event, candidates, attending=()):
+        super().__init__(candidates, attending)
+        self._event = event
+        self.added: list = []
+        self.committed = 0
+
+    async def get(self, _model, _pk):
+        return self._event
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed += 1
+
+
+def test_auto_confirmed_approvals_selects_only_the_net_id_rows():
+    report = {
+        "rows": [
+            {"row": 2, "status": "matched", "auto_confirmed": True,
+             "attendee": {"net_id": "jsmith12"},
+             "candidates": [{"alumni_id": 1}]},
+            {"row": 3, "status": "matched", "auto_confirmed": False,
+             "attendee": {"net_id": None},
+             "candidates": [{"alumni_id": 2}]},
+            {"row": 4, "status": "ambiguous", "auto_confirmed": False,
+             "attendee": {"net_id": "asmith01"},
+             "candidates": [{"alumni_id": 3}, {"alumni_id": 4}]},
+        ]
+    }
+    assert attendee_match.auto_confirmed_approvals(report) == [
+        {"alumni_id": 1, "row": 2, "net_id": "jsmith12"}
+    ]
+
+
+def test_preview_then_apply_writes_the_net_id_row_and_not_the_email_row(
+    approve_client,
+):
+    """End to end through the routes: the preview reports the Net ID row
+    auto_confirmed and the email row proposed; feeding ONLY the auto-confirmed
+    rows to the SAME /approve endpoint writes attendance for the Net ID row,
+    the email row stays in the human queue, and the audit entry says so."""
+    net_id_alum = _db_row(alumni_id=1, first_name="John", last_name="Smith",
+                          net_id="jsmith12")
+    email_alum = _db_row(alumni_id=2, first_name="Michael", last_name="Andersen",
+                         personal_email="mike@goldman.com")
+    preview_session = _PreviewSession(_event(), [net_id_alum, email_alum])
+    with approve_client(preview_session) as client:
+        response = client.post(
+            "/events/7/attendees/match/preview",
+            files={
+                "file": (
+                    "a.csv",
+                    _csv(
+                        "Net ID,First name,Last name,Email\n"
+                        "JSMITH12,John,Smith,\n"
+                        ",Michael,Andersen,mike@goldman.com\n"
+                    ),
+                )
+            },
+        )
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert [r["auto_confirmed"] for r in preview["rows"]] == [True, False]
+    assert [r["status"] for r in preview["rows"]] == ["matched", "matched"]
+    assert preview["summary"]["auto_confirmed"] == 1
+    assert preview["rows"][1]["candidates"][0]["tier"] == "email"
+    # The preview never wrote attendance; it audited the disclosure.
+    assert [type(o).__name__ for o in preview_session.added] == ["AuditLog"]
+    assert "auto_confirmed=1" in preview_session.added[0].new_value
+
+    approvals = attendee_match.auto_confirmed_approvals(preview)
+    assert approvals == [{"alumni_id": 1, "row": 2, "net_id": "jsmith12"}]
+
+    apply_session = _RouteSession(
+        _event(),
+        {
+            1: _alumnus(1, first_name="John", net_id="jsmith12"),
+            2: _alumnus(2, first_name="Michael", last_name="Andersen"),
+        },
+    )
+    with approve_client(apply_session) as client:
+        response = client.post(
+            "/events/7/attendees/match/approve", json={"approvals": approvals}
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["added"] == 1 and body["net_id_mismatch"] == 0
+    assert body["items"] == [
+        {"alumni_id": 1, "row": 2, "status": "added", "name": "John Smith",
+         "message": None}
+    ]
+    attendance = [o for o in apply_session.added if type(o).__name__ == "EventAttendance"]
+    assert [a.alumni_id for a in attendance] == [1]  # the email row is NOT written
+    audit = [o for o in apply_session.added if type(o).__name__ == "AuditLog"]
+    assert audit[0].new_value == (
+        "1: John Smith (Net ID match jsmith12, confirmed without approval)"
+    )
+
+
+def test_a_human_approval_is_still_labelled_as_one(approve_client):
+    session = _RouteSession(_event(), {5: _alumnus(5, net_id="msmith07")})
+    with approve_client(session) as client:
+        response = client.post(
+            "/events/7/attendees/match/approve",
+            json={"approvals": [{"alumni_id": 5, "row": 2}]},
+        )
+    assert response.json()["added"] == 1
+    audit = [o for o in session.added if type(o).__name__ == "AuditLog"]
+    assert audit[0].new_value.endswith("(approved match)")
+
+
+def test_a_net_id_the_record_does_not_bear_is_refused_not_downgraded(
+    approve_client,
+):
+    """A client cannot label an arbitrary id as a Net ID confirmation: the
+    server checks the record's own Net ID and writes nothing on a mismatch."""
+    session = _RouteSession(
+        _event(),
+        {5: _alumnus(5, net_id="msmith07"), 6: _alumnus(6, net_id=None)},
+    )
+    with approve_client(session) as client:
+        response = client.post(
+            "/events/7/attendees/match/approve",
+            json={
+                "approvals": [
+                    {"alumni_id": 5, "net_id": "someoneelse"},
+                    {"alumni_id": 6, "net_id": "msmith07"},
+                    {"alumni_id": 5, "net_id": " MSMITH07 "},  # normalised hit
+                ]
+            },
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["net_id_mismatch"] == 2
+    assert body["added"] == 0  # alumni 5 was de-duplicated by its first entry
+    assert [i["status"] for i in body["items"]] == [
+        "net_id_mismatch", "net_id_mismatch"
+    ]
+    assert not [o for o in session.added if type(o).__name__ == "EventAttendance"]
+
+
+def test_a_normalised_net_id_approval_is_written(approve_client):
+    session = _RouteSession(_event(), {5: _alumnus(5, net_id="msmith07")})
+    with approve_client(session) as client:
+        response = client.post(
+            "/events/7/attendees/match/approve",
+            json={"approvals": [{"alumni_id": 5, "net_id": " MSMITH07 "}]},
+        )
+    assert response.json()["added"] == 1

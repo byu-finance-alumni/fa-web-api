@@ -232,6 +232,32 @@ the flag exists to surface). Widening past these four is a decision for Jake, no
 a judgement call in code: every status added silently removes people from the
 only worklist that would fix them.
 
+### No employer on file: show the status instead (#536)
+
+A **display** rule, decided by Jake 2026-09-15/16 — nothing about stored data
+changes, and `current_employer` keeps reading exactly what is stored. When the
+employer is blank, the alumni list, the profile page and the CSV export's
+"Current employer" column show the employment status in its place, for every
+status **except the ones that mean employed**:
+
+- **Employed, no fallback:** `Full-time`, `Part-time`, `Self-Employed` — a blank
+  employer here is a real gap and stays blank.
+- **Fallback:** `Graduate Student`, `Military`, `Not in the Labor Force`,
+  `Unemployed`, `Unknown`.
+
+For someone in graduate school the employer field holds the school's **name**
+(and industry the program), so the fallback only fires when that is empty. An
+off-list legacy value is not guessed at — the rule is an allow-list.
+
+`EMPLOYED_STATUSES` / `EMPLOYER_FALLBACK_STATUSES` in `app/core/dropdowns.py`
+hold the split; one function, `app/services/employment_display.py`
+`employer_display()`, applies it and every read surface exposes the result as a
+read-only `employer_display` field (`AlumniListItem`, `ProfileRead`, the
+dashboard birthday row and the geography drill-down rows) so the frontend never
+recomputes it and the list and the export cannot disagree. Matching is
+case-insensitive on the trimmed value and the display uses the dropdown's
+spelling. This is a separate question from the #608 hygiene exemption above.
+
 ### Military status suggests the Military industry (#608)
 
 Status and industry are independent columns, so someone can be `Military` by

@@ -37,6 +37,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.geo import CityGeo
 from app.models.tags import AlumniTag, Tag
+from app.services.employment_display import employer_display
 
 # US state / territory abbreviation → display name.
 STATE_NAMES: dict[str, str] = {
@@ -476,6 +477,8 @@ async def get_state_alumni(
                 "city": city,
                 "graduation_year": a.graduation_year,
                 "current_employer": employer,
+                # Display fallback (#536) — same rule as the alumni list.
+                "employer_display": employer_display(employer, a.employment_status),
                 "current_title": title,
             }
             for a, city, employer, title in rows
@@ -535,6 +538,8 @@ async def get_country_alumni(
                 "city": city,
                 "graduation_year": a.graduation_year,
                 "current_employer": employer,
+                # Display fallback (#536) — same rule as the alumni list.
+                "employer_display": employer_display(employer, a.employment_status),
                 "current_title": title,
             }
             for a, city, employer, title in rows
@@ -638,6 +643,8 @@ async def get_radius_alumni(
                 "state": STATE_NAMES.get(state, state),
                 "graduation_year": a.graduation_year,
                 "current_employer": employer,
+                # Display fallback (#536) — same rule as the alumni list.
+                "employer_display": employer_display(employer, a.employment_status),
                 "current_title": title,
                 "distance_miles": round(float(distance), 1),
             }
@@ -719,6 +726,8 @@ async def get_city_detail(session, state: str, city: str, filters: dict) -> dict
                 "name": _full_name(a),
                 "graduation_year": a.graduation_year,
                 "current_employer": employer,
+                # Display fallback (#536) — same rule as the alumni list.
+                "employer_display": employer_display(employer, a.employment_status),
             }
             for a, employer in alumni
         ],

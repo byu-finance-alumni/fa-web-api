@@ -41,6 +41,7 @@ from app.schemas.dashboard import (
     InteractionActivity,
 )
 from app.services import headshot_index
+from app.services.employment_display import employer_display
 from app.utils.sql import escape_like
 
 logger = logging.getLogger(__name__)
@@ -775,6 +776,8 @@ async def birthdays(actor: RequireViewAccess, session: SessionDep) -> list[dict]
             "first_name": a.first_name,
             "last_name": a.last_name,
             "current_employer": employer,
+            # Display fallback (#536) — same rule as the alumni list.
+            "employer_display": employer_display(employer, a.employment_status),
             "graduation_year": a.graduation_year,
             # Recurring month+day only — never the birth year (FERPA: full DOB).
             "birth_month": a.birth_date.month if a.birth_date else None,

@@ -822,6 +822,7 @@ def test_birthdays_serializes_rows_matching_contract(client):
         first_name="Jane",
         last_name="Doe",
         graduation_year=2019,
+        employment_status="Full-time",
         birth_date=datetime.date(1997, 6, 3),
     )
     rows = [(alum, "Goldman Sachs")]
@@ -837,6 +838,8 @@ def test_birthdays_serializes_rows_matching_contract(client):
             "first_name": "Jane",
             "last_name": "Doe",
             "current_employer": "Goldman Sachs",
+            # #536: the display value is the employer when one is on file.
+            "employer_display": "Goldman Sachs",
             "graduation_year": 2019,
             "birth_month": 6,
             "birth_day": 3,
@@ -850,6 +853,7 @@ def test_birthdays_handles_null_employer(client):
         first_name="John",
         last_name="Smith",
         graduation_year=None,
+        employment_status="Graduate Student",
         birth_date=datetime.date(2000, 6, 15),
     )
     rows = [(alum, None)]
@@ -860,6 +864,9 @@ def test_birthdays_handles_null_employer(client):
     assert response.status_code == 200
     body = response.json()
     assert body[0]["current_employer"] is None
+    # #536: no employer on file -> the non-employed status stands in for it,
+    # via the same rule the alumni list and the CSV export use.
+    assert body[0]["employer_display"] == "Graduate Student"
     assert body[0]["graduation_year"] is None
 
 

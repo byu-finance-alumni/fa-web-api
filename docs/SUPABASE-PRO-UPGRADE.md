@@ -52,7 +52,41 @@ number on the invoice:
   billed on top, and every paid org gets **$10/month of Compute Credits** back —
   enough to cover exactly one project at the default size.
 
-### The recommendation
+### The decision (Jake, 2026-09-15) — dev was moved to a separate org
+
+**Superseded: the single-org ~$35 table below no longer applies.** Jake moved the
+dev project out, so the two orgs are real and the prod org is upgraded **alone**.
+Dev stays on **Free** in its own org. This is the "two separate organizations →
+leave dev on Free" path described in the next section, chosen deliberately.
+
+| Line item | Amount |
+|---|---|
+| Pro plan (prod organization) | $25.00 |
+| Compute — prod project, default size | ~$10.00 |
+| Compute Credits (included with any paid plan) | −$10.00 |
+| **Expected monthly total** | **~$25.00 + tax** |
+
+Dev adds **nothing** to this invoice while it sits in a Free org.
+
+⚠️ **The one consequence to accept, not discover later:** #743 (Supabase's own
+Inactivity timeout) is a **Pro-only, per-project** setting. With dev on Free it
+**cannot be enabled or tested on dev** — it would have to be configured directly on
+prod and verified there, against real alumni data. That is the cost of the $10
+saved. Decide it as part of #743, not on the day.
+
+✅ **Dev auto-pausing is already solved and is NOT a reason to reconsider.** The
+api `supabase-keepalive.yml` pings dev and prod `/health/db` daily; dev has stayed
+up on it. Free projects pause after ~7 quiet days and the cron is well inside that.
+
+> Verify at the dashboard before clicking: the prod org's Projects list should show
+> **`njobhhdopwdodvzosrns` only**. If `tnnhhnzglyfqolxdojyb` is still listed there,
+> the move did not complete and the invoice will be ~$35, not ~$25.
+
+---
+
+### Superseded: the original single-org recommendation (~$35)
+
+_Kept for the reasoning only. Both projects are no longer in one org._
 
 **Upgrade the one organization that holds both projects, and keep both projects in
 it.** There is then no "order" to get right — it is a single switch on the org's
@@ -71,12 +105,6 @@ inside the Pro quotas — which, at ~15 users and 94 MB of storage, it will by a
 factor of roughly 100. Plan fees are charged **upfront**; compute and usage are
 charged **in arrears**.
 
-> ⚠️ **UNCONFIRMED, and it is the one fact that changes the price: are both project
-> refs in the same organization?** The 2026-08-19 capacity note records "the org has
-> two (dev + prod)", which reads as one org holding both, but that was written for a
-> different purpose and has not been re-verified. **Check it first** —
-> Dashboard → the org → Projects, and confirm both refs are listed.
-
 ### If they turn out to be in two separate organizations
 
 Then a single $25 does **not** cover both, and there is a real ordering decision:
@@ -91,9 +119,10 @@ Then a single $25 does **not** cover both, and there is a real ordering decision
      GitHub integration connected** and **no log drains**. Billing splits at the
      cycle boundary — the source org pays through the current cycle, the target org
      starts next cycle.
-   - **Leave dev on Free** (~$25/month total). Cheaper, but **dev then cannot have
-     the Inactivity timeout**, which #743 explicitly requires on *both* projects,
-     and dev keeps auto-pausing. Not recommended.
+   - **Leave dev on Free** (~$25/month total). ✅ **THIS IS THE CHOSEN PATH
+     (2026-09-15).** The cost is that **dev cannot have the Inactivity timeout**,
+     so #743 can only be configured and verified on prod. Dev auto-pausing is
+     *not* a cost — the daily keepalive cron already covers it.
 
 > ⚠️ Do **not** try to keep prod Pro and dev Free inside one org. Supabase will not
 > allow it, and the only way to get there is a project transfer to a second org.
@@ -149,9 +178,10 @@ it is a small charge and nothing breaks.
 
 Work top to bottom. Items 1–3 are the ones that cost money or data if skipped.
 
-1. **Confirm which organization holds each project.** Dashboard → org → Projects,
-   for both `tnnhhnzglyfqolxdojyb` and `njobhhdopwdodvzosrns`. This decides whether
-   §1's ~$35 or the two-org path applies. Do not proceed on the assumption.
+1. **Confirm the prod org holds `njobhhdopwdodvzosrns` and NOT
+   `tnnhhnzglyfqolxdojyb`.** Jake moved dev to its own org on/before 2026-09-15, so
+   the expected bill is **~$25**. If dev is still listed in the prod org the move
+   did not complete and upgrading bills ~$35. Read the list, don't assume.
 2. **Read back the current compute size of both projects** (Project Settings →
    Compute and Disk). Free projects run on **Nano**. Write down what each says —
    §6 explains why this matters and it is invisible after the fact.
@@ -183,9 +213,10 @@ Work top to bottom. Items 1–3 are the ones that cost money or data if skipped.
    nothing will approach a quota, so leaving it **on** is the right default — it
    protects against a bug or an attack, not against normal use. Note that **Compute
    is not covered by the spend cap** either way.
-10. **Tell the agent working on keepalive crons.** Auto-pause disappears for every
-    project inside the Pro org, which makes that work unnecessary there. Do not let
-    both land silently.
+10. **Leave the keepalive cron alone.** Auto-pause disappears for prod once its org
+    is Pro, but **dev stays Free and still pauses after ~7 quiet days** — the cron
+    is now load-bearing for dev. Do not remove it as "no longer needed"; the prod
+    half simply becomes a harmless health ping.
 
 ---
 
@@ -194,8 +225,9 @@ Work top to bottom. Items 1–3 are the ones that cost money or data if skipped.
 Walk this in order. It ends in "confirmed" — do not call the upgrade done before
 the last line.
 
-1. **Org billing page reads "Pro"**, and **both** project refs are listed under
-   that org.
+1. **Org billing page reads "Pro"**, and the prod ref `njobhhdopwdodvzosrns` is
+   listed under it. `tnnhhnzglyfqolxdojyb` (dev) should **not** be — it stays Free
+   in its own org, and its presence here means an extra ~$10/month.
 2. **Both projects are ACTIVE_HEALTHY** in the dashboard project list.
 3. **The app is up on both environments.** `curl <prod-api>/health` returns 200 and
    reports `environment: production`; same for dev. ⚠️ A 200 on `/health` proves the

@@ -252,6 +252,12 @@ hash, nothing more. Nested `.msg` attachments are recorded, not recursed into.
 HTML bodies are converted to text locally with the standard library — no URL is
 ever fetched.
 
+**Retention.** An attachment can be an alumni spreadsheet. It lives in
+`attachments/<request id>/` only as long as the request is open: when the
+request is completed or rejected, delete that folder by hand in the same
+sitting. The request Markdown keeps the name, size and SHA-256, which is all
+the audit trail needs. Nothing under `change-requests/` is ever committed.
+
 ---
 
 ## 4. Working an approved request

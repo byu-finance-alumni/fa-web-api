@@ -321,7 +321,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             continue
         for entry in sorted(folder.glob("CR-*.md")):
             text = entry.read_text(encoding="utf-8", errors="replace")
-            trusted = render.split_trusted(text)
+            trusted = render.split_header_region(text)
             status = render.STATUS_KEY.findall(trusted)
             heading = next(
                 (ln[2:].strip() for ln in text.split("\n") if ln.startswith("# ")), entry.stem
@@ -642,7 +642,7 @@ def _target_repo(text: str, default: str) -> tuple[str | None, str | None]:
     a REFUSAL, not a fallback to the default: an unattended run does not guess
     which codebase to branch.
     """
-    values = render.TARGET_REPO_KEY.findall(render.split_trusted(text))
+    values = render.TARGET_REPO_KEY.findall(render.split_header_region(text))
     if not values:
         return default, None
     if len(values) > 1:
@@ -831,7 +831,7 @@ PREVIOUS_STATUS_KEY = re.compile(
 
 
 def _trusted_status(text: str) -> str | None:
-    values = render.STATUS_KEY.findall(render.split_trusted(text))
+    values = render.STATUS_KEY.findall(render.split_header_region(text))
     return values[0].strip() if len(values) == 1 else None
 
 
@@ -924,7 +924,7 @@ def cmd_unpark(args: argparse.Namespace) -> int:
         return 2
 
     text = path.read_text(encoding="utf-8")
-    previous = PREVIOUS_STATUS_KEY.findall(render.split_trusted(text))
+    previous = PREVIOUS_STATUS_KEY.findall(render.split_header_region(text))
     restore = previous[-1].strip() if previous else None
 
     entry = "\n".join(

@@ -14,6 +14,7 @@ import json
 import pathlib
 import subprocess
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -94,7 +95,9 @@ def test_non_postgres_scheme_is_refused():
 
 def test_direct_host_carries_the_ref_in_the_hostname(tmp_path):
     env = good_env(tmp_path)
-    env["BACKUP_DATABASE_URL"] = f"postgresql://postgres:{PASSWORD}@db.{REF}.supabase.co:5432/postgres"
+    env["BACKUP_DATABASE_URL"] = (
+        f"postgresql://postgres:{PASSWORD}@db.{REF}.supabase.co:5432/postgres"
+    )
     cfg = bp.load_config(env, repo_root=REPO_ROOT)
     assert cfg.expect_project_ref == REF
 
@@ -130,11 +133,99 @@ def test_supabase_url_must_be_https(tmp_path):
         bp.load_config(env, repo_root=REPO_ROOT)
 
 
+def test_project_ref_must_be_a_whole_segment_not_a_substring(tmp_path):
+    longer = REF + "x"
+    env = good_env(
+        tmp_path,
+        BACKUP_DATABASE_URL=(
+            f"postgresql://postgres.{longer}:{PASSWORD}@aws-0-us-east-1.pooler.supabase.com"
+            ":5432/postgres"
+        ),
+        BACKUP_SUPABASE_URL=f"https://{longer}.supabase.co",
+    )
+    with pytest.raises(bp.ConfigError):
+        bp.load_config(env, repo_root=REPO_ROOT)
+    assert bp._has_ref_segment(f"postgres.{REF}", REF)
+    assert bp._has_ref_segment(f"db.{REF}.supabase.co", REF.upper())
+    assert not bp._has_ref_segment(f"db.{REF}x.supabase.co", REF)
+
+
 def test_backup_dir_inside_the_repo_is_refused(tmp_path):
     env = good_env(tmp_path, BACKUP_DIR=str(REPO_ROOT / "backups"))
     with pytest.raises(bp.ConfigError) as exc:
         bp.load_config(env, repo_root=REPO_ROOT)
     assert "OUTSIDE" in str(exc.value)
+
+
+def test_backup_dir_under_a_onedrive_segment_is_refused(tmp_path):
+    env = good_env(tmp_path, BACKUP_DIR=str(tmp_path / "OneDrive" / "Documents" / "fa-backups"))
+    with pytest.raises(bp.ConfigError) as exc:
+        bp.load_config(env, repo_root=REPO_ROOT)
+    assert "cloud-synced" in str(exc.value)
+    assert "OneDrive" in str(exc.value)
+
+
+def test_backup_dir_inside_the_onedrive_env_root_is_refused_even_without_the_name(tmp_path):
+    sync_root = tmp_path / "Work Files"
+    env = good_env(
+        tmp_path, BACKUP_DIR=str(sync_root / "fa-backups"), OneDriveCommercial=str(sync_root)
+    )
+    with pytest.raises(bp.ConfigError) as exc:
+        bp.load_config(env, repo_root=REPO_ROOT)
+    assert "%OneDriveCommercial%" in str(exc.value)
+
+
+def test_synced_backup_dir_allowed_only_with_explicit_override(tmp_path):
+    env = good_env(
+        tmp_path,
+        BACKUP_DIR=str(tmp_path / "Dropbox" / "fa-backups"),
+        BACKUP_ALLOW_SYNCED_DIR="1",
+    )
+    cfg = bp.load_config(env, repo_root=REPO_ROOT)
+    assert cfg.backup_dir == tmp_path / "Dropbox" / "fa-backups"
+
+
+def test_split_password_moves_the_decoded_password_out_of_the_url():
+    url = f"postgresql://postgres.{REF}:p%40ss-w0rd%2Fx@aws-0.pooler.supabase.com:5432/postgres"
+    stripped, password = bp.split_password(url)
+    assert stripped == f"postgresql://postgres.{REF}@aws-0.pooler.supabase.com:5432/postgres"
+    assert password == "p@ss-w0rd/x"
+    assert bp.split_password(stripped) == (stripped, None)
+
+
+def test_run_db_tool_passes_the_password_only_through_the_environment(tmp_path, monkeypatch):
+    cfg = bp.load_config(good_env(tmp_path), repo_root=REPO_ROOT)
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        seen["env"] = dict(kwargs["env"])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(bp.subprocess, "run", fake_run)
+    bp.run_db_tool(["psql", "-tAc", "select 1"], cfg, what="probe")
+    joined = " ".join(seen["args"])  # type: ignore[arg-type]
+    assert PASSWORD not in joined and "%40" not in joined
+    assert seen["env"]["PGPASSWORD"] == "p@ss-w0rd"  # decoded for libpq  # type: ignore[index]
+    assert seen["env"]["PGSSLMODE"] == "require"  # type: ignore[index]
+
+
+def test_auth_dump_never_captures_session_or_mfa_rows(tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run_tool(argv, secrets, *, what, env=None):
+        calls.append(list(argv))
+        pathlib.Path(argv[-2].removeprefix("--file=")).write_text("-- dump")
+        return None
+
+    cfg = bp.load_config(good_env(tmp_path), repo_root=REPO_ROOT)
+    with patch.object(bp, "run_tool", fake_run_tool):
+        mode, note = bp.pg_dump_auth({"pg_dump": "pg_dump"}, cfg, tmp_path / "auth.sql")
+    assert mode == "schema+data" and note == ""
+    argv = calls[0]
+    for table in ("refresh_tokens", "sessions", "mfa_factors", "one_time_tokens", "flow_state"):
+        assert f"--exclude-table-data=auth.{table}" in argv
+    assert "--schema=auth" in argv
 
 
 def test_backup_dir_must_be_absolute(tmp_path):
@@ -459,10 +550,12 @@ def test_pg_dump_auth_falls_back_to_data_only(monkeypatch, tmp_path):
     assert len(attempts) == 2
     assert "--data-only" in attempts[1]
     assert dest.read_text(encoding="utf-8") == "COPY auth.users ..."
-    # The dump argv never spells the password in a way we did not intend: it is
-    # the URL, and the URL is the LAST argument on both attempts.
-    assert attempts[0][-1] == cfg.database_url
-    assert attempts[1][-1] == cfg.database_url
+    # The URL is the LAST argument on both attempts and carries NO password —
+    # that travels in PGPASSWORD, so a process listing never shows it.
+    stripped, _ = bp.split_password(cfg.database_url)
+    assert attempts[0][-1] == stripped
+    assert attempts[1][-1] == stripped
+    assert PASSWORD not in " ".join(attempts[0]) and "p%40ss" not in " ".join(attempts[0])
 
 
 def test_pg_dump_auth_prefers_a_full_dump(monkeypatch, tmp_path):

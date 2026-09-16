@@ -277,11 +277,17 @@ def collect(fetch: Fetch, ref: str, org: str | None) -> Snapshot:
         items = _as_list(page.get("projects", []), "org projects.projects")
         org_projects.extend(i for i in items if isinstance(i, dict))
         pagination = page.get("pagination") or {}
-        count = int(pagination.get("count", len(org_projects)) or 0)
+        count = int(pagination.get("count", 0) or 0)
         offset += limit
-        # Stop when the pages have yielded everything `count` promised, when a
-        # page comes back empty, or after a sane number of pages.
-        if not items or len(org_projects) >= count or offset > 10_000:
+        # Keep paging while EITHER signal says there may be more: a full page
+        # (the pattern walk_bucket / walk_listing use elsewhere) OR a
+        # `pagination.count` we have not yet reached. Stopping on `count` alone
+        # let a stale count end the walk before a page holding an extra
+        # billable project — a false PASS from the one check whose job is
+        # "find every project". Stop on an empty page or after a sane cap.
+        if not items or offset > 10_000:
+            break
+        if len(items) < limit and len(org_projects) >= count:
             break
 
     addons = _as_dict(fetch(f"/v1/projects/{ref}/billing/addons"), "billing/addons")
@@ -301,11 +307,25 @@ def collect(fetch: Fetch, ref: str, org: str | None) -> Snapshot:
 # ----------------------------------------------------------------------------
 # Pricing helpers
 # ----------------------------------------------------------------------------
+def _amount(price: dict) -> float:
+    """``price.amount`` as a float, or a GuardError — never a raw ValueError.
+
+    An unparseable amount must land on the "FAIL guard / NOTHING was verified"
+    path, not a traceback the workflow's one-line summary would garble."""
+    raw = price.get("amount")
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise GuardError(f"billing price amount is not a number: {raw!r}") from None
+
+
 def monthly_usd(price: dict | None) -> float:
     """Normalise a spec ``price`` object to dollars per month."""
     if not price:
         return 0.0
-    amount = float(price.get("amount") or 0.0)
+    amount = _amount(price)
     interval = str(price.get("interval") or "monthly").lower()
     if interval == "hourly":
         return amount * HOURS_PER_MONTH
@@ -551,7 +571,7 @@ def _rate(price: dict) -> str:
     """' (0.01344/h x 744h)' for hourly prices, '' for monthly ones."""
     if str(price.get("interval", "")).lower() != "hourly":
         return ""
-    return f" ({float(price.get('amount') or 0):.5f}/h x {HOURS_PER_MONTH}h)"
+    return f" ({_amount(price):.5f}/h x {HOURS_PER_MONTH}h)"
 
 
 def check_projection(snapshot: Snapshot) -> CheckResult:

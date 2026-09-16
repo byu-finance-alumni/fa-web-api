@@ -303,9 +303,7 @@ def render_report(listing: Listing, diff: Diff, *, prefix: str = STAGED_PREFIX) 
     lines.append(f"DANGLING (a row references them, object missing): {len(diff.dangling)}")
     lines.extend(f"  {path}" for path in diff.dangling)
     if diff.outside_prefix:
-        lines.append(
-            f"References outside {prefix} (not checked): {len(diff.outside_prefix)}"
-        )
+        lines.append(f"References outside {prefix} (not checked): {len(diff.outside_prefix)}")
         lines.extend(f"  {path}" for path in diff.outside_prefix)
     return "\n".join(lines)
 
@@ -348,7 +346,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--expect-project-ref",
         metavar="REF",
-        help="abort unless SUPABASE_URL contains this Supabase project ref",
+        help=(
+            "abort unless SUPABASE_URL contains this Supabase project ref; REQUIRED with --delete"
+        ),
+    )
+    parser.add_argument(
+        "--allow-no-references",
+        action="store_true",
+        help=(
+            "with --delete: proceed even when survey_responses references no staged "
+            "photo at all (every object is then an orphan). Needed right after a "
+            "campaign reset; refused otherwise because a wrong database looks the same"
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -356,7 +365,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=DEFAULT_BATCH_SIZE,
         help=f"deletes per progress line (default {DEFAULT_BATCH_SIZE})",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.delete and not (args.expect_project_ref or "").strip():
+        # A delete decided by whatever project the environment (or a stray .env)
+        # happens to resolve to is the one failure this tool must not allow.
+        parser.error("--delete requires --expect-project-ref <ref>: say which project you mean")
+    return args
 
 
 async def _run(args: argparse.Namespace, out=sys.stdout) -> int:
@@ -420,6 +434,19 @@ async def _run(args: argparse.Namespace, out=sys.stdout) -> int:
     if not diff.orphans:
         print("Nothing to delete.", file=out)
         return 0
+    if not referenced and not args.allow_no_references:
+        # Zero rows referencing a photo means EVERY staged object is an orphan.
+        # That is exactly right after the #445 reset — and exactly what a wrong
+        # database, a botched migration or a renamed column would also look
+        # like. Make the operator say which one it is.
+        print(
+            "REFUSING TO DELETE: survey_responses references NO staged photo, so this "
+            f"run would remove every one of the {len(diff.orphans)} object(s) under "
+            f"{STAGED_PREFIX}. If that is intended (e.g. right after a campaign reset "
+            "deleted the responses), re-run with --allow-no-references.",
+            file=out,
+        )
+        return 1
 
     print(f"Deleting {len(diff.orphans)} orphan object(s)...", file=out)
     deleted, failed = await delete_orphans(

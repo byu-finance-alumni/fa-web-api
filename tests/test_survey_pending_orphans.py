@@ -253,9 +253,7 @@ def test_delete_runs_in_batches_prints_each_path_and_survives_a_failure():
     orphans = [(f"survey-pending/{i}", 10) for i in range(5)]
     deleter = FakeDeleter(fail={"survey-pending/3"})
     out = io.StringIO()
-    deleted, failed = _run(
-        tool.delete_orphans(orphans, deleter, batch_size=2, out=out)
-    )
+    deleted, failed = _run(tool.delete_orphans(orphans, deleter, batch_size=2, out=out))
     assert deleted == 4
     assert failed == ["survey-pending/3"]
     assert deleter.deleted == [
@@ -314,6 +312,13 @@ def _main(monkeypatch, argv):
     return code, out.getvalue()
 
 
+def test_delete_without_a_project_ref_is_refused_before_anything_runs(capsys):
+    with pytest.raises(SystemExit) as exc:
+        tool._parse_args(["--delete"])
+    assert exc.value.code == 2
+    assert "--expect-project-ref" in capsys.readouterr().err
+
+
 def test_default_is_a_dry_run_that_deletes_nothing(monkeypatch):
     objects = {"survey-pending/1": 100, "survey-pending/2": 200}
     _, deleter = _wire(monkeypatch, objects=objects, referenced=["survey-pending/2"])
@@ -338,7 +343,7 @@ def test_dry_run_reports_dangling_references(monkeypatch):
 def test_delete_removes_only_the_orphans(monkeypatch):
     objects = {"survey-pending/1": 100, "survey-pending/2": 200, "survey-pending/3": 300}
     _, deleter = _wire(monkeypatch, objects=objects, referenced=["survey-pending/2"])
-    code, text = _main(monkeypatch, ["--delete"])
+    code, text = _main(monkeypatch, ["--delete", "--expect-project-ref", "prodrefprodrefprodre"])
     assert code == 0
     assert deleter.deleted == ["survey-pending/1", "survey-pending/3"]
     assert "removed survey-pending/1" in text
@@ -346,10 +351,30 @@ def test_delete_removes_only_the_orphans(monkeypatch):
     assert "Deleted 2; failed 0." in text
 
 
+def test_delete_refuses_when_no_row_references_any_photo(monkeypatch):
+    objects = {"survey-pending/1": 100, "survey-pending/2": 200}
+    _, deleter = _wire(monkeypatch, objects=objects, referenced=[])
+    code, text = _main(monkeypatch, ["--delete", "--expect-project-ref", "prodrefprodrefprodre"])
+    assert code == 1
+    assert deleter.deleted == []
+    assert "REFUSING TO DELETE" in text and "--allow-no-references" in text
+
+
+def test_allow_no_references_lets_a_post_reset_sweep_delete_everything(monkeypatch):
+    objects = {"survey-pending/1": 100, "survey-pending/2": 200}
+    _, deleter = _wire(monkeypatch, objects=objects, referenced=[])
+    code, text = _main(
+        monkeypatch,
+        ["--delete", "--expect-project-ref", "prodrefprodrefprodre", "--allow-no-references"],
+    )
+    assert code == 0
+    assert sorted(deleter.deleted) == ["survey-pending/1", "survey-pending/2"]
+
+
 def test_delete_refuses_on_a_partial_listing(monkeypatch):
     objects = {f"survey-pending/{i}": 1 for i in range(250)}
     _, deleter = _wire(monkeypatch, objects=objects, referenced=[], fail_at=2)
-    code, text = _main(monkeypatch, ["--delete"])
+    code, text = _main(monkeypatch, ["--delete", "--expect-project-ref", "prodrefprodrefprodre"])
     assert code == 1
     assert deleter.deleted == []
     assert "LISTING INCOMPLETE" in text
@@ -440,7 +465,7 @@ def test_a_database_failure_reports_the_type_only(monkeypatch):
 def test_output_never_contains_a_secret(monkeypatch):
     objects = {"survey-pending/1": 100}
     _wire(monkeypatch, objects=objects, referenced=[])
-    for argv in ([], ["--delete"], ["--expect-project-ref", "prodrefprodrefprodre", "--delete"]):
+    for argv in ([], ["--expect-project-ref", "prodrefprodrefprodre", "--delete"]):
         _wire(monkeypatch, objects=objects, referenced=[])
         _, text = _main(monkeypatch, argv)
         assert "do-not-print" not in text

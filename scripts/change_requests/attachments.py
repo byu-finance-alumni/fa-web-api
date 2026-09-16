@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import pathlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from . import sanitize
@@ -45,18 +46,53 @@ ALLOWED = "ALLOWED"
 #: their behalf. These are never written to disk.
 BLOCKED_EXTENSIONS = frozenset(
     {
-        ".exe", ".com", ".scr", ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".vbe",
-        ".js", ".jse", ".wsf", ".wsh", ".hta", ".msi", ".msp", ".cpl", ".dll",
-        ".lnk", ".reg", ".jar", ".iso", ".img", ".vhd", ".scf", ".url", ".chm",
-        ".pif", ".application", ".gadget", ".msc", ".inf",
+        ".exe",
+        ".com",
+        ".scr",
+        ".bat",
+        ".cmd",
+        ".ps1",
+        ".psm1",
+        ".vbs",
+        ".vbe",
+        ".js",
+        ".jse",
+        ".wsf",
+        ".wsh",
+        ".hta",
+        ".msi",
+        ".msp",
+        ".cpl",
+        ".dll",
+        ".lnk",
+        ".reg",
+        ".jar",
+        ".iso",
+        ".img",
+        ".vhd",
+        ".scf",
+        ".url",
+        ".chm",
+        ".pif",
+        ".application",
+        ".gadget",
+        ".msc",
+        ".inf",
     }
 )
 
 #: Written, but marked: macro-enabled Office documents and archives.
 FLAGGED_EXTENSIONS = frozenset(
     {
-        ".docm", ".xlsm", ".pptm", ".xlsb", ".dotm", ".xltm",
-        ".zip", ".7z", ".rar",
+        ".docm",
+        ".xlsm",
+        ".pptm",
+        ".xlsb",
+        ".dotm",
+        ".xltm",
+        ".zip",
+        ".7z",
+        ".rar",
     }
 )
 
@@ -112,10 +148,27 @@ def _basename(name: str) -> str:
     return "" if candidate.strip(". ") == "" else candidate.strip()
 
 
-def extension_of(name: str) -> str:
+def _folded_basename(name: str) -> str:
+    """The basename with the same folding ``safe_filename`` applies, up front.
+
+    The verdict and the stored name MUST be read off one string. Unicode
+    fullwidth letters (U+FF21 "Ａ" …) and a fullwidth full stop (U+FF0E "．")
+    decompose under NFKD to plain ASCII, so a raw-suffix check saw
+    ``invoice.ｅｘｅ`` as harmless while the slugified stored name came out as a
+    real ``.exe``. Folding first closes that gap: whatever survives here is what
+    both ``classify`` and ``safe_filename`` see.
+    """
     base = _basename(name)
-    suffix = pathlib.PurePosixPath(base).suffix.lower()
-    return suffix
+    base, _ = sanitize.strip_invisible(base)
+    base = unicodedata.normalize("NFKD", base)
+    return base.encode("ascii", "ignore").decode("ascii")
+
+
+def extension_of(name: str) -> str:
+    base = _folded_basename(name)
+    raw = pathlib.PurePosixPath(base).suffix
+    ext = sanitize.slugify(raw, max_len=12, default="")
+    return f".{ext}" if ext else ""
 
 
 def classify(name: str) -> tuple[str, str]:
@@ -139,12 +192,12 @@ def safe_filename(name: str, *, fallback: str = "attachment") -> str:
     name must not disagree with the record) but slugifies the stem and rewrites
     Windows device names.
     """
-    base = _basename(name) or fallback
-    ext = pathlib.PurePosixPath(base).suffix
-    stem = base[: len(base) - len(ext)] if ext else base
+    base = _folded_basename(name) or fallback
+    raw_ext = pathlib.PurePosixPath(base).suffix
+    stem = base[: len(base) - len(raw_ext)] if raw_ext else base
 
-    ext = sanitize.slugify(ext, max_len=12, default="")
-    ext = f".{ext}" if ext else ""
+    # Same derivation as ``extension_of`` — the verdict was decided on it.
+    ext = extension_of(name)
     stem = sanitize.slugify(stem, max_len=60, default=fallback)
 
     if stem.upper() in WINDOWS_RESERVED:

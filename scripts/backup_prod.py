@@ -151,6 +151,50 @@ class BackupConfig:
         return tuple(s for s in out if s)
 
 
+#: auth-schema tables whose DATA is never dumped. They hold live session and
+#: second-factor material (refresh tokens, sessions, TOTP secrets, one-time
+#: tokens, in-flight OAuth/SAML state). A restore does not need them — staff
+#: sign in again and re-enrol MFA — and a backup folder holding them would be a
+#: ready-made account-takeover kit for every staff login. Table structure is
+#: still dumped; only the rows are excluded.
+AUTH_SESSION_TABLES: tuple[str, ...] = (
+    "refresh_tokens",
+    "sessions",
+    "mfa_factors",
+    "mfa_challenges",
+    "mfa_amr_claims",
+    "one_time_tokens",
+    "flow_state",
+    "saml_relay_states",
+    "audit_log_entries",
+)
+
+
+# Folder names and env vars that mark a cloud-synced location. Documents and
+# Desktop on a managed Windows machine are commonly redirected into OneDrive,
+# so "outside the repo" alone is not enough of a check for a full PII dump.
+_SYNC_FOLDER_NAMES = ("onedrive", "dropbox", "icloud drive", "iclouddrive", "google drive", "box")
+_SYNC_ENV_VARS = ("OneDrive", "OneDriveCommercial", "OneDriveConsumer")
+
+
+def _cloud_sync_marker(path: pathlib.Path, environ: Mapping[str, str]) -> str | None:
+    """Why ``path`` looks cloud-synced, or ``None`` if it does not."""
+    resolved = path.resolve()
+    for name in _SYNC_ENV_VARS:
+        root = environ.get(name)
+        if not root:
+            continue
+        try:
+            resolved.relative_to(pathlib.Path(root).resolve())
+        except (ValueError, OSError):
+            continue
+        return f"inside %{name}%"
+    for part in resolved.parts:
+        if part.lower() in _SYNC_FOLDER_NAMES:
+            return f"path segment '{part}'"
+    return None
+
+
 def load_config(env: Mapping[str, str], *, repo_root: pathlib.Path | None = None) -> BackupConfig:
     """Read and validate configuration from ``env``. Contacts nothing."""
     missing = [name for name in REQUIRED_ENV if not (env.get(name) or "").strip()]
@@ -192,6 +236,14 @@ def load_config(env: Mapping[str, str], *, repo_root: pathlib.Path | None = None
             "BACKUP_DIR must be OUTSIDE the repository. A dump is every alumnus in one "
             "file and must never sit where a git command could pick it up."
         )
+    synced = _cloud_sync_marker(backup_dir, env)
+    if synced and env.get("BACKUP_ALLOW_SYNCED_DIR") != "1":
+        raise ConfigError(
+            f"BACKUP_DIR looks like a cloud-synced folder ({synced}). A dump of every "
+            "alumnus plus the staff auth schema must not replicate to a sync service. "
+            "Choose a local, unsynced folder, or set BACKUP_ALLOW_SYNCED_DIR=1 if that "
+            "is a deliberate, approved destination."
+        )
 
     cfg = BackupConfig(
         database_url=database_url,
@@ -229,6 +281,15 @@ def check_database_url(database_url: str) -> None:
         )
 
 
+def _has_ref_segment(value: str, ref: str) -> bool:
+    """True when ``ref`` is a whole dot-separated segment of ``value``.
+
+    Whole-segment, not substring: ``abc`` must not accept ``abcdef`` as its
+    host, and this check is the one the script's safety model leans on.
+    """
+    return ref.lower() in value.lower().split(".")
+
+
 def assert_project_ref(cfg: BackupConfig) -> None:
     """Both the DB host and the Supabase URL must name the expected project.
 
@@ -242,13 +303,13 @@ def assert_project_ref(cfg: BackupConfig) -> None:
     # Supavisor pooler hosts look like aws-0-us-east-1.pooler.supabase.com and
     # carry the ref in the USERNAME (postgres.<ref>); direct hosts look like
     # db.<ref>.supabase.co and carry it in the host. Accept either place.
-    if ref.lower() not in db_host and ref.lower() not in db_user.lower():
+    if not _has_ref_segment(db_host, ref) and not _has_ref_segment(db_user, ref):
         raise ConfigError(
             f"BACKUP_DATABASE_URL does not reference project {ref!r} (checked the host and "
             "the username). Wrong project, wrong variable, or a stale connection string."
         )
     supa_host = (urllib.parse.urlsplit(cfg.supabase_url).hostname or "").lower()
-    if ref.lower() not in supa_host:
+    if not _has_ref_segment(supa_host, ref):
         raise ConfigError(
             f"BACKUP_SUPABASE_URL host does not contain project ref {ref!r}. Expected "
             f"https://{ref}.supabase.co."
@@ -484,17 +545,49 @@ def run_tool(
     return result
 
 
+def split_password(database_url: str) -> tuple[str, str | None]:
+    """``(url without the password, decoded password)``.
+
+    The pg tools accept the password from ``PGPASSWORD`` in the environment, so
+    it never has to sit in argv where a process listing or endpoint telemetry
+    would record it for the life of the dump. libpq wants the raw password in
+    the environment, so a percent-encoded one in the URL is decoded here.
+    """
+    parts = urllib.parse.urlsplit(database_url)
+    if parts.password is None:
+        return database_url, None
+    userinfo = urllib.parse.quote(parts.username or "", safe="")
+    hostport = parts.hostname or ""
+    if ":" in hostport:  # bare IPv6 literal
+        hostport = f"[{hostport}]"
+    if parts.port is not None:
+        hostport = f"{hostport}:{parts.port}"
+    netloc = f"{userinfo}@{hostport}" if userinfo else hostport
+    return urllib.parse.urlunsplit(parts._replace(netloc=netloc)), urllib.parse.unquote(
+        parts.password
+    )
+
+
+def run_db_tool(
+    args: list[str], cfg: BackupConfig, *, what: str
+) -> subprocess.CompletedProcess[str]:
+    """``run_tool`` for a command that ends with the database URL: the password is
+    moved out of argv into ``PGPASSWORD`` before the process starts."""
+    url, password = split_password(cfg.database_url)
+    env = {"PGPASSWORD": password} if password is not None else None
+    return run_tool([*args, url], cfg.secrets, what=what, env=env)
+
+
 def pg_dump_public(tools: Mapping[str, str], cfg: BackupConfig, dest: pathlib.Path) -> None:
-    run_tool(
+    run_db_tool(
         [
             tools["pg_dump"],
             "--format=custom",
             "--schema=public",
             "--no-password",
             f"--file={dest}",
-            cfg.database_url,
         ],
-        cfg.secrets,
+        cfg,
         what="pg_dump of schema public",
     )
 
@@ -503,6 +596,12 @@ def pg_dump_auth(
     tools: Mapping[str, str], cfg: BackupConfig, dest: pathlib.Path
 ) -> tuple[str, str]:
     """Dump the auth schema to plain SQL.
+
+    What this captures is the staff ACCOUNTS: ``auth.users`` (including the
+    ``encrypted_password`` hashes, so a restore keeps logins working) and
+    ``auth.identities``. Live session material is deliberately NOT captured —
+    see ``AUTH_SESSION_TABLES``. Even so, the file is a credential artifact and
+    the runbook treats it as one.
 
     Returns ``(mode, note)``. Tries schema+data first. The auth schema's objects
     are owned by ``supabase_auth_admin`` and a full dump can fail on
@@ -519,25 +618,22 @@ def pg_dump_auth(
         "--no-owner",
         "--no-privileges",
         "--no-password",
+        *[f"--exclude-table-data=auth.{t}" for t in AUTH_SESSION_TABLES],
         f"--file={dest}",
     ]
     try:
-        run_tool([*base, cfg.database_url], cfg.secrets, what="pg_dump of schema auth")
+        run_db_tool(base, cfg, what="pg_dump of schema auth")
         return "schema+data", ""
     except BackupError as first:
         note = str(first)
         if dest.exists():
             dest.unlink()
-        run_tool(
-            [*base, "--data-only", cfg.database_url],
-            cfg.secrets,
-            what="pg_dump of schema auth (data only)",
-        )
+        run_db_tool([*base, "--data-only"], cfg, what="pg_dump of schema auth (data only)")
         return "data-only", note
 
 
 def psql_scalar(tools: Mapping[str, str], cfg: BackupConfig, sql: str, *, what: str) -> str:
-    result = run_tool(
+    result = run_db_tool(
         [
             tools["psql"],
             "--no-psqlrc",
@@ -546,9 +642,8 @@ def psql_scalar(tools: Mapping[str, str], cfg: BackupConfig, sql: str, *, what: 
             "ON_ERROR_STOP=1",
             "-tAc",
             sql,
-            cfg.database_url,
         ],
-        cfg.secrets,
+        cfg,
         what=what,
     )
     return result.stdout.strip()

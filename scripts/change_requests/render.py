@@ -89,7 +89,8 @@ IN_REGION_KEYS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 _FENCE_LINE = re.compile(r"^(`{3,})\s*$")
-_HTML_COMMENT = re.compile(r"(?<!\\)<!--|(?<!\\)-->")
+# `--!>` also terminates a comment in the HTML5 parser, so it is a marker too.
+_HTML_COMMENT = re.compile(r"(?<!\\)<!--|(?<!\\)--!?>")
 
 REQUEST_ID_RE = re.compile(r"^CR-(\d{4})-(\d{3,})$")
 FILENAME_RE = re.compile(r"^(CR-\d{4}-\d{3,})-(.+)\.md$")
@@ -254,7 +255,7 @@ def sentinel_problems(text: str) -> list[str]:
     return problems
 
 
-def split_trusted(text: str) -> str:
+def split_header_region(text: str) -> str:
     """The file with the untrusted region excised, sentinels included.
 
     Every machine-read key is parsed from THIS, never from the whole file. That
@@ -438,7 +439,7 @@ def set_status(text: str, value: str) -> str:
 
     Only ever called by Jake-initiated commands, never by import.
     """
-    trusted = split_trusted(text)
+    trusted = split_header_region(text)
     if len(STATUS_KEY.findall(trusted)) != 1:
         raise ValueError("expected exactly one trusted 'Status:' line")
     region = find_region(text)

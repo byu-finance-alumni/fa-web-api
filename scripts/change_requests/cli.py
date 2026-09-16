@@ -321,8 +321,8 @@ def cmd_list(args: argparse.Namespace) -> int:
             continue
         for entry in sorted(folder.glob("CR-*.md")):
             text = entry.read_text(encoding="utf-8", errors="replace")
-            trusted = render.split_header_region(text)
-            status = render.STATUS_KEY.findall(trusted)
+            header_region = render.split_header_region(text)
+            status = render.STATUS_KEY.findall(header_region)
             heading = next(
                 (ln[2:].strip() for ln in text.split("\n") if ln.startswith("# ")), entry.stem
             )

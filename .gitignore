@@ -108,11 +108,3 @@ desktop.ini
 
 # Local git worktrees (see .claude / dev workflow) — never committed.
 .worktrees/
-
-# -----------------------------------------------------------------------------
-# Change-request intake data (scripts/change_requests/). Email bodies, sender
-# addresses and attachments — never committed. The real folder lives at the
-# WORKSPACE ROOT, outside both repos; this entry only catches a stray CR_HOME
-# or --home pointed inside the checkout.
-# -----------------------------------------------------------------------------
-/change-requests/

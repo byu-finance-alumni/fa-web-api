@@ -44,7 +44,7 @@ a storage question. **This is Jake's call and it gates the rest.**
 
 | Option | Cost | Verdict |
 |---|---|---|
-| **A. Local — Jake's machine / a BYU network drive** | $0 | ✅ **Recommended to start.** Data never leaves BYU-controlled hardware, there is no new vendor, no PII in CI, and no approval to chase. We already run a local Windows scheduled task for the change-request intake (`scripts/change-requests-*.ps1`) — the exact same shape. Cost: only runs when the machine is on |
+| **A. Local — Jake's machine / a BYU network drive** | $0 | ✅ **Recommended to start.** Data never leaves BYU-controlled hardware, there is no new vendor, no PII in CI, and no approval to chase. A local Windows scheduled task is a shape this project already uses. Cost: only runs when the machine is on |
 | **B. Backblaze B2 / AWS S3** (object-lock + lifecycle) | pennies (135 MB) | Good *later*: immutable, automatable, real retention. But it is a **new place alumni PII lives** and needs approval first |
 | **C. GitHub Actions artifacts** | free | ❌ **No.** Retention caps out at 90 days and it parks a full PII dump in GitHub. Fine for a transient check, never for the backup of record |
 | **D. A second Supabase project / bucket** | ~$0 | ❌ Same blast radius. Does nothing for "the org lapsed" or "the project was deleted", which are the scenarios we are insuring against |
@@ -66,7 +66,7 @@ produces one eventually.
 
 ### Phase 1 — a script that works by hand ⭐ start here
 
-`scripts/backup_prod.py` (or `.ps1` to match the change-request tooling), run
+`scripts/backup_prod.py`, run
 manually, producing a single timestamped folder:
 
 ```
@@ -115,7 +115,7 @@ _Status: **built 2026-09-16, on dev.** `scripts/backup-install-task.ps1` +
 `--incremental` bucket capture, prod ref pinned as a literal in the wrapper.
 See docs/BACKUPS.md "Weekly automatic backups". Phase 3 has NOT been done._
 
-Local scheduled task, mirroring `scripts/change-requests-install-task.ps1`. Weekly.
+Local scheduled task (`scripts/backup-install-task.ps1`). Weekly.
 Only once phases 1–3 pass by hand.
 
 ### Phase 5 — retention and pruning

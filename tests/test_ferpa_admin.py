@@ -138,6 +138,7 @@ def test_birthdays_drops_birth_year_for_view_only(client):
         first_name="Jane",
         last_name="Doe",
         graduation_year=2019,
+        employment_status="Full-time",
         birth_date=datetime.date(1997, 6, 3),
     )
     session = _FakeSession(executes=[[(alum, "Goldman Sachs")]])

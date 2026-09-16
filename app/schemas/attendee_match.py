@@ -39,6 +39,7 @@ class AttendeeMatchAttendee(BaseModel):
     last_name: str | None = None
     maiden_name: str | None = None
     email: str | None = None
+    net_id: str | None = None
     company: str | None = None
     title: str | None = None
     graduation_year: int | None = None
@@ -51,7 +52,12 @@ class AttendeeMatchCandidate(BaseModel):
     city/state, net id, emails) plus ``evidence`` — the human-readable reasons
     this record was proposed, including the ones that argue against it (an
     employer that differs is listed too). ``score``/``confidence`` rank
-    candidates; they never authorise an automatic write."""
+    candidates; they never authorise an automatic write.
+
+    ``tier`` is ``netid`` (#537, exact identifier; ``confidence`` is then
+    ``certain``), ``email``, ``name`` or ``name_company``. ``corroborated`` is
+    only meaningful on a ``netid`` candidate: whether the file's email or name
+    ALSO agrees with the record."""
 
     alumni_id: int
     name: str
@@ -72,6 +78,7 @@ class AttendeeMatchCandidate(BaseModel):
     tier: str
     score: int
     confidence: str
+    corroborated: bool = False
     evidence: list[str] = []
     already_attending: bool = False
 
@@ -80,23 +87,36 @@ class AttendeeMatchRow(BaseModel):
     """One row of the uploaded attendee list and what was proposed for it.
 
     ``status``:
-      * ``matched``    — exactly ONE plausible record. Still a proposal: it is
-        written only when a human approves that specific ``alumni_id``.
-      * ``ambiguous``  — several plausible records. ALL of them are in
-        ``candidates``; the top-scoring one is never silently chosen.
-      * ``no_match``   — nothing plausible. Eligible for friend creation.
+      * ``matched``    — exactly ONE plausible record. A proposal (written only
+        when a human approves that specific ``alumni_id``) UNLESS
+        ``auto_confirmed`` is true: then it is an exact Net ID hit (#537) that
+        the client applies through the same ``/approve`` call without a human
+        click, sending the row's ``net_id`` so the server re-verifies it.
+      * ``ambiguous``  — several plausible records, OR a Net ID that matches one
+        record while the email / name matches a different one. ALL of them are
+        in ``candidates``; the top-scoring one is never silently chosen.
+      * ``no_match``   — nothing plausible on any tier. Eligible for friend
+        creation.
       * ``not_reviewed`` — the review hit its aggregate disclosure budget before
         reaching this row. NOT the same as ``no_match``: re-upload the remaining
         rows as a smaller file rather than creating friends for them.
-    ``friend_fields`` lists the DB fields a friend record built from this row
-    would carry, so "create a friend" is not a black box."""
+    ``match_key`` is the key that decided the row: ``netid``, ``email`` or
+    ``name``. ``reason`` is the one-line Net ID verdict when there is one
+    (confirmed / contradicted / unknown Net ID fell through to email + name).
+    ``friend_eligible`` is true only when the row failed EVERY tier — never
+    merely because it lacks a Net ID (that would duplicate an alum matched on
+    email or name). ``friend_fields`` lists the DB fields a friend record built
+    from this row would carry, so "create a friend" is not a black box."""
 
     row: int
     status: str
     attendee: AttendeeMatchAttendee
     match_key: str
+    auto_confirmed: bool = False
+    reason: str | None = None
     candidates: list[AttendeeMatchCandidate] = []
     warnings: list[str] = []
+    friend_eligible: bool = False
     friend_fields: list[str] = []
 
 
@@ -108,6 +128,8 @@ class AttendeeMatchSummary(BaseModel):
 
     total_rows: int
     matched: int
+    # Subset of ``matched``: rows confirmed by Net ID that need no approval.
+    auto_confirmed: int = 0
     ambiguous: int
     no_match: int
     not_reviewed: int = 0
@@ -133,16 +155,36 @@ class AttendeeMatchPreview(BaseModel):
 
 
 class AttendeeApproval(BaseModel):
-    """One human-approved match. ``alumni_id`` is the record the reviewer PICKED
-    — for an ambiguous row that is a real choice between candidates, and the
-    server re-validates it (exists, not archived) before writing."""
+    """One match to record. ``alumni_id`` is the record the reviewer PICKED —
+    for an ambiguous row that is a real choice between candidates, and the
+    server re-validates it (exists, not archived) before writing.
+
+    ``net_id`` is set ONLY for a Net ID row the preview reported
+    ``auto_confirmed`` (#537): the server re-verifies that the record's Net ID
+    equals it (normalised) before writing and labels the audit entry as a Net
+    ID match instead of a human approval; a mismatch is reported
+    ``net_id_mismatch`` and nothing is written. It is never a way to approve a
+    row that the preview only proposed."""
 
     model_config = ConfigDict(extra="forbid")
 
     alumni_id: int
     row: int | None = None
+    net_id: str | None = None
     attendance_status: str | None = None
     notes: str | None = None
+
+    @field_validator("net_id")
+    @classmethod
+    def _net_id_normalised(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip().lower()
+        if not stripped:
+            return None
+        if len(stripped) > 50:
+            raise ValueError("must be at most 50 characters.")
+        return stripped
 
     @field_validator("attendance_status")
     @classmethod
@@ -173,7 +215,8 @@ class AttendeeApprovalRequest(BaseModel):
     """``POST /events/{event_id}/attendees/match/approve`` body.
 
     There is deliberately no "approve everything above X% confidence" option:
-    the client can only send ids a human ticked."""
+    the client can only send ids a human ticked, plus the ``auto_confirmed``
+    Net ID rows the preview reported (each with its ``net_id``)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -191,8 +234,9 @@ class AttendeeApprovalRequest(BaseModel):
 
 class AttendeeApplyItem(BaseModel):
     """Per-approval outcome. ``status`` is ``added``, ``already_attending``
-    (idempotent no-op — re-running the same file never double-adds), or
-    ``not_found`` (unknown or archived alumnus)."""
+    (idempotent no-op — re-running the same file never double-adds),
+    ``not_found`` (unknown or archived alumnus), or ``net_id_mismatch`` (the
+    approval carried a ``net_id`` the record does not have — nothing written)."""
 
     alumni_id: int
     row: int | None = None
@@ -208,6 +252,7 @@ class AttendeeApplyResult(BaseModel):
     added: int
     already_attending: int
     not_found: int
+    net_id_mismatch: int = 0
     items: list[AttendeeApplyItem] = []
 
 
@@ -216,28 +261,50 @@ class AttendeeApplyResult(BaseModel):
 
 class AttendeeFriendItem(BaseModel):
     """Per-row outcome of creating a friend from a no-match row. ``status`` is
-    ``created``, ``skipped`` (somebody with this name + employer is already on
-    the event's roster — the idempotency guard, so re-posting the same file
-    never creates a second copy) or ``rejected`` (the create path refused it,
-    e.g. an exact duplicate)."""
+    one of:
+
+    * ``created`` — a new friend record; ``alumni_id`` + ``friend_id`` are its
+      ids.
+    * ``reused`` — an EXISTING friend (from any event) matched this row on
+      email, or on name + employer when the row has no email (#538), and was
+      attached to this event instead of a twin being created; ``alumni_id`` +
+      ``friend_id`` name the record so the UI can say "linked existing friend
+      FRIEND-00042".
+    * ``skipped`` — nothing to do: the person is already on this event's
+      roster (a re-post of the same file, or a second row for the same person
+      in one file).
+    * ``existing_alumnus`` — the row's email belongs to a real ALUMNUS, so no
+      friend was created and nothing was attached; ``is_existing_alumnus`` is
+      true and ``alumni_id`` is the alumnus. Staff should match the row
+      instead.
+    * ``rejected`` — the create path refused it (e.g. an exact duplicate).
+    """
 
     row: int
     name: str
     status: str
     alumni_id: int | None = None
+    # Visible friend id (``FRIEND-00042``) of the created / reused record; None
+    # for every other outcome, including ``existing_alumnus``.
+    friend_id: str | None = None
+    is_existing_alumnus: bool = False
     message: str | None = None
 
 
 class AttendeeFriendResult(BaseModel):
     """``POST /events/{event_id}/attendees/match/friends`` result. Every created
-    friend is ALSO attached to the event, so the operator never has to make two
-    passes."""
+    or reused friend is ALSO attached to the event, so the operator never has to
+    make two passes (``attached`` = created + reused)."""
 
     event_id: int
     created: int
     attached: int
     rejected: int
     skipped: int = 0
+    # Existing friends linked to this event rather than created again (#538).
+    reused: int = 0
+    # Rows refused because the email belongs to an alumnus (#538).
+    existing_alumni: int = 0
     items: list[AttendeeFriendItem] = []
     header_errors: list[str] = []
 

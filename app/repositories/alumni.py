@@ -23,6 +23,7 @@ from app.core.dropdowns import (
     WHEEL_INDUSTRIES,
     engagement_flag_for_tag,
 )
+from app.core.friend_id import parse_friend_id
 from app.core.search_terms import parse_free_text
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
@@ -36,7 +37,11 @@ from app.models.employment import (
 from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
 from app.models.event import Event, EventAttendance
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
-from app.repositories.alumni_search import q_conditions, relevance_expression
+from app.repositories.alumni_search import (
+    friend_id_predicate,
+    q_conditions,
+    relevance_expression,
+)
 from app.utils.sql import escape_like
 
 # Biennial survey cadence (#160): an alumnus is DUE for surveying when their
@@ -523,7 +528,13 @@ def build_alumni_query(
                 column.ilike(f"%{escape_like(value.strip())}%", escape="\\")
             )
 
-    _field_like(net_id, Alumni.net_id)
+    # The Net ID box also takes a friend id (#538): "FRIEND-00042" names the
+    # friend record with primary key 42 (friends have no Net ID to type).
+    friend_pk = parse_friend_id(net_id)
+    if friend_pk is not None:
+        conditions.append(friend_id_predicate(friend_pk))
+    else:
+        _field_like(net_id, Alumni.net_id)
     _field_like(first_name, Alumni.first_name)
     # Last-name field search also matches the maiden / birth name (#216) so an
     # alumna looked up by her birth name is found even via the dedicated

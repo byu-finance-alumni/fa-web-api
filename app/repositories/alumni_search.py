@@ -71,6 +71,7 @@ table.
 from sqlalchemy import ColumnElement, and_, case, func, literal, or_, select
 from sqlalchemy.orm import aliased
 
+from app.core.friend_id import parse_friend_id
 from app.core.search_terms import (
     MIN_FUZZY_LENGTH,
     ROLE_ANY,
@@ -384,10 +385,27 @@ def q_conditions(parsed: ParsedQuery, *, extra=None) -> list:
     keeps hitting. Ranking lives in :func:`relevance_expression` and is applied
     only by the list's ORDER BY, so it cannot affect the exported population.
     """
-    return [
+    conditions = [
         segment_predicate(segment, include_ids=parsed.single_token, extra=extra)
         for segment in parsed.segments
     ]
+    # A typed friend id (#538) -- "FRIEND-00042" -- is atomic like a Net ID, so
+    # it joins the search only as a single unrouted word, OR-ed into that word's
+    # predicate: the id leg finds the friend record, the ordinary legs still run
+    # for a name that merely starts with "friend".
+    if parsed.single_token:
+        friend_pk = parse_friend_id(parsed.segments[0].tokens[0])
+        if friend_pk is not None:
+            conditions[0] = or_(conditions[0], friend_id_predicate(friend_pk))
+    return conditions
+
+
+def friend_id_predicate(alumni_id: int):
+    """``alumni_id = <n> AND is_alumni = false`` -- the record a friend id names.
+
+    The ``is_alumni`` guard is what makes the id a FRIEND id: typing the
+    primary key of an alumnus as "FRIEND-00017" must not find that alumnus."""
+    return and_(Alumni.alumni_id == alumni_id, Alumni.is_alumni.is_(False))
 
 
 # --- ranking ------------------------------------------------------------------

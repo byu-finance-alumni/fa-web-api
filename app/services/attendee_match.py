@@ -1,13 +1,31 @@
-"""Conference-attendee matching for a single event (#612).
+"""Conference-attendee matching for a single event (#612, #537).
 
-Conference registrations do not collect Net IDs, and attendees do not know
-theirs — so every existing bulk path into this database (photo import, alumni
-import, the events attendee import) is unusable for a conference list. This
-module matches an attendee list to existing alumni on **email, then name**, and
-PROPOSES the matches for a human to approve one at a time.
+Originally, conference registrations did not collect Net IDs and attendees did
+not know theirs — so every existing bulk path into this database (photo import,
+alumni import, the events attendee import) was unusable for a conference list,
+and this module matched on **email, then name** only. Since #537 (Jake,
+2026-09-15: registration lists now carry Net IDs) the tiers are:
+
+  0. **Net ID** — exact after normalisation (strip + lower-case, the same rule
+     the alumni schema validates stored Net IDs with). A Net ID hit is
+     CONFIRMED rather than proposed (Jake: "if the Net ID matches then no need
+     to approve; if emails match but no Net ID then ask for approval"), UNLESS
+     the email or name tier points at a DIFFERENT record — then the row is
+     ``ambiguous`` with both candidates listed, never a silent pick.
+  1. **Email** — proposed, one-at-a-time human approval, exactly as before.
+  2. **Name** (+ employer corroboration) — proposed, exactly as before.
+
+A Net ID that is present but unknown to us does NOT make the row a no-match
+and does NOT silently fall back: the row continues to the email and name tiers
+(our own record may simply lack a Net ID, and a no-match would invite a
+duplicate friend record for an alum we could still match), and the unknown Net
+ID is recorded on the row as a data-quality reason. Those fall-through matches
+are proposed, never confirmed.
 
 Nothing here ever writes. :func:`propose` is a pure dry-run report; the writes
-live in the route layer and only ever act on ids a human explicitly approved.
+live in the route layer and only ever act on ids the client explicitly sends —
+either a human's approval or, for a confirmed Net ID row, the row itself,
+through the SAME ``/approve`` endpoint (see :func:`auto_confirmed_approvals`).
 
 Three stages, mirroring ``import_csv`` / ``import_events``:
 
@@ -33,9 +51,11 @@ Three stages, mirroring ``import_csv`` / ``import_events``:
 
 Safety rules this module exists to enforce (from the issue, non-negotiable):
 
-  * **Nothing is auto-applied.** ``propose`` returns proposals only. There is
-    deliberately no confidence threshold above which a match is applied — the
-    caller cannot ask for one.
+  * **``propose`` never writes.** It returns a report only. There is
+    deliberately no confidence threshold above which an email or name match is
+    applied — the caller cannot ask for one. The single exception is the exact
+    Net ID identifier (#537), which is flagged ``auto_confirmed`` on the row and
+    still only written by ``/approve`` when the client sends it.
   * **Ambiguity surfaces as ambiguity.** Every candidate that survives scoring
     is returned, ranked, and a row with more than one candidate is reported as
     ``ambiguous``. The top-scoring candidate is never silently chosen.
@@ -293,8 +313,12 @@ def parse_and_map(
 
         {"row": int, "display_name": str, "first_name": str|None,
          "last_name": str|None, "maiden_name": str|None, "emails": [str],
-         "company": str|None, "graduation_year": int|None, "note": str|None,
-         "payload": dict, "cell_warnings": [str]}
+         "net_id": str|None, "company": str|None, "graduation_year": int|None,
+         "note": str|None, "payload": dict, "cell_warnings": [str]}
+
+    ``net_id`` is the file's Net ID cell normalised exactly as the alumni schema
+    stores it (strip + lower-case); ``None`` when the column or cell is empty,
+    in which case matching behaves exactly as it did before #537.
 
     ``payload`` is a full ``AlumniCreateFull``-shaped friend payload
     (``is_alumni = False``) built by the SAME ``import_csv._map_row`` the alumni
@@ -432,6 +456,7 @@ def _build_row(
         "last_name": last_name,
         "maiden_name": maiden,
         "emails": emails,
+        "net_id": _norm_net_id(payload.get("net_id")),
         "company": career.get("current_employer"),
         "graduation_year": payload.get("graduation_year"),
         "note": payload.get("notes"),
@@ -448,6 +473,24 @@ def _norm_email(value: object) -> str | None:
         return None
     cleaned = value.strip().lower()
     return cleaned or None
+
+
+# Stored Net IDs are validated as 2-12 lower-case letters and digits
+# (``app.schemas.alumni._NET_ID_RE``); the template value is normalised the
+# same way so " JSmith12 " and "jsmith12" are one key.
+_NET_ID_RE = re.compile(r"^[a-z0-9]{2,12}$")
+
+
+def _norm_net_id(value: object) -> str | None:
+    """Strip + lower-case a Net ID cell; ``None`` when empty."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    return cleaned or None
+
+
+def net_id_is_well_formed(value: str | None) -> bool:
+    return bool(value) and _NET_ID_RE.match(value) is not None
 
 
 _NAME_PUNCT = re.compile(r"[^a-z0-9]+")
@@ -692,6 +735,21 @@ def _norm_col(column):
     return func.lower(func.trim(column))
 
 
+def build_net_id_query(net_ids: list[str]):
+    """Candidates whose Net ID is one of ``net_ids`` (tier 0, #537).
+
+    ``lower(trim(net_id))`` is exactly the expression of the partial unique
+    index ``uq_alumni_net_id_lower_active`` (archived = false AND net_id IS NOT
+    NULL), which ``_candidate_select``'s ``archived = false`` predicate lets the
+    planner use — so a Net ID hit is both indexed and, over active rows, unique.
+    """
+    return (
+        _candidate_select()
+        .where(_norm_col(Alumni.net_id).in_(net_ids))
+        .limit(_MAX_CANDIDATE_ROWS)
+    )
+
+
 def build_email_query(emails: list[str]):
     """Candidates whose personal OR work email is one of ``emails`` (exact,
     case-insensitive). One query for the whole file."""
@@ -803,12 +861,19 @@ def _row_to_candidate(row) -> dict:
 #
 # Tiers, highest first. The tier decides precedence; the numeric score only
 # ranks WITHIN a tier. There is intentionally no threshold that turns a score
-# into an applied match — a human approves every one.
+# into an applied match — a human approves every email / name match. The Net
+# ID tier is different in kind: it is an exact identifier, not a score, and a
+# lone uncontradicted hit is reported ``auto_confirmed`` (#537).
+TIER_NETID = "netid"
 TIER_EMAIL = "email"
 TIER_NAME = "name"
 TIER_NAME_COMPANY = "name_company"
 
-_TIER_RANK = {TIER_EMAIL: 3, TIER_NAME: 2, TIER_NAME_COMPANY: 1}
+_TIER_RANK = {TIER_NETID: 4, TIER_EMAIL: 3, TIER_NAME: 2, TIER_NAME_COMPANY: 1}
+
+# Confidence of a Net ID hit. Distinct from "high" so the UI can render it as
+# a confirmation rather than a strong proposal.
+CONFIDENCE_CERTAIN = "certain"
 
 # How much agreement on the given name is worth, within the name tier.
 _GIVEN_SCORE = {"exact": 40, "nickname": 30, "initial": 10}
@@ -821,8 +886,16 @@ def score_candidate(row: dict, candidate: dict) -> dict | None:
     otherwise a dict with ``tier``, ``score``, ``confidence`` and a list of
     human-readable ``evidence`` strings ("Email matches", "Maiden name matches",
     "Employer corroborates") so the reviewer can judge rather than trust a badge.
+
+    A Net ID hit (tier 0) additionally carries ``corroborated`` — whether the
+    row's email or name ALSO agrees with this record — which
+    :func:`rank_candidates` uses to decide whether a name-tier candidate for a
+    different person contradicts the Net ID or is merely a homonym.
     """
     evidence: list[str] = []
+    file_net_id = row.get("net_id")
+    candidate_net_id = _norm_net_id(candidate.get("net_id"))
+    net_id_hit = bool(file_net_id) and file_net_id == candidate_net_id
     candidate_emails = {
         e
         for e in (
@@ -859,7 +932,24 @@ def score_candidate(row: dict, candidate: dict) -> dict | None:
         and row.get("graduation_year") == candidate.get("graduation_year")
     )
 
-    if email_hit:
+    # What the email / name legs say about this candidate, independent of the
+    # Net ID — a Net ID hit reports them as corroboration (or its absence).
+    corroborated = bool(email_hit) or bool(surname_hit and given)
+
+    if net_id_hit:
+        tier = TIER_NETID
+        score = 200
+        evidence.append(f"Net ID matches ({file_net_id})")
+        if email_hit:
+            evidence.append(f"Email also matches ({email_hit})")
+        if surname_hit and given:
+            evidence.append("Name also matches")
+        elif row.get("last_name") or row.get("first_name"):
+            evidence.append(
+                "Name on the file does NOT agree with this record "
+                "(the Net ID is the only match key)"
+            )
+    elif email_hit:
         tier = TIER_EMAIL
         score = 100
         evidence.append(f"Email matches ({email_hit})")
@@ -900,8 +990,19 @@ def score_candidate(row: dict, candidate: dict) -> dict | None:
         evidence.append(f"Graduation year matches ({candidate.get('graduation_year')})")
     if not candidate.get("is_alumni"):
         evidence.append("Existing friend record (not an alumnus)")
+    # An email / name candidate whose stored Net ID disagrees with the file's
+    # (or who has none) is still proposed — but the reviewer must SEE that.
+    if file_net_id and not net_id_hit:
+        if candidate_net_id:
+            evidence.append(
+                f"Net ID differs (file: {file_net_id}; record: {candidate_net_id})"
+            )
+        else:
+            evidence.append(f"Record has no Net ID on file (file gives {file_net_id})")
 
-    if tier == TIER_EMAIL:
+    if tier == TIER_NETID:
+        confidence = CONFIDENCE_CERTAIN
+    elif tier == TIER_EMAIL:
         confidence = "high"
     elif tier == TIER_NAME and given == "exact" and (company_hit or year_hit):
         confidence = "high"
@@ -915,12 +1016,36 @@ def score_candidate(row: dict, candidate: dict) -> dict | None:
         "tier": tier,
         "score": score,
         "confidence": confidence,
+        "corroborated": corroborated,
         "evidence": evidence,
     }
 
 
+def _contradicts_net_id(net_id_hits: list[dict], other: dict) -> bool:
+    """Does an email / name candidate for a DIFFERENT person contradict the
+    Net ID hit(s), or is it merely a homonym?
+
+    * An EMAIL hit on somebody else always contradicts — email is itself an
+      identifier, and two identifiers disagreeing is exactly the case Jake
+      wants surfaced, never silently resolved.
+    * A NAME hit on somebody else contradicts only when the name tier does NOT
+      also agree with the Net ID record. If the Net ID record's own name
+      agrees with the file, the other candidate is just another John Smith and
+      the exact identifier has already told them apart.
+    """
+    if other["tier"] == TIER_EMAIL:
+        return True
+    return not any(hit["corroborated"] for hit in net_id_hits)
+
+
 def rank_candidates(row: dict, candidates: list[dict]) -> list[dict]:
     """Score, filter and rank a row's candidate pool.
+
+    A NET ID hit (tier 0, #537) outranks everything. Alone and uncontradicted
+    it is the row's only candidate. It is contradicted — and the contradicting
+    candidates are KEPT so the reviewer sees both — when an email hit or an
+    un-corroborated name hit points at a different record
+    (:func:`_contradicts_net_id`); the caller then reports ``ambiguous``.
 
     An EMAIL hit is decisive about which candidates are worth showing at all: if
     any candidate matches on email, only the email-tier candidates survive
@@ -932,7 +1057,15 @@ def rank_candidates(row: dict, candidates: list[dict]) -> list[dict]:
     if not scored:
         return []
     best_rank = max(_TIER_RANK[s["tier"]] for s in scored)
-    if best_rank == _TIER_RANK[TIER_EMAIL]:
+    if best_rank == _TIER_RANK[TIER_NETID]:
+        net_id_hits = [s for s in scored if s["tier"] == TIER_NETID]
+        others = [s for s in scored if s["tier"] != TIER_NETID]
+        conflicts = [s for s in others if _contradicts_net_id(net_id_hits, s)]
+        # Among the conflicts the usual email-beats-name rule still applies.
+        if any(s["tier"] == TIER_EMAIL for s in conflicts):
+            conflicts = [s for s in conflicts if s["tier"] == TIER_EMAIL]
+        scored = net_id_hits + conflicts
+    elif best_rank == _TIER_RANK[TIER_EMAIL]:
         scored = [s for s in scored if s["tier"] == TIER_EMAIL]
     scored.sort(key=lambda s: (-_TIER_RANK[s["tier"]], -s["score"], s["alumni_id"]))
     return scored[:MAX_CANDIDATES_PER_ROW]
@@ -944,10 +1077,18 @@ def rank_candidates(row: dict, candidates: list[dict]) -> list[dict]:
 async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict:
     """Build the per-row match proposal for ONE event. NO writes, ever.
 
-    Resolves the whole file in at most FOUR batched queries (email leg, surname
-    leg, given-name+employer leg, and the event's existing roster) regardless of
-    how many rows the file has. Never fetches the roster into Python.
+    Resolves the whole file in at most FIVE batched queries (Net ID leg, email
+    leg, surname leg, given-name+employer leg, and the event's existing roster)
+    regardless of how many rows the file has. A file without a Net ID column
+    runs the same four queries it did before #537. Never fetches the roster
+    into Python.
     """
+    # Only well-formed Net IDs go to SQL: a malformed cell ("j.smith@byu.edu"
+    # in the Net ID column) can never equal a stored value, so it is reported
+    # on the row instead of queried.
+    net_ids = sorted(
+        {r["net_id"] for r in rows if net_id_is_well_formed(r.get("net_id"))}
+    )
     emails = sorted({e for r in rows for e in r["emails"]})
     surnames = sorted(
         {
@@ -987,6 +1128,8 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
             candidate = _row_to_candidate(db_row)
             pool.setdefault(candidate["alumni_id"], candidate)
 
+    if net_ids:
+        await _collect(build_net_id_query(net_ids))
     if emails:
         await _collect(build_email_query(emails))
     if surnames:
@@ -996,10 +1139,14 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
 
     # Index the pool by the keys each leg can be looked up on, so per-row
     # scoring touches a handful of candidates instead of the whole pool.
+    by_net_id: dict[str, list[dict]] = {}
     by_email: dict[str, list[dict]] = {}
     by_surname: dict[str, list[dict]] = {}
     by_given: dict[str, list[dict]] = {}
     for candidate in pool.values():
+        net_id_key = _norm_net_id(candidate["net_id"])
+        if net_id_key:
+            by_net_id.setdefault(net_id_key, []).append(candidate)
         for email in (
             _norm_email(candidate["personal_email"]),
             _norm_email(candidate["work_email"]),
@@ -1031,6 +1178,7 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
     seen_keys: dict[tuple, int] = {}
     tally = {
         "matched": 0,
+        "auto_confirmed": 0,
         "ambiguous": 0,
         "no_match": 0,
         "not_reviewed": 0,
@@ -1048,6 +1196,7 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
         # A row repeated inside the same file is counted once (the second
         # occurrence is reported, never silently merged away).
         dedup_key = (
+            row.get("net_id") or "",
             tuple(sorted(row["emails"])),
             _norm_name(row.get("first_name")),
             _norm_name(row.get("last_name")),
@@ -1057,6 +1206,9 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
             seen_keys[dedup_key] = row["row"]
 
         pool_for_row: dict[int, dict] = {}
+        net_id = row.get("net_id")
+        for candidate in by_net_id.get(net_id, ()) if net_id else ():
+            pool_for_row[candidate["alumni_id"]] = candidate
         for email in row["emails"]:
             for candidate in by_email.get(email, ()):
                 pool_for_row[candidate["alumni_id"]] = candidate
@@ -1072,6 +1224,62 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
 
         candidates = rank_candidates(row, list(pool_for_row.values()))
 
+        # Tier 0 verdict (#537). ``reason`` is the one-line explanation the
+        # reviewer sees for anything the Net ID decided or failed to decide.
+        net_id_hits = [c for c in candidates if c["tier"] == TIER_NETID]
+        auto_confirmed = False
+        reason: str | None = None
+        if net_id and not net_id_hits:
+            # Present but unknown (or malformed): NOT a no-match and NOT a
+            # silent fallback. The row goes on to the email and name tiers as
+            # a PROPOSAL — our own record may simply lack a Net ID, and a
+            # no-match here would invite a duplicate friend record for an alum
+            # we can still match — and the reviewer is told why.
+            if net_id_is_well_formed(net_id):
+                reason = (
+                    f"Net ID '{net_id}' is not on any record; matched on email "
+                    "and name instead. Check the Net ID before approving."
+                )
+            else:
+                reason = (
+                    f"'{net_id}' is not a valid Net ID (2-12 letters and "
+                    "digits); matched on email and name instead."
+                )
+            row_warnings.append(reason)
+        elif net_id_hits and len(candidates) == 1:
+            # Exact identifier, nothing contradicting it: confirmed, not
+            # proposed. The client applies it through the same /approve
+            # endpoint as a human approval, with ``net_id`` set so the server
+            # re-verifies the identifier before writing.
+            auto_confirmed = True
+            reason = (
+                f"Net ID matches {candidates[0]['name']}; no approval needed."
+            )
+            if not candidates[0]["corroborated"] and (
+                row["emails"] or row.get("last_name") or row.get("first_name")
+            ):
+                row_warnings.append(
+                    "Only the Net ID matches: the name and email on the file "
+                    "do not agree with this record. Check the Net ID."
+                )
+        elif net_id_hits:
+            contradicting = [c for c in candidates if c["tier"] != TIER_NETID]
+            if not contradicting:
+                # More than one active record with this Net ID should be
+                # impossible (partial unique index) — if it happens, it is
+                # data corruption to surface, never to resolve here.
+                reason = (
+                    f"Net ID '{net_id}' matches more than one record; "
+                    "choose one."
+                )
+            else:
+                other = contradicting[0]
+                via = "email" if other["tier"] == TIER_EMAIL else "name"
+                reason = (
+                    f"Net ID matches {net_id_hits[0]['name']} but the {via} "
+                    f"matches {other['name']}. Choose one."
+                )
+
         if budget <= 0 and candidates:
             # The response has already disclosed its whole budget of alumni
             # records. Say so plainly rather than returning "no match", which
@@ -1079,6 +1287,7 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
             # duplicate friend record.
             candidates = []
             status = "not_reviewed"
+            auto_confirmed = False
             row_warnings.append(
                 "Not reviewed: this upload reached the limit on how many alumni "
                 "records one review may show. Re-upload the remaining rows as a "
@@ -1096,6 +1305,8 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
             else:
                 status = "ambiguous"
         tally[status] += 1
+        if auto_confirmed:
+            tally["auto_confirmed"] += 1
         if candidates and all(c["already_attending"] for c in candidates):
             tally["already_attending"] += 1
 
@@ -1114,13 +1325,28 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
                     "last_name": row["last_name"],
                     "maiden_name": row["maiden_name"],
                     "email": row["emails"][0] if row["emails"] else None,
+                    "net_id": net_id,
                     "company": row["company"],
                     "title": (row["payload"].get("career") or {}).get("current_title"),
                     "graduation_year": row["graduation_year"],
                 },
-                "match_key": "email" if row["emails"] else "name",
+                # The key that DECIDED the row: "netid" only when a Net ID hit
+                # did; an unknown Net ID row reports the key it fell through to.
+                "match_key": (
+                    "netid"
+                    if net_id_hits
+                    else ("email" if row["emails"] else "name")
+                ),
+                "auto_confirmed": auto_confirmed,
+                "reason": reason,
                 "candidates": candidates,
                 "warnings": row_warnings,
+                # Friend prompt rule (#537; Jake did not answer this one, so the
+                # SAFER default): a row may be offered "create as friend" only
+                # when it failed EVERY tier — never merely because it lacks a
+                # Net ID, which would duplicate an alum we matched on email or
+                # name. The friend-creation endpoint itself is unchanged.
+                "friend_eligible": status == "no_match",
                 "friend_fields": _friend_field_labels(row["payload"]),
             }
         )
@@ -1149,6 +1375,7 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
         "summary": {
             "total_rows": len(rows),
             "matched": tally["matched"],
+            "auto_confirmed": tally["auto_confirmed"],
             "ambiguous": tally["ambiguous"],
             "no_match": tally["no_match"],
             "not_reviewed": tally["not_reviewed"],
@@ -1161,6 +1388,29 @@ async def propose(session: AsyncSession, event: Event, rows: list[dict]) -> dict
         # only how many rows were processed.
         "_disclosed_alumni_ids": sorted(disclosed),
     }
+
+
+def auto_confirmed_approvals(report: dict) -> list[dict]:
+    """The ``/approve`` items for every ``auto_confirmed`` row of a
+    :func:`propose` report — and NOTHING else.
+
+    This is how a confirmed Net ID match reaches the database: through the
+    SAME apply endpoint a human approval uses, never a second write path that
+    can drift. Each item carries the file's ``net_id`` so the route re-verifies
+    the identifier against the record before writing and labels the audit
+    entry as a Net ID match rather than a human approval. Proposed rows (email
+    / name, or a contradicted Net ID) are deliberately absent: they still go
+    through the one-at-a-time approval queue.
+    """
+    return [
+        {
+            "alumni_id": row["candidates"][0]["alumni_id"],
+            "row": row["row"],
+            "net_id": row["attendee"]["net_id"],
+        }
+        for row in report.get("rows", ())
+        if row.get("auto_confirmed") and len(row.get("candidates") or ()) == 1
+    ]
 
 
 _SECTION_KEYS = ("contact", "career", "education", "engagement", "former", "leadership")
@@ -1187,14 +1437,17 @@ def _friend_field_labels(payload: dict) -> list[str]:
 def friend_identity_key(
     first_name: object, last_name: object, company: object
 ) -> str:
-    """Stable key for "the same person already created from this list".
+    """Normalised name + employer key for a friend row that carries NO email.
 
     Friend records carry no Net ID or BYU ID, so ``create_alumni``'s exact-id
     duplicate blocker cannot see them: re-posting the same file would happily
-    create a second Jane Doe. The friends route therefore builds this key for
-    everyone already on the event's roster and skips a row that matches, making
-    friend creation idempotent per (event, person) the same way approval is
-    idempotent per (event, alumni).
+    create a second Jane Doe. Since #538 a friend's identity is its EMAIL
+    (``services.friend_identity``); this key is the fallback for rows that did
+    not collect one, checked against every friend in the table AND against the
+    event's roster (idempotent per (event, person), the way approval is
+    idempotent per (event, alumni)). Accepted trade-off: a job change between
+    events duplicates, and two people with a common name at one large employer
+    collide. Email fixes both; this key exists only where there is none.
     """
     return "|".join(
         (
@@ -1207,7 +1460,12 @@ def friend_identity_key(
 
 # --- CSV template ------------------------------------------------------------
 
+# "Net ID" is first because it is the exact match key (#537): a row whose Net
+# ID is on file is confirmed without approval; a row without one is matched on
+# email, then name, and proposed for approval. The header aliases "net id" and
+# "netid" (any casing) as well.
 TEMPLATE_HEADERS: list[str] = [
+    "Net ID",
     "First name",
     "Last name",
     "Maiden name",
@@ -1221,6 +1479,7 @@ TEMPLATE_HEADERS: list[str] = [
 ]
 _TEMPLATE_EXAMPLES: list[list[str]] = [
     [
+        "msmith07",
         "Michael",
         "Smith",
         "",
@@ -1233,6 +1492,7 @@ _TEMPLATE_EXAMPLES: list[list[str]] = [
         "Panelist",
     ],
     [
+        "",
         "Kate",
         "Nielsen",
         "Barker",
@@ -1251,9 +1511,11 @@ def build_template_csv() -> str:
     """A starting-point attendee CSV.
 
     Only a starting point on purpose: this importer does NOT require the
-    template's columns. Any recognisable spelling maps (Email / E-mail Address /
-    Company / Employer / Organization ...) and anything unrecognised is ignored,
-    so a raw conference registration export can be uploaded untouched.
+    template's columns. Any recognisable spelling maps (Net ID / netid, Email /
+    E-mail Address / Company / Employer / Organization ...) and anything
+    unrecognised is ignored, so a raw conference registration export can be
+    uploaded untouched. Supply the Net ID column whenever the registration
+    system has it: it is the one key that confirms a match without review.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer)

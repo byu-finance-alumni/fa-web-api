@@ -14,9 +14,18 @@ import re
 import unicodedata
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from app.core.dropdowns import validate_industry
+from app.core.friend_id import friend_id_for
+from app.services.employment_display import employer_display
 
 # --- Validation constants ----------------------------------------------------
 
@@ -869,6 +878,17 @@ class AlumniRead(BaseModel):
     created_at: datetime.datetime
     updated_at: datetime.datetime
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def friend_id(self) -> str | None:
+        """Visible id of a friend-of-the-program record (#538): ``FRIEND-00042``
+        for ``alumni_id`` 42 when ``is_alumni`` is false, ``None`` for every
+        alumnus. Read-only and derived (see ``app.core.friend_id``) -- a client
+        can never send one. Rides on this base schema so the list row, the
+        profile read and the write results all carry the same value for the
+        same record; the CSV export derives its column from the same helper."""
+        return friend_id_for(self.alumni_id, self.is_alumni)
+
 
 class DuplicateWarning(BaseModel):
     """One soft duplicate warning raised by a create or update (#627).
@@ -916,6 +936,16 @@ class AlumniListItem(AlumniRead):
     current_industry_secondary: str | None = None
     current_city: str | None = None
     current_state: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def employer_display(self) -> str | None:
+        """What the employer column SHOWS (#536): ``current_employer`` when set,
+        else the employment status for the non-employed statuses, else null.
+        Derived from this row's own fields at serialization time, so it can
+        never disagree with them; the CSV export's "Current employer" column
+        runs the same function. ``current_employer`` stays the stored value."""
+        return employer_display(self.current_employer, self.employment_status)
 
 
 class AlumniLocation(BaseModel):

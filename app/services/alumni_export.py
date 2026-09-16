@@ -40,6 +40,7 @@ from app.schemas.alumni_export import (
     ExportColumnCatalog,
 )
 from app.services import geo_search, headshot_index
+from app.services.employment_display import employer_display
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +74,10 @@ CATALOG: list[_Col] = [
     _Col("byu_id", "BYU ID", "Identity", _ALUMNI, "byu_id"),
     _Col("mst_id", "MSTID", "Identity", _ALUMNI, "mst_id"),
     _Col("net_id", "Net ID", "Identity", _ALUMNI, "net_id"),
+    # Visible id of a friend-of-the-program record (#538) -- ``FRIEND-00042``,
+    # blank for every alumnus. Derived from the primary key by the ORM
+    # ``Alumni.friend_id`` property (see ``app.core.friend_id``), not a column.
+    _Col("friend_id", "Friend ID", "Identity", _ALUMNI, "friend_id"),
     _Col("first_name", "First name", "Identity", _ALUMNI, "first_name"),
     _Col("middle_name", "Middle name", "Identity", _ALUMNI, "middle_name"),
     _Col("last_name", "Last name", "Identity", _ALUMNI, "last_name"),
@@ -202,6 +207,11 @@ CATALOG: list[_Col] = [
     _Col("region", "Region", "Contact", _CONTACT, "region"),
     _Col("best_contact", "Best contact", "Contact", _CONTACT, "best_contact"),
     # --- Current career ---
+    # The VALUE of this column is the employer DISPLAY value (#536): the stored
+    # employer when set, else the employment status for the non-employed
+    # statuses — see `_EMPLOYER_DISPLAY_KEY` in `export_csv`. Same function the
+    # list row's `employer_display` uses, so a CSV never shows a blank where the
+    # list showed "Graduate Student". The header keeps its name.
     _Col("current_employer", "Current employer", "Career", _CAREER, "current_employer"),
     _Col("current_title", "Current title", "Career", _CAREER, "current_title"),
     _Col("current_industry", "Current industry", "Career", _CAREER, "current_industry"),
@@ -333,6 +343,11 @@ CATALOG: list[_Col] = [
 ]
 
 _BY_KEY: dict[str, _Col] = {c.key: c for c in CATALOG}
+
+# The one column whose cell is derived rather than read straight off its source
+# row (#536). Kept as a key, not a flag on `_Col`, because it is a single
+# deliberate exception: the raw `employment_status` column stays raw.
+_EMPLOYER_DISPLAY_KEY = "current_employer"
 
 # Default-checked columns: the everyday directory fields, deliberately excluding
 # the most sensitive PII (BYU/Net id, birthday, free-text notes) so a casual
@@ -570,6 +585,12 @@ async def export_csv(
         for c in columns:
             source_row = a if c.source == _ALUMNI else record_for.get(c.source)
             value = getattr(source_row, c.attr, None) if source_row is not None else None
+            if c.key == _EMPLOYER_DISPLAY_KEY:
+                # Export <-> list parity (#536): the list row shows
+                # `employer_display`, so the CSV must show the same value — a
+                # missing career row falls through to the status exactly as the
+                # list's NULL scalar subquery does.
+                value = employer_display(value, a.employment_status)
             row_out.append(_fmt(value, c.kind))
         writer.writerow(row_out)
 

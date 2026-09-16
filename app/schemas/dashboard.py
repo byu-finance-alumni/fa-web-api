@@ -134,6 +134,11 @@ class BirthdayRow(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     current_employer: str | None = None
+    # The employer column's DISPLAY value (#536): ``current_employer`` when set,
+    # else the employment status for the non-employed statuses. Computed by the
+    # route with ``employment_display.employer_display`` — the same rule the
+    # alumni list, profile and CSV export use.
+    employer_display: str | None = None
     graduation_year: int | None = None
     birth_month: int | None = None
     birth_day: int | None = None

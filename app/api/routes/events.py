@@ -698,10 +698,14 @@ async def remove_event_attendee(
 
 # --- Conference-attendee matching (#612) -------------------------------------
 #
-# Conference registrations do not collect Net IDs and attendees do not know
-# theirs, so no existing bulk path can get an attendee list into this database.
-# This flow uploads a list of names/companies/emails scoped to ONE event,
-# PROPOSES matches, and writes attendance only for the matches a human ticked.
+# Conference registrations originally did not collect Net IDs, so no existing
+# bulk path could get an attendee list into this database. This flow uploads a
+# list of names/companies/emails (and, since #537, Net IDs) scoped to ONE
+# event, PROPOSES matches, and writes attendance only for the matches a human
+# ticked -- plus exact Net ID hits, which the preview reports ``auto_confirmed``
+# and the client applies through the SAME /approve call (Jake, 2026-09-15: "if
+# the Net ID matches then no need to approve; if emails match but no Net ID
+# then ask for approval").
 #
 # Everything here is gated at ``full_access``, the same rung as the attendee
 # roster and the attendee CSV export: /preview reads real alumni PII (names,
@@ -709,10 +713,12 @@ async def remove_event_attendee(
 # not sit on a looser guard than the export that already discloses the same
 # columns. Every leg carries the SAME guard on purpose.
 #
-# THE INVARIANT: nothing is ever auto-applied. /preview writes no attendance and
-# the apply routes act only on ids / row numbers the client explicitly sends,
-# which the UI only ever populates from an explicit human approval. There is no
-# confidence-threshold parameter anywhere in this surface, by design.
+# THE INVARIANT: /preview writes no attendance and the apply routes act only on
+# ids / row numbers the client explicitly sends -- an explicit human approval,
+# or an auto_confirmed Net ID row carrying its net_id, which /approve
+# re-verifies against the record before writing. There is no
+# confidence-threshold parameter anywhere in this surface, by design: the Net
+# ID is an exact identifier, not a score.
 
 
 async def _read_capped_attendees(file: UploadFile) -> bytes | None:
@@ -747,6 +753,7 @@ def _empty_match_preview(header_errors: list[str], ignored: list[str]) -> dict:
         "summary": {
             "total_rows": 0,
             "matched": 0,
+            "auto_confirmed": 0,
             "ambiguous": 0,
             "no_match": 0,
             "not_reviewed": 0,
@@ -769,6 +776,12 @@ async def preview_attendee_match(
     """Propose matches for a conference attendee list (full_access, NO writes).
 
     Matching precedence, per row:
+      0. **Net ID** (#537), when the file gives one - exact after strip +
+         lower-case. A lone, uncontradicted hit is ``auto_confirmed``: apply it
+         through ``/approve`` with its ``net_id`` and no human click. If the
+         email or name instead points at a DIFFERENT record the row is
+         ``ambiguous`` with both listed. A Net ID we do not know falls through
+         to the tiers below as a PROPOSAL, with the reason on the row.
       1. **Email**, when the file gives one - an exact, case-insensitive hit on
          the alumnus's personal OR work email. Treated as high confidence, and
          when an email hit exists the name-only candidates for that row are
@@ -812,6 +825,7 @@ async def preview_attendee_match(
             new_value=(
                 f"rows={report['summary']['total_rows']}; "
                 f"matched={report['summary']['matched']}; "
+                f"auto_confirmed={report['summary']['auto_confirmed']}; "
                 f"ambiguous={report['summary']['ambiguous']}; "
                 f"no_match={report['summary']['no_match']}; "
                 f"not_reviewed={report['summary']['not_reviewed']}; "
@@ -833,12 +847,18 @@ async def approve_attendee_matches(
     user: RequireEventsManage,
     session: SessionDep,
 ) -> AttendeeApplyResult:
-    """Record attendance for HUMAN-APPROVED matches (full_access).
+    """Record attendance for approved matches (full_access).
 
     Approving a match marks that person as attending THIS event and changes
     nothing else on the alumnus (Jake, 2026-08-04). Every ``alumni_id`` is
     re-validated server-side (must exist and not be archived) - the client's
     proposal is never trusted.
+
+    An ``auto_confirmed`` Net ID row from the preview (#537) is applied through
+    this same call with its ``net_id`` set: the server re-verifies that the
+    record's Net ID equals it before writing (``net_id_mismatch`` otherwise,
+    nothing written) and the audit entry records a Net ID match rather than a
+    human approval. There is still no confidence threshold here.
 
     **Idempotent per (event, alumni):** an alumnus already on the roster is
     reported ``already_attending`` and skipped, so re-running the same file
@@ -860,7 +880,7 @@ async def approve_attendee_matches(
     )
 
     items: list[AttendeeApplyItem] = []
-    added = already = missing = 0
+    added = already = missing = mismatched = 0
     # De-duplicate within the request as well: the same alumnus approved twice
     # in one batch must still produce exactly one attendance row.
     seen: set[int] = set()
@@ -882,6 +902,29 @@ async def approve_attendee_matches(
             )
             continue
         name = _attendee_name(alumni)
+        if approval.net_id is not None:
+            stored = (alumni.net_id or "").strip().lower()
+            if stored != approval.net_id:
+                # The client claimed a Net ID confirmation the record does not
+                # bear. Refuse rather than quietly downgrade to an "approved
+                # match": nothing here was approved by a human.
+                mismatched += 1
+                items.append(
+                    AttendeeApplyItem(
+                        alumni_id=approval.alumni_id,
+                        row=approval.row,
+                        status="net_id_mismatch",
+                        name=name,
+                        message=(
+                            f"Net ID '{approval.net_id}' does not match this "
+                            "record; re-run the preview."
+                        ),
+                    )
+                )
+                continue
+            how = f"Net ID match {approval.net_id}, confirmed without approval"
+        else:
+            how = "approved match"
         if approval.alumni_id in existing:
             already += 1
             items.append(
@@ -908,7 +951,7 @@ async def approve_attendee_matches(
                 action_type="add_attendee",
                 entity_type="event",
                 entity_id=event_id,
-                new_value=f"{approval.alumni_id}: {name} (approved match)",
+                new_value=f"{approval.alumni_id}: {name} ({how})",
             )
         )
         existing.add(approval.alumni_id)
@@ -928,6 +971,7 @@ async def approve_attendee_matches(
         added=added,
         already_attending=already,
         not_found=missing,
+        net_id_mismatch=mismatched,
         items=items,
     )
 

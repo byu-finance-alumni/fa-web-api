@@ -73,6 +73,10 @@ CATALOG: list[_Col] = [
     _Col("byu_id", "BYU ID", "Identity", _ALUMNI, "byu_id"),
     _Col("mst_id", "MSTID", "Identity", _ALUMNI, "mst_id"),
     _Col("net_id", "Net ID", "Identity", _ALUMNI, "net_id"),
+    # Visible id of a friend-of-the-program record (#538) -- ``FRIEND-00042``,
+    # blank for every alumnus. Derived from the primary key by the ORM
+    # ``Alumni.friend_id`` property (see ``app.core.friend_id``), not a column.
+    _Col("friend_id", "Friend ID", "Identity", _ALUMNI, "friend_id"),
     _Col("first_name", "First name", "Identity", _ALUMNI, "first_name"),
     _Col("middle_name", "Middle name", "Identity", _ALUMNI, "middle_name"),
     _Col("last_name", "Last name", "Identity", _ALUMNI, "last_name"),

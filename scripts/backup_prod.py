@@ -536,17 +536,49 @@ def run_tool(
     return result
 
 
+def split_password(database_url: str) -> tuple[str, str | None]:
+    """``(url without the password, decoded password)``.
+
+    The pg tools accept the password from ``PGPASSWORD`` in the environment, so
+    it never has to sit in argv where a process listing or endpoint telemetry
+    would record it for the life of the dump. libpq wants the raw password in
+    the environment, so a percent-encoded one in the URL is decoded here.
+    """
+    parts = urllib.parse.urlsplit(database_url)
+    if parts.password is None:
+        return database_url, None
+    userinfo = urllib.parse.quote(parts.username or "", safe="")
+    hostport = parts.hostname or ""
+    if ":" in hostport:  # bare IPv6 literal
+        hostport = f"[{hostport}]"
+    if parts.port is not None:
+        hostport = f"{hostport}:{parts.port}"
+    netloc = f"{userinfo}@{hostport}" if userinfo else hostport
+    return urllib.parse.urlunsplit(parts._replace(netloc=netloc)), urllib.parse.unquote(
+        parts.password
+    )
+
+
+def run_db_tool(
+    args: list[str], cfg: BackupConfig, *, what: str
+) -> subprocess.CompletedProcess[str]:
+    """``run_tool`` for a command that ends with the database URL: the password is
+    moved out of argv into ``PGPASSWORD`` before the process starts."""
+    url, password = split_password(cfg.database_url)
+    env = {"PGPASSWORD": password} if password is not None else None
+    return run_tool([*args, url], cfg.secrets, what=what, env=env)
+
+
 def pg_dump_public(tools: Mapping[str, str], cfg: BackupConfig, dest: pathlib.Path) -> None:
-    run_tool(
+    run_db_tool(
         [
             tools["pg_dump"],
             "--format=custom",
             "--schema=public",
             "--no-password",
             f"--file={dest}",
-            cfg.database_url,
         ],
-        cfg.secrets,
+        cfg,
         what="pg_dump of schema public",
     )
 
@@ -581,22 +613,18 @@ def pg_dump_auth(
         f"--file={dest}",
     ]
     try:
-        run_tool([*base, cfg.database_url], cfg.secrets, what="pg_dump of schema auth")
+        run_db_tool(base, cfg, what="pg_dump of schema auth")
         return "schema+data", ""
     except BackupError as first:
         note = str(first)
         if dest.exists():
             dest.unlink()
-        run_tool(
-            [*base, "--data-only", cfg.database_url],
-            cfg.secrets,
-            what="pg_dump of schema auth (data only)",
-        )
+        run_db_tool([*base, "--data-only"], cfg, what="pg_dump of schema auth (data only)")
         return "data-only", note
 
 
 def psql_scalar(tools: Mapping[str, str], cfg: BackupConfig, sql: str, *, what: str) -> str:
-    result = run_tool(
+    result = run_db_tool(
         [
             tools["psql"],
             "--no-psqlrc",
@@ -605,9 +633,8 @@ def psql_scalar(tools: Mapping[str, str], cfg: BackupConfig, sql: str, *, what: 
             "ON_ERROR_STOP=1",
             "-tAc",
             sql,
-            cfg.database_url,
         ],
-        cfg.secrets,
+        cfg,
         what=what,
     )
     return result.stdout.strip()

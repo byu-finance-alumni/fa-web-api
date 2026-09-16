@@ -168,10 +168,35 @@ def test_synced_backup_dir_allowed_only_with_explicit_override(tmp_path):
     assert cfg.backup_dir == tmp_path / "Dropbox" / "fa-backups"
 
 
+def test_split_password_moves_the_decoded_password_out_of_the_url():
+    url = f"postgresql://postgres.{REF}:p%40ss-w0rd%2Fx@aws-0.pooler.supabase.com:5432/postgres"
+    stripped, password = bp.split_password(url)
+    assert stripped == f"postgresql://postgres.{REF}@aws-0.pooler.supabase.com:5432/postgres"
+    assert password == "p@ss-w0rd/x"
+    assert bp.split_password(stripped) == (stripped, None)
+
+
+def test_run_db_tool_passes_the_password_only_through_the_environment(tmp_path, monkeypatch):
+    cfg = bp.load_config(good_env(tmp_path), repo_root=REPO_ROOT)
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        seen["env"] = dict(kwargs["env"])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(bp.subprocess, "run", fake_run)
+    bp.run_db_tool(["psql", "-tAc", "select 1"], cfg, what="probe")
+    joined = " ".join(seen["args"])  # type: ignore[arg-type]
+    assert PASSWORD not in joined and "%40" not in joined
+    assert seen["env"]["PGPASSWORD"] == "p@ss-w0rd"  # decoded for libpq  # type: ignore[index]
+    assert seen["env"]["PGSSLMODE"] == "require"  # type: ignore[index]
+
+
 def test_auth_dump_never_captures_session_or_mfa_rows(tmp_path):
     calls: list[list[str]] = []
 
-    def fake_run_tool(argv, secrets, *, what):
+    def fake_run_tool(argv, secrets, *, what, env=None):
         calls.append(list(argv))
         pathlib.Path(argv[-2].removeprefix("--file=")).write_text("-- dump")
         return None
@@ -508,10 +533,12 @@ def test_pg_dump_auth_falls_back_to_data_only(monkeypatch, tmp_path):
     assert len(attempts) == 2
     assert "--data-only" in attempts[1]
     assert dest.read_text(encoding="utf-8") == "COPY auth.users ..."
-    # The dump argv never spells the password in a way we did not intend: it is
-    # the URL, and the URL is the LAST argument on both attempts.
-    assert attempts[0][-1] == cfg.database_url
-    assert attempts[1][-1] == cfg.database_url
+    # The URL is the LAST argument on both attempts and carries NO password —
+    # that travels in PGPASSWORD, so a process listing never shows it.
+    stripped, _ = bp.split_password(cfg.database_url)
+    assert attempts[0][-1] == stripped
+    assert attempts[1][-1] == stripped
+    assert PASSWORD not in " ".join(attempts[0]) and "p%40ss" not in " ".join(attempts[0])
 
 
 def test_pg_dump_auth_prefers_a_full_dump(monkeypatch, tmp_path):

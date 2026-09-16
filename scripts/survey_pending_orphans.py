@@ -303,9 +303,7 @@ def render_report(listing: Listing, diff: Diff, *, prefix: str = STAGED_PREFIX) 
     lines.append(f"DANGLING (a row references them, object missing): {len(diff.dangling)}")
     lines.extend(f"  {path}" for path in diff.dangling)
     if diff.outside_prefix:
-        lines.append(
-            f"References outside {prefix} (not checked): {len(diff.outside_prefix)}"
-        )
+        lines.append(f"References outside {prefix} (not checked): {len(diff.outside_prefix)}")
         lines.extend(f"  {path}" for path in diff.outside_prefix)
     return "\n".join(lines)
 
@@ -348,7 +346,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--expect-project-ref",
         metavar="REF",
-        help="abort unless SUPABASE_URL contains this Supabase project ref",
+        help=(
+            "abort unless SUPABASE_URL contains this Supabase project ref; REQUIRED with --delete"
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -356,7 +356,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=DEFAULT_BATCH_SIZE,
         help=f"deletes per progress line (default {DEFAULT_BATCH_SIZE})",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.delete and not (args.expect_project_ref or "").strip():
+        # A delete decided by whatever project the environment (or a stray .env)
+        # happens to resolve to is the one failure this tool must not allow.
+        parser.error("--delete requires --expect-project-ref <ref>: say which project you mean")
+    return args
 
 
 async def _run(args: argparse.Namespace, out=sys.stdout) -> int:

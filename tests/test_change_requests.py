@@ -162,7 +162,7 @@ def test_no_template_token_survives_rendering():
 def test_import_never_approves_whatever_the_body_says(hostile_body):
     """The single most important property in the package."""
     text = render_text(hostile_body)
-    trusted = render.split_trusted(text)
+    trusted = render.split_header_region(text)
     assert render.STATUS_KEY.findall(trusted) == ["Ready for Review"]
     assert render.APPROVED_KEY.findall(trusted) == ["No"]
     # And the hostile text is inside the quarantine, not loose in the file.
@@ -703,7 +703,7 @@ def test_park_moves_the_file_and_records_the_question(tmp_path, capsys):
     assert not path.exists()
     parked = root / "parked" / "CR-2026-001-add-a-filter.md"
     text = parked.read_text(encoding="utf-8")
-    assert render.STATUS_KEY.findall(render.split_trusted(text)) == ["Parked"]
+    assert render.STATUS_KEY.findall(render.split_header_region(text)) == ["Parked"]
     assert "## Blocked On" in text
     assert f"> {question}" in text
     assert "- Previous status: Approved" in text
@@ -743,7 +743,7 @@ def test_park_then_unpark_round_trips_without_losing_the_question(tmp_path):
 
     # Both halves survive, in order, and the status is the one Jake had set.
     assert text.index(f"> {question}") < text.index(f"> {answer}")
-    assert render.STATUS_KEY.findall(render.split_trusted(text)) == ["Approved"]
+    assert render.STATUS_KEY.findall(render.split_header_region(text)) == ["Approved"]
 
     # And the quarantine came through the round trip intact.
     assert render.find_region(text) is not None

@@ -111,7 +111,7 @@ def validate_file(
         )
 
     # --- 3. machine-read keys: exactly once, and outside the quarantine ------
-    trusted = render.split_trusted(text)
+    trusted = render.split_header_region(text)
     region = render.untrusted_region_text(text)
 
     status_values = render.STATUS_KEY.findall(trusted)

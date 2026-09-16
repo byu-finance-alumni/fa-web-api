@@ -140,6 +140,11 @@ class GeoAlumniRow(BaseModel):
     graduation_year: int | None
     current_employer: str | None
     current_title: str | None
+    # Employer DISPLAY value (#536): ``current_employer`` when set, else the
+    # employment status for the non-employed statuses. Set by the geography
+    # service with ``employment_display.employer_display`` — the same rule the
+    # alumni list, profile and CSV export use.
+    employer_display: str | None = None
 
 
 class GeoAlumniPage(BaseModel):
@@ -160,6 +165,11 @@ class RadiusAlumniRow(BaseModel):
     graduation_year: int | None
     current_employer: str | None
     current_title: str | None
+    # Employer DISPLAY value (#536): ``current_employer`` when set, else the
+    # employment status for the non-employed statuses. Set by the geography
+    # service with ``employment_display.employer_display`` — the same rule the
+    # alumni list, profile and CSV export use.
+    employer_display: str | None = None
     distance_miles: float
 
 
@@ -197,6 +207,11 @@ class CityAlumniRow(BaseModel):
     name: str
     graduation_year: int | None
     current_employer: str | None
+    # Employer DISPLAY value (#536): ``current_employer`` when set, else the
+    # employment status for the non-employed statuses. Set by the geography
+    # service with ``employment_display.employer_display`` — the same rule the
+    # alumni list, profile and CSV export use.
+    employer_display: str | None = None
 
 
 class CityDetail(BaseModel):

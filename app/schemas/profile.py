@@ -11,7 +11,14 @@ from __future__ import annotations
 
 import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from app.core.dropdowns import (
     validate_industry,
@@ -19,6 +26,7 @@ from app.core.dropdowns import (
     validate_tag,
 )
 from app.schemas.alumni import AlumniRead
+from app.services.employment_display import employer_display
 
 
 class _Orm(BaseModel):
@@ -582,3 +590,15 @@ class ProfileRead(BaseModel):
     # amount-viewers (full_access+) in the profile service.
     pay_it_forward: PayItForwardSummary = Field(default_factory=PayItForwardSummary)
     audit: list[AuditEntryRead] = []
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def employer_display(self) -> str | None:
+        """What the profile SHOWS as the employer (#536): ``current_career
+        .current_employer`` when set, else ``alumni.employment_status`` for the
+        non-employed statuses, else null. Lives on the aggregate rather than on
+        ``CurrentCareerRead`` because the fallback must still fire when there
+        is NO career row at all. Same function as the alumni list and the CSV
+        export; the stored fields are untouched."""
+        company = self.current_career.current_employer if self.current_career else None
+        return employer_display(company, self.alumni.employment_status)

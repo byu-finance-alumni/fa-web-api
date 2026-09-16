@@ -9,7 +9,7 @@ One run produces one folder:
 ```
 <BACKUP_DIR>/2026-09-16T150000Z/
   database.dump            public schema, pg_dump custom format (restore with pg_restore)
-  auth.sql                 auth schema, plain SQL (the staff logins)
+  auth.sql                 auth schema, plain SQL (the staff accounts; see below)
   storage/headshots/...    every object in the headshots bucket, same paths as the bucket
   MANIFEST.json            what was captured, sizes, sha256s, row counts, checks
 ```
@@ -17,6 +17,39 @@ One run produces one folder:
 Supabase's own backups (Pro, 7 days) do not include the bucket. This folder is
 the only copy of the photos anywhere, and the database and the photos are a
 matched pair: keep the folder together.
+
+## What the folder is
+
+Treat it as two things at once:
+
+- **Every alumnus in one place.** `database.dump` is the whole `public` schema:
+  contact details, employment, interactions, survey answers. FERPA-covered.
+- **A credential artifact.** `auth.sql` holds `auth.users`, including the
+  `encrypted_password` hashes (kept so a restore keeps logins working), and
+  `auth.identities`. Live session material is deliberately excluded from the
+  dump — refresh tokens, sessions, MFA/TOTP secrets, one-time tokens, in-flight
+  OAuth state (`AUTH_SESSION_TABLES` in the script). After a restore, staff
+  sign in again and re-enrol MFA. Even without those rows, a password hash
+  file is exactly what an attacker wants: handle the folder like a key, not
+  like a spreadsheet.
+
+Rules that follow from that:
+
+1. The destination must be a **local, unsynced** folder on a BYU-managed,
+   disk-encrypted machine (BitLocker on). The script refuses a path that looks
+   cloud-synced (OneDrive, Dropbox, iCloud, Google Drive, Box, or anything
+   under `%OneDrive%`) unless `BACKUP_ALLOW_SYNCED_DIR=1` is set deliberately.
+   Documents and Desktop are often redirected into OneDrive on managed
+   machines — check before choosing them.
+2. Only the engineer opens the folder. Nobody else needs it, including the
+   admins who use the app.
+3. Delete old runs by hand for now: keep the most recent two, remove the rest.
+   No pruning is automated yet (plan Phase 5); a folder of full dumps that
+   nobody deletes is a growing liability, not a growing safety margin.
+4. Taking a backup is not recorded anywhere except the folder's own
+   `MANIFEST.json` — the script runs outside the app with the service key and
+   cannot write to the app's audit tables. Note the run on the board issue
+   (#535) until scheduling ships with its own notification.
 
 ## Before the first run
 

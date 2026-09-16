@@ -151,6 +151,50 @@ class BackupConfig:
         return tuple(s for s in out if s)
 
 
+#: auth-schema tables whose DATA is never dumped. They hold live session and
+#: second-factor material (refresh tokens, sessions, TOTP secrets, one-time
+#: tokens, in-flight OAuth/SAML state). A restore does not need them — staff
+#: sign in again and re-enrol MFA — and a backup folder holding them would be a
+#: ready-made account-takeover kit for every staff login. Table structure is
+#: still dumped; only the rows are excluded.
+AUTH_SESSION_TABLES: tuple[str, ...] = (
+    "refresh_tokens",
+    "sessions",
+    "mfa_factors",
+    "mfa_challenges",
+    "mfa_amr_claims",
+    "one_time_tokens",
+    "flow_state",
+    "saml_relay_states",
+    "audit_log_entries",
+)
+
+
+# Folder names and env vars that mark a cloud-synced location. Documents and
+# Desktop on a managed Windows machine are commonly redirected into OneDrive,
+# so "outside the repo" alone is not enough of a check for a full PII dump.
+_SYNC_FOLDER_NAMES = ("onedrive", "dropbox", "icloud drive", "iclouddrive", "google drive", "box")
+_SYNC_ENV_VARS = ("OneDrive", "OneDriveCommercial", "OneDriveConsumer")
+
+
+def _cloud_sync_marker(path: pathlib.Path, environ: Mapping[str, str]) -> str | None:
+    """Why ``path`` looks cloud-synced, or ``None`` if it does not."""
+    resolved = path.resolve()
+    for name in _SYNC_ENV_VARS:
+        root = environ.get(name)
+        if not root:
+            continue
+        try:
+            resolved.relative_to(pathlib.Path(root).resolve())
+        except (ValueError, OSError):
+            continue
+        return f"inside %{name}%"
+    for part in resolved.parts:
+        if part.lower() in _SYNC_FOLDER_NAMES:
+            return f"path segment '{part}'"
+    return None
+
+
 def load_config(env: Mapping[str, str], *, repo_root: pathlib.Path | None = None) -> BackupConfig:
     """Read and validate configuration from ``env``. Contacts nothing."""
     missing = [name for name in REQUIRED_ENV if not (env.get(name) or "").strip()]
@@ -191,6 +235,14 @@ def load_config(env: Mapping[str, str], *, repo_root: pathlib.Path | None = None
         raise ConfigError(
             "BACKUP_DIR must be OUTSIDE the repository. A dump is every alumnus in one "
             "file and must never sit where a git command could pick it up."
+        )
+    synced = _cloud_sync_marker(backup_dir, env)
+    if synced and env.get("BACKUP_ALLOW_SYNCED_DIR") != "1":
+        raise ConfigError(
+            f"BACKUP_DIR looks like a cloud-synced folder ({synced}). A dump of every "
+            "alumnus plus the staff auth schema must not replicate to a sync service. "
+            "Choose a local, unsynced folder, or set BACKUP_ALLOW_SYNCED_DIR=1 if that "
+            "is a deliberate, approved destination."
         )
 
     cfg = BackupConfig(
@@ -504,6 +556,12 @@ def pg_dump_auth(
 ) -> tuple[str, str]:
     """Dump the auth schema to plain SQL.
 
+    What this captures is the staff ACCOUNTS: ``auth.users`` (including the
+    ``encrypted_password`` hashes, so a restore keeps logins working) and
+    ``auth.identities``. Live session material is deliberately NOT captured —
+    see ``AUTH_SESSION_TABLES``. Even so, the file is a credential artifact and
+    the runbook treats it as one.
+
     Returns ``(mode, note)``. Tries schema+data first. The auth schema's objects
     are owned by ``supabase_auth_admin`` and a full dump can fail on
     Supabase-owned functions, triggers or sequences the ``postgres`` role may not
@@ -519,6 +577,7 @@ def pg_dump_auth(
         "--no-owner",
         "--no-privileges",
         "--no-password",
+        *[f"--exclude-table-data=auth.{t}" for t in AUTH_SESSION_TABLES],
         f"--file={dest}",
     ]
     try:

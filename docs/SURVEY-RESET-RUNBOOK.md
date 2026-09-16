@@ -85,9 +85,18 @@ right now — that is the condition the reset removes. Note the `total_rows` in
 1.1; Section 2 must report the same numbers.
 
 1.5 lists who submitted — the decision is that none of it is real, but read it.
-1.6 shows `applied` responses: deleting the row does not undo what it already
-wrote into the profile (Q3 in the script header stays a judgment call). 1.8
-lists staged photo paths that will be orphaned (see the end of this page).
+It prints names and email addresses: run Section 1 in a private terminal, not
+over a shared screen or a recorded session.
+
+**1.6 is a gate, like 3.4.** It lists `applied` responses. Deleting such a row
+does not undo what it already wrote into the profile, and the row is the only
+record of what was originally submitted. If 1.6 returns **zero rows**, carry
+on. If it returns anything, stop before Section 2 and decide, per row, whether
+the profile change stays (it will, either way — the script never touches
+`alumni` or `audit_logs`) and whether losing the submitted payload is
+acceptable. Do not commit Section 2 with 1.6 unread.
+
+1.8 lists staged photo paths that will be orphaned (see the end of this page).
 
 ### (d) Section 2 — as-is first (ROLLBACK), then COMMIT
 

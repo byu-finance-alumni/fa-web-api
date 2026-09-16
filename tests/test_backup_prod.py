@@ -14,6 +14,7 @@ import json
 import pathlib
 import subprocess
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -94,7 +95,9 @@ def test_non_postgres_scheme_is_refused():
 
 def test_direct_host_carries_the_ref_in_the_hostname(tmp_path):
     env = good_env(tmp_path)
-    env["BACKUP_DATABASE_URL"] = f"postgresql://postgres:{PASSWORD}@db.{REF}.supabase.co:5432/postgres"
+    env["BACKUP_DATABASE_URL"] = (
+        f"postgresql://postgres:{PASSWORD}@db.{REF}.supabase.co:5432/postgres"
+    )
     cfg = bp.load_config(env, repo_root=REPO_ROOT)
     assert cfg.expect_project_ref == REF
 
@@ -135,6 +138,52 @@ def test_backup_dir_inside_the_repo_is_refused(tmp_path):
     with pytest.raises(bp.ConfigError) as exc:
         bp.load_config(env, repo_root=REPO_ROOT)
     assert "OUTSIDE" in str(exc.value)
+
+
+def test_backup_dir_under_a_onedrive_segment_is_refused(tmp_path):
+    env = good_env(tmp_path, BACKUP_DIR=str(tmp_path / "OneDrive" / "Documents" / "fa-backups"))
+    with pytest.raises(bp.ConfigError) as exc:
+        bp.load_config(env, repo_root=REPO_ROOT)
+    assert "cloud-synced" in str(exc.value)
+    assert "OneDrive" in str(exc.value)
+
+
+def test_backup_dir_inside_the_onedrive_env_root_is_refused_even_without_the_name(tmp_path):
+    sync_root = tmp_path / "Work Files"
+    env = good_env(
+        tmp_path, BACKUP_DIR=str(sync_root / "fa-backups"), OneDriveCommercial=str(sync_root)
+    )
+    with pytest.raises(bp.ConfigError) as exc:
+        bp.load_config(env, repo_root=REPO_ROOT)
+    assert "%OneDriveCommercial%" in str(exc.value)
+
+
+def test_synced_backup_dir_allowed_only_with_explicit_override(tmp_path):
+    env = good_env(
+        tmp_path,
+        BACKUP_DIR=str(tmp_path / "Dropbox" / "fa-backups"),
+        BACKUP_ALLOW_SYNCED_DIR="1",
+    )
+    cfg = bp.load_config(env, repo_root=REPO_ROOT)
+    assert cfg.backup_dir == tmp_path / "Dropbox" / "fa-backups"
+
+
+def test_auth_dump_never_captures_session_or_mfa_rows(tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run_tool(argv, secrets, *, what):
+        calls.append(list(argv))
+        pathlib.Path(argv[-2].removeprefix("--file=")).write_text("-- dump")
+        return None
+
+    cfg = bp.load_config(good_env(tmp_path), repo_root=REPO_ROOT)
+    with patch.object(bp, "run_tool", fake_run_tool):
+        mode, note = bp.pg_dump_auth({"pg_dump": "pg_dump"}, cfg, tmp_path / "auth.sql")
+    assert mode == "schema+data" and note == ""
+    argv = calls[0]
+    for table in ("refresh_tokens", "sessions", "mfa_factors", "one_time_tokens", "flow_state"):
+        assert f"--exclude-table-data=auth.{table}" in argv
+    assert "--schema=auth" in argv
 
 
 def test_backup_dir_must_be_absolute(tmp_path):

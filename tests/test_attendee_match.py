@@ -807,59 +807,6 @@ def test_every_leg_is_full_access_only(role, method, path, kwargs):
         app.dependency_overrides.clear()
 
 
-class _FriendsRouteSession:
-    """Event lookup + the "who is already on this roster" query, which is all
-    the friends route touches when every chosen row is skipped."""
-
-    def __init__(self, event, roster_rows):
-        self._event = event
-        self._roster = list(roster_rows)
-        self.began_nested = 0
-
-    async def get(self, _model, _pk):
-        return self._event
-
-    async def execute(self, _stmt):
-        return _Result(self._roster)
-
-    def begin_nested(self):  # pragma: no cover - must never be reached
-        self.began_nested += 1
-        raise AssertionError("a skipped row must not open a savepoint")
-
-    def add(self, _obj):  # pragma: no cover
-        raise AssertionError("a skipped row must not write")
-
-    async def commit(self):  # pragma: no cover
-        raise AssertionError("a skipped row must not commit")
-
-
-def test_rerunning_the_file_does_not_create_a_second_friend(approve_client):
-    """Friend records carry no Net ID, so create_alumni's exact-id duplicate
-    blocker cannot see one -- without this guard a re-post would make a second
-    Jane Doe. Skipping is reported, never silent."""
-    session = _FriendsRouteSession(
-        _event(),
-        # (first_name, preferred_first_name, last_name, current_employer)
-        [("Jane", None, "Doe", "Byrne Capital")],
-    )
-    with approve_client(session) as client:
-        response = client.post(
-            "/events/7/attendees/match/friends",
-            files={
-                "file": (
-                    "a.csv",
-                    _csv("First name,Last name,Company\nJane,Doe,Byrne Capital LLC"),
-                )
-            },
-            data={"rows": "2"},
-        )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["created"] == 0
-    assert body["skipped"] == 1
-    assert body["items"][0]["status"] == "skipped"
-
-
 # --- Tier 0: Net ID (#537) ----------------------------------------------------
 #
 # Jake, 2026-09-15: "if the Net ID matches then no need to approve; if emails
@@ -1352,3 +1299,8 @@ def test_a_normalised_net_id_approval_is_written(approve_client):
             json={"approvals": [{"alumni_id": 5, "net_id": " MSMITH07 "}]},
         )
     assert response.json()["added"] == 1
+
+
+# The friends route's identity / idempotency tests live in
+# tests/test_friend_identity.py (#538): dedupe by email across events, the
+# name + employer fallback, the alumnus guard, and the visible friend id.

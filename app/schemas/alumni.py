@@ -14,9 +14,17 @@ import re
 import unicodedata
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from app.core.dropdowns import validate_industry
+from app.core.friend_id import friend_id_for
 
 # --- Validation constants ----------------------------------------------------
 
@@ -868,6 +876,17 @@ class AlumniRead(BaseModel):
     last_imported_at: datetime.datetime | None = None
     created_at: datetime.datetime
     updated_at: datetime.datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def friend_id(self) -> str | None:
+        """Visible id of a friend-of-the-program record (#538): ``FRIEND-00042``
+        for ``alumni_id`` 42 when ``is_alumni`` is false, ``None`` for every
+        alumnus. Read-only and derived (see ``app.core.friend_id``) -- a client
+        can never send one. Rides on this base schema so the list row, the
+        profile read and the write results all carry the same value for the
+        same record; the CSV export derives its column from the same helper."""
+        return friend_id_for(self.alumni_id, self.is_alumni)
 
 
 class DuplicateWarning(BaseModel):

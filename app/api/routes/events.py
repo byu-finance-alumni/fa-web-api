@@ -39,10 +39,10 @@ from app.api.dependencies.auth import (
 from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
+from app.core.friend_id import friend_id_for
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
-from app.models.employment import CurrentEmployment
 from app.models.event import Event, EventAttendance
 from app.schemas.alumni import AlumniCreateFull
 from app.schemas.attendee_match import (
@@ -56,7 +56,7 @@ from app.schemas.attendee_match import (
 from app.schemas.event import AttendeeCreate, AttendeeRead, EventCreate, EventUpdate
 from app.schemas.imports import EventImportPreview, EventImportResult
 from app.services import alumni as alumni_service
-from app.services import attendee_match, import_events
+from app.services import attendee_match, friend_identity, import_events
 
 # Reuse the alumni export's formula-injection neutralizer (canonical source:
 # alumni_export._FORMULA_LEAD) so attendee cells starting with = + - @ \t \r are
@@ -1002,7 +1002,14 @@ async def create_attendee_friends(
     own column mapping with ``is_alumni = false`` and written through the shared
     ``create_alumni`` path, so cleaning, duplicate detection and audit logging
     fire exactly as for a manual create. Columns that map to nothing are
-    ignored, never an error. 404 if the event is unknown."""
+    ignored, never an error. 404 if the event is unknown.
+
+    Identity (#538, ``services.friend_identity``): before a row is created it
+    is resolved against EVERY friend in the table -- by email when the row has
+    one, by name + employer otherwise -- and an existing friend is attached to
+    this event as ``reused`` rather than duplicated. A row whose email belongs
+    to a real alumnus is refused as ``existing_alumnus`` (match it instead).
+    Every created / reused item carries the visible ``friend_id``."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
@@ -1039,37 +1046,19 @@ async def create_attendee_friends(
             header_errors=header_errors,
         )
 
-    # Idempotency for the friends leg. A friend record carries no Net ID or BYU
-    # ID, so create_alumni's exact-id duplicate blocker cannot see one: without
-    # this, re-posting the same file after a partial success would create a
-    # SECOND Jane Doe. Key everyone already attached to this event by
-    # normalized name + employer and skip a row that matches -- mirroring the
-    # per-(event, alumni) idempotency the approve route already has.
-    roster = (
-        await session.execute(
-            select(
-                Alumni.first_name,
-                Alumni.preferred_first_name,
-                Alumni.last_name,
-                CurrentEmployment.current_employer,
-            )
-            .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
-            .outerjoin(
-                CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id
-            )
-            .where(EventAttendance.event_id == event_id)
-        )
-    ).all()
-    on_roster: set[str] = set()
-    for first, preferred, last, employer in roster:
-        on_roster.add(attendee_match.friend_identity_key(first, last, employer))
-        if preferred:
-            on_roster.add(
-                attendee_match.friend_identity_key(preferred, last, employer)
-            )
+    chosen = [row for row in parsed if row["row"] in wanted]
+
+    # Identity + idempotency for the friends leg (#538). A friend record carries
+    # no Net ID or BYU ID, so create_alumni's exact-id duplicate blocker cannot
+    # see one. The index resolves every chosen row in at most three batched
+    # queries: this event's roster (re-posting the same file after a partial
+    # success must not create a SECOND Jane Doe), the owners of every email in
+    # the file (a friend anywhere is reused; an alumnus is refused), and the
+    # name + employer twins of the rows that carry no email.
+    index = await friend_identity.build_friend_index(session, event_id, chosen)
 
     items: list[AttendeeFriendItem] = []
-    created = attached = rejected = skipped = 0
+    created = attached = rejected = skipped = reused = existing_alumni = 0
 
     # Batch the whole set into ONE transaction: create_alumni commits
     # internally, so its commit/refresh are temporarily neutralized (the pattern
@@ -1083,27 +1072,87 @@ async def create_attendee_friends(
     async def _noop_refresh(_obj: object) -> None:
         return None
 
-    for row in parsed:
-        if row["row"] not in wanted:
+    for row in chosen:
+        decision = index.decide(row)
+        if decision.kind == "existing_alumnus":
+            existing_alumni += 1
+            items.append(
+                AttendeeFriendItem(
+                    row=row["row"],
+                    name=row["display_name"],
+                    status="existing_alumnus",
+                    alumni_id=decision.alumni_id,
+                    is_existing_alumnus=True,
+                    message=(
+                        "This email belongs to an alumni record, so no friend "
+                        "was created. Match the row to that alumnus instead."
+                    ),
+                )
+            )
             continue
-        identity = attendee_match.friend_identity_key(
-            row.get("first_name"), row.get("last_name"), row.get("company")
-        )
-        if identity in on_roster:
+        if decision.kind == "on_roster" or (
+            decision.kind == "reuse" and decision.alumni_id in index.attending_ids
+        ):
             skipped += 1
+            friend_pk = decision.alumni_id
+            visible = friend_id_for(friend_pk, False)
             items.append(
                 AttendeeFriendItem(
                     row=row["row"],
                     name=row["display_name"],
                     status="skipped",
+                    alumni_id=friend_pk,
+                    friend_id=visible,
                     message=(
-                        "Someone with this name and employer is already on this "
-                        "event's roster; nothing was created."
+                        f"{visible} is already on this event's roster; nothing "
+                        "was created."
+                        if visible
+                        else "Someone with this name and employer is already on "
+                        "this event's roster; nothing was created."
                     ),
                 )
             )
             continue
-        on_roster.add(identity)
+        if decision.kind == "reuse" and decision.alumni_id is not None:
+            friend_pk = decision.alumni_id
+            visible = friend_id_for(friend_pk, False)
+            session.add(
+                EventAttendance(
+                    event_id=event_id,
+                    alumni_id=friend_pk,
+                    attendance_notes=row.get("note"),
+                )
+            )
+            session.add(
+                AuditLog(
+                    user_id=user.user_id,
+                    action_type="add_attendee",
+                    entity_type="event",
+                    entity_id=event_id,
+                    new_value=(
+                        f"{friend_pk}: {row['display_name']} (existing friend "
+                        f"{visible} linked from attendee list, matched on "
+                        f"{decision.matched_on})"
+                    ),
+                )
+            )
+            index.remember(row, friend_pk)
+            reused += 1
+            attached += 1
+            items.append(
+                AttendeeFriendItem(
+                    row=row["row"],
+                    name=row["display_name"],
+                    status="reused",
+                    alumni_id=friend_pk,
+                    friend_id=visible,
+                    message=(
+                        f"Linked existing friend {visible} (matched on "
+                        f"{decision.matched_on}); nothing new was created."
+                    ),
+                )
+            )
+            continue
         async with session.begin_nested() as savepoint:
             try:
                 model = AlumniCreateFull(**row["payload"])
@@ -1137,6 +1186,7 @@ async def create_attendee_friends(
                         ),
                     )
                 )
+                index.remember(row, friend.alumni_id)
                 created += 1
                 attached += 1
                 items.append(
@@ -1145,6 +1195,7 @@ async def create_attendee_friends(
                         name=row["display_name"],
                         status="created",
                         alumni_id=friend.alumni_id,
+                        friend_id=friend_id_for(friend.alumni_id, False),
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - record + continue per row
@@ -1159,7 +1210,7 @@ async def create_attendee_friends(
                     )
                 )
 
-    if created:
+    if attached:
         await session.commit()
     return AttendeeFriendResult(
         event_id=event_id,
@@ -1167,6 +1218,8 @@ async def create_attendee_friends(
         attached=attached,
         rejected=rejected,
         skipped=skipped,
+        reused=reused,
+        existing_alumni=existing_alumni,
         items=items,
         header_errors=[],
     )

@@ -1437,14 +1437,17 @@ def _friend_field_labels(payload: dict) -> list[str]:
 def friend_identity_key(
     first_name: object, last_name: object, company: object
 ) -> str:
-    """Stable key for "the same person already created from this list".
+    """Normalised name + employer key for a friend row that carries NO email.
 
     Friend records carry no Net ID or BYU ID, so ``create_alumni``'s exact-id
     duplicate blocker cannot see them: re-posting the same file would happily
-    create a second Jane Doe. The friends route therefore builds this key for
-    everyone already on the event's roster and skips a row that matches, making
-    friend creation idempotent per (event, person) the same way approval is
-    idempotent per (event, alumni).
+    create a second Jane Doe. Since #538 a friend's identity is its EMAIL
+    (``services.friend_identity``); this key is the fallback for rows that did
+    not collect one, checked against every friend in the table AND against the
+    event's roster (idempotent per (event, person), the way approval is
+    idempotent per (event, alumni)). Accepted trade-off: a job change between
+    events duplicates, and two people with a common name at one large employer
+    collide. Email fixes both; this key exists only where there is none.
     """
     return "|".join(
         (

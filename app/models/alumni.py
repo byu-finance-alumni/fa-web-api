@@ -25,6 +25,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.core.friend_id import friend_id_for
 from app.models.mixins import TimestampMixin
 
 
@@ -135,6 +136,14 @@ class Alumni(TimestampMixin, Base):
     is_alumni: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+
+    @property
+    def friend_id(self) -> str | None:
+        """Visible friend id (#538): ``FRIEND-00042`` for a friend row, ``None``
+        for an alumnus. Derived from the primary key -- NOT a column, so nothing
+        to migrate or backfill. Exposed here so attribute-driven readers (the
+        CSV export's ``getattr`` column loop) see it like any other field."""
+        return friend_id_for(self.alumni_id, self.is_alumni)
 
     linkedin_url: Mapped[str | None] = mapped_column(String(500))
     notes: Mapped[str | None] = mapped_column(Text)

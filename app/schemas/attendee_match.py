@@ -261,28 +261,50 @@ class AttendeeApplyResult(BaseModel):
 
 class AttendeeFriendItem(BaseModel):
     """Per-row outcome of creating a friend from a no-match row. ``status`` is
-    ``created``, ``skipped`` (somebody with this name + employer is already on
-    the event's roster — the idempotency guard, so re-posting the same file
-    never creates a second copy) or ``rejected`` (the create path refused it,
-    e.g. an exact duplicate)."""
+    one of:
+
+    * ``created`` — a new friend record; ``alumni_id`` + ``friend_id`` are its
+      ids.
+    * ``reused`` — an EXISTING friend (from any event) matched this row on
+      email, or on name + employer when the row has no email (#538), and was
+      attached to this event instead of a twin being created; ``alumni_id`` +
+      ``friend_id`` name the record so the UI can say "linked existing friend
+      FRIEND-00042".
+    * ``skipped`` — nothing to do: the person is already on this event's
+      roster (a re-post of the same file, or a second row for the same person
+      in one file).
+    * ``existing_alumnus`` — the row's email belongs to a real ALUMNUS, so no
+      friend was created and nothing was attached; ``is_existing_alumnus`` is
+      true and ``alumni_id`` is the alumnus. Staff should match the row
+      instead.
+    * ``rejected`` — the create path refused it (e.g. an exact duplicate).
+    """
 
     row: int
     name: str
     status: str
     alumni_id: int | None = None
+    # Visible friend id (``FRIEND-00042``) of the created / reused record; None
+    # for every other outcome, including ``existing_alumnus``.
+    friend_id: str | None = None
+    is_existing_alumnus: bool = False
     message: str | None = None
 
 
 class AttendeeFriendResult(BaseModel):
     """``POST /events/{event_id}/attendees/match/friends`` result. Every created
-    friend is ALSO attached to the event, so the operator never has to make two
-    passes."""
+    or reused friend is ALSO attached to the event, so the operator never has to
+    make two passes (``attached`` = created + reused)."""
 
     event_id: int
     created: int
     attached: int
     rejected: int
     skipped: int = 0
+    # Existing friends linked to this event rather than created again (#538).
+    reused: int = 0
+    # Rows refused because the email belongs to an alumnus (#538).
+    existing_alumni: int = 0
     items: list[AttendeeFriendItem] = []
     header_errors: list[str] = []
 

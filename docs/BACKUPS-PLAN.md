@@ -1,8 +1,9 @@
 # Our Own Backups — Build Plan
 
-_Written 2026-09-15 for api #535. **Nothing has been built.** This is the plan to
-work from tomorrow. No credential was read, no dump was taken, no dashboard
-setting was touched._
+_Written 2026-09-15 for api #535. Phases 1, 2, 4 and 5 are built (status lines
+below); Phase 3 is not. Originally: nothing built, the plan to work from
+tomorrow. No credential was read, no dump was taken, no dashboard setting was
+touched._
 
 ---
 
@@ -109,10 +110,21 @@ re-uploaded separately, and the runbook must say so in the same breath.
 
 ### Phase 4 — schedule it
 
+_Status: **built 2026-09-16, on dev.** `scripts/backup-install-task.ps1` +
+`scripts/backup-scheduled.ps1`; Sunday 03:00 local, DPAPI-stored secrets,
+`--incremental` bucket capture, prod ref pinned as a literal in the wrapper.
+See docs/BACKUPS.md "Weekly automatic backups". Phase 3 has NOT been done._
+
 Local scheduled task, mirroring `scripts/change-requests-install-task.ps1`. Weekly.
 Only once phases 1–3 pass by hand.
 
 ### Phase 5 — retention and pruning
+
+_Status: **built 2026-09-16, on dev.** `backup_prod.py --keep N` (the task uses 8),
+runs only after an OK run, deletes only OK run folders, never the newest, never
+FAILED or manifest-less ones, refuses a drive root or the repo. Tested against a
+directory of dummy folders as this section asks. Failures: `LAST-RUN-FAILED.txt`
++ optional Slack line._
 
 Prune on a documented rule. ⚠️ Write the pruning step **last** and test it against a
 directory of dummy files — a rotation bug deletes backups, which is the one failure

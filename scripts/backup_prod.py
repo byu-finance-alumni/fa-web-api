@@ -1,4 +1,7 @@
-"""Full backup of the PRODUCTION Supabase project, run by hand (api #535).
+"""Full backup of the PRODUCTION Supabase project (api #535).
+
+Run by hand, or every week by the Windows scheduled task that
+``scripts/backup-scheduled.ps1`` wraps around it (``--incremental --keep 8``).
 
 Captures the three things a restore needs, stamped as one matched set:
 
@@ -25,25 +28,46 @@ Configuration is environment variables only (see docs/BACKUPS.md):
   BACKUP_SUPABASE_SERVICE_ROLE_KEY    service-role key (bucket is private)
   BACKUP_DIR                          destination root, OUTSIDE the repo
   BACKUP_EXPECT_PROJECT_REF           e.g. njobhhdopwdodvzosrns
+  BACKUP_SLACK_WEBHOOK_URL            optional; one line posted on FAILURE only
 
 The project ref is asserted against BOTH the database host and the Supabase URL
 before anything is dumped. Base URLs in this project are easy to get backwards
 (the keepalive workflow asserts its environment for the same reason), and a
 "backup" of dev would be worse than no backup because it would look fine.
 
-Runs with `--dry-run` to validate configuration and tooling without opening a
-single connection.
+Flags (all off by default, so a hand run behaves exactly as before):
+
+  --incremental   download only bucket objects that are NEW or CHANGED since the
+                  most recent previous run whose MANIFEST says "ok"; copy the
+                  unchanged ones from that run's folder (size and sha256 checked
+                  against the previous manifest first, otherwise re-download).
+                  Every run folder is still complete on its own. The DATABASE is
+                  always dumped in full: it is ~40 MB and change detection would
+                  cost more than it saves.
+  --keep N        AFTER a run finished OK, delete the oldest run folders so that
+                  at most N OK runs remain. Never deletes the run just written,
+                  the newest OK run, a FAILED run, or a folder without a
+                  manifest; refuses a BACKUP_DIR that is a drive root or inside
+                  the repo. Prints every folder it deletes.
+  --dry-run       validate configuration and tooling, print the incremental and
+                  pruning plan, connect to nothing, write nothing.
+
+Every run leaves BACKUP_DIR/LAST-RUN.json behind; a failed run also leaves
+BACKUP_DIR/LAST-RUN-FAILED.txt (removed again by the next success) and, when
+BACKUP_SLACK_WEBHOOK_URL is set, posts one redacted line to Slack. Nothing is
+posted on success.
 
 Deliberately stdlib-only so it runs under any Python 3.12+ on the machine (no
 venv needed) and adds nothing to the deployed function's dependencies.
 pg_dump / pg_restore / psql are taken from PATH; PostgreSQL 17 is installed on
 the Windows machine this was written for.
 
-Secrets are never printed. Every message that could carry the database URL or
-the service key passes through `redact()` first. gitleaks scans history, so a
-single careless echo would be permanent.
+Secrets are never printed. Every message that could carry the database URL,
+the service key or the webhook URL passes through `redact()` first. gitleaks
+scans history, so a single careless echo would be permanent.
 
-Phase 1 + 2 of docs/BACKUPS-PLAN.md only: no scheduling, no pruning, no Slack.
+Phases 1, 2, 4 and 5 of docs/BACKUPS-PLAN.md. Phase 3 (the restore rehearsal)
+is a human task and has not been done.
 """
 
 from __future__ import annotations
@@ -54,6 +78,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -109,7 +134,22 @@ RECORDED_TABLES = (
     "auth.users",
 )
 
-MANIFEST_SCHEMA_VERSION = 1
+#: 2 added the per-object ``etag`` / ``updated_at`` change markers and the
+#: incremental bookkeeping under ``storage``. A version-1 manifest is still a
+#: valid previous run: its objects just cannot be proven unchanged, so they are
+#: re-downloaded once and the run after that is incremental.
+MANIFEST_SCHEMA_VERSION = 2
+
+#: Run folders are named by ``utc_stamp``; only folders that look like one are
+#: ever considered for reuse or deletion.
+RUN_FOLDER_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}Z$")
+
+FAILED_MARKER_NAME = "LAST-RUN-FAILED.txt"
+LAST_RUN_NAME = "LAST-RUN.json"
+
+WEBHOOK_TIMEOUT_SECONDS = 10
+#: The Slack line carries the first failure only, cut to this many characters.
+WEBHOOK_REASON_MAX_CHARS = 240
 
 
 # --- Errors -----------------------------------------------------------------
@@ -137,11 +177,14 @@ class BackupConfig:
     service_role_key: str
     backup_dir: pathlib.Path
     expect_project_ref: str
+    #: A Slack incoming-webhook URL is a credential (anyone holding it can post
+    #: to the channel), so it is redacted like the key and never logged.
+    slack_webhook_url: str | None = None
 
     @property
     def secrets(self) -> tuple[str, ...]:
         """Every string that must never appear in output."""
-        out = [self.database_url, self.service_role_key]
+        out = [self.database_url, self.service_role_key, self.slack_webhook_url or ""]
         parsed = urllib.parse.urlsplit(self.database_url)
         if parsed.password:
             out.append(parsed.password)
@@ -245,12 +288,17 @@ def load_config(env: Mapping[str, str], *, repo_root: pathlib.Path | None = None
             "is a deliberate, approved destination."
         )
 
+    webhook = (env.get("BACKUP_SLACK_WEBHOOK_URL") or "").strip() or None
+    if webhook is not None and not webhook.startswith("https://"):
+        raise ConfigError("BACKUP_SLACK_WEBHOOK_URL must be an https:// URL (or unset).")
+
     cfg = BackupConfig(
         database_url=database_url,
         supabase_url=supabase_url,
         service_role_key=service_role_key,
         backup_dir=backup_dir,
         expect_project_ref=expect_project_ref,
+        slack_webhook_url=webhook,
     )
     assert_project_ref(cfg)
     return cfg
@@ -368,10 +416,25 @@ def tool_version(path: str) -> str:
 class StorageObject:
     path: str  # full object key within the bucket, e.g. "survey-pending/abc.jpg"
     size: int
+    #: Change markers from the listing, used by ``--incremental`` to decide
+    #: whether an object has to be downloaded again. Supabase returns the etag
+    #: under ``metadata.eTag`` and the modification time as ``updated_at`` on the
+    #: row (``metadata.lastModified`` on older storage versions). Either may be
+    #: absent; the comparison copes with that (see ``plan_incremental``).
+    etag: str | None = None
+    updated_at: str | None = None
 
 
 ListPageFn = Callable[[str, int, int], list[dict]]
 """(prefix, limit, offset) -> one page of raw listing rows."""
+
+
+def _clean_marker(value: object) -> str | None:
+    """A non-empty string marker, with the quotes an HTTP etag carries removed."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().strip('"')
+    return cleaned or None
 
 
 def walk_bucket(list_page: ListPageFn, *, page_size: int = LIST_PAGE_SIZE) -> list[StorageObject]:
@@ -411,7 +474,13 @@ def walk_bucket(list_page: ListPageFn, *, page_size: int = LIST_PAGE_SIZE) -> li
                     raise CheckError(
                         f"Bucket listing has no size for {full!r}; cannot verify the download."
                     )
-                objects.append(StorageObject(path=full, size=size))
+                etag = _clean_marker(metadata.get("eTag")) or _clean_marker(metadata.get("etag"))
+                updated_at = _clean_marker(row.get("updated_at")) or _clean_marker(
+                    metadata.get("lastModified")
+                )
+                objects.append(
+                    StorageObject(path=full, size=size, etag=etag, updated_at=updated_at)
+                )
             if len(rows) < page_size:
                 break
             offset += len(rows)
@@ -704,6 +773,18 @@ def toc_lists_table(toc: str, schema: str, table: str) -> bool:
 class FileRecord:
     bytes: int
     sha256: str
+    #: Only bucket objects carry these (from the listing); dumps leave them None
+    #: and the manifest omits them.
+    etag: str | None = None
+    updated_at: str | None = None
+
+    def as_manifest(self) -> dict:
+        out: dict = {"bytes": self.bytes, "sha256": self.sha256}
+        if self.etag is not None:
+            out["etag"] = self.etag
+        if self.updated_at is not None:
+            out["updated_at"] = self.updated_at
+        return out
 
 
 @dataclass
@@ -721,8 +802,22 @@ class RunResult:
     listing_total_bytes: int = 0
     downloaded_object_count: int = 0
     downloaded_total_bytes: int = 0
+    #: Objects copied from the previous OK run instead of downloaded.
+    reused_object_count: int = 0
+    reused_total_bytes: int = 0
+    capture_mode: str = "full"
+    previous_run: str | None = None
+    removed_since_previous: list[str] = field(default_factory=list)
     checks: dict[str, bool] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
+
+    @property
+    def captured_object_count(self) -> int:
+        return self.downloaded_object_count + self.reused_object_count
+
+    @property
+    def captured_total_bytes(self) -> int:
+        return self.downloaded_total_bytes + self.reused_total_bytes
 
 
 def utc_stamp(now: datetime) -> str:
@@ -763,16 +858,19 @@ def build_manifest(result: RunResult) -> dict:
         },
         "storage": {
             "bucket": BUCKET,
+            "capture_mode": result.capture_mode,
+            "previous_run": result.previous_run,
             "listing_object_count": result.listing_object_count,
             "listing_total_bytes": result.listing_total_bytes,
             "downloaded_object_count": result.downloaded_object_count,
             "downloaded_total_bytes": result.downloaded_total_bytes,
+            "reused_object_count": result.reused_object_count,
+            "reused_total_bytes": result.reused_total_bytes,
+            "removed_count": len(result.removed_since_previous),
+            "removed_since_previous": list(result.removed_since_previous),
             "file_count_on_disk": len(storage_files),
         },
-        "files": {
-            name: {"bytes": rec.bytes, "sha256": rec.sha256}
-            for name, rec in sorted(result.files.items())
-        },
+        "files": {name: rec.as_manifest() for name, rec in sorted(result.files.items())},
         "total_bytes": sum(rec.bytes for rec in result.files.values()),
         "checks": dict(result.checks),
         "failures": list(result.failures),
@@ -785,6 +883,394 @@ def write_manifest(folder: pathlib.Path, manifest: dict) -> pathlib.Path:
     return path
 
 
+def read_manifest(folder: pathlib.Path) -> dict | None:
+    """The folder's MANIFEST.json as a dict, or ``None`` if absent or unreadable.
+
+    Unreadable is treated like absent on purpose: a folder whose manifest is
+    half-written or corrupt is something a human looks at, never something the
+    script reuses or deletes.
+    """
+    path = folder / "MANIFEST.json"
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def manifest_is_ok(manifest: dict | None) -> bool:
+    return isinstance(manifest, dict) and str(manifest.get("status", "")).lower() == "ok"
+
+
+# --- Previous runs and incremental capture ----------------------------------
+
+
+def run_folders(backup_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Directories DIRECTLY under ``backup_dir`` named like a run, newest first.
+
+    The stamp format sorts lexically in time order, so sorting by name is
+    sorting by time. Symlinks are skipped: deleting through one would delete
+    somewhere else.
+    """
+    if not backup_dir.is_dir():
+        return []
+    found = [
+        child
+        for child in backup_dir.iterdir()
+        if RUN_FOLDER_RE.match(child.name) and child.is_dir() and not child.is_symlink()
+    ]
+    return sorted(found, key=lambda p: p.name, reverse=True)
+
+
+def find_previous_ok_run(
+    backup_dir: pathlib.Path, *, exclude: str, project_ref: str
+) -> tuple[pathlib.Path, dict] | None:
+    """The newest run folder whose manifest says ``ok`` for THIS project.
+
+    A FAILED run, a folder with no manifest, and a run of a different project
+    ref are all skipped: files are only ever reused from a folder the checks
+    passed for, of the same database.
+    """
+    for folder in run_folders(backup_dir):
+        if folder.name == exclude:
+            continue
+        manifest = read_manifest(folder)
+        if not manifest_is_ok(manifest):
+            continue
+        assert manifest is not None
+        if manifest.get("project_ref") != project_ref:
+            continue
+        return folder, manifest
+    return None
+
+
+@dataclass
+class IncrementalPlan:
+    download: list[StorageObject] = field(default_factory=list)
+    reuse: list[StorageObject] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    #: Why each object in ``download`` is there (``new``, ``size``, ``etag``,
+    #: ``updated_at``, ``no-marker``); only logged and shown in --dry-run.
+    reasons: dict[str, str] = field(default_factory=dict)
+
+
+def previous_storage_records(manifest: dict) -> dict[str, dict]:
+    """``{object key: file record}`` for the bucket objects of a manifest."""
+    prefix = f"storage/{BUCKET}/"
+    files = manifest.get("files")
+    if not isinstance(files, Mapping):
+        return {}
+    out: dict[str, dict] = {}
+    for name, record in files.items():
+        if isinstance(name, str) and name.startswith(prefix) and isinstance(record, Mapping):
+            out[name[len(prefix) :]] = dict(record)
+    return out
+
+
+def plan_incremental(objects: Iterable[StorageObject], previous: dict) -> IncrementalPlan:
+    """Decide, per listed object, whether to download it or copy it from the
+    previous run. Pure: touches no file.
+
+    An object is reused only when ALL of these hold:
+
+    * the previous manifest has a record for the same key with a sha256
+      (that hash is what the copy is verified against),
+    * the sizes agree,
+    * at least one change marker (etag, updated_at) is present on BOTH sides,
+      and every marker present on both sides agrees.
+
+    "No marker on both sides" means download. Size alone cannot tell a
+    re-uploaded photo of the same byte length from the original, and a stale
+    photo carried forward for ever would be exactly the silent failure this
+    script exists to prevent. The cost is one full download after a
+    schema-version-1 manifest, which is acceptable.
+    """
+    plan = IncrementalPlan()
+    old = previous_storage_records(previous)
+    seen: set[str] = set()
+    for obj in objects:
+        seen.add(obj.path)
+        record = old.get(obj.path)
+        if record is None:
+            plan.download.append(obj)
+            plan.reasons[obj.path] = "new"
+            continue
+        if not isinstance(record.get("sha256"), str):
+            plan.download.append(obj)
+            plan.reasons[obj.path] = "no-sha256"
+            continue
+        if record.get("bytes") != obj.size:
+            plan.download.append(obj)
+            plan.reasons[obj.path] = "size"
+            continue
+        compared = 0
+        changed: str | None = None
+        for marker in ("etag", "updated_at"):
+            mine = getattr(obj, marker)
+            theirs = _clean_marker(record.get(marker))
+            if mine is None or theirs is None:
+                continue
+            compared += 1
+            if mine != theirs:
+                changed = marker
+                break
+        if changed:
+            plan.download.append(obj)
+            plan.reasons[obj.path] = changed
+        elif compared == 0:
+            plan.download.append(obj)
+            plan.reasons[obj.path] = "no-marker"
+        else:
+            plan.reuse.append(obj)
+    plan.removed = sorted(key for key in old if key not in seen)
+    return plan
+
+
+def reuse_from_previous(
+    previous_folder: pathlib.Path,
+    previous_record: Mapping,
+    obj: StorageObject,
+    dest: pathlib.Path,
+) -> FileRecord | None:
+    """Copy ``obj`` from the previous run folder into ``dest`` and verify it.
+
+    Returns the verified record, or ``None`` (and leaves nothing at ``dest``)
+    when the previous file is missing, a different size, or hashes differently
+    from what the previous manifest recorded, so the caller downloads instead.
+    """
+    try:
+        source = safe_object_destination(previous_folder / "storage" / BUCKET, obj.path)
+    except CheckError:
+        return None
+    expected_sha = previous_record.get("sha256")
+    if not source.is_file() or not isinstance(expected_sha, str):
+        return None
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+        size, digest = sha256_file(dest)
+    except OSError:
+        size, digest = -1, ""
+    if size != obj.size or digest != expected_sha:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        return None
+    return FileRecord(size, digest, etag=obj.etag, updated_at=obj.updated_at)
+
+
+# --- Retention ---------------------------------------------------------------
+
+
+def check_prunable_root(backup_dir: pathlib.Path, repo_root: pathlib.Path) -> None:
+    """Refuse to prune anywhere a mistake would be catastrophic.
+
+    ``load_config`` already refuses a BACKUP_DIR inside the repo, but this is
+    called again right before anything is deleted, with the resolved path,
+    because "delete the oldest folders under X" must never run with X being a
+    drive root, the filesystem root, or the source tree.
+    """
+    resolved = backup_dir.resolve()
+    if resolved.parent == resolved or resolved == pathlib.Path(resolved.anchor):
+        raise ConfigError(
+            f"Refusing to prune: BACKUP_DIR resolves to a filesystem or drive root ({resolved})."
+        )
+    try:
+        resolved.relative_to(repo_root.resolve())
+    except ValueError:
+        return
+    raise ConfigError(f"Refusing to prune: BACKUP_DIR resolves inside the repository ({resolved}).")
+
+
+def plan_prune(backup_dir: pathlib.Path, keep: int, *, current: str) -> list[pathlib.Path]:
+    """The run folders that ``prune_old_runs`` would delete. Pure.
+
+    Keeps the ``keep`` newest OK runs. A folder is a candidate only when it is
+    named like a run, sits directly under ``backup_dir``, has a readable
+    manifest, and that manifest says ``ok``. Everything else (FAILED runs,
+    manifest-less folders, stray directories) is left for a human. The run
+    being written (``current``) and the newest OK run are never candidates
+    even if ``keep`` would otherwise say so.
+    """
+    if keep < 1:
+        raise ConfigError("--keep must be at least 1.")
+    ok_runs = [f for f in run_folders(backup_dir) if manifest_is_ok(read_manifest(f))]
+    newest = ok_runs[0].name if ok_runs else None
+    return [f for f in ok_runs[keep:] if f.name not in (current, newest)]
+
+
+def prune_old_runs(
+    backup_dir: pathlib.Path,
+    keep: int,
+    *,
+    current: str,
+    repo_root: pathlib.Path | None = None,
+    logger: Callable[[str], None] = print,
+) -> list[str]:
+    """Delete the oldest OK runs beyond ``keep``; return the deleted names."""
+    check_prunable_root(backup_dir, repo_root or _repo_root())
+    deleted: list[str] = []
+    for folder in plan_prune(backup_dir, keep, current=current):
+        # Re-check right before the delete: the folder must still be a real,
+        # non-symlinked directory directly under BACKUP_DIR.
+        if folder.parent != backup_dir or folder.is_symlink() or not folder.is_dir():
+            continue
+        shutil.rmtree(folder)
+        deleted.append(folder.name)
+        logger(f"  pruned {folder}")
+    return deleted
+
+
+# --- Outcome files and the failure webhook ----------------------------------
+
+
+def write_last_run(
+    backup_dir: pathlib.Path,
+    *,
+    status: str,
+    run_folder: str | None,
+    finished_at: datetime,
+    downloaded: int,
+    reused: int,
+    pruned: list[str],
+    reason: str | None = None,
+) -> pathlib.Path:
+    """BACKUP_DIR/LAST-RUN.json: the one file a monitor needs to read."""
+    payload = {
+        "status": status,
+        "run_folder": run_folder,
+        "finished_at_utc": finished_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "downloaded": downloaded,
+        "reused": reused,
+        "pruned": list(pruned),
+    }
+    if reason:
+        payload["reason"] = reason
+    path = backup_dir / LAST_RUN_NAME
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def write_failed_marker(
+    backup_dir: pathlib.Path, *, when: datetime, run_folder: str | None, reason: str
+) -> pathlib.Path:
+    """BACKUP_DIR/LAST-RUN-FAILED.txt. ``reason`` must already be redacted."""
+    path = backup_dir / FAILED_MARKER_NAME
+    stamp = when.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    path.write_text(
+        f"prod backup FAILED at {stamp}\nrun folder: {run_folder or '(none created)'}\n"
+        f"reason: {reason}\n\nSee docs/BACKUPS.md. This file is removed by the next "
+        "successful run.\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def clear_failed_marker(backup_dir: pathlib.Path) -> None:
+    try:
+        (backup_dir / FAILED_MARKER_NAME).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def slack_reason(reason: str) -> str:
+    """The first line of a failure, with quoted values dropped and cut short.
+
+    The script quotes anything it echoes from the outside world (object keys,
+    table names) with ``repr``, so removing quoted runs keeps bucket keys - which
+    may be survey tokens - out of the channel. Secrets are redacted by the
+    caller before this runs.
+    """
+    first = reason.strip().splitlines()[0] if reason.strip() else "unknown"
+    first = re.sub(r"'[^']*'", "'...'", first)
+    first = first.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if len(first) > WEBHOOK_REASON_MAX_CHARS:
+        first = first[: WEBHOOK_REASON_MAX_CHARS - 3] + "..."
+    return first
+
+
+def post_failure_webhook(
+    url: str,
+    *,
+    when: datetime,
+    run_folder: str | None,
+    reason: str,
+    opener: Callable[..., object] | None = None,
+) -> bool:
+    """POST one line to a Slack incoming webhook. FAILURE ONLY, never success.
+
+    Returns whether it was delivered. Never raises: a webhook that is down must
+    not change the exit code of a backup that has already failed for its own
+    reasons, and it must not print the URL. Retries are deliberately absent for
+    the same reason the app's failure alerter has none.
+    """
+    stamp = when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    where = f" (run {run_folder})" if run_folder else ""
+    text = f"prod backup FAILED at {stamp}{where}: {slack_reason(reason)}"
+    body = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    open_fn = opener or urllib.request.urlopen
+    try:
+        with open_fn(req, timeout=WEBHOOK_TIMEOUT_SECONDS) as resp:  # type: ignore[attr-defined]
+            code = getattr(resp, "status", 200)
+        return 200 <= int(code) < 300
+    except Exception:  # noqa: BLE001 - see docstring
+        return False
+
+
+def record_outcome(
+    *,
+    backup_dir: pathlib.Path | None,
+    webhook_url: str | None,
+    secrets: Iterable[str],
+    status: str,
+    run_folder: str | None,
+    finished_at: datetime,
+    downloaded: int = 0,
+    reused: int = 0,
+    pruned: list[str] | None = None,
+    reason: str | None = None,
+) -> None:
+    """Write LAST-RUN.json, set or clear the failure marker, alert on failure.
+
+    Best effort throughout: the exit code is decided by the backup itself, and
+    a full disk while writing a marker must not mask the real reason.
+    """
+    secrets = tuple(secrets)
+    safe_reason = redact(reason, secrets) if reason else None
+    if backup_dir is not None and backup_dir.is_dir():
+        try:
+            write_last_run(
+                backup_dir,
+                status=status,
+                run_folder=run_folder,
+                finished_at=finished_at,
+                downloaded=downloaded,
+                reused=reused,
+                pruned=pruned or [],
+                reason=safe_reason,
+            )
+            if status == "OK":
+                clear_failed_marker(backup_dir)
+            else:
+                write_failed_marker(
+                    backup_dir, when=finished_at, run_folder=run_folder, reason=safe_reason or ""
+                )
+        except OSError as exc:
+            print(f"WARNING: could not write the run outcome files ({exc})", file=sys.stderr)
+    if status != "OK" and webhook_url:
+        delivered = post_failure_webhook(
+            webhook_url, when=finished_at, run_folder=run_folder, reason=safe_reason or status
+        )
+        print(
+            "Slack: failure notice " + ("sent." if delivered else "could NOT be delivered."),
+            file=sys.stderr,
+        )
+
+
 # --- Orchestration -----------------------------------------------------------
 
 
@@ -792,7 +1278,13 @@ def log(msg: str, secrets: Iterable[str] = ()) -> None:
     print(redact(msg, secrets), flush=True)
 
 
-def dry_run(cfg: BackupConfig, tools: Mapping[str, str]) -> int:
+def dry_run(
+    cfg: BackupConfig,
+    tools: Mapping[str, str],
+    *,
+    incremental: bool = False,
+    keep: int | None = None,
+) -> int:
     now = datetime.now(UTC)
     folder = cfg.backup_dir / utc_stamp(now)
     db_host = urllib.parse.urlsplit(cfg.database_url).hostname
@@ -802,22 +1294,53 @@ def dry_run(cfg: BackupConfig, tools: Mapping[str, str]) -> int:
     print(f"  supabase url         {cfg.supabase_url}")
     print(f"  bucket               {BUCKET}")
     print(f"  destination          {folder}")
+    print(f"  capture              {'incremental' if incremental else 'full'}")
+    print(f"  keep                 {keep if keep else 'everything (no pruning)'}")
+    print(f"  slack on failure     {'yes' if cfg.slack_webhook_url else 'no (not configured)'}")
     for name in REQUIRED_TOOLS:
         print(f"  {name:<20} {tools[name]}  ({tool_version(tools[name])})")
     print("Would:")
-    print("  1. pg_dump --format=custom --schema=public  -> database.dump")
+    print("  1. pg_dump --format=custom --schema=public  -> database.dump (always in full)")
     print("  2. pg_dump --format=plain  --schema=auth    -> auth.sql (data-only fallback)")
-    print(f"  3. list bucket {BUCKET!r} (pages of {LIST_PAGE_SIZE}, folders walked) and download")
-    print("     every object -> storage/headshots/<key>")
+    print(f"  3. list bucket {BUCKET!r} (pages of {LIST_PAGE_SIZE}, folders walked)")
+    if incremental:
+        previous = find_previous_ok_run(
+            cfg.backup_dir, exclude=folder.name, project_ref=cfg.expect_project_ref
+        )
+        if previous is None:
+            print("     no previous OK run found -> would download EVERY object (full)")
+        else:
+            prev_folder, prev_manifest = previous
+            count = len(previous_storage_records(prev_manifest))
+            print(f"     previous OK run: {prev_folder.name} ({count} objects recorded)")
+            print("     download only NEW/CHANGED objects; copy unchanged ones from that folder")
+            print("     after verifying size + sha256; list objects gone from the bucket")
+    else:
+        print("     and download every object -> storage/headshots/<key>")
     print(
         "  4. verify: pg_restore --list shows public.alumni; alumni rows >= "
-        f"{ALUMNI_ROW_FLOOR}; object count + bytes == listing"
+        f"{ALUMNI_ROW_FLOOR}; objects on disk + bytes == listing"
     )
-    print("  5. write MANIFEST.json; exit non-zero on any failure")
+    print("  5. write MANIFEST.json, LAST-RUN.json; exit non-zero on any failure")
+    if keep:
+        check_prunable_root(cfg.backup_dir, _repo_root())
+        # The simulated run would be the newest OK run, so of the EXISTING OK
+        # runs only the newest keep-1 survive.
+        ok_now = [f for f in run_folders(cfg.backup_dir) if manifest_is_ok(read_manifest(f))]
+        doomed = ok_now[keep - 1 :]
+        print(f"  6. prune to the newest {keep} OK runs. Would delete now: ", end="")
+        print(", ".join(sorted(f.name for f in doomed)) if doomed else "nothing")
     return 0
 
 
-def run_backup(cfg: BackupConfig, tools: Mapping[str, str], *, now: datetime | None = None) -> int:
+def run_backup(
+    cfg: BackupConfig,
+    tools: Mapping[str, str],
+    *,
+    now: datetime | None = None,
+    incremental: bool = False,
+    keep: int | None = None,
+) -> int:
     started = now or datetime.now(UTC)
     secrets = cfg.secrets
     result = RunResult(project_ref=cfg.expect_project_ref, started_at=started)
@@ -826,16 +1349,32 @@ def run_backup(cfg: BackupConfig, tools: Mapping[str, str], *, now: datetime | N
     folder = cfg.backup_dir / utc_stamp(started)
     if folder.exists():
         raise BackupError(f"Destination already exists: {folder}")
+    if keep:
+        # Fail BEFORE dumping, not after: a refusal to prune should not cost a
+        # full run to discover.
+        check_prunable_root(cfg.backup_dir, _repo_root())
+
+    previous: tuple[pathlib.Path, dict] | None = None
+    if incremental:
+        previous = find_previous_ok_run(
+            cfg.backup_dir, exclude=folder.name, project_ref=cfg.expect_project_ref
+        )
+        if previous is None:
+            result.capture_mode = "full (no previous OK run)"
+            log("No previous OK run found under BACKUP_DIR; downloading every object.")
+        else:
+            result.capture_mode = "incremental"
+            result.previous_run = previous[0].name
+            log(f"Incremental against previous OK run {previous[0].name}")
+
     storage_root = folder / "storage" / BUCKET
     storage_root.mkdir(parents=True, exist_ok=False)
     log(f"Backup folder: {folder}")
     for name, version in result.tools.items():
         log(f"  {name}: {version}")
 
-    exit_code = 1
     try:
-        _run_steps(cfg, tools, folder, storage_root, result)
-        exit_code = 0 if not result.failures else 1
+        _run_steps(cfg, tools, folder, storage_root, result, previous=previous)
     except BackupError as exc:
         result.failures.append(redact(str(exc), secrets))
     except Exception as exc:  # noqa: BLE001 - recorded in the manifest, never re-raised raw
@@ -846,19 +1385,63 @@ def run_backup(cfg: BackupConfig, tools: Mapping[str, str], *, now: datetime | N
         path = write_manifest(folder, manifest)
         log(f"Manifest: {path}")
 
-    if result.failures:
-        print("\nBACKUP FAILED - do not trust this folder:", file=sys.stderr)
-        for failure in result.failures:
-            print(f"  - {redact(failure, secrets)}", file=sys.stderr)
+    pruned: list[str] = []
+    prune_error: str | None = None
+    if not result.failures and keep:
+        # LAST: only after the manifest above says ok, and never touching it.
+        log(f"Pruning to the newest {keep} OK runs...")
+        try:
+            pruned = prune_old_runs(
+                cfg.backup_dir, keep, current=folder.name, logger=lambda m: log(m, secrets)
+            )
+        except (BackupError, OSError) as exc:
+            prune_error = redact(f"backup {folder.name} is OK but pruning failed: {exc}", secrets)
+        if not pruned and not prune_error:
+            log("  nothing to prune")
+
+    if result.failures or prune_error:
+        reason = prune_error or "\n".join(result.failures)
+        record_outcome(
+            backup_dir=cfg.backup_dir,
+            webhook_url=cfg.slack_webhook_url,
+            secrets=secrets,
+            status="FAILED",
+            run_folder=folder.name,
+            finished_at=result.finished_at or datetime.now(UTC),
+            downloaded=result.downloaded_object_count,
+            reused=result.reused_object_count,
+            pruned=pruned,
+            reason=reason,
+        )
+        if result.failures:
+            print("\nBACKUP FAILED - do not trust this folder:", file=sys.stderr)
+            for failure in result.failures:
+                print(f"  - {redact(failure, secrets)}", file=sys.stderr)
+        else:
+            print(f"\nPRUNE FAILED (the backup itself is OK): {prune_error}", file=sys.stderr)
         return 1
 
+    record_outcome(
+        backup_dir=cfg.backup_dir,
+        webhook_url=cfg.slack_webhook_url,
+        secrets=secrets,
+        status="OK",
+        run_folder=folder.name,
+        finished_at=result.finished_at or datetime.now(UTC),
+        downloaded=result.downloaded_object_count,
+        reused=result.reused_object_count,
+        pruned=pruned,
+    )
     log(
-        f"OK  {result.downloaded_object_count} objects, "
+        f"OK  {result.captured_object_count} objects "
+        f"({result.downloaded_object_count} downloaded, {result.reused_object_count} reused, "
+        f"{len(result.removed_since_previous)} removed), "
         f"{manifest['total_bytes']:,} bytes total, "
         f"alumni rows {result.row_counts.get('public.alumni')}, "
         f"{manifest['duration_seconds']}s"
+        + (f", pruned {len(pruned)} old run(s)" if pruned else "")
     )
-    return exit_code
+    return 0
 
 
 def _run_steps(
@@ -867,6 +1450,8 @@ def _run_steps(
     folder: pathlib.Path,
     storage_root: pathlib.Path,
     result: RunResult,
+    *,
+    previous: tuple[pathlib.Path, dict] | None = None,
 ) -> None:
     secrets = cfg.secrets
 
@@ -915,10 +1500,37 @@ def _run_steps(
     if not objects:
         raise CheckError(f"Bucket {BUCKET!r} listed zero objects. Wrong project or wrong key.")
 
-    log("Downloading objects...")
+    # Which objects can be copied from the previous OK run instead of fetched.
+    reuse_from: dict[str, dict] = {}
+    if previous is not None:
+        prev_folder, prev_manifest = previous
+        plan = plan_incremental(objects, prev_manifest)
+        result.removed_since_previous = plan.removed
+        prev_records = previous_storage_records(prev_manifest)
+        reuse_from = {obj.path: prev_records[obj.path] for obj in plan.reuse}
+        log(
+            f"  plan: {len(plan.download)} to download, {len(plan.reuse)} unchanged "
+            f"(copy from {prev_folder.name}), {len(plan.removed)} gone from the bucket"
+        )
+    else:
+        prev_folder = None
+
+    log("Capturing objects...")
     mismatched: list[str] = []
+    fallback = 0
     for index, obj in enumerate(objects, start=1):
         dest = safe_object_destination(storage_root, obj.path)
+        name = f"storage/{BUCKET}/{obj.path}"
+        if prev_folder is not None and obj.path in reuse_from:
+            record = reuse_from_previous(prev_folder, reuse_from[obj.path], obj, dest)
+            if record is not None:
+                result.reused_object_count += 1
+                result.reused_total_bytes += record.bytes
+                result.files[name] = record
+                continue
+            # Missing, wrong size or wrong hash on disk: the previous folder is
+            # not what its manifest says. Download, and say so.
+            fallback += 1
         data = client.download(obj.path)
         if len(data) != obj.size:
             mismatched.append(f"{obj.path}: listing {obj.size} bytes, downloaded {len(data)}")
@@ -927,11 +1539,13 @@ def _run_steps(
         dest.write_bytes(data)
         result.downloaded_object_count += 1
         result.downloaded_total_bytes += len(data)
-        result.files[f"storage/{BUCKET}/{obj.path}"] = FileRecord(
-            len(data), hashlib.sha256(data).hexdigest()
+        result.files[name] = FileRecord(
+            len(data), hashlib.sha256(data).hexdigest(), etag=obj.etag, updated_at=obj.updated_at
         )
         if index % 50 == 0 or index == len(objects):
             log(f"  {index}/{len(objects)}")
+    if fallback:
+        log(f"  {fallback} object(s) failed copy verification and were downloaded instead")
 
     # 4. checks.
     log("Verifying...")
@@ -941,17 +1555,19 @@ def _run_steps(
     if not ok_toc:
         result.failures.append("pg_restore --list database.dump does not list TABLE public alumni.")
 
+    # Parity: what is on disk (downloaded + copied) must equal the listing.
     ok_storage = (
         not mismatched
-        and result.downloaded_object_count == result.listing_object_count
-        and result.downloaded_total_bytes == result.listing_total_bytes
+        and result.captured_object_count == result.listing_object_count
+        and result.captured_total_bytes == result.listing_total_bytes
     )
     result.checks["storage_totals_match"] = ok_storage
     if not ok_storage:
         result.failures.append(
             f"Storage mismatch: listing reported {result.listing_object_count} objects / "
-            f"{result.listing_total_bytes} bytes, downloaded {result.downloaded_object_count} / "
-            f"{result.downloaded_total_bytes}."
+            f"{result.listing_total_bytes} bytes, captured {result.captured_object_count} / "
+            f"{result.captured_total_bytes} ({result.downloaded_object_count} downloaded, "
+            f"{result.reused_object_count} reused)."
         )
         result.failures.extend(mismatched[:20])
 
@@ -971,35 +1587,86 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="validate configuration and tooling, connect to nothing, print the plan",
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="download only bucket objects that are new or changed since the previous OK run; "
+        "copy the rest from that run (verified). The database is always dumped in full.",
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=None,
+        metavar="N",
+        help="after a run finished OK, delete the oldest run folders so at most N OK runs "
+        "remain (default: keep everything)",
+    )
     args = parser.parse_args(argv)
+    if args.keep is not None and args.keep < 1:
+        parser.error("--keep must be at least 1")
 
     secrets: tuple[str, ...] = tuple(
         v
         for v in (
             os.environ.get("BACKUP_DATABASE_URL"),
             os.environ.get("BACKUP_SUPABASE_SERVICE_ROLE_KEY"),
+            os.environ.get("BACKUP_SLACK_WEBHOOK_URL"),
         )
         if v
     )
+    cfg: BackupConfig | None = None
     try:
         cfg = load_config(os.environ)
         secrets = cfg.secrets
         tools = find_tools()
         if args.dry_run:
-            return dry_run(cfg, tools)
-        return run_backup(cfg, tools)
+            return dry_run(cfg, tools, incremental=args.incremental, keep=args.keep)
+        return run_backup(cfg, tools, incremental=args.incremental, keep=args.keep)
     except BackupError as exc:
-        print("ERROR: " + redact(str(exc), secrets), file=sys.stderr)
+        message = redact(str(exc), secrets)
+        print("ERROR: " + message, file=sys.stderr)
+        if not args.dry_run:
+            _record_early_failure(cfg, secrets, message)
         return 2
     except KeyboardInterrupt:
         print("Interrupted. The folder written so far is INCOMPLETE; delete it.", file=sys.stderr)
+        if not args.dry_run:
+            _record_early_failure(cfg, secrets, "interrupted (KeyboardInterrupt)")
         return 130
     except Exception as exc:  # noqa: BLE001 - last resort, must not leak secrets
-        print(
-            "UNEXPECTED ERROR: " + redact(f"{type(exc).__name__}: {exc}", secrets),
-            file=sys.stderr,
-        )
+        message = redact(f"{type(exc).__name__}: {exc}", secrets)
+        print("UNEXPECTED ERROR: " + message, file=sys.stderr)
+        if not args.dry_run:
+            _record_early_failure(cfg, secrets, message)
         return 3
+
+
+def _record_early_failure(cfg: BackupConfig | None, secrets: Iterable[str], reason: str) -> None:
+    """Marker + webhook for a failure BEFORE ``run_backup`` took over.
+
+    Config may be unusable (that is often the failure), so fall back to the
+    raw ``BACKUP_DIR`` / ``BACKUP_SLACK_WEBHOOK_URL`` values: an unattended run
+    that cannot even load its config must still leave a trace and page.
+    """
+    backup_dir = cfg.backup_dir if cfg else None
+    webhook = cfg.slack_webhook_url if cfg else None
+    if backup_dir is None:
+        raw = (os.environ.get("BACKUP_DIR") or "").strip()
+        candidate = pathlib.Path(raw).expanduser() if raw else None
+        if candidate is not None and candidate.is_absolute() and candidate.is_dir():
+            backup_dir = candidate
+    if webhook is None:
+        raw_hook = (os.environ.get("BACKUP_SLACK_WEBHOOK_URL") or "").strip()
+        webhook = raw_hook if raw_hook.startswith("https://") else None
+    record_outcome(
+        backup_dir=backup_dir,
+        webhook_url=webhook,
+        secrets=secrets,
+        status="FAILED",
+        run_folder=None,
+        finished_at=datetime.now(UTC),
+        reason=reason,
+    )
 
 
 if __name__ == "__main__":

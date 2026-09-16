@@ -439,8 +439,8 @@ def set_status(text: str, value: str) -> str:
 
     Only ever called by Jake-initiated commands, never by import.
     """
-    trusted = split_header_region(text)
-    if len(STATUS_KEY.findall(trusted)) != 1:
+    header_region = split_header_region(text)
+    if len(STATUS_KEY.findall(header_region)) != 1:
         raise ValueError("expected exactly one trusted 'Status:' line")
     region = find_region(text)
     if region is None:

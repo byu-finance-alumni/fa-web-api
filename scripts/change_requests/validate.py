@@ -111,12 +111,12 @@ def validate_file(
         )
 
     # --- 3. machine-read keys: exactly once, and outside the quarantine ------
-    trusted = render.split_header_region(text)
+    header_region = render.split_header_region(text)
     region = render.untrusted_region_text(text)
 
-    status_values = render.STATUS_KEY.findall(trusted)
-    approved_values = render.APPROVED_KEY.findall(trusted)
-    id_values = render.REQUEST_ID_KEY.findall(trusted)
+    status_values = render.STATUS_KEY.findall(header_region)
+    approved_values = render.APPROVED_KEY.findall(header_region)
+    id_values = render.REQUEST_ID_KEY.findall(header_region)
 
     for label, values in (
         ("Status:", status_values),
@@ -174,10 +174,10 @@ def validate_file(
         )
 
     # --- 6. flagged requests need an explicit sign-off ----------------------
-    flags_match = render.INJECTION_FLAGS_KEY.search(trusted)
+    flags_match = render.INJECTION_FLAGS_KEY.search(header_region)
     flags = int(flags_match.group(1)) if flags_match else 0
     if flags > 0:
-        reviewed = render.REVIEWED_KEY.findall(trusted)
+        reviewed = render.REVIEWED_KEY.findall(header_region)
         signed = any(value.strip() == "Yes" for value in reviewed)
         if not signed:
             result.failures.append(

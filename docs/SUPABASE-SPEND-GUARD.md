@@ -88,6 +88,18 @@ restarts the database, so pick a quiet hour). After that the WARN becomes PASS.
    branch, `prod`. Until this is promoted, the Run workflow button is the only
    way it runs.
 
+### Token on file
+
+| | |
+|---|---|
+| Secret | `SUPABASE_ACCESS_TOKEN` in the `fa-web-api` repo |
+| Created | 2026-09-17 (first successful run the same day: 4 PASS + `WARN compute-variant`) |
+| **Expires** | **2027-06-01** |
+
+When it expires the daily run goes red with an auth error, not a spend error.
+Before then: generate a new token on the same Supabase page, replace the
+secret's value, run the workflow by hand once, and update the dates above.
+
 A failed run emails whoever last edited the workflow (GitHub's default) and
 posts one line to the security Slack channel via `SLACK_SECURITY_WEBHOOK_URL`,
 the same webhook the weekly audit uses. A green run is silent.

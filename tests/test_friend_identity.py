@@ -559,9 +559,17 @@ def test_an_alumnus_email_is_refused_not_created_and_nothing_is_written(friends_
     assert item["alumni_id"] == 5
     assert item["friend_id"] is None
     assert "match" in item["message"].lower()
-    assert session.added == []
+    # Nothing is created or attached -- but telling the reviewer whose record
+    # that email belongs to is a disclosure, and it is recorded as one: an
+    # audit row naming the alumnus (never the email), committed on its own.
+    assert [type(o).__name__ for o in session.added] == ["AuditLog"]
+    audit = session.added[0]
+    assert audit.action_type == "attendee_friend_existing_alumnus"
+    assert audit.entity_type == "event"
+    assert "alumni 5" in audit.new_value
+    assert "jane@x.com" not in audit.new_value
     assert session.savepoints == 0
-    assert session.committed == 0
+    assert session.committed == 1
 
 
 def test_reposting_the_same_file_is_idempotent(friends_client):

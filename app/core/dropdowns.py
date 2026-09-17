@@ -277,6 +277,48 @@ EMPLOYER_NOT_APPLICABLE_BY_LOWER: frozenset[str] = frozenset(
 )
 
 
+# --- employer DISPLAY fallback (#536) ----------------------------------------
+#
+# When an alumnus has NO employer on file, the alumni list, the profile page and
+# the CSV export show their employment status in the employer's place instead
+# of a blank (Jake, 2026-09-15 / 2026-09-16). A DISPLAY rule only: nothing is
+# written, and ``current_employer`` keeps reading exactly what is stored.
+#
+# It applies to every status EXCEPT the ones that mean "employed" — for those a
+# blank employer is a real gap (see :data:`EMPLOYER_NOT_APPLICABLE_STATUSES`
+# above), and showing "Full-time" where the company should be would paper over
+# it. So the split, from the actual dropdown labels:
+#
+#   employed (NO fallback): "Full-time", "Part-time", "Self-Employed"
+#   fallback:               "Graduate Student", "Military",
+#                           "Not in the Labor Force", "Unemployed", "Unknown"
+#
+# "Graduate Student" is the case that prompted the issue — for someone in grad
+# school the employer field holds the school's NAME when we know it, so the
+# fallback only fires when we don't. "Military" shows as "Military" when no
+# branch is on file (the branch, when known, is in the employer field — #608).
+# "Unknown" is deliberately IN the set: the rule is "never a blank", and
+# "Unknown" is exactly what we know. An off-list legacy value ("Employed",
+# "Stay at home parent") is NOT a fallback — the rule is an allow-list, so an
+# unrecognised status leaves the cell blank rather than guessing.
+#
+# This is a different question from :data:`EMPLOYER_NOT_APPLICABLE_STATUSES`
+# (which blank employers are DATA GAPS worth chasing) — that set stays as it is.
+#
+# The function that applies the rule is ``app.services.employment_display
+# .employer_display``; every read surface goes through it so the list, the
+# profile and the export can never disagree.
+EMPLOYED_STATUSES: tuple[str, ...] = ("Full-time", "Part-time", "Self-Employed")
+EMPLOYER_FALLBACK_STATUSES: tuple[str, ...] = tuple(
+    v for v in EMPLOYMENT_STATUSES if v not in EMPLOYED_STATUSES
+)
+# lower(trim(value)) -> canonical label, so casing drift in the stored value
+# ("graduate student", "UNEMPLOYED ") still displays as the dropdown spells it.
+EMPLOYER_FALLBACK_BY_LOWER: dict[str, str] = {
+    v.lower(): v for v in EMPLOYER_FALLBACK_STATUSES
+}
+
+
 def employer_applies(employment_status: str | None) -> bool:
     """False when *employment_status* means there is no employer to record.
 

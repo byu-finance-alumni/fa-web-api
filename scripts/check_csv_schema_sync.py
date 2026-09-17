@@ -68,7 +68,11 @@ SECTION_MODEL = {
 # by (section, field) so a genuine typo in any other field still fails.
 PAYLOAD_ONLY = {
     # "Spouse BYU ID" is looked up and stored as ``spouse_alumni_id`` — which IS
-    # a real Alumni column, so it is validated normally; nothing to exempt yet.
+    # a real Alumni column, so it is validated normally.
+    # The export's "Friend ID" column (#538) is DERIVED from the primary key by
+    # the ``Alumni.friend_id`` property (``app.core.friend_id``) — deliberately
+    # not a column, so there is nothing to migrate.
+    ("alumni", "friend_id"),
 }
 
 

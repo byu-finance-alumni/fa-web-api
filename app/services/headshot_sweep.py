@@ -109,26 +109,34 @@ _SKIP_UNDER_BYTES = 400 * 1024
 
 # --- Per-run bounds ----------------------------------------------------------
 #
-# A cron invocation is a normal serverless function: a wall-clock limit (60s by
-# default on this project — nothing in vercel.json raises it) and memory SHARED
-# with whatever real requests are being served by the same instance. So the run
-# is bounded twice, and stops at whichever bound it reaches first.
+# A cron invocation is a normal serverless function: a wall-clock limit
+# (`maxDuration` 300s for `app/main.py`, set in vercel.json — the platform
+# default is also 300s, but the number this budget leans on is written down
+# rather than assumed) and memory SHARED with whatever real requests are being
+# served by the same instance. So the run is bounded twice, and stops at
+# whichever bound it reaches first.
 #
 # Shape of the work per object: download ~3.4 MB, decode + LANCZOS down to
 # 1024px, re-encode, upload ~100-200 KB. The CPU half is cheap — measured
 # 2026-08-08, a 12 Mpx 5.7 MB photo normalises in 0.23s locally — so the cost is
-# almost entirely the two round-trips, call it ~1-1.5s each. 25 objects is
-# therefore roughly what the time budget affords, and whichever bound bites
-# first is the right one: TIME protects a slow night, the COUNT protects against
-# a bucket of small files that would otherwise churn hundreds of objects.
-_MAX_OBJECTS_PER_RUN = 25
-_TIME_BUDGET_SECONDS = 45.0
+# almost entirely the two round-trips, call it ~1-1.5s each. 150 objects is
+# therefore roughly what a 240s budget affords, and whichever bound bites first
+# is the right one: TIME protects a slow night (and leaves a full minute of
+# headroom under the platform limit), the COUNT protects against a bucket of
+# small files that would otherwise churn hundreds of objects.
+#
+# ⚠️ These were 25 / 45s until 2026-09-17. A bulk import of ~830 phone photos in
+# September outran that by a month (462 still oversized after 30 nights), and
+# Hobby-plan crons can only fire once a day, so per-run throughput is the only
+# lever. At 150 a night a backlog of that size drains in under a week.
+_MAX_OBJECTS_PER_RUN = 150
+_TIME_BUDGET_SECONDS = 240.0
 
 # Listing is metadata only and cheap, but it still costs a round-trip per page,
 # and a run that spends its budget paging has done nothing useful. This caps the
-# scan at 2,000 objects — an order of magnitude above the current inventory.
+# scan at 5,000 objects — the bucket held ~1,400 on 2026-09-17.
 _LIST_PAGE_SIZE = 100
-_MAX_LIST_PAGES = 20
+_MAX_LIST_PAGES = 50
 
 
 async def _list_candidates(min_bytes: int) -> tuple[list[tuple[str, int]], int, int]:

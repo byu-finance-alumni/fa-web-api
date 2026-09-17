@@ -102,8 +102,9 @@ $CRON_SECRET`, sent automatically by Vercel Cron, and default-closed when
 `CRON_SECRET` is unset. That matters more here than for the survey cron, because
 this endpoint **rewrites stored photos**.
 
-⚠️ Each run rewrites at most 25 objects and stops after 45 s, so a large backlog
-drains over successive nights rather than timing out. Re-running is always safe:
+⚠️ Each run rewrites at most 150 objects and stops after 240 s (the function's
+`maxDuration` is 300 s, set in `vercel.json`), so a large backlog drains over a
+few nights rather than timing out. Re-running is always safe:
 a normalised object falls under the threshold and is never picked up again.
 ⚠️ Unlike the offline `compress-headshots.py`, the cron keeps **no backup** of the
 originals — a serverless function has nowhere to put them. To drain a large

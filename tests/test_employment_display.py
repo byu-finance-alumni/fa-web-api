@@ -92,11 +92,55 @@ def test_blank_company_every_dropdown_value(company: str | None, status: str) ->
     assert employer_display(company, status) == expected
 
 
-@pytest.mark.parametrize("status", (*EMPLOYMENT_STATUSES, None, "", "Employed"))
+@pytest.mark.parametrize(
+    "status", (*(s for s in EMPLOYMENT_STATUSES if s != "Military"), None, "", "Employed")
+)
 def test_company_present_always_wins(status: str | None) -> None:
     # Returned exactly as stored — no trimming, no case change.
     assert employer_display("Goldman Sachs", status) == "Goldman Sachs"
     assert employer_display("  Goldman Sachs ", status) == "  Goldman Sachs "
+
+
+# --- Military/<branch> (#608, restored by #547) --------------------------------
+
+
+def test_military_with_branch_shows_the_prefixed_branch() -> None:
+    """The company field holds the BRANCH for a serving alumnus; on its own
+    "Air Force" reads as a company, so it is shown as "Military/Air Force" —
+    exactly what the profile rendered before #536 moved the rule here."""
+    assert employer_display("Air Force", "Military") == "Military/Air Force"
+    assert employer_display("Army", "Military") == "Military/Army"
+
+
+def test_military_branch_is_trimmed_and_status_casing_tolerant() -> None:
+    assert employer_display("  Navy ", "Military") == "Military/Navy"
+    assert employer_display("Army", "  military ") == "Military/Army"
+    assert employer_display("Army", "MILITARY") == "Military/Army"
+
+
+@pytest.mark.parametrize("company", _BLANK_COMPANIES)
+def test_military_without_branch_is_plain_military_never_a_dangling_slash(
+    company: str | None,
+) -> None:
+    assert employer_display(company, "Military") == "Military"
+
+
+def test_military_branch_that_is_itself_military_does_not_double_up() -> None:
+    assert employer_display("Military", "Military") == "Military"
+    assert employer_display("military", "Military") == "Military"
+    assert employer_display(" MILITARY ", "military") == "Military"
+
+
+def test_military_company_already_prefixed_is_left_alone() -> None:
+    assert employer_display("Military/Marines", "Military") == "Military/Marines"
+    assert employer_display("military/Marines", "Military") == "military/Marines"
+
+
+def test_prefix_only_applies_to_the_military_status() -> None:
+    """A branch-looking company under any other status is an ordinary company."""
+    assert employer_display("Air Force", "Full-time") == "Air Force"
+    assert employer_display("Air Force", None) == "Air Force"
+    assert employer_display("Air Force", "Graduate Student") == "Air Force"
 
 
 @pytest.mark.parametrize("company", _BLANK_COMPANIES)
@@ -270,6 +314,7 @@ def test_profile_and_list_agree_for_the_same_alumnus() -> None:
         (None, "Full-time"),
         ("", "unknown"),
         (None, "Stay at home parent"),
+        ("Air Force", "Military"),
     ]:
         assert (
             _profile(company=company, status=status).employer_display
@@ -358,6 +403,7 @@ def test_export_employer_column_matches_list_display(client) -> None:
         (4, None, "unemployed", "Unemployed"),
         (5, "   ", "Stay at home parent", None),
         (6, None, None, None),
+        (7, "Air Force", "Military", "Military/Air Force"),
     ]
     alumni = [
         _alumni_model(alumni_id=i, first_name=f"A{i}", employment_status=status)

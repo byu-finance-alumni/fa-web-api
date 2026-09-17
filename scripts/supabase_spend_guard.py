@@ -180,7 +180,7 @@ class HttpFetcher:
         try:
             # url is API_BASE (a literal https://api.supabase.com) plus a
             # path this module composes; nothing external picks the scheme.
-            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+            # nosemgrep -- dynamic-urllib-use-detected, see above
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:  # noqa: S310
                 body = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:

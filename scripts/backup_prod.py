@@ -542,7 +542,7 @@ class StorageClient:
             try:
                 # every request targets BACKUP_SUPABASE_URL, which load_config
                 # rejects unless it is https:// with a hostname; no file:// path.
-                # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+                # nosemgrep -- dynamic-urllib-use-detected, see above
                 with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:  # noqa: S310
                     return resp.read()
             except urllib.error.HTTPError as exc:

@@ -1289,6 +1289,13 @@ def test_a_net_id_the_record_does_not_bear_is_refused_not_downgraded(
         "net_id_mismatch", "net_id_mismatch"
     ]
     assert not [o for o in session.added if type(o).__name__ == "EventAttendance"]
+    # Each refusal leaves an audit row attributed to the caller -- a run of
+    # them is what a tampered payload looks like -- without the claimed value.
+    audit = [o for o in session.added if type(o).__name__ == "AuditLog"]
+    assert [a.action_type for a in audit] == ["attendee_net_id_mismatch"] * 2
+    assert all(a.entity_type == "event" and a.entity_id == 7 for a in audit)
+    assert all("someoneelse" not in a.new_value for a in audit)
+    assert [a.new_value.split(":")[0] for a in audit] == ["5", "6"]
 
 
 def test_a_normalised_net_id_approval_is_written(approve_client):

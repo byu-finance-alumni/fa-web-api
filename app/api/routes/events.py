@@ -909,6 +909,22 @@ async def approve_attendee_matches(
                 # bear. Refuse rather than quietly downgrade to an "approved
                 # match": nothing here was approved by a human.
                 mismatched += 1
+                # Refusals at this trust boundary are recorded too: a run of
+                # them from one account is the shape a tampered approval
+                # payload takes, and the response body is not kept anywhere.
+                # The claimed value is deliberately not written down.
+                session.add(
+                    AuditLog(
+                        user_id=user.user_id,
+                        action_type="attendee_net_id_mismatch",
+                        entity_type="event",
+                        entity_id=event_id,
+                        new_value=(
+                            f"{approval.alumni_id}: {name} (claimed Net ID does "
+                            "not match the record; nothing written)"
+                        ),
+                    )
+                )
                 items.append(
                     AttendeeApplyItem(
                         alumni_id=approval.alumni_id,
@@ -1076,6 +1092,22 @@ async def create_attendee_friends(
         decision = index.decide(row)
         if decision.kind == "existing_alumnus":
             existing_alumni += 1
+            # Telling the reviewer "this email belongs to alumnus N" is a
+            # disclosure like the preview's candidates, so it gets the same
+            # kind of record (the preview logs its own; this is the friends
+            # leg's). Row counts and the id only -- never the email.
+            session.add(
+                AuditLog(
+                    user_id=user.user_id,
+                    action_type="attendee_friend_existing_alumnus",
+                    entity_type="event",
+                    entity_id=event_id,
+                    new_value=(
+                        f"row {row['row']}: email belongs to alumni "
+                        f"{decision.alumni_id}; no friend created"
+                    ),
+                )
+            )
             items.append(
                 AttendeeFriendItem(
                     row=row["row"],
@@ -1210,7 +1242,7 @@ async def create_attendee_friends(
                     )
                 )
 
-    if attached:
+    if attached or existing_alumni:
         await session.commit()
     return AttendeeFriendResult(
         event_id=event_id,

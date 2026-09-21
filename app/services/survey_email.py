@@ -753,7 +753,11 @@ def _build_on_file(alum, contact, job) -> tuple[tuple[str, str], ...]:
 
 
 def render_survey_email(
-    r: Recipient, link: str, message: SurveyMessage | None = None
+    r: Recipient,
+    link: str,
+    message: SurveyMessage | None = None,
+    *,
+    stage: int = STAGE_INITIAL,
 ) -> tuple[str, str, str]:
     """Return (subject, html, text) for one recipient.
 
@@ -761,12 +765,31 @@ def render_survey_email(
     ``survey_message.get_for_send`` and passed down; omitting it renders the
     built-in defaults, which is what an unedited deployment sends and what makes
     this callable from a test without a database.
+
+    ``stage`` decides ONE thing: whether ``message.reminder_note`` is prepended
+    (#560). Before this, all three emails were byte for byte identical, so a
+    reminder arrived looking exactly like the original with nothing to say it was
+    a second ask. Stages 1 and 2 now open with the note; stage 0 never does.
+
+    ⚠️ The default is :data:`STAGE_INITIAL`, so a caller that forgets the argument
+    sends the UNDECORATED email. That direction is deliberate — a missing
+    argument understates, and a first contact that reads like a chase-up is the
+    worse of the two failures.
+
+    Everything else — subject, intro, on-file box, link, closing — is identical
+    across all three stages (Jake, 2026-09-21: a line on top of the current
+    message, not a per-stage rewrite).
     """
     message = message or survey_message.DEFAULT_MESSAGE
     rows = _on_file_rows(r, message.on_file_fields)
+    # Empty for the initial, and empty whenever staff have cleared the box.
+    note = message.reminder_note.strip() if stage != STAGE_INITIAL else ""
 
     # Plain-text part.
-    text_lines = [f"Hello {r.first_name},", "", message.intro, ""]
+    text_lines = [f"Hello {r.first_name},", ""]
+    if note:
+        text_lines += [note, ""]
+    text_lines += [message.intro, ""]
     if rows:
         text_lines.append("Here's what we have on file:")
         text_lines += [f"  {label}: {value}" for label, value in rows]
@@ -794,11 +817,24 @@ def render_survey_email(
 
     # ⚠️ ESCAPE FIRST, THEN ADD MARKUP — and only ever this markup. The copy is
     # now staff-authored input rendered into an email, so it is escaped exactly
-    # as the on-file values above are; the two `replace` calls run on the ALREADY
+    # as the on-file values above are; every `replace` below runs on the ALREADY
     # ESCAPED text and can only introduce paragraph and line breaks. Anything
-    # that looks like a tag in what someone typed stays visible text.
+    # that looks like a tag in what someone typed stays visible text. The
+    # reminder note (#560) is under the same rule — see `note_html`.
     intro_html = escape(message.intro).replace(
         "\n\n", "</p><p style=\"margin:0 0 12px;\">"
+    )
+    # Same escape-then-markup rule as the intro above, and the same markup: the
+    # note is staff-authored input too, and it gets no styling of its own. It
+    # reads as the email's opening line, not as a banner — no icon, no coloured
+    # box. Empty string on the initial, so the template below collapses to
+    # exactly what it rendered before #560.
+    note_html = (
+        '<p style="margin:0 0 12px;font-size:15px;">'
+        + escape(note).replace("\n\n", '</p><p style="margin:0 0 12px;">')
+        + "</p>"
+        if note
+        else ""
     )
     closing_html = escape(message.closing).replace("\n", "<br>")
     html = f"""\
@@ -809,6 +845,7 @@ def render_survey_email(
     </div>
     <div style="padding:24px;font-family:Arial,sans-serif;color:#374151;line-height:1.55;">
       <p style="margin:0 0 12px;font-size:15px;">Hello {escape(r.first_name)},</p>
+      {note_html}
       <p style="margin:0 0 12px;font-size:15px;">{intro_html}</p>
       {info_html}
       <div style="margin:20px 0;">
@@ -1901,15 +1938,21 @@ def _build_survey_email(
     base_url: str,
     from_field: str,
     message: SurveyMessage | None = None,
+    stage: int = STAGE_INITIAL,
 ) -> dict:
     """One Resend batch entry for a recipient (unique link + rendered content).
 
     ``message`` is the staff-edited copy (#524). It is REQUIRED in practice — the
     only caller reads it once per send and passes it — and defaults to the
     built-in wording so a direct call still produces a valid email rather than a
-    blank one."""
+    blank one.
+
+    ``stage`` is the stage being sent, and decides only whether the reminder line
+    goes on (#560). It defaults to the initial for the same reason the renderer
+    does. The real caller, :func:`_send_and_log`, already has the stage in hand —
+    it is claiming the send log with it."""
     link = _survey_link(base_url, r.alumni_id, graduation_year)
-    subject, html, text = render_survey_email(r, link, message)
+    subject, html, text = render_survey_email(r, link, message, stage=stage)
     return {
         "from": from_field,
         "to": [r.email],
@@ -2246,6 +2289,7 @@ async def _send_and_log(
                 base_url=base_url,
                 from_field=from_field,
                 message=message,
+                stage=stage,
             )
             for r in claimed
         ]

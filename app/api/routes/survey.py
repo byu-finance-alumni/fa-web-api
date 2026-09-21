@@ -564,6 +564,7 @@ async def update_survey_message(
         subject=body.subject,
         intro=body.intro,
         closing=body.closing,
+        reminder_note=body.reminder_note,
         on_file_fields=body.on_file_fields,
         actor_user_id=user.user_id,
     )

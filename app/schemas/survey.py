@@ -662,6 +662,12 @@ class SurveyMessageRead(BaseModel):
     # `survey_message.ON_FILE_FIELDS`; an empty list means the on-file box is
     # omitted from the email entirely.
     on_file_fields: list[str]
+    # The line the 1-WEEK and 2-WEEK reminders open with, above the intro (#560).
+    # The initial email never shows it. '' means the reminders carry no extra
+    # line — which is a real, saveable choice here, not "nothing stored": the
+    # NULL-means-default distinction is resolved in `survey_message._resolve`
+    # and never reaches the editor.
+    reminder_note: str = ""
     # False while the copy still matches the built-in default — which is how the
     # editor decides whether to offer "Reset to default". Compared against the
     # DEFAULTS, not against the existence of a row.
@@ -691,6 +697,14 @@ class SurveyMessageUpdate(BaseModel):
     intro: str
     closing: str
     on_file_fields: list[str]
+    # The reminder line (#560). Unlike the three above this MAY be empty — empty
+    # is the off switch, not a validation failure.
+    #
+    # Defaulted rather than required, so the API can deploy ahead of the console
+    # (backend first is the house order) without 422-ing the older editor's save.
+    # For that window an old client's save stores '' — harmless, because nothing
+    # is stored until the new editor exists to store it.
+    reminder_note: str = ""
 
 
 # ----------------------------------------------- per-alumnus campaign reset ----

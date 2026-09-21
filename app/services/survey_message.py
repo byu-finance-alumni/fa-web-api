@@ -25,6 +25,13 @@ never be able to make the email empty, and it must never be able to stop a send.
 :data:`DEFAULT_MESSAGE`, which is byte for byte what the email said before this
 feature existed.
 
+⚠️ ``reminder_note`` IS THE ONE FIELD WHERE BLANK IS NOT "USE THE DEFAULT" (#560).
+It is the line the 1-week and 2-week reminders open with, above the intro, and
+the initial email never shows it. A NULL column means "never set" and resolves to
+:data:`DEFAULT_REMINDER_NOTE`; a stored ``''`` means someone cleared it in the
+console and the reminders carry no extra line. Every other field here folds blank
+into the default, and folding this one would make the off switch un-saveable.
+
 ⚠️ ``on_file_fields`` CAN ONLY HIDE, NEVER ADD. It is validated against
 :data:`ON_FILE_FIELDS` — the canonical label list that ``survey_email``'s
 ``_build_on_file`` builds from — and stored in that canonical order. A stored
@@ -85,6 +92,23 @@ DEFAULT_CLOSING = (
     "Warmest regards,\nTanya Harmon & Amy Densley\nBYU Finance Career Directors"
 )
 
+# The line the REMINDER emails open with, above the intro (#560). Amy's own
+# wording, from her 2026-09-21 mail asking for it — the directors' authored copy,
+# exactly like the three fields above, so "Reset to default" restores this.
+#
+# ⚠️ NOT BLANK BY DEFAULT, and that is deliberate. Everywhere else on this table
+# "nothing stored" means "send what we always sent"; here it means "send the
+# reminder line", because the POINT of #560 is that reminders stop reading like a
+# first contact. Shipping it blank would have left the change inert until someone
+# happened to type it into the console, which is the failure mode this feature
+# exists to remove. Clearing the box in the console stores '' and turns it off.
+#
+# Stage 0 NEVER shows it, whatever is stored — see `survey_email.render_survey_email`.
+DEFAULT_REMINDER_NOTE = (
+    "In case you missed this survey, we really value your update and would "
+    "appreciate you filling it out."
+)
+
 #: The "here's what we have on file" rows, by label, IN THE ORDER THE EMAIL SHOWS
 #: THEM. This is the canonical list: ``survey_email._ON_FILE_BUILDERS`` is keyed
 #: by exactly these strings and iterates this tuple, so a label that appears in
@@ -123,6 +147,8 @@ ON_FILE_FIELDS: tuple[str, ...] = (
 # 400, and an email lost to a 400 is worse than a wordy one.
 SUBJECT_MAX_CHARS = 200
 BODY_MAX_CHARS = 5000
+# The reminder line is a sentence or two, not a second body (#560).
+REMINDER_NOTE_MAX_CHARS = 2000
 
 
 @dataclass(frozen=True)
@@ -140,6 +166,11 @@ class SurveyMessage:
     intro: str
     closing: str
     on_file_fields: tuple[str, ...]
+    #: The line the 1-week and 2-week reminders open with (#560). '' means the
+    #: reminders carry no extra line and read exactly as the initial does. Never
+    #: None — the None/'' distinction lives in the COLUMN, and is resolved away
+    #: by :func:`_resolve` before it gets this far.
+    reminder_note: str = DEFAULT_REMINDER_NOTE
 
 
 #: What the email says with nothing stored — and what a reset restores.
@@ -148,6 +179,7 @@ DEFAULT_MESSAGE = SurveyMessage(
     intro=DEFAULT_INTRO,
     closing=DEFAULT_CLOSING,
     on_file_fields=ON_FILE_FIELDS,
+    reminder_note=DEFAULT_REMINDER_NOTE,
 )
 
 
@@ -210,6 +242,35 @@ def _clean_body(value: str | None, *, label: str) -> str:
     return trimmed
 
 
+def _clean_reminder_note(value: str | None) -> str:
+    """Trim and check the reminder line (#560). MAY be empty — that is the off switch.
+
+    The one validated field on this message that is allowed to come back "".
+    Every other one raises on blank, because a blank subject or intro is a broken
+    email; a blank reminder note is a deliberate choice to leave the reminders
+    reading exactly as they did before #560, and the console has to be able to
+    save it.
+
+    Otherwise identical to :func:`_clean_body`: CRLF normalised, length capped,
+    control and invisible characters refused — this text is rendered into an
+    email to alumni like everything else here.
+    """
+    trimmed = (value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not trimmed:
+        return ""
+    if len(trimmed) > REMINDER_NOTE_MAX_CHARS:
+        raise InvalidRequestError(
+            f"The reminder line is too long ({len(trimmed)} characters); "
+            f"the limit is {REMINDER_NOTE_MAX_CHARS}."
+        )
+    if _has_forbidden_chars(trimmed, allow_newlines=True):
+        raise InvalidRequestError(
+            "The reminder line contains a control or invisible character. "
+            "Use ordinary text and blank lines between paragraphs."
+        )
+    return trimmed
+
+
 def canonical_fields(fields: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
     """The selection, de-duplicated and forced back into canonical order.
 
@@ -248,6 +309,16 @@ def _resolve(row: SurveyEmailMessage | None) -> SurveyMessage:
     subject = (row.subject or "").strip() or DEFAULT_SUBJECT
     intro = (row.intro or "").strip() or DEFAULT_INTRO
     closing = (row.closing or "").strip() or DEFAULT_CLOSING
+    # ⚠️ NOT the `or DEFAULT` pattern above, and it must not become one. NULL
+    # means "never set" and takes the default; '' means someone cleared the box
+    # and the reminders get no extra line. Collapsing the two would make the off
+    # switch un-saveable — clearing it would put the default sentence back on the
+    # next read.
+    reminder_note = (
+        DEFAULT_REMINDER_NOTE
+        if row.reminder_note is None
+        else row.reminder_note.strip()
+    )
     stored = row.on_file_fields
     if stored is None:
         fields = ON_FILE_FIELDS
@@ -258,7 +329,11 @@ def _resolve(row: SurveyEmailMessage | None) -> SurveyMessage:
         chosen = set(stored)
         fields = tuple(label for label in ON_FILE_FIELDS if label in chosen)
     return SurveyMessage(
-        subject=subject, intro=intro, closing=closing, on_file_fields=fields
+        subject=subject,
+        intro=intro,
+        closing=closing,
+        on_file_fields=fields,
+        reminder_note=reminder_note,
     )
 
 
@@ -315,6 +390,7 @@ async def get_message(session: AsyncSession) -> SurveyMessageRead:
         intro=message.intro,
         closing=message.closing,
         on_file_fields=list(message.on_file_fields),
+        reminder_note=message.reminder_note,
         # Compared against the DEFAULTS, not "is there a row" — a row that
         # happens to hold the default copy is not a customisation, and the
         # editor's "Reset to default" affordance keys off this.
@@ -334,6 +410,7 @@ async def set_message(
     intro: str,
     closing: str,
     on_file_fields: list[str],
+    reminder_note: str,
     actor_user_id: int | None,
 ) -> None:
     """Store the copy. Validates first; raises 422 if it will not do.
@@ -350,6 +427,7 @@ async def set_message(
         intro=_clean_body(intro, label="introduction"),
         closing=_clean_body(closing, label="closing"),
         on_file_fields=canonical_fields(on_file_fields),
+        reminder_note=_clean_reminder_note(reminder_note),
     )
     row = await _load_row(session)
     if row is None:
@@ -359,6 +437,10 @@ async def set_message(
     row.intro = clean.intro
     row.closing = clean.closing
     row.on_file_fields = list(clean.on_file_fields)
+    # Written as '' rather than NULL when cleared — see `_resolve`. A save always
+    # makes the column non-NULL, so "never set" can only ever mean a row that
+    # predates #560.
+    row.reminder_note = clean.reminder_note
     row.updated_by_user_id = actor_user_id
 
 

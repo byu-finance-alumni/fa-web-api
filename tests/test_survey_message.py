@@ -258,7 +258,11 @@ def test_a_field_that_would_break_the_email_is_refused(field, value):
     with pytest.raises(InvalidRequestError):
         asyncio.run(
             survey_message.set_message(
-                _MessageSession(), on_file_fields=[], actor_user_id=1, **payload
+                _MessageSession(),
+                on_file_fields=[],
+                reminder_note="",
+                actor_user_id=1,
+                **payload,
             )
         )
 
@@ -275,12 +279,16 @@ def test_a_textarea_crlf_is_normalised_not_rejected():
             intro="Para one\r\n\r\nPara two",
             closing="Bye\r\nJake",
             on_file_fields=["Company"],
+            reminder_note="Chase\r\nup",
             actor_user_id=4,
         )
     )
     assert session.row.intro == "Para one\n\nPara two"
     assert session.row.closing == "Bye\nJake"
-    assert "\r" not in session.row.intro + session.row.closing
+    assert session.row.reminder_note == "Chase\nup"
+    assert "\r" not in (
+        session.row.intro + session.row.closing + session.row.reminder_note
+    )
 
 
 # ----------------------------------------------------------------- storage ----
@@ -382,10 +390,12 @@ def test_set_message_stores_canonical_order_and_does_not_commit():
             intro="Intro",
             closing="Closing",
             on_file_fields=["Title", "Company"],
+            reminder_note="  In case you missed it.  ",
             actor_user_id=7,
         )
     )
     assert session.row.subject == "Trimmed"
+    assert session.row.reminder_note == "In case you missed it."
     assert session.row.on_file_fields == ["Company", "Title"]
     assert session.row.updated_by_user_id == 7
     assert session.commits == 0

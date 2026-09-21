@@ -26,7 +26,13 @@ validated on write and re-filtered at render time, so this column can only ever
 hide rows the email already knew how to build. It can never introduce a field,
 which is what keeps the form / email picker / sample-survey lists in agreement.
 
-See migration ``database/migrations/2026-09-09_survey_email_message.sql``.
+``reminder_note`` (#560) is the one column here that does NOT follow the
+blank-means-default rule — NULL means "never set, use the default sentence" and
+'' means "no reminder line at all". It is rendered on stages 1 and 2 only, so the
+initial email is unaffected by whatever it holds.
+
+See migrations ``database/migrations/2026-09-09_survey_email_message.sql`` and
+``database/migrations/2026-09-21_survey_email_message_reminder_note.sql``.
 """
 
 from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Integer, Text
@@ -56,6 +62,12 @@ class SurveyEmailMessage(TimestampMixin, Base):
             "char_length(closing) BETWEEN 1 AND 5000",
             name="ck_survey_email_message_closing_len",
         ),
+        # NULL-tolerant, unlike the three above: an unset note is NULL and means
+        # "use the default", while '' means "no note at all". See the column.
+        CheckConstraint(
+            "reminder_note IS NULL OR char_length(reminder_note) <= 2000",
+            name="ck_survey_email_message_reminder_note_len",
+        ),
     )
 
     # Pinned to 1 by a CHECK constraint — there is only ever one copy row.
@@ -66,6 +78,16 @@ class SurveyEmailMessage(TimestampMixin, Base):
     intro: Mapped[str] = mapped_column(Text, nullable=False)
     # The paragraph(s) below the button, sign-off included.
     closing: Mapped[str] = mapped_column(Text, nullable=False)
+    # The extra line the REMINDER emails (stage 1 and stage 2) open with, above
+    # the intro — "In case you missed this survey..." (#560). The initial email
+    # never shows it.
+    #
+    # ⚠️ NULLABLE, AND NULL IS NOT '': this is the one column on this table where
+    # blank does not mean "fall back to the default". NULL = never set = use
+    # ``survey_message.DEFAULT_REMINDER_NOTE``; '' = deliberately cleared in the
+    # console = the reminders carry no extra line and read exactly as they did
+    # before #560. Folding '' into NULL would make the off switch un-saveable.
+    reminder_note: Mapped[str | None] = mapped_column(Text)
     # Which on-file rows the email shows, by LABEL. Always a subset of
     # ``survey_message.ON_FILE_FIELDS`` and stored in that canonical order.
     on_file_fields: Mapped[list[str]] = mapped_column(

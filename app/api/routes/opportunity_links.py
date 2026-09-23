@@ -335,7 +335,9 @@ async def opportunity_link_digest_cron(request: Request, session: SessionDep) ->
     THE SCHEDULE: 6PM MOUNTAIN ALL YEAR. ``vercel.json`` cannot hold a comment,
     so the reasoning lives here. Vercel crons run in UTC and the Hobby plan fires
     anywhere inside the scheduled hour, and 6pm Mountain is a different UTC hour
-    in summer and winter, so the route is registered TWICE:
+    in summer and winter, so the route is registered TWICE, under two distinct
+    paths (``?slot=mdt`` / ``?slot=mst``, a label this handler ignores) so the
+    platform can never collapse them into one cron:
 
       ``0 0 * * *``  fires 00:00-00:59 UTC = 6:xx pm MDT (summer) / 5:xx pm MST
       ``0 1 * * *``  fires 01:00-01:59 UTC = 7:xx pm MDT (summer) / 6:xx pm MST

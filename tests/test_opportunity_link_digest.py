@@ -718,9 +718,16 @@ def test_only_an_engineer_may_read_or_change_it(monkeypatch, console, role):
 def test_the_cron_is_registered_once_per_utc_offset():
     crons = json.loads((REPO / "vercel.json").read_text(encoding="utf-8"))["crons"]
     digest = sorted(
-        c["schedule"] for c in crons if c["path"] == "/opportunity-links/cron/digest"
+        (c["schedule"], c["path"])
+        for c in crons
+        if c["path"].split("?")[0] == "/opportunity-links/cron/digest"
     )
-    assert digest == ["0 0 * * *", "0 1 * * *"]
+    # Distinct paths (the `slot` query is a label the handler ignores) so the
+    # two entries can never be deduplicated as one cron by the platform.
+    assert digest == [
+        ("0 0 * * *", "/opportunity-links/cron/digest?slot=mdt"),
+        ("0 1 * * *", "/opportunity-links/cron/digest?slot=mst"),
+    ]
 
 
 def _utc(y, mo, d, h, mi=0):

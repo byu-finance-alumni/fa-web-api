@@ -597,9 +597,12 @@ async def list_responders(
 # "No reply yet" in the Progress tab (#836) is `recipients - replied`: emailed in
 # the year's current cycle and without a qualifying reply. The export below is
 # that column's people, built on the same current-cycle rows and the same reply
-# predicate as both counts — so the file has exactly as many rows as the column
-# shows. It is deliberately NOT `_cycle_non_responders` (the follow-up set): that
-# one also requires all three emails, so mid-campaign it is a strict subset.
+# predicate as both counts, minus archived alumni (Jake, #836): the file leaves
+# them out exactly as the follow-up call sheet does, while the column still
+# counts them — so the file can have FEWER rows than the column shows, by the
+# number of archived alumni in it, and never more. It is deliberately NOT
+# `_cycle_non_responders` (the follow-up set): that one also requires all
+# three emails, so mid-campaign it is a strict subset.
 
 
 def _cycle_no_reply():
@@ -646,8 +649,11 @@ async def export_no_reply_csv(
     (the route 404s). ``graduation_year=None`` is the all-years export and never
     ``None`` — no campaigns at all is just a header row.
 
-    Archived alumni are INCLUDED, unlike the follow-up call sheet, because the
-    count this file must match includes them. Every free-text cell goes through
+    Archived alumni are LEFT OUT, the same way and with the same filter as the
+    follow-up call sheet (:func:`list_non_responders`) — Jake's call (#836): an
+    archived record is not someone to chase. The "No reply yet" count and the
+    hover lists still include them, so the row count is that column minus its
+    archived alumni. Every free-text cell goes through
     the shared formula-injection guard. The email shown is the one the survey
     would have used (personal, else work — same display rule as the call sheet).
 
@@ -675,6 +681,8 @@ async def export_no_reply_csv(
         )
         .join(sub, sub.c.alumni_id == Alumni.alumni_id)
         .outerjoin(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        # Same archived exclusion as `list_non_responders`.
+        .where(Alumni.archived.is_(False))
         # Newest cohort first, like the Progress table; then by name.
         .order_by(
             sub.c.graduation_year.desc(),

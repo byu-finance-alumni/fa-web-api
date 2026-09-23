@@ -921,8 +921,9 @@ async def export_survey_no_reply_all(
     """Every year's "No reply yet" people as one CSV (#836).
 
     The all-years twin of `GET /schedules/{grad_year}/no-reply/export` — the
-    Progress table's totals-row Export. Its row count equals the footer's "No
-    reply yet" total. Same gate, same columns, same audit trail."""
+    Progress table's totals-row Export. Its row count is the footer's "No reply
+    yet" total minus archived alumni, which the file leaves out. Same gate,
+    same columns, same audit trail."""
     csv_text = await survey_schedule.export_no_reply_csv(
         session, None, actor_user_id=user.user_id
     )
@@ -939,12 +940,13 @@ async def export_survey_no_reply(
 ) -> Response:
     """This year's "No reply yet" people as a CSV download (#836).
 
-    EXACTLY the Progress table's "No reply yet" column (`recipients - replied`
+    The Progress table's "No reply yet" column (`recipients - replied`
     on `SurveyScheduleItem`): emailed in the year's current cycle, with no
     pending, applied or confirmed reply inside the re-survey window that a
     reset has not superseded. A `rejected`-only alum IS in it — a discarded
     submission is not a reply. Built from the same shared predicate as the
-    counts, so the row count matches the column.
+    counts, except that archived alumni are left out, as in the follow-up call
+    sheet — so the row count is the column minus its archived alumni.
 
     Not to be confused with `GET /schedules/{grad_year}/non-responders`, the
     manual follow-up call sheet, which also requires all three emails and so is

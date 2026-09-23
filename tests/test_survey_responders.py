@@ -201,10 +201,11 @@ def test_route_404s_for_a_year_with_no_campaign(db):
 
 # ------------------------------------------------- "No reply yet" export ------
 #
-# The export's contract is the same as the hover's: its row count is the number
-# on screen. "No reply yet" is `recipients - replied` (web `toProgressRow`), so
-# every population test below compares the CSV against those two counts from
-# `list_schedules` over the same rows.
+# The export's contract: its row count is the number on screen MINUS archived
+# alumni, which the file leaves out as the follow-up call sheet does (Jake,
+# #836) while the count keeps them. "No reply yet" is `recipients - replied`
+# (web `toProgressRow`), so every population test below compares the CSV
+# against those two counts from `list_schedules` over the same rows.
 
 
 class _AuditingSession:
@@ -309,6 +310,47 @@ def test_export_neutralises_spreadsheet_formulas(db):
     assert name.startswith("\t=")
     assert email == "\t@SUM(A1)"
     assert phone == "\t+1 801 555 0100"
+
+
+def _archive(db, alumni_id):
+    db.conn.execute(
+        text("UPDATE alumni SET archived = 1 WHERE alumni_id = :a"), {"a": alumni_id}
+    )
+
+
+def test_an_archived_non_replier_is_left_out_of_the_file_but_still_counted(db):
+    _world(db)
+    _archive(db, 6)  # Diaz: emailed, never replied
+    item = _item(db)
+    body = _rows(_export(db)[0])[1:]
+    assert "A6 Diaz" not in [r[0] for r in body]
+    # The column is unchanged; the file is it minus the one archived alum.
+    assert _silent(item) == 4
+    assert len(body) == _silent(item) - 1 == 3
+
+
+def test_archiving_a_replier_changes_neither_the_file_nor_the_column(db):
+    # Only archived NON-repliers are the difference: an archived replier was
+    # never in the file to begin with.
+    _world(db)
+    _archive(db, 1)  # Young replied
+    assert len(_rows(_export(db)[0])[1:]) == _silent(_item(db)) == 4
+
+
+def test_export_all_years_leaves_out_archived_alumni_too(db):
+    _world(db)
+    db.schedule(year=2001)
+    db.alum(20, last_name="Hale")
+    db.alum(21, last_name="Iver")
+    db.sent(20, (0,), year=2001)
+    db.sent(21, (0,), year=2001)
+    _archive(db, 21)
+    _archive(db, 7)  # Evans, in the 2000 cohort
+    body = _rows(_export(db, year=None)[0])[1:]
+    items = asyncio.run(ss.list_schedules(db.session))
+    assert sum(_silent(i) for i in items) == 6
+    assert len(body) == 6 - 2
+    assert not {"A21 Iver", "A7 Evans"} & {r[0] for r in body}
 
 
 def test_export_all_years_matches_the_summed_column(db):

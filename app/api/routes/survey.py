@@ -28,7 +28,11 @@ from fastapi import (
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireEngineer, RequireSurveysManage
+from app.api.dependencies.auth import (
+    RequireAlumniExport,
+    RequireEngineer,
+    RequireSurveysManage,
+)
 from app.api.routes.alumni import (
     _HEADSHOT_MAX_BYTES,
     _HEADSHOT_MIME_TYPES,
@@ -912,7 +916,7 @@ def _no_reply_csv_response(csv_text: str, scope: str) -> Response:
 # that way — FastAPI matches in declaration order and would 422 on the int.
 @router.get("/schedules/no-reply/export", response_model=None)
 async def export_survey_no_reply_all(
-    user: RequireSurveysManage, session: SessionDep
+    user: RequireAlumniExport, session: SessionDep
 ) -> Response:
     """Every year's "No reply yet" people as one CSV (#836).
 
@@ -930,7 +934,7 @@ async def export_survey_no_reply_all(
 @router.get("/schedules/{grad_year}/no-reply/export", response_model=None)
 async def export_survey_no_reply(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: RequireAlumniExport,
     session: SessionDep,
 ) -> Response:
     """This year's "No reply yet" people as a CSV download (#836).
@@ -947,8 +951,10 @@ async def export_survey_no_reply(
     a subset of this until the campaign ends.
 
     Columns: name, graduation year, email, phone, emails sent this cycle, last
-    email sent (date). Formula-injection-safe. Gated like the schedules it
-    reads; audit-logged as `export_survey_no_reply`. 404 = no campaign for the
+    email sent (date). Formula-injection-safe. Gated by `RequireAlumniExport`,
+    not the surveys guard: bulk contact details leave the system here, and every
+    file of alumni data does so under that one capability (as the event attendee
+    export does). Audit-logged as `export_survey_no_reply`. 404 = no campaign for the
     year. Returns `text/csv` as `survey_no_reply_<year>_<YYYY-MM-DD>.csv`."""
     csv_text = await survey_schedule.export_no_reply_csv(
         session, grad_year, actor_user_id=user.user_id

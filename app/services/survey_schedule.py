@@ -64,7 +64,9 @@ TRAIL, not the ledger; usage is counted from ``survey_send_log``.
 
 from __future__ import annotations
 
+import csv
 import datetime
+import io
 import logging
 from collections.abc import Sequence
 
@@ -84,6 +86,8 @@ from app.models.user import User
 from app.schemas.survey import (
     SurveyNewCyclePreview,
     SurveyNonResponder,
+    SurveyResponder,
+    SurveyResponders,
     SurveyScheduleCancelAllResult,
     SurveyScheduleCreateRequest,
     SurveyScheduleDeleteResult,
@@ -94,6 +98,10 @@ from app.schemas.survey import (
     SurveySendConfigItem,
 )
 from app.services import survey_email
+
+# The formula-injection-safe cell renderer every CSV export shares, imported
+# rather than re-derived (same rule as `opportunity_links._cell`).
+from app.services.alumni_export import _fmt as _csv_cell
 
 log = logging.getLogger(__name__)
 
@@ -266,6 +274,34 @@ def _cycle_non_responders():
     )
 
 
+# The status lists behind the `replied` and `confirmed` progress counts. Named
+# because each is used twice — once for the count (`_cycle_progress`) and once
+# for the names behind it (`list_responders`, #836) — and the two must never be
+# handed different lists.
+_REPLIED_STATUSES = survey_email.RESPONDED_STATUSES
+_CONFIRMED_STATUSES = (survey_email.STATUS_CONFIRMED,)
+
+
+def _current_cycle_sends(stmt):
+    """Scope a select over ``survey_send_log`` to each year's CURRENT campaign.
+
+    The cycle join and the reset rule that every progress number shares — the
+    counts in :func:`_cycle_progress` and the names behind two of them in
+    :func:`_cycle_responders` (#836). Both are built on this so the list under a
+    count cannot be scoped differently from the count itself.
+
+    The join is the #357 cycle scope, identical to `_cycle_non_responders`:
+    without it the counts become all-time and a year on its second campaign
+    reports last year's replies as this year's. Pre-reset sends are dropped
+    (#395): someone an engineer reset is owed the campaign again, so their old
+    emails must not inflate the denominator."""
+    return stmt.join(
+        SurveySchedule,
+        (SurveySchedule.graduation_year == SurveySendLog.graduation_year)
+        & (SurveySchedule.cycle_seq == SurveySendLog.cycle_seq),
+    ).where(survey_email.send_not_superseded())
+
+
 def _qualifying_reply(status_filter: tuple[str, ...]):
     """Correlated EXISTS: this send-log row's alumnus has replied.
 
@@ -340,12 +376,12 @@ def _cycle_progress():
     same alum legitimately appears under ``rejected`` and under
     ``non_responders``.
     """
-    replied = _qualifying_reply(survey_email.RESPONDED_STATUSES)
+    replied = _qualifying_reply(_REPLIED_STATUSES)
     pending = _qualifying_reply((survey_email.STATUS_PENDING,))
     applied = _qualifying_reply((survey_email.STATUS_APPLIED,))
     rejected = _qualifying_reply((survey_email.STATUS_REJECTED,))
-    confirmed = _qualifying_reply((survey_email.STATUS_CONFIRMED,))
-    return (
+    confirmed = _qualifying_reply(_CONFIRMED_STATUSES)
+    counts = (
         select(
             SurveySendLog.graduation_year,
             func.count(func.distinct(SurveySendLog.alumni_id)).label("recipients"),
@@ -365,17 +401,9 @@ def _cycle_progress():
                 "confirmed"
             ),
         )
-        # The cycle scope, identical to `_cycle_non_responders`. Without this join
-        # the counts become all-time and a year on its second campaign reports
-        # last year's replies as this year's (#357).
-        .join(
-            SurveySchedule,
-            (SurveySchedule.graduation_year == SurveySendLog.graduation_year)
-            & (SurveySchedule.cycle_seq == SurveySendLog.cycle_seq),
-        )
-        .where(survey_email.send_not_superseded())
         .group_by(SurveySendLog.graduation_year)
     )
+    return _current_cycle_sends(counts)
 
 
 async def _progress_counts(
@@ -468,7 +496,6 @@ async def list_non_responders(
     rows = (await session.execute(stmt)).all()
     items: list[SurveyNonResponder] = []
     for alumni_id, preferred, first, last, personal, work, last_sent_at in rows:
-        name = " ".join(p for p in (preferred or first, last) if p).strip()
         # The address the survey went to — personal preferred, work as the
         # fallback (#392). Showing the personal column unconditionally left this
         # call sheet blank for exactly the alumni the work-email fallback newly
@@ -478,12 +505,231 @@ async def list_non_responders(
         items.append(
             SurveyNonResponder(
                 alumni_id=alumni_id,
-                name=name or f"Alum #{alumni_id}",
+                name=_display_name(alumni_id, preferred, first, last),
                 email=email,
                 last_sent_at=last_sent_at,
             )
         )
     return items
+
+
+def _cycle_responders(status_filter: tuple[str, ...]):
+    """``(graduation_year, alumni_id)`` for each alum in a year's CURRENT
+    campaign with a qualifying reply — the people a progress count counts.
+
+    Built from exactly the pieces :func:`_cycle_progress` counts with: the same
+    current-cycle send rows (:func:`_current_cycle_sends`) and the same reply
+    predicate (:func:`_qualifying_reply`). ``count(distinct case(reply, id))``
+    over those rows and ``distinct id where reply`` over them are the same set,
+    so the list and the number cannot drift apart without one of the shared
+    helpers changing for both."""
+    return _current_cycle_sends(
+        select(SurveySendLog.graduation_year, SurveySendLog.alumni_id)
+        .where(_qualifying_reply(status_filter))
+        .distinct()
+    )
+
+
+def _display_name(
+    alumni_id: int, preferred: str | None, first: str | None, last: str | None
+) -> str:
+    """How the console names an alum: preferred (else legal) first name + last,
+    falling back to the id when the record has neither."""
+    name = " ".join(p for p in (preferred or first, last) if p).strip()
+    return name or f"Alum #{alumni_id}"
+
+
+async def _responder_names(
+    session: AsyncSession, graduation_year: int, status_filter: tuple[str, ...]
+) -> list[SurveyResponder]:
+    sub = (
+        _cycle_responders(status_filter)
+        .where(SurveySendLog.graduation_year == graduation_year)
+        .subquery()
+    )
+    stmt = (
+        select(
+            Alumni.alumni_id,
+            Alumni.preferred_first_name,
+            Alumni.first_name,
+            Alumni.last_name,
+        )
+        .join(sub, sub.c.alumni_id == Alumni.alumni_id)
+        # Archived alumni are NOT dropped, unlike the follow-up call sheet: the
+        # count above this list includes them, and a hover that listed fewer
+        # names than the number it hangs off would read as a bug.
+        .order_by(Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        SurveyResponder(
+            alumni_id=alumni_id, name=_display_name(alumni_id, preferred, first, last)
+        )
+        for alumni_id, preferred, first, last in rows
+    ]
+
+
+async def list_responders(
+    session: AsyncSession, graduation_year: int
+) -> SurveyResponders | None:
+    """WHO is behind this year's ``replied`` and ``confirmed`` counts (#836).
+
+    The Progress tab shows the counts; hovering one shows these names. Same
+    population as the counts by construction (see :func:`_cycle_responders`).
+    Returns ``None`` when the year has no schedule (the route 404s), distinct
+    from a campaign nobody has answered yet (two empty lists).
+
+    Ordered by name — last, then first, then id — so a hover list is stable
+    between refreshes and reads the way the follow-up call sheet does."""
+    sched = await _load_schedule_row(session, graduation_year)
+    if sched is None:
+        return None
+    return SurveyResponders(
+        replied=await _responder_names(session, graduation_year, _REPLIED_STATUSES),
+        confirmed=await _responder_names(
+            session, graduation_year, _CONFIRMED_STATUSES
+        ),
+    )
+
+
+# ------------------------------------------------------ no-reply export ------
+#
+# "No reply yet" in the Progress tab (#836) is `recipients - replied`: emailed in
+# the year's current cycle and without a qualifying reply. The export below is
+# that column's people, built on the same current-cycle rows and the same reply
+# predicate as both counts — so the file has exactly as many rows as the column
+# shows. It is deliberately NOT `_cycle_non_responders` (the follow-up set): that
+# one also requires all three emails, so mid-campaign it is a strict subset.
+
+
+def _cycle_no_reply():
+    """``(graduation_year, alumni_id, emails_sent, last_sent_at)`` for each alum
+    emailed in their year's CURRENT campaign who has not replied.
+
+    ``~_qualifying_reply(_REPLIED_STATUSES)`` is the complement of the ``replied``
+    count's predicate over the same rows, so this set's size per year is
+    ``recipients - replied``. A ``rejected``-only alum is IN it: a discarded
+    submission is not a reply, exactly as the sender and the count treat it."""
+    return _current_cycle_sends(
+        select(
+            SurveySendLog.graduation_year,
+            SurveySendLog.alumni_id,
+            # Distinct stages, not rows — "how many of the three emails has this
+            # person had", which is what a caller working the list wants to know.
+            func.count(func.distinct(SurveySendLog.stage)).label("emails_sent"),
+            func.max(SurveySendLog.sent_at).label("last_sent_at"),
+        )
+        .where(~_qualifying_reply(_REPLIED_STATUSES))
+        .group_by(SurveySendLog.graduation_year, SurveySendLog.alumni_id)
+    )
+
+
+NO_REPLY_EXPORT_COLUMNS = (
+    "Name",
+    "Graduation year",
+    "Email",
+    "Phone",
+    "Emails sent this cycle",
+    "Last email sent",
+)
+
+
+async def export_no_reply_csv(
+    session: AsyncSession,
+    graduation_year: int | None,
+    *,
+    actor_user_id: int | None,
+) -> str | None:
+    """The "No reply yet" column as a CSV (#836) — one year, or every year.
+
+    Returns ``None`` when a single year was asked for and it has no schedule
+    (the route 404s). ``graduation_year=None`` is the all-years export and never
+    ``None`` — no campaigns at all is just a header row.
+
+    Archived alumni are INCLUDED, unlike the follow-up call sheet, because the
+    count this file must match includes them. Every free-text cell goes through
+    the shared formula-injection guard. The email shown is the one the survey
+    would have used (personal, else work — same display rule as the call sheet).
+
+    Audit-logged as ``export_survey_no_reply`` with the row count and the year
+    — what left the system and under which selection, never the rows."""
+    if graduation_year is not None:
+        if await _load_schedule_row(session, graduation_year) is None:
+            return None
+    no_reply = _cycle_no_reply()
+    if graduation_year is not None:
+        no_reply = no_reply.where(SurveySendLog.graduation_year == graduation_year)
+    sub = no_reply.subquery()
+    stmt = (
+        select(
+            Alumni.alumni_id,
+            Alumni.preferred_first_name,
+            Alumni.first_name,
+            Alumni.last_name,
+            sub.c.graduation_year,
+            AlumniContactInfo.personal_email,
+            AlumniContactInfo.work_email,
+            AlumniContactInfo.phone,
+            sub.c.emails_sent,
+            sub.c.last_sent_at,
+        )
+        .join(sub, sub.c.alumni_id == Alumni.alumni_id)
+        .outerjoin(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        # Newest cohort first, like the Progress table; then by name.
+        .order_by(
+            sub.c.graduation_year.desc(),
+            Alumni.last_name,
+            Alumni.first_name,
+            Alumni.alumni_id,
+        )
+    )
+    rows = (await session.execute(stmt)).all()
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(list(NO_REPLY_EXPORT_COLUMNS))
+    for (
+        alumni_id,
+        preferred,
+        first,
+        last,
+        year,
+        personal,
+        work,
+        phone,
+        emails_sent,
+        last_sent_at,
+    ) in rows:
+        writer.writerow(
+            [
+                _csv_cell(_display_name(alumni_id, preferred, first, last), "str"),
+                _csv_cell(year, "int"),
+                _csv_cell(email_reach.preferred_display_email(personal, work), "str"),
+                _csv_cell(phone, "str"),
+                _csv_cell(emails_sent, "int"),
+                _csv_cell(
+                    last_sent_at.date() if last_sent_at is not None else None, "date"
+                ),
+            ]
+        )
+
+    if actor_user_id is None:
+        log.warning("No-reply export audit skipped: no actor (rows=%s)", len(rows))
+    else:
+        session.add(
+            AuditLog(
+                user_id=actor_user_id,
+                action_type="export_survey_no_reply",
+                entity_type="survey_campaign",
+                entity_id=graduation_year,
+                new_value=(
+                    f"rows={len(rows)}; graduation_year="
+                    f"{graduation_year if graduation_year is not None else 'all'}"
+                ),
+            )
+        )
+        await session.commit()
+    return buffer.getvalue()
 
 
 async def _creator_names(

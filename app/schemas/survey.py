@@ -611,6 +611,30 @@ class SurveyNonResponder(BaseModel):
     last_sent_at: datetime.datetime | None = None
 
 
+class SurveyResponder(BaseModel):
+    """One alum behind a progress count (#836) — who, and nothing else.
+
+    Deliberately narrower than :class:`SurveyNonResponder`: the Progress tab
+    only needs to put a name to a number, and nobody has to be contacted from
+    it, so no address or reply content is carried."""
+
+    alumni_id: int
+    name: str
+
+
+class SurveyResponders(BaseModel):
+    """The people behind ``SurveyScheduleItem.replied`` and ``.confirmed`` (#836).
+
+    Same population rules as those counts, by construction — both are read off
+    the same current-cycle send rows and the same reply predicate — so
+    ``len(replied)`` equals the ``replied`` count and ``len(confirmed)`` the
+    ``confirmed`` one. Everyone in ``confirmed`` is also in ``replied``. Each
+    list is sorted by name."""
+
+    replied: list[SurveyResponder] = Field(default_factory=list)
+    confirmed: list[SurveyResponder] = Field(default_factory=list)
+
+
 # ------------------------------------------------------------- send cap --------
 
 

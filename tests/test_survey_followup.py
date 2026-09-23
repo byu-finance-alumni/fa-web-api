@@ -98,7 +98,9 @@ def _ddl(conn):
             " personal_email VARCHAR(255),"
             # The call sheet now reports the address the survey actually went
             # to, which may be the work email (#392).
-            " work_email VARCHAR(255))"
+            " work_email VARCHAR(255),"
+            # The "No reply yet" export (#836) carries the phone number.
+            " phone VARCHAR(50))"
         )
     )
 

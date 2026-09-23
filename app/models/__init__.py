@@ -33,6 +33,10 @@ from app.models.login_ip_block import LoginIpBlock
 from app.models.maintenance import MaintenanceMode
 from app.models.note import Note
 from app.models.opportunity_link import OpportunityLink
+from app.models.opportunity_link_digest import (
+    OpportunityLinkDigestConfig,
+    OpportunityLinkDigestSend,
+)
 from app.models.role_capability import RoleCapability
 from app.models.service_incident import ServiceIncident
 from app.models.survey_email_message import SurveyEmailMessage
@@ -75,6 +79,8 @@ __all__ = [
     "MaintenanceMode",
     "Note",
     "OpportunityLink",
+    "OpportunityLinkDigestConfig",
+    "OpportunityLinkDigestSend",
     "Role",
     "RoleCapability",
     "ServiceIncident",

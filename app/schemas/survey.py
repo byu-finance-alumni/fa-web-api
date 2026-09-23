@@ -349,7 +349,8 @@ class SurveySendResult(BaseModel):
 
 class SurveyUsage(BaseModel):
     """Real Resend send usage for the console's daily/monthly tallies — emails
-    actually sent today and this calendar month, counted from `survey_send_log`.
+    actually sent today and this calendar month, counted from `survey_send_log`
+    plus the staff job-posting digest's send log (same Resend quota, #567).
     NOT from the audit trail: an engineer actor's audit row is rerouted to
     `engineer_action_log`, which left the meter reading zero. UTC day/month
     boundaries, matching the rest of the app's date filtering."""

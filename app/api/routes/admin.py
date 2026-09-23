@@ -53,6 +53,10 @@ from app.models.login_failure import LoginFailure
 from app.models.user import Role, User, UserRole
 from app.schemas.alert_delivery import AlertDeliveryState, AlertDeliveryUpdate
 from app.schemas.auth import UserContext
+from app.schemas.opportunity_link_digest import (
+    OpportunityLinkDigestState,
+    OpportunityLinkDigestUpdate,
+)
 from app.services import (
     alert_delivery,
     alert_templates,
@@ -61,6 +65,7 @@ from app.services import (
     login_abuse,
     login_block,
     login_campaign,
+    opportunity_link_digest,
 )
 from app.services.supabase_admin import create_user as create_auth_user
 from app.services.supabase_admin import delete_auth_user, set_user_password
@@ -1628,6 +1633,60 @@ async def set_alert_delivery(
     """
     return await alert_delivery.set_mode(
         session, mode=body.mode, actor_user_id=actor.user_id
+    )
+
+
+@router.get("/opportunity-link-digest", response_model=OpportunityLinkDigestState)
+async def get_opportunity_link_digest(
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> OpportunityLinkDigestState:
+    """Who gets the daily job-posting digest (#567). Engineer only.
+
+    The staff addresses that receive one e-mail at about 6pm Mountain on days
+    alumni submitted job or internship links through the survey. An empty list
+    means no digest, and the per-posting alert to the engineer channels (#771)
+    is what fires instead.
+
+    ``email_configured`` says whether the API can send mail at all. When it is
+    false the digest cannot go out, so the per-posting alert stays on even with
+    recipients set, and the console says so rather than showing a list that
+    looks live.
+
+    UNCACHED and allowed to fail, like ``GET /admin/alert-delivery``: an
+    unreadable setting renders the console's load error rather than an empty
+    list that looks verified. Not audited as a read, for the same reason that
+    one is not -- it is fetched on every render of the Maintenance page.
+    """
+    return await opportunity_link_digest.get_state(session)
+
+
+@router.put("/opportunity-link-digest", response_model=OpportunityLinkDigestState)
+async def set_opportunity_link_digest(
+    body: OpportunityLinkDigestUpdate,
+    actor: RequireEngineer,
+    session: SessionDep,
+) -> OpportunityLinkDigestState:
+    """Replace the digest's recipient list. Engineer only.
+
+    The body is the WHOLE list (PUT: idempotent, and the console always holds
+    the full list it is showing). Each address is shape-checked, lowercased and
+    deduped, and there are at most ten -- every address is one e-mail out of the
+    survey's daily Resend budget. A bad list is a 422 before any query runs.
+
+    A table and not an env var because the owner asked to manage the list from
+    the console. Takes effect on the submission path within the read cache's TTL
+    (a minute); the cron reads it fresh.
+
+    Switching the digest ON (empty list to non-empty) starts its watermark now,
+    so postings already announced one by one are not reported again.
+
+    Audited as ``set_opportunity_link_digest_recipients`` with the old and new
+    lists, rerouted to ``engineer_action_log`` for an engineer actor by the
+    ``before_flush`` guard (#199); nothing here writes that table directly.
+    """
+    return await opportunity_link_digest.set_recipients(
+        session, recipients=body.recipients, actor_user_id=actor.user_id
     )
 
 

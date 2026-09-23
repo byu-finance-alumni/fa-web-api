@@ -19,6 +19,11 @@ dependencies = [
     # exercises it — a lazy import inside a handler would pass CI and 500 on the
     # first upload in production.
     "pillow>=11.0",
+    # IANA time zones for zoneinfo (the 6pm Mountain job-posting digest, #567).
+    # Serverless images do not reliably ship /usr/share/zoneinfo, and
+    # ZoneInfo("America/Denver") raising there would silently stop the digest;
+    # zoneinfo falls back to this package when the system has no tz database.
+    "tzdata>=2024.1",
 ]
 # IMPORTANT: Vercel's Python builder installs from THIS list (not requirements.txt),
 # so every package the app imports at load time must be here or the deployed

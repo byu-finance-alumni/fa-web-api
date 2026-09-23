@@ -323,21 +323,43 @@ async def export_opportunity_links(
 
 @router.post("/cron/digest", include_in_schema=False)
 async def opportunity_link_digest_cron(request: Request, session: SessionDep) -> dict:
-    """The DAILY-DIGEST half of the #771 notification switch. NOT WIRED BY DEFAULT.
+    """The staff job-posting digest (#567), fired by the Vercel cron at about
+    6pm Mountain.
 
-    The shipped behaviour is one alert per posting, immediately. If campaign
-    volume ever makes that too noisy, switching to a digest is a config change
-    rather than a rewrite, and this endpoint is the half that has to exist for
-    that to be true:
+    Live whenever an engineer has set digest recipients in the console (and the
+    API can send mail); otherwise this is a no-op that reports ``{"sent":
+    false}`` and the per-posting alert of #771 is announcing postings instead.
+    Both paths ask the same predicate, so they never both fire for the same rows
+    -- see ``opportunity_link_alert``.
 
-      1. set ``OPPORTUNITY_LINK_NOTIFY_MODE=daily_digest``;
-      2. add ``{"path": "/opportunity-links/cron/digest", "schedule": "0 17 * * *"}``
-         to ``vercel.json``.
+    THE SCHEDULE: 6PM MOUNTAIN ALL YEAR. ``vercel.json`` cannot hold a comment,
+    so the reasoning lives here. Vercel crons run in UTC and the Hobby plan fires
+    anywhere inside the scheduled hour, and 6pm Mountain is a different UTC hour
+    in summer and winter, so the route is registered TWICE:
 
-    Until step 1 happens this endpoint is a no-op that reports
-    ``{"sent": false}`` — the mode is checked inside
-    ``opportunity_link_alert.send_digest``, so the two paths can never both fire
-    for the same rows.
+      ``0 0 * * *``  fires 00:00-00:59 UTC = 6:xx pm MDT (summer) / 5:xx pm MST
+      ``0 1 * * *``  fires 01:00-01:59 UTC = 7:xx pm MDT (summer) / 6:xx pm MST
+
+    and this handler proceeds only when the America/Denver local hour is 18
+    (``opportunity_link_alert.digest_due``); the other call answers
+    ``{"sent": false}`` with a 200. EXACTLY ONE of the two lands in the 6pm hour
+    on every local day, the changeover days included: the clocks change at 2am,
+    sixteen hours from 6pm, so each evening sits wholly on one offset. On
+    2026-11-01 (fall back) the evening is MST, so ``0 1`` fires at 01:xx UTC on
+    11-02 = 6:xx pm; the evening before was still MDT, so ``0 0`` at 00:xx UTC on
+    11-01 = 6:xx pm. On 2027-03-14 (spring forward) the evening is MDT and ``0 0``
+    at 00:xx UTC on 03-15 = 6:xx pm. The tests walk both dates.
+
+    ONCE PER LOCAL DAY: the digest records the local date it ran, so a Vercel
+    retry or duplicate delivery of the right call cannot send (or spend the
+    survey's quota) twice. If a call slips past the end of its hour and misses
+    6pm, nothing is lost: the digest reports from a watermark, so the next
+    evening carries those postings. Either way the send lands on the NEXT UTC
+    day for Resend's quota (00:xx or 01:xx UTC), which is why every digest
+    e-mail is counted in the survey budget.
+
+    GET and POST: Vercel Cron invokes the path with a GET (the survey and
+    headshot crons take GET for the same reason); POST stays for a manual call.
 
     NOT login-gated (Vercel Cron cannot log in): same shared-secret contract as
     ``/survey/cron/run`` and ``/storage/cron/headshot-sweep``. The request must
@@ -351,6 +373,10 @@ async def opportunity_link_digest_cron(request: Request, session: SessionDep) ->
     provided = request.headers.get("Authorization", "")
     if not expected or not hmac.compare_digest(provided, f"Bearer {expected}"):
         raise HTTPException(status_code=401, detail="Invalid cron credentials.")
+    if not opportunity_link_alert.digest_due():
+        # The twin entry's call, an hour off 6pm Mountain. A no-op, not an error:
+        # a non-2xx here would read as a failing cron in the Vercel dashboard.
+        return {"sent": False}
     return {"sent": await opportunity_link_alert.send_digest(session)}
 
 

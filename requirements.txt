@@ -14,3 +14,6 @@ httpx>=0.27
 # smoke check installs from HERE, so a dep in only one of them fails in only one
 # place -- this file passing deploy and that file passing CI.
 pillow>=11.0
+# IANA time zones for zoneinfo (6pm Mountain job-posting digest, #567). Same
+# pyproject/requirements pairing rule as pillow above.
+tzdata>=2024.1

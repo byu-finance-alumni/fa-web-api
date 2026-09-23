@@ -81,7 +81,7 @@ from app.schemas.survey import (
     SurveyUnreachableAlum,
     SurveyUsage,
 )
-from app.services import mailer, survey_message
+from app.services import mailer, opportunity_link_digest, survey_message
 from app.services.survey_message import ON_FILE_FIELDS, SurveyMessage
 
 log = logging.getLogger(__name__)
@@ -436,7 +436,9 @@ async def logged_alumni_ids(
 
 async def get_send_usage(session: AsyncSession) -> SurveyUsage:
     """Real send usage for the console tallies: emails actually sent today and
-    this calendar month, counted from ``survey_send_log``.
+    this calendar month, counted from ``survey_send_log`` PLUS the staff
+    job-posting digest's ledger (#567) -- every email this Resend account spent
+    that the survey budget has to leave room for.
 
     The ledger is the send log, NOT the audit trail. Audit rows are still written
     for every send, but they cannot be counted on: an ENGINEER actor's
@@ -467,6 +469,19 @@ async def get_send_usage(session: AsyncSession) -> SurveyUsage:
         stmt = stmt.where(SurveySendLog.sent_at > anchor)
     row = (await session.execute(stmt)).first()
     sent_this_month, sent_today = (row[0] or 0, row[1] or 0) if row else (0, 0)
+    # THE STAFF JOB-POSTING DIGEST SPENDS FROM THE SAME RESEND QUOTA (#567), and
+    # it goes out at 6pm Mountain -- already the NEXT UTC day -- so without this
+    # the noon survey run would plan its full daily budget and meet a 429 on its
+    # last emails. Counted from its own ledger, one row per digest e-mail
+    # actually sent, so the allowance, the send gate below and the console meter
+    # all shrink by exactly that. Never raises: an unreadable ledger counts as
+    # zero, i.e. the budget as it was before the digest existed. See
+    # `opportunity_link_digest` for why a ledger and not a flat reserve.
+    digest_today, digest_month = await opportunity_link_digest.sent_counts(
+        session, start_today=start_today, start_month=start_month, after=anchor
+    )
+    sent_today += digest_today
+    sent_this_month += digest_month
     if anchor is not None:
         # Add the baseline only while we're still in the anchor's day / month.
         if now.date() == anchor.date():

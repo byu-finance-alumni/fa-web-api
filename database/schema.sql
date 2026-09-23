@@ -1160,6 +1160,32 @@ CREATE INDEX IF NOT EXISTS idx_opportunity_links_status_submitted ON opportunity
 CREATE INDEX IF NOT EXISTS idx_opportunity_links_role_type ON opportunity_links (role_type);
 CREATE INDEX IF NOT EXISTS idx_opportunity_links_alumni_id ON opportunity_links (alumni_id);
 
+-- The 6pm job-posting digest to staff (#567). Single-row config: the staff
+-- recipients set from the engineer console (empty = no digest; the #771
+-- per-posting alert fires instead) and the digest's watermark. The send log is
+-- one row per digest e-mail handed to Resend, counted into the survey's send
+-- budget by survey_email.get_send_usage (same Resend account, same UTC-day
+-- quota). No addresses in the log. See
+-- migrations/2026-09-23_opportunity_link_digest.sql.
+CREATE TABLE opportunity_link_digest_config (
+    id                  int PRIMARY KEY DEFAULT 1,
+    recipients          text[] NOT NULL DEFAULT '{}',
+    reported_through    timestamptz,
+    last_digest_on      date,
+    updated_by_user_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_opportunity_link_digest_config_singleton CHECK (id = 1),
+    CONSTRAINT ck_opportunity_link_digest_config_recipients_max CHECK (cardinality(recipients) <= 10),
+    CONSTRAINT fk_opportunity_link_digest_config_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
+CREATE TABLE opportunity_link_digest_send_log (
+    digest_send_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sent_at         timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_link_digest_send_log_sent_at ON opportunity_link_digest_send_log (sent_at);
+
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded
 -- from the frontend crosswalk. Keys are normalized: city_norm = lower(trim(city)),

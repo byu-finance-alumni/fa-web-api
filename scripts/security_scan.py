@@ -60,11 +60,11 @@ EXPECTED_PUBLIC_ROUTES = {
     ("GET", "/survey/cron/run"),
     ("POST", "/storage/cron/headshot-sweep"),
     ("GET", "/storage/cron/headshot-sweep"),
-    # The #771 daily-digest half of the opportunity-link notification switch.
-    # Same shared-secret contract as the two above, and NOT WIRED BY DEFAULT --
-    # it is a no-op until OPPORTUNITY_LINK_NOTIFY_MODE=daily_digest. It carries
-    # Authorization: Bearer <CRON_SECRET>; check_cron_auth proves that below.
-    # Vercel Cron invokes the path with a GET, so both verbs exist.
+    # The 6pm staff job-posting digest (#771 / #567). Same shared-secret
+    # contract as the two above; a no-op unless digest recipients are set in the
+    # engineer console. It carries Authorization: Bearer <CRON_SECRET>;
+    # check_cron_auth proves that below. Vercel Cron invokes the path with a
+    # GET, so both verbs exist.
     ("POST", "/opportunity-links/cron/digest"),
     ("GET", "/opportunity-links/cron/digest"),
     # The survey. Authenticated by a stateless HMAC token in the path, with the

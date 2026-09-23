@@ -37,7 +37,11 @@ from app.core.database import get_session
 from app.main import app
 from app.models.alumni import Alumni
 from app.models.opportunity_link import OpportunityLink
-from app.services import failure_alert, opportunity_link_alert
+from app.services import (
+    failure_alert,
+    opportunity_link_alert,
+    opportunity_link_digest,
+)
 from app.services import opportunity_links as service
 
 GOOD_URL = "https://careers.acme-capital.example/jobs/analyst-2027"
@@ -109,10 +113,15 @@ def _submission(count: int = 1):
 
 
 @pytest.fixture(autouse=True)
-def _reset_mode(monkeypatch):
-    """Every test states its own mode. Without this an env var on the developer's
-    machine would decide what the suite asserts."""
-    monkeypatch.delenv("OPPORTUNITY_LINK_NOTIFY_MODE", raising=False)
+def _no_digest_recipients(monkeypatch):
+    """Every test here runs in per-posting mode unless it says otherwise: no
+    staff digest recipients (#567), so the submission path does the talking. The
+    digest itself is tested in tests/test_opportunity_link_digest.py."""
+
+    async def _none():
+        return []
+
+    monkeypatch.setattr(opportunity_link_digest, "read_recipients", _none)
     yield
 
 
@@ -410,114 +419,33 @@ def test_an_empty_submission_says_nothing(alerting_on):
     assert alerting_on == []
 
 
-def test_the_default_mode_is_per_posting(monkeypatch):
-    monkeypatch.delenv("OPPORTUNITY_LINK_NOTIFY_MODE", raising=False)
-    assert opportunity_link_alert.notify_mode() == (
-        opportunity_link_alert.MODE_PER_POSTING
-    )
-
-
-def test_an_unrecognised_mode_falls_back_to_sending(monkeypatch):
-    """A typo in an env var must not turn the feature off — the whole defect is
-    that nothing was being sent."""
-    monkeypatch.setenv("OPPORTUNITY_LINK_NOTIFY_MODE", "weekly-ish")
-    assert opportunity_link_alert.notify_mode() == (
-        opportunity_link_alert.MODE_PER_POSTING
-    )
-
-
 def test_digest_mode_moves_the_message_off_the_request_path(monkeypatch, alerting_on):
-    """The switch is a switch, not a second sender: in digest mode the public
-    write says nothing and the cron does the talking."""
-    monkeypatch.setenv("OPPORTUNITY_LINK_NOTIFY_MODE", "daily_digest")
+    """The switch is a switch, not a second sender: with staff digest recipients
+    set, the public write says nothing and the 6pm digest does the talking."""
+
+    async def _two():
+        return ["amy@byu.edu", "tanya@byu.edu"]
+
+    monkeypatch.setattr(opportunity_link_digest, "read_recipients", _two)
+    monkeypatch.setattr(opportunity_link_digest, "email_ready", lambda: True)
     token = _token(monkeypatch)
     result = _run(service.submit_links(_Session(_alum()), token, _submission()))
     assert result.staged is True
     assert alerting_on == []
 
 
-class _DigestSession:
-    def __init__(self, rows, pending_total=0):
-        self._rows = rows
-        self._pending = pending_total
-
-    async def execute(self, stmt):
-        rows = self._rows
-
-        class _R:
-            def scalars(self):
-                return self
-
-            def all(self):
-                return list(rows)
-
-        return _R()
-
-    async def scalar(self, stmt):
-        return self._pending
-
-
-def _survey_link(link_id: int, role_type: str = "internship") -> OpportunityLink:
-    return OpportunityLink(
-        opportunity_link_id=link_id,
-        alumni_id=1,
-        is_own_company=False,
-        company_name="Acme Capital",
-        url=GOOD_URL,
-        role_type=role_type,
-        status="pending",
-        source="survey",
-        submitted_at=datetime.datetime(2026, 8, 28, 9, 0, tzinfo=datetime.UTC),
+def test_the_digest_renders_the_window_and_the_queue_depth():
+    """The engineer copy (its Slack line) says how big the queue has become."""
+    subject, _intro, rows, summary = opportunity_link_alert.render_digest(
+        link_ids=[1, 2],
+        role_types=["internship", "full_time"],
+        pending_total=9,
+        since=datetime.datetime(2026, 8, 28, 0, 0, tzinfo=datetime.UTC),
     )
-
-
-def test_the_digest_reports_the_window_and_the_queue_depth(monkeypatch, alerting_on):
-    monkeypatch.setenv("OPPORTUNITY_LINK_NOTIFY_MODE", "daily_digest")
-    session = _DigestSession(
-        [_survey_link(1), _survey_link(2, "full_time")], pending_total=9
-    )
-    assert _run(opportunity_link_alert.send_digest(session)) is True
-    rows = dict(alerting_on[0]["rows"])
-    assert rows["Submitted"] == "2"
-    assert rows["Pending in total"] == "9"
-    assert alerting_on[0]["purpose"] == failure_alert.SUBMISSION
-
-
-def test_the_digest_is_silent_on_a_quiet_day(monkeypatch, alerting_on):
-    """A daily "nothing happened" message is how a channel gets muted, and a muted
-    channel is the failure this is preventing."""
-    monkeypatch.setenv("OPPORTUNITY_LINK_NOTIFY_MODE", "daily_digest")
-    assert _run(opportunity_link_alert.send_digest(_DigestSession([]))) is False
-    assert alerting_on == []
-
-
-def test_the_digest_is_inert_in_the_shipped_mode(monkeypatch, alerting_on):
-    """Both halves exist so the switch is config; only one of them ever speaks."""
-    monkeypatch.delenv("OPPORTUNITY_LINK_NOTIFY_MODE", raising=False)
-    session = _DigestSession([_survey_link(1)], pending_total=3)
-    assert _run(opportunity_link_alert.send_digest(session)) is False
-    assert alerting_on == []
-
-
-def test_the_digest_carries_no_pii_either(monkeypatch, alerting_on):
-    monkeypatch.setenv("OPPORTUNITY_LINK_NOTIFY_MODE", "daily_digest")
-    _run(opportunity_link_alert.send_digest(_DigestSession([_survey_link(1)], 1)))
-    blob = " ".join(
-        [alerting_on[0]["subject"], alerting_on[0]["summary"]]
-        + [f"{k} {v}" for k, v in alerting_on[0]["rows"]]
-    )
-    assert "Acme Capital" not in blob
-    assert GOOD_URL not in blob
-
-
-def test_a_broken_digest_query_does_not_500_the_cron(monkeypatch, alerting_on):
-    monkeypatch.setenv("OPPORTUNITY_LINK_NOTIFY_MODE", "daily_digest")
-
-    class _Broken:
-        async def execute(self, stmt):
-            raise RuntimeError("the database is unreachable")
-
-    assert _run(opportunity_link_alert.send_digest(_Broken())) is False
+    assert dict(rows)["Submitted"] == "2"
+    assert dict(rows)["Pending in total"] == "9"
+    assert "9 pending" in summary
+    assert "Acme" not in subject + summary
 
 
 # =============================================================================

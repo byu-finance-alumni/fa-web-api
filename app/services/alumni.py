@@ -369,8 +369,11 @@ def _employer_key(value: object) -> str | None:
 def employer_changed(old: object, new: object) -> bool:
     """True when *old* -> *new* is a MOVE BETWEEN NAMED EMPLOYERS (#446).
 
-    This is the trigger the SURVEY and IMPORT paths archive on, decided by the
-    product owner on 2026-08-18. The staff edit path does not use it: there the
+    This is the trigger the IMPORT path archives on, decided by the product owner
+    on 2026-08-18. (The SURVEY path used it too until 2026-09-24; it now uses the
+    wider ``survey_role_changed``, because this rule let a promotion or a cleared
+    employer overwrite a job with no history row.) The staff edit path does not
+    use it: there the
     trigger is the explicit "this is a new role" checkbox, because a person is
     present to answer the question. Nobody is present on the other two, and the
     owner chose to infer rather than to leave those paths never archiving.
@@ -399,6 +402,81 @@ def employer_changed(old: object, new: object) -> bool:
     if old_key is None or new_key is None:
         return False
     return old_key != new_key
+
+
+def survey_role_changed(
+    outgoing: dict[str, object], new_employer: object, new_title: object
+) -> bool:
+    """True when a SURVEY apply replaced the alum's current role (#446 follow-up).
+
+    ``employer_changed`` alone was the survey's trigger until 2026-09-24, and it
+    let two ordinary survey answers destroy a job outright, because the survey
+    overwrites ``current_employment`` in place and nothing else keeps the old
+    values on the record:
+
+    * **Title-only change** -- a promotion at the same company ("Vice President"
+      -> "Managing Director"). The old title simply vanished.
+    * **Employer cleared** -- an alum who left for graduate school, the military
+      or retirement blanks the Company box. ``employer_changed`` treats
+      named -> blank as "not a change", so the whole outgoing role (employer,
+      title, industry, location) was wiped with no history row.
+
+    Jake's rule (2026-09-24): an alum's existing jobs must ALWAYS be preserved.
+    So on the survey path the outgoing role is archived when, compared case- and
+    whitespace-insensitively:
+
+    * there WAS a named employer (no employer on file = no job to preserve; a
+      title with no employer is not a role anyone can find again), and
+    * the employer is now different OR blank, or
+    * the employer is the same but a title that was on file is now different or
+      blank.
+
+    Deliberately NOT a trigger: a pure casing/spacing edit, a first-ever employer
+    (blank -> named), filling in a title that was blank, and changes to
+    industry / location only (those describe the SAME job, and the audit trail
+    keeps their old values).
+
+    The staff path (explicit checkbox) and the CSV import path (``employer_changed``,
+    where one blank column must not demote an 8,000-row sheet) are unchanged.
+    """
+    old_employer = _employer_key(outgoing.get("current_employer"))
+    if old_employer is None:
+        return False
+    if _employer_key(new_employer) != old_employer:
+        return True
+    old_title = _employer_key(outgoing.get("current_title"))
+    if old_title is None:
+        return False
+    return _employer_key(new_title) != old_title
+
+
+async def history_has_role(
+    session: AsyncSession, alumni_id: int, outgoing: dict[str, object]
+) -> bool:
+    """True when ``employment_history`` already holds the outgoing role as a PAST row.
+
+    Keeps the survey archive idempotent: if the same employer + title is already
+    filed as history (an earlier apply, an import's "former" column, or a staff
+    entry), a second copy would just be a duplicate on the Career history panel.
+    Matched on the same normalised key ``survey_role_changed`` uses. Rows flagged
+    ``is_current`` are not counted -- they are not shown as history, so treating
+    them as "already archived" would leave the role invisible.
+    """
+    employer = _employer_key(outgoing.get("current_employer"))
+    title = _employer_key(outgoing.get("current_title"))
+    rows = (
+        await session.execute(
+            select(EmploymentHistory).where(
+                EmploymentHistory.alumni_id == alumni_id,
+                EmploymentHistory.is_current.is_(False),
+            )
+        )
+    ).scalars().all()
+    return any(
+        _employer_key(getattr(row, "employer_name", None)) == employer
+        and _employer_key(getattr(row, "employment_title", None)) == title
+        for row in rows
+    )
 
 
 def audit_role_archive(
@@ -453,8 +531,9 @@ async def archive_current_role(
 
     The ONE implementation, shared by the staff edit, survey apply and CSV import
     paths, so an archived role looks the same however it was demoted. Only the
-    TRIGGER differs between them (see ``employer_changed``): staff tick a
-    checkbox, the other two infer from the employer moving.
+    TRIGGER differs between them: staff tick a checkbox, the import infers from
+    the employer moving (``employer_changed``) and the survey from the role
+    being replaced (``survey_role_changed``).
 
     Returns the created row (flushed, so it has an id for the audit trail), or
     ``None`` when the outgoing role held nothing worth keeping.

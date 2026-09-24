@@ -43,6 +43,7 @@ from tests.test_alumni_update_import import FakeUpdateSession
 from tests.test_audit_field_capture import _alumnus, _patch_get, _SectionSession
 from tests.test_survey_apply_audit import _alum as _survey_alum
 from tests.test_survey_apply_audit import _apply, _fake_resp
+from tests.test_survey_apply_audit import _Result as _SurveyResult
 from tests.test_survey_apply_audit import _Session as _SurveySession
 
 
@@ -490,10 +491,11 @@ def test_survey_apply_does_not_archive_on_a_no_op_reconfirm(monkeypatch):
     assert _archive_audits(session) == []
 
 
-def test_survey_apply_does_not_archive_on_a_title_only_change(monkeypatch):
-    """A promotion at the same employer is a real role change that this path
-    deliberately does NOT catch -- the trigger is the EMPLOYER, and inferring
-    from the title too would fire on every job-title tidy-up."""
+def test_survey_apply_archives_the_old_title_on_a_title_only_change(monkeypatch):
+    """REGRESSION (2026-09-24). A promotion at the same employer used to
+    overwrite the old title with no history row -- the survey trigger was the
+    EMPLOYER only. Jake's rule: an alum's existing jobs are always preserved, so
+    the outgoing title is filed as history under the same employer."""
     job = _survey_job()
     session = _SurveySession(_survey_alum())
     _apply(
@@ -503,7 +505,12 @@ def test_survey_apply_does_not_archive_on_a_title_only_change(monkeypatch):
         side_rows=({}, {5: job}, {}),
     )
 
-    assert _history(session) == []
+    (archived,) = _history(session)
+    assert archived.employer_name == "Old Bank"
+    assert archived.employment_title == "Analyst"
+    assert archived.is_current is False
+    assert job.current_employer == "Old Bank"
+    assert job.current_title == "Associate"
 
 
 def test_survey_apply_does_not_archive_a_first_ever_employer(monkeypatch):
@@ -553,6 +560,257 @@ def test_survey_archive_shares_the_approvals_change_set(monkeypatch):
     change_sets = {a.change_set_id for a in _audits(session)}
     assert len(change_sets) == 1
     assert None not in change_sets
+
+
+class _HistorySurveySession(_SurveySession):
+    """`_SurveySession` whose `employment_history` read returns *history* rows,
+    so the duplicate guard (`history_has_role`) has something to look at. Every
+    other read (the alumnus, the fuzzy duplicate check) behaves as before."""
+
+    def __init__(self, obj, history=()):
+        super().__init__(obj)
+        self._history_rows = list(history)
+
+    async def execute(self, stmt):
+        descriptions = getattr(stmt, "column_descriptions", None) or [{}]
+        if descriptions[0].get("entity") is EmploymentHistory:
+            rows = [r for r in self._history_rows if not r.is_current]
+            return _SurveyResult(None, rows)
+        return await super().execute(stmt)
+
+
+def _past(employer, title, *, is_current=False):
+    return EmploymentHistory(
+        alumni_id=5,
+        employer_name=employer,
+        employment_title=title,
+        start_year=2015,
+        end_year=2018,
+        is_current=is_current,
+    )
+
+
+def test_survey_apply_archives_when_the_employer_is_cleared(monkeypatch):
+    """REGRESSION (2026-09-24), reproduced live on dev. An alum who left for
+    graduate school blanks the Company and Title boxes; `employer_changed` read
+    named -> blank as "no change", so the whole role was wiped from the record
+    with no history row. It must be filed as history instead."""
+    job = _survey_job()
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(
+            payload={
+                "profile.employment_status": "Graduate Student",
+                "employment.current_employer": "",
+                "employment.current_title": "",
+            }
+        ),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    (archived,) = _history(session)
+    assert archived.employer_name == "Old Bank"
+    assert archived.employment_title == "Analyst"
+    assert archived.city == "Provo"
+    assert job.current_employer is None
+    (audit,) = _archive_audits(session)
+    assert audit.source == "survey"
+
+
+def test_survey_apply_archives_when_the_employer_moves_and_title_is_unchanged(
+    monkeypatch,
+):
+    """New company, same title: still a different job."""
+    job = _survey_job()
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Morgan Stanley"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    (archived,) = _history(session)
+    assert (archived.employer_name, archived.employment_title) == ("Old Bank", "Analyst")
+
+
+@pytest.mark.parametrize(
+    "payload, why",
+    [
+        (
+            {
+                "employment.current_employer": "  OLD   bank ",
+                "employment.current_title": "ANALYST",
+            },
+            "casing / spacing only",
+        ),
+        ({"employment.current_industry": "Investment Banking"}, "industry only"),
+        (
+            {"employment.current_city": "Salt Lake City", "employment.current_state": "Utah"},
+            "work location only",
+        ),
+    ],
+)
+def test_survey_apply_does_not_archive_when_the_role_is_the_same(
+    monkeypatch, payload, why
+):
+    job = _survey_job()
+    session = _SurveySession(_survey_alum())
+    _apply(session, _fake_resp(payload=payload), monkeypatch, side_rows=({}, {5: job}, {}))
+
+    assert _history(session) == [], why
+
+
+def test_survey_apply_does_not_archive_when_filling_in_a_blank_title(monkeypatch):
+    """Same employer, and there was no title on file: nothing is being replaced."""
+    job = _survey_job(current_title=None)
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_title": "Analyst"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    assert _history(session) == []
+
+
+def test_survey_apply_does_not_archive_a_role_with_no_employer(monkeypatch):
+    """No previous employer means no job to preserve, even if a title was on file."""
+    job = _survey_job(current_employer="  ")
+    session = _SurveySession(_survey_alum())
+    _apply(
+        session,
+        _fake_resp(
+            payload={
+                "employment.current_employer": "Goldman Sachs",
+                "employment.current_title": "Associate",
+            }
+        ),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    assert _history(session) == []
+
+
+def test_survey_apply_does_not_duplicate_a_role_already_in_history(monkeypatch):
+    """Idempotent: the outgoing role is already filed as a PAST row (an earlier
+    apply, an import's "former" column, a staff entry) -- matched case- and
+    whitespace-insensitively -- so no second copy is written. The current row
+    still moves on."""
+    job = _survey_job()
+    session = _HistorySurveySession(
+        _survey_alum(), history=[_past(" old BANK", "analyst")]
+    )
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Goldman Sachs"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    assert _history(session) == []
+    assert _archive_audits(session) == []
+    assert job.current_employer == "Goldman Sachs"
+
+
+def test_survey_duplicate_guard_matches_employer_and_title_together(monkeypatch):
+    """Same employer under a DIFFERENT title is a different role (a promotion),
+    so it is not a duplicate and the outgoing role is still archived."""
+    job = _survey_job()
+    session = _HistorySurveySession(
+        _survey_alum(), history=[_past("Old Bank", "Intern")]
+    )
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Goldman Sachs"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    (archived,) = _history(session)
+    assert archived.employment_title == "Analyst"
+
+
+def test_survey_duplicate_guard_ignores_rows_still_flagged_current(monkeypatch):
+    """A history row flagged `is_current` is not shown as history, so it must not
+    count as "already archived" -- otherwise the old job would stay invisible."""
+    job = _survey_job()
+    session = _HistorySurveySession(
+        _survey_alum(), history=[_past("Old Bank", "Analyst", is_current=True)]
+    )
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_employer": "Goldman Sachs"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    assert len(_history(session)) == 1
+
+
+def test_survey_reapplying_the_same_change_archives_once(monkeypatch):
+    """Two responses carrying the same job change (an alum who submitted twice):
+    the first archives, the second finds the role already current AND the old one
+    already in history, so nothing more is written."""
+    job = _survey_job()
+    first = _SurveySession(_survey_alum())
+    payload = {
+        "employment.current_employer": "Goldman Sachs",
+        "employment.current_title": "Associate",
+    }
+    _apply(first, _fake_resp(payload=payload), monkeypatch, side_rows=({}, {5: job}, {}))
+    (archived,) = _history(first)
+
+    second = _HistorySurveySession(_survey_alum(), history=[archived])
+    _apply(second, _fake_resp(payload=payload), monkeypatch, side_rows=({}, {5: job}, {}))
+    assert _history(second) == []
+
+
+def test_survey_archive_is_in_the_same_transaction_as_the_apply(monkeypatch):
+    """The demotion must commit (or roll back) with the rest of the approval: it
+    is added before the ONE commit, never committed on its own."""
+    job = _survey_job()
+    session = _SurveySession(_survey_alum())
+    commits_when_archived: list[int] = []
+    real_add = session.add
+
+    def add(obj):
+        if isinstance(obj, EmploymentHistory):
+            commits_when_archived.append(session.committed)
+        real_add(obj)
+
+    session.add = add
+    _apply(
+        session,
+        _fake_resp(payload={"employment.current_title": "Associate"}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+
+    assert commits_when_archived == [0]
+    assert session.committed == 1
+
+
+@pytest.mark.parametrize(
+    "outgoing, employer, title, expected",
+    [
+        ({"current_employer": "Acme", "current_title": "Analyst"}, "Beta", "Analyst", True),
+        ({"current_employer": "Acme", "current_title": "Analyst"}, None, None, True),
+        ({"current_employer": "Acme", "current_title": "Analyst"}, "", "Analyst", True),
+        ({"current_employer": "Acme", "current_title": "Analyst"}, "Acme", "VP", True),
+        ({"current_employer": "Acme", "current_title": "Analyst"}, "Acme", None, True),
+        ({"current_employer": "Acme", "current_title": "Analyst"}, " acme ", "ANALYST", False),
+        ({"current_employer": "Acme", "current_title": None}, "Acme", "Analyst", False),
+        ({"current_employer": None, "current_title": "Analyst"}, "Beta", "VP", False),
+        ({"current_employer": "  ", "current_title": None}, "Beta", None, False),
+    ],
+)
+def test_survey_role_changed(outgoing, employer, title, expected):
+    assert service.survey_role_changed(outgoing, employer, title) is expected
 
 
 # =============================================================================
@@ -680,4 +938,6 @@ def test_every_path_uses_the_one_archive_implementation():
     happened to demote them."""
     assert survey_responses.archive_current_role is service.archive_current_role
     assert survey_responses.audit_role_archive is service.audit_role_archive
+    assert survey_responses.survey_role_changed is service.survey_role_changed
+    assert survey_responses.history_has_role is service.history_has_role
     assert import_csv.alumni_service.employer_changed is service.employer_changed

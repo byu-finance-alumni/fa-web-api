@@ -1,7 +1,7 @@
 # Runtime dependencies for fa-web-api
 fastapi>=0.110
 uvicorn[standard]>=0.29
-sqlalchemy[asyncio]>=2.0
+sqlalchemy[asyncio]>=2.0,<2.1  # 2.1 changed LIKE ESCAPE rendering; upgrade deliberately, not via CI drift
 asyncpg>=0.29
 pydantic>=2.6
 pydantic-settings>=2.2

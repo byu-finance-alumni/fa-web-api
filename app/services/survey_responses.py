@@ -83,7 +83,8 @@ from app.services.alumni import (
     archive_current_role,
     audit_role_archive,
     career_snapshot,
-    employer_changed,
+    history_has_role,
+    survey_role_changed,
 )
 from app.services.images import normalise_headshot
 from app.services.survey_email import (
@@ -1672,17 +1673,20 @@ async def apply_response(
     go to `audit_logs` and nowhere else — nothing below logs a value, only counts
     and (already-safe) field keys.
 
-    EMPLOYMENT ARCHIVING (#446). When this apply moves the alum to a DIFFERENT
-    named employer, the outgoing `current_employment` row is copied down into
-    `employment_history` first, through the same `archive_current_role` the staff
-    edit and CSV import paths use, so a demoted role looks identical whichever
-    path produced it. The staff path asks a human ("this is a new role"); nobody
-    is present here to ask, and the product owner decided on 2026-08-18 that the
-    survey should infer from the employer rather than never archive at all —
-    over both "no archiving" and "ask the reviewer at apply time". The accepted
-    cost is that a corrected typo or a company rename produces a prior role the
-    alum never left; `alumni_service.employer_changed` documents how narrowly the
-    comparison is drawn to limit it.
+    EMPLOYMENT ARCHIVING (#446). When this apply REPLACES the alum's current
+    role -- a different employer, a cleared employer, or a different title at
+    the same employer (see `alumni_service.survey_role_changed`) -- the outgoing
+    `current_employment` row is copied down into `employment_history` first,
+    through the same `archive_current_role` the staff edit and CSV import paths
+    use, so a demoted role looks identical whichever path produced it. The staff
+    path asks a human ("this is a new role"); nobody is present here to ask, and
+    the product owner decided on 2026-08-18 that the survey should infer rather
+    than never archive at all -- over both "no archiving" and "ask the reviewer
+    at apply time". The accepted cost is that a corrected typo or a company
+    rename produces a prior role the alum never left. Widened on 2026-09-24 from
+    "the employer moved" after title-only changes and cleared employers were
+    found to overwrite jobs with no history: an alum's existing jobs must always
+    be preserved.
     """
     resp = await _get_pending(session, response_id)
     alum = (
@@ -1817,9 +1821,8 @@ async def apply_response(
     # The survey has NO checkbox and, by the product owner's decision of
     # 2026-08-18, does not get one: an alum re-confirming their details cannot be
     # asked "is this a new role?", and asking the reviewer instead was considered
-    # and rejected. So this path archives when the EMPLOYER moves — see
-    # `alumni_service.employer_changed` for exactly what counts and for the
-    # tradeoff that was accepted to get it.
+    # and rejected. So this path infers it from the values — see
+    # `alumni_service.survey_role_changed` for exactly what counts.
     outgoing_role = career_snapshot(job) if job is not None else None
 
     def _capture(field: _Field, old: object, new: object) -> None:
@@ -1877,10 +1880,23 @@ async def apply_response(
     # than inside the loop because the employer and the rest of the role arrive as
     # separate payload keys in no guaranteed order: archiving mid-loop would
     # snapshot a half-written row.
+    #
+    # The trigger is `survey_role_changed`, NOT `employer_changed` (2026-09-24).
+    # `employer_changed` let a title-only change (a promotion) and a CLEARED
+    # employer (left for grad school) overwrite the old job with no history row --
+    # data loss Jake ruled must never happen: an alum's existing jobs are always
+    # preserved. `history_has_role` keeps it idempotent: a role already filed as
+    # history is not filed twice. Same transaction as every other write here --
+    # `archive_current_role` only flushes; the one commit is at the bottom.
     archived_role = None
-    if outgoing_role is not None and employer_changed(
-        outgoing_role.get("current_employer"),
-        getattr(job, "current_employer", None),
+    if (
+        outgoing_role is not None
+        and survey_role_changed(
+            outgoing_role,
+            getattr(job, "current_employer", None),
+            getattr(job, "current_title", None),
+        )
+        and not await history_has_role(session, alum.alumni_id, outgoing_role)
     ):
         archived_role = await archive_current_role(
             session, alum.alumni_id, outgoing_role

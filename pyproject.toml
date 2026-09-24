@@ -5,7 +5,7 @@ description = "Backend API and database layer for the BYU Finance Alumni Databas
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.110",
-    "sqlalchemy[asyncio]>=2.0",
+    "sqlalchemy[asyncio]>=2.0,<2.1",  # 2.1.0 (2026-09-24) changed LIKE ESCAPE rendering; upgrade deliberately
     "asyncpg>=0.29",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",

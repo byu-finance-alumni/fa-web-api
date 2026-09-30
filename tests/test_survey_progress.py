@@ -201,6 +201,7 @@ def test_counts_reach_the_schedule_item(
                     (year, recipients, replied, awaiting, applied, rejected, confirmed)
                 ]
             ),
+            _Res(rows=[]),  # median fill time per cycle
         ]
     )
     item = asyncio.run(survey_schedule.list_schedules(session))[0]
@@ -226,6 +227,7 @@ def test_a_rejected_submission_never_lands_in_replied():
             _Res(rows=[]),
             _Res(rows=[]),
             _Res(rows=[(year, 10, 1, 1, 0, 5, 0)]),
+            _Res(rows=[]),  # median fill time per cycle
         ]
     )
     item = asyncio.run(survey_schedule.list_schedules(session))[0]
@@ -252,3 +254,96 @@ def test_a_year_with_no_sends_reports_zeroes_rather_than_failing():
         item.rejected,
         item.confirmed,
     ) == (0, 0, 0, 0, 0, 0)
+
+
+# --------------------------------------------- median time-to-complete --------
+#
+# How long an alum ACTIVELY spent filling the survey, aggregated to a per-cycle
+# median. The fill time is a property of the RESPONSE (not the send), so this
+# reads `survey_responses` directly and pins each row to the year's current
+# campaign by its stamped `cycle_seq`, over the same "replied" population every
+# other progress number uses.
+
+
+def _fill_sql() -> str:
+    return str(
+        survey_schedule._cycle_fill_times().compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+
+def test_median_uses_percentile_cont_over_fill_seconds():
+    sql = _fill_sql().lower()
+    assert "percentile_cont" in sql
+    assert "within group" in sql
+    assert "survey_responses.fill_seconds" in sql
+
+
+def test_median_is_scoped_to_the_current_cycle_by_the_response_stamp():
+    # The response's own `cycle_seq` joined to the schedule's current cycle — the
+    # same #357 scope the counts get, expressed on the response rather than the
+    # send log because a fill time has no send-log row.
+    sql = _fill_sql()
+    assert (
+        "JOIN survey_schedule ON survey_schedule.graduation_year = "
+        "survey_responses.graduation_year AND survey_schedule.cycle_seq = "
+        "survey_responses.cycle_seq" in sql
+    )
+
+
+def test_median_counts_only_replies_with_a_usable_value():
+    sql = _fill_sql()
+    # A reply, by the shared definition: RESPONDED_STATUSES, in-window, not reset.
+    assert "IN ('pending', 'applied', 'confirmed')" in sql
+    assert "survey_responses.submitted_at >=" in sql
+    assert "survey_reset_log" in sql
+    # Non-null and in a sane range — a confirmation (no timer) and every pre-column
+    # row are NULL and drop out; a forged huge value the writer somehow let through
+    # is floored here too.
+    assert "survey_responses.fill_seconds IS NOT NULL" in sql
+    assert "survey_responses.fill_seconds > 0" in sql
+    assert str(survey_schedule._FILL_SECONDS_MAX) in sql
+
+
+def test_median_reaches_the_schedule_item():
+    year = 2005
+    session = QueueSession(
+        [
+            _Res(scalars_all=[_sched(year, datetime.date(2026, 5, 1), status="active")]),
+            _Res(rows=[]),  # per-stage counts
+            _Res(rows=[]),  # manual-follow-up counts
+            _Res(rows=[]),  # all-time sent counts
+            _Res(rows=[(year, 30, 9, 1, 0, 0, 8)]),  # progress counts
+            _Res(rows=[(year, 72.0)]),  # median fill time per cycle
+        ]
+    )
+    item = asyncio.run(survey_schedule.list_schedules(session))[0]
+    assert item.median_fill_seconds == 72.0
+
+
+def test_a_year_with_no_usable_fill_time_reports_none():
+    # No response carried a usable timer, so the year is simply absent from the
+    # median result — the item reports None (the console renders a dash), not 0.
+    year = 2006
+    session = QueueSession(
+        [
+            _Res(scalars_all=[_sched(year, datetime.date(2026, 5, 1), status="active")]),
+            _Res(rows=[]),
+            _Res(rows=[]),
+            _Res(rows=[]),
+            _Res(rows=[(year, 10, 3, 3, 0, 0, 0)]),
+            _Res(rows=[]),  # no median for this year
+        ]
+    )
+    item = asyncio.run(survey_schedule.list_schedules(session))[0]
+    assert item.median_fill_seconds is None
+
+
+def test_median_mapping_skips_a_null_median():
+    # percentile_cont over an empty group yields NULL; the mapping must drop it
+    # rather than crash on float(None).
+    rows = survey_schedule._median_fill_times
+    session = QueueSession([_Res(rows=[(2007, None), (2008, 50.0)])])
+    result = asyncio.run(rows(session))
+    assert result == {2008: 50.0}

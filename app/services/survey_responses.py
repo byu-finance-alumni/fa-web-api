@@ -1327,12 +1327,40 @@ async def _record_confirmation(
     )
 
 
+# Longest active fill time we will store, in seconds. The survey is a
+# minute-or-two task, so the only values above this are a tab left focused for
+# hours or an outright forged number — neither is a real fill time, and both
+# would drag the median. Anything over it (or below 0) is dropped to NULL rather
+# than clamped to the bound, so a poisoned submission cannot pile up at the
+# ceiling and pull the median toward it. Lives here, not in the DB CHECK, so it
+# can move without a migration.
+_FILL_SECONDS_MAX = 4 * 60 * 60
+
+
+def _sane_fill_seconds(value: int | None) -> int | None:
+    """The public submit's ``fill_seconds``, made safe to store — or ``None``.
+
+    ⚠️ The value is ATTACKER-CONTROLLABLE (public, token-gated endpoint, no
+    login), so it is never trusted. A usable number is a whole count of seconds
+    from 0 up to :data:`_FILL_SECONDS_MAX`; anything else — negative, absurdly
+    large, or not an int at all — is DROPPED to ``None`` so it is simply not
+    recorded. It must NEVER raise: a bad timer value is ignored, not a 500, and
+    the submission it rode in on succeeds exactly as if no timer had run.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    if value < 0 or value > _FILL_SECONDS_MAX:
+        return None
+    return value
+
+
 async def submit_response(
     session: AsyncSession,
     token: str,
     fields: dict[str, str],
     has_photo: bool = False,
     confirmed_only: bool = False,
+    fill_seconds: int | None = None,
 ) -> SurveySubmitResult:
     """Stage an alum's submission (token-gated, public). Keeps only recognized
     fields; nothing is applied to the record here.
@@ -1379,6 +1407,10 @@ async def submit_response(
         return SurveySubmitResult(staged=False, change_count=0)
 
     cycle_seq, stage = await _sent_cycle_and_stage(session, alum, alumni_id)
+    # Clamp the attacker-supplied timer BEFORE it can touch a row. `None` here is
+    # "no usable measurement" and simply leaves the column NULL — see
+    # `_sane_fill_seconds`.
+    fill = _sane_fill_seconds(fill_seconds)
 
     # CONFIRM, THEN CHANGE YOUR MIND (#755). An alum can press "Yes, everything
     # is correct", then "I need to make changes", then submit real edits -- or
@@ -1424,6 +1456,11 @@ async def submit_response(
             upgrade.cycle_seq = cycle_seq
         if upgrade.stage is None:
             upgrade.stage = stage
+        # The row being upgraded is a `confirmed` one, and a confirmation never
+        # carried a timer, so this is the first fill time it has ever had — fill
+        # the gap, but never null out a value that is somehow already there.
+        if fill is not None and upgrade.fill_seconds is None:
+            upgrade.fill_seconds = fill
         # Read the id BEFORE the commit expires the row.
         upgraded_id = upgrade.survey_response_id
         await session.commit()
@@ -1439,6 +1476,8 @@ async def submit_response(
         # WHICH campaign asked (#497). Capture only — nothing reads it yet.
         cycle_seq=cycle_seq,
         stage=stage,
+        # Active fill time, already clamped — NULL when not measured or unusable.
+        fill_seconds=fill,
     )
     session.add(response)
     # Flush so the identity is assigned; capture it BEFORE commit expires the row,

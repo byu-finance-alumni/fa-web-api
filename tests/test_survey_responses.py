@@ -308,7 +308,9 @@ def test_apply_forbidden_for_view_only(client):
 def test_submit_route_is_public(client, monkeypatch):
     from app.schemas.survey import SurveySubmitResult
 
-    async def fake_submit(session, token, fields, has_photo=False, confirmed_only=False):
+    async def fake_submit(
+        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None
+    ):
         return SurveySubmitResult(staged=True, change_count=len(fields))
 
     monkeypatch.setattr(sr, "submit_response", fake_submit)
@@ -459,6 +461,66 @@ def test_submit_empty_no_photo_is_noop(monkeypatch):
     assert result.survey_response_id is None
     assert [o for o in session.added if isinstance(o, SurveyResponse)] == []
     assert session.committed == 0
+
+
+def test_sane_fill_seconds_clamps_attacker_values():
+    # The value rides the PUBLIC token-gated submit, so it is whatever the poster
+    # sends. A usable number is a whole count of seconds from 0..MAX; anything
+    # else is DROPPED to None so it is simply not recorded — never clamped to the
+    # ceiling (which would let a forged value pile up there and drag the median),
+    # and never raised.
+    assert sr._sane_fill_seconds(0) == 0
+    assert sr._sane_fill_seconds(73) == 73
+    assert sr._sane_fill_seconds(sr._FILL_SECONDS_MAX) == sr._FILL_SECONDS_MAX
+    # Out of range -> dropped, not clamped.
+    assert sr._sane_fill_seconds(-1) is None
+    assert sr._sane_fill_seconds(sr._FILL_SECONDS_MAX + 1) is None
+    assert sr._sane_fill_seconds(10**12) is None
+    # Not an int (or a bool, which is an int subclass) -> dropped.
+    assert sr._sane_fill_seconds(None) is None
+    assert sr._sane_fill_seconds(12.5) is None  # type: ignore[arg-type]
+    assert sr._sane_fill_seconds("60") is None  # type: ignore[arg-type]
+    assert sr._sane_fill_seconds(True) is None  # type: ignore[arg-type]
+
+
+def test_submit_persists_a_sane_fill_time(monkeypatch):
+    # A good timer value is stored on the staged row so the campaign's median
+    # time-to-complete has something to read.
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    asyncio.run(
+        sr.submit_response(session, "tok", {"contact.city": "Provo"}, fill_seconds=95)
+    )
+    staged = [o for o in session.added if isinstance(o, SurveyResponse)]
+    assert staged[0].fill_seconds == 95
+
+
+def test_submit_drops_an_absurd_fill_time_without_failing(monkeypatch):
+    # A poisoned value must not 500 and must not be stored — the submission still
+    # succeeds exactly as if no timer had run.
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    result = asyncio.run(
+        sr.submit_response(
+            session, "tok", {"contact.city": "Provo"}, fill_seconds=-9999
+        )
+    )
+    assert result.staged is True
+    staged = [o for o in session.added if isinstance(o, SurveyResponse)]
+    assert staged[0].fill_seconds is None
+
+
+def test_submit_without_a_fill_time_still_works(monkeypatch):
+    # Best-effort/optional: a missing timer leaves the column NULL and changes
+    # nothing else about the submission.
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    alum = types.SimpleNamespace(alumni_id=5, archived=False, graduation_year=2020)
+    session = _Session(alum)
+    asyncio.run(sr.submit_response(session, "tok", {"contact.city": "Provo"}))
+    staged = [o for o in session.added if isinstance(o, SurveyResponse)]
+    assert staged[0].fill_seconds is None
 
 
 def test_stage_photo_foreign_response_404(monkeypatch):

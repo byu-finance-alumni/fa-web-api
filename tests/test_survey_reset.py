@@ -147,6 +147,7 @@ def _ddl(conn):
             # only because the model selects it.
             " cycle_seq INTEGER,"
             " stage SMALLINT,"
+            " fill_seconds INTEGER,"
             " submitted_at TIMESTAMP NOT NULL,"
             " reviewed_by_user_id INTEGER,"
             " reviewed_at TIMESTAMP)"

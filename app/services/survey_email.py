@@ -551,6 +551,17 @@ def _token_secret() -> str:
 # every outstanding link at once.
 SURVEY_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
+# `alumni_id` is a Postgres BIGINT. A validly-signed token carrying a value
+# outside the signed-64-bit range would otherwise reach asyncpg as an
+# out-of-range bind parameter and raise (an unhandled 500 — and a break in the
+# uniform "this link is dead" contract every other failure here upholds, which
+# on its own tells a secret-holding prober that the id was well-formed). Treat
+# out-of-range as just another invalid token. In-range-but-unused ids (0,
+# negatives, unassigned ids) are NOT rejected here: they resolve to "no such
+# response" downstream, which is the same 404, so there is nothing to gain.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
 # Tokens minted BEFORE this change carry no issued-at (payload is two fields, not
 # three). They cannot be dated, so they are given one fixed, shared deadline
 # rather than an unbounded life: the same 7 days, measured from the day the fix
@@ -655,9 +666,12 @@ def verify_survey_token(token: str, *, now: datetime.datetime | None = None) -> 
         return None
 
     try:
-        return int(parts[0])
+        alumni_id = int(parts[0])
     except ValueError:
         return None
+    if not _INT64_MIN <= alumni_id <= _INT64_MAX:
+        return None
+    return alumni_id
 
 
 # ---------------------------------------------------------------- template ---

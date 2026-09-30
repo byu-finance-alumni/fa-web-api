@@ -27,6 +27,18 @@ class SurveySubmitRequest(BaseModel):
     # or a photo describes a submission WITH changes, and honouring the flag
     # would throw them away — so content always wins. Send the flag on its own.
     confirmed_only: bool = False
+    # How long the alum ACTIVELY spent filling the survey, in whole seconds — the
+    # frontend accumulates wall-time only while the tab is visible and pauses on
+    # `visibilitychange`, so "opened it, went to lunch, came back" does not
+    # inflate it. Surfaced as the campaign's median time-to-complete.
+    #
+    # ⚠️ ATTACKER-CONTROLLABLE. This rides the PUBLIC token-gated submit, so the
+    # number is whatever the poster sends. It is NEVER trusted: the value is
+    # clamped to a sane range server-side (`survey_responses._sane_fill_seconds`)
+    # and anything negative or absurd is DROPPED to NULL, never stored and never
+    # a 500. Best-effort and optional — a missing value leaves the submission
+    # working exactly as before.
+    fill_seconds: int | None = None
 
 
 class SurveySubmitResult(BaseModel):
@@ -505,6 +517,17 @@ class SurveyScheduleItem(BaseModel):
     # for, which looks like a bug in the table rather than the best possible
     # outcome — an alum whose record was already right.
     confirmed: int = 0
+    # MEDIAN active seconds this cycle's respondents spent filling the survey —
+    # `percentile_cont(0.5)` over `survey_responses.fill_seconds`, counting only
+    # replies (`RESPONDED_STATUSES`, not superseded, inside the re-survey window)
+    # that carry a non-null, in-range value. The frontend measures ACTIVE time
+    # (paused while the tab is hidden); the backend clamps the attacker-supplied
+    # number before it is ever stored, so a poisoned value cannot move it.
+    #
+    # `None` is a REAL answer — a cycle nobody has replied to yet, or one whose
+    # replies all predate the `fill_seconds` column (never backfilled). The
+    # console renders a dash for it, never 0, which would read as "instant".
+    median_fill_seconds: float | None = None
 
 
 class SurveySchedulePauseAllResult(BaseModel):

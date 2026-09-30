@@ -937,11 +937,11 @@ class _Res:
         return row[0] if isinstance(row, tuple) else row
 
 
-# `_to_item` is fed by FOUR whole-table reads — the per-stage sent counts, the
+# `_to_item` is fed by FIVE whole-table reads — the per-stage sent counts, the
 # manual-follow-up counts (#359), the all-time sent counts that decide whether a
-# campaign may be deleted (#398), and the at-a-glance progress counts (#543) —
-# so every queue that reaches it needs all four.
-_COUNTS = 4
+# campaign may be deleted (#398), the at-a-glance progress counts (#543), and the
+# median fill-time per cycle — so every queue that reaches it needs all five.
+_COUNTS = 5
 
 
 class QueueSession:
@@ -954,6 +954,12 @@ class QueueSession:
     async def execute(self, _stmt):
         self.executed += 1
         return self._q.pop(0)
+
+    def get_bind(self):
+        # The median fill-time read runs only against Postgres (its
+        # `percentile_cont` is Postgres-only); report that dialect so these
+        # fakes exercise the real path and consume the queued median result.
+        return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
 
     def add(self, obj):
         self.added.append(obj)
@@ -976,6 +982,7 @@ def test_create_schedule_inserts_new():
             _Res(rows=[]),  # manual-follow-up counts
             _Res(rows=[]),  # all-time sent counts (#398)
             _Res(rows=[]),  # recipients / replied / awaiting review (#543)
+            _Res(rows=[]),  # median fill time per cycle
         ]
     )
     item = asyncio.run(
@@ -1006,6 +1013,7 @@ def test_create_schedule_replaces_existing():
             _Res(rows=[]),  # manual-follow-up counts
             _Res(rows=[]),  # all-time sent counts (#398)
             _Res(rows=[]),  # recipients / replied / awaiting review (#543)
+            _Res(rows=[]),  # median fill time per cycle
             # The upsert stamped created_by_user_id, so the creator-name lookup
             # runs (it is skipped entirely when no row has a creator).
             _Res(rows=[]),
@@ -1094,6 +1102,7 @@ def test_create_schedules_bulk_empty_is_noop():
             _Res(rows=[]),  # manual-follow-up counts
             _Res(rows=[]),  # all-time sent counts (#398)
             _Res(rows=[]),  # recipients / replied / awaiting review (#543)
+            _Res(rows=[]),  # median fill time per cycle
         ]
     )
     result = asyncio.run(
@@ -1151,6 +1160,7 @@ def test_list_schedules_includes_stage_counts():
             # (#755). The rejected one is NOT in the 2 who replied — staff
             # binned that submission.
             _Res(rows=[(2001, 6, 2, 1, 1, 1, 0)]),
+            _Res(rows=[]),  # median fill time per cycle
         ]
     )
     items = asyncio.run(survey_schedule.list_schedules(session))
@@ -1181,6 +1191,7 @@ def test_list_schedules_resolves_creator_names_in_one_query():
             _Res(rows=[]),  # manual-follow-up counts
             _Res(rows=[]),  # all-time sent counts (#398)
             _Res(rows=[]),  # recipients / replied / awaiting review (#543)
+            _Res(rows=[]),  # median fill time per cycle
             _Res(
                 rows=[
                     (7, "Jake", "Gunnell", "jake@byu.edu"),
@@ -1201,6 +1212,7 @@ def test_list_schedules_skips_creator_query_when_none_recorded():
     session = QueueSession(
         [
             _Res(scalars_all=[_sched(2000, datetime.date(2026, 5, 1))]),
+            _Res(rows=[]),
             _Res(rows=[]),
             _Res(rows=[]),
             _Res(rows=[]),

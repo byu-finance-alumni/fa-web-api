@@ -158,6 +158,7 @@ def _ddl(conn):
             " payload TEXT NOT NULL DEFAULT '{}',"
             " status VARCHAR(20) NOT NULL,"
             " staged_photo_path VARCHAR(255),"
+            " fill_seconds INTEGER,"
             " submitted_at TIMESTAMP NOT NULL,"
             " reviewed_by_user_id INTEGER,"
             " reviewed_at TIMESTAMP)"

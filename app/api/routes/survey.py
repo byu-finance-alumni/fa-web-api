@@ -303,7 +303,12 @@ async def survey_submit(
     if too_large is not None:
         return too_large
     return await survey_responses.submit_response(
-        session, token, body.fields, body.has_photo, body.confirmed_only
+        session,
+        token,
+        body.fields,
+        body.has_photo,
+        body.confirmed_only,
+        body.fill_seconds,
     )
 
 

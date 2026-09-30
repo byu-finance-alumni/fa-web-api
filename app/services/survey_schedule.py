@@ -103,6 +103,12 @@ from app.services import survey_email
 # rather than re-derived (same rule as `opportunity_links._cell`).
 from app.services.alumni_export import _fmt as _csv_cell
 
+# The canonical upper bound the public submit clamps `fill_seconds` to. Imported
+# rather than re-declared so the reader (the median below) and the writer share
+# ONE number — a mirrored magic constant is exactly the drift that keeps biting
+# this codebase.
+from app.services.survey_responses import _FILL_SECONDS_MAX
+
 log = logging.getLogger(__name__)
 
 # Campaign states (mirror the DB CHECK constraint).
@@ -424,6 +430,88 @@ async def _progress_counts(
         )
         for year, recipients, replied, awaiting, applied, rejected, confirmed in rows
     }
+
+
+def _cycle_fill_times():
+    """``(graduation_year, median_fill_seconds)`` per year, over the CURRENT
+    cycle's replies that carry a usable active fill time (#543 follow-on).
+
+    The median time an alum actually spent filling the survey —
+    ``percentile_cont(0.5)`` over ``survey_responses.fill_seconds``.
+
+    Scoped to match the progress counts as closely as the grain allows: the
+    counts are over the send log (you cannot reply to a survey you were not
+    sent), but a fill time is a property of the RESPONSE, so this reads the
+    response rows directly and pins them to the year's current campaign by their
+    stamped ``cycle_seq`` (:data:`SurveyResponse.cycle_seq`), joined to
+    ``survey_schedule.cycle_seq`` exactly as :func:`_current_cycle_sends` pins
+    the send rows. A NULL ``cycle_seq`` (history, unmatched send) drops out of
+    the join, so a pre-stamp response can never leak into a current-cycle median.
+
+    The population is the same "replied" definition every other count uses — a
+    reply in :data:`survey_email.RESPONDED_STATUSES`, inside the re-survey
+    window, not superseded by a reset (#395) — so the median describes the very
+    people the console reports as having answered. Only rows with a non-null,
+    in-range ``fill_seconds`` are counted: a confirmation carries no timer (NULL),
+    every row predating the column is NULL, and the writer already clamps the
+    public value, so the range guard here is a belt-and-braces floor that also
+    drops a genuine 0 (an "instant" submission is not a fill time worth
+    averaging)."""
+    return (
+        select(
+            SurveyResponse.graduation_year,
+            func.percentile_cont(0.5)
+            .within_group(SurveyResponse.fill_seconds.asc())
+            .label("median_fill_seconds"),
+        )
+        .join(
+            SurveySchedule,
+            (SurveySchedule.graduation_year == SurveyResponse.graduation_year)
+            & (SurveySchedule.cycle_seq == SurveyResponse.cycle_seq),
+        )
+        .where(
+            SurveyResponse.fill_seconds.is_not(None),
+            SurveyResponse.fill_seconds > 0,
+            SurveyResponse.fill_seconds <= _FILL_SECONDS_MAX,
+            SurveyResponse.status.in_(_REPLIED_STATUSES),
+            SurveyResponse.submitted_at >= survey_email._resurvey_cutoff(),
+            survey_email.response_not_superseded(),
+        )
+        .group_by(SurveyResponse.graduation_year)
+    )
+
+
+def _is_postgres(session: AsyncSession) -> bool:
+    """Whether this session talks to PostgreSQL.
+
+    ``percentile_cont(...) WITHIN GROUP`` is a Postgres ordered-set aggregate, and
+    the ``fill_seconds`` column it reads does not exist in the lightweight SQLite
+    tables the service tests build. Both real environments — dev and prod — are
+    Supabase/Postgres, so the median is computed there and simply skipped
+    anywhere else. A skipped median is a real, handled answer: the item reports
+    ``None`` and the console renders a dash, exactly as for a cycle nobody has
+    replied to yet. Detection never raises — a list of campaigns must not fail
+    because the bind could not be inspected."""
+    try:
+        get_bind = getattr(session, "get_bind", None)
+        bind = get_bind() if callable(get_bind) else getattr(session, "bind", None)
+    except Exception:  # noqa: BLE001 - detection is best-effort; unknown => not pg
+        return False
+    return getattr(getattr(bind, "dialect", None), "name", None) == "postgresql"
+
+
+async def _median_fill_times(session: AsyncSession) -> dict[int, float]:
+    """``{year: median_fill_seconds}`` for every year with a usable fill time,
+    in ONE query — a year with none is simply absent, and its schedule item
+    reports ``None``. Resolved for all years at once, like the other aggregates,
+    so listing the console stays a fixed number of round trips.
+
+    Postgres-only (see :func:`_is_postgres`): elsewhere it returns ``{}`` and
+    every item's ``median_fill_seconds`` is ``None``."""
+    if not _is_postgres(session):
+        return {}
+    rows = (await session.execute(_cycle_fill_times())).all()
+    return {year: float(median) for year, median in rows if median is not None}
 
 
 async def _non_responder_counts(session: AsyncSession) -> dict[int, int]:
@@ -796,6 +884,7 @@ def _to_item(
     non_responders: dict[int, int] | None = None,
     all_time_sent: dict[int, int] | None = None,
     progress: dict[int, tuple[int, int, int, int, int, int]] | None = None,
+    fill_medians: dict[int, float] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     created_by_id = getattr(sched, "created_by_user_id", None)
@@ -828,6 +917,9 @@ def _to_item(
         applied=applied,
         rejected=rejected,
         confirmed=confirmed,
+        # None when this cycle has no usable fill time yet — the console renders
+        # a dash, never 0.
+        median_fill_seconds=(fill_medians or {}).get(year),
     )
 
 
@@ -850,9 +942,12 @@ async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
     non_responders = await _non_responder_counts(session)
     all_time = await _all_time_send_counts(session)
     progress = await _progress_counts(session)
+    fill_medians = await _median_fill_times(session)
     creators = await _creator_names(session, schedules)
     return [
-        _to_item(s, counts, creators, non_responders, all_time, progress)
+        _to_item(
+            s, counts, creators, non_responders, all_time, progress, fill_medians
+        )
         for s in schedules
     ]
 
@@ -874,8 +969,11 @@ async def get_schedule(
     non_responders = await _non_responder_counts(session)
     all_time = await _all_time_send_counts(session)
     progress = await _progress_counts(session)
+    fill_medians = await _median_fill_times(session)
     creators = await _creator_names(session, [sched])
-    return _to_item(sched, counts, creators, non_responders, all_time, progress)
+    return _to_item(
+        sched, counts, creators, non_responders, all_time, progress, fill_medians
+    )
 
 
 async def _upsert_schedule(

@@ -73,6 +73,18 @@ class SurveyResponse(Base):
     # accumulating now, since it cannot be reconstructed later.
     cycle_seq: Mapped[int | None] = mapped_column(Integer)
     stage: Mapped[int | None] = mapped_column(SmallInteger)
+    # Active seconds the alum spent filling the survey (wall-time while the tab
+    # was visible, paused when hidden — see the frontend timer). Feeds the
+    # campaign's median time-to-complete.
+    #
+    # NULLABLE and ATTACKER-CONTROLLABLE, never trusted. It arrives on the PUBLIC
+    # token-gated submit, so `survey_responses._sane_fill_seconds` clamps it and
+    # drops anything negative or absurd to NULL before it reaches this column.
+    # NULL therefore means "not measured / not usable": every row predating the
+    # column (never backfilled), a confirmation (the confirm press carries no
+    # timer), and any submission whose number failed the clamp. Readers exclude
+    # NULL from the median rather than treating it as 0.
+    fill_seconds: Mapped[int | None] = mapped_column(Integer)
     submitted_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -47,7 +47,9 @@ def staged(monkeypatch):
     """Stub the stage-it service and record what the route passed through."""
     calls = []
 
-    async def _submit(session, token, fields, has_photo, confirmed_only=False):
+    async def _submit(
+        session, token, fields, has_photo, confirmed_only=False, fill_seconds=None
+    ):
         calls.append({"token": token, "fields": fields, "has_photo": has_photo})
         return SurveySubmitResult(staged=True, change_count=len(fields), survey_response_id=7)
 

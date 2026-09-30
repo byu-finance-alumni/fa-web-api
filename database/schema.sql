@@ -660,6 +660,13 @@ CREATE TABLE survey_responses (
     -- been sent (0 = initial, 1 = 1-week, 2 = 2-week). NULL = unknown.
     cycle_seq           int,
     stage               smallint,
+    -- Active seconds the alum spent filling the survey (tab-visible wall-time,
+    -- paused while hidden). NULL = not measured or not usable. The value is
+    -- ATTACKER-CONTROLLABLE (public token-gated submit) and NEVER backfilled:
+    -- the service clamps it and drops anything out of range to NULL before it is
+    -- stored. Feeds the campaign's median time-to-complete. See
+    -- migrations/2026-09-30_survey_response_fill_seconds.sql.
+    fill_seconds        int,
     submitted_at        timestamptz NOT NULL DEFAULT now(),
     reviewed_by_user_id bigint,
     reviewed_at         timestamptz,
@@ -667,7 +674,8 @@ CREATE TABLE survey_responses (
     CONSTRAINT fk_survey_responses_reviewer FOREIGN KEY (reviewed_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
     CONSTRAINT ck_survey_responses_status CHECK (status IN ('pending', 'applied', 'rejected', 'confirmed')),
     CONSTRAINT ck_survey_responses_cycle_seq CHECK (cycle_seq IS NULL OR cycle_seq >= 1),
-    CONSTRAINT ck_survey_responses_stage CHECK (stage IS NULL OR stage BETWEEN 0 AND 2)
+    CONSTRAINT ck_survey_responses_stage CHECK (stage IS NULL OR stage BETWEEN 0 AND 2),
+    CONSTRAINT ck_survey_responses_fill_seconds CHECK (fill_seconds IS NULL OR fill_seconds >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_survey_responses_status_year ON survey_responses (status, graduation_year);
 CREATE INDEX IF NOT EXISTS idx_survey_responses_alumni_id ON survey_responses (alumni_id);

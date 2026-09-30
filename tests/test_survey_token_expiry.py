@@ -119,6 +119,21 @@ def test_tampered_alumni_id_still_fails(fake_settings):
     assert verify_survey_token(forged, now=now) is None
 
 
+def test_validly_signed_out_of_int64_alumni_id_is_rejected(fake_settings):
+    """A validly-signed token whose alumni_id is outside the BIGINT range must
+    verify to None, not raise. Downstream it becomes the same uniform dead-link
+    404 instead of an out-of-range bind param crashing asyncpg with a 500 (which
+    would also break the uniform-error contract by revealing a well-formed id)."""
+    now = datetime.datetime.now(UTC)
+    over = make_survey_token(2**63, 1900, issued_at=now)  # one past int64 max
+    under = make_survey_token(-(2**63) - 1, 1900, issued_at=now)
+    assert verify_survey_token(over, now=now) is None
+    assert verify_survey_token(under, now=now) is None
+    # The boundary values themselves are in range and still resolve normally.
+    at_max = make_survey_token(2**63 - 1, 1900, issued_at=now)
+    assert verify_survey_token(at_max, now=now) == 2**63 - 1
+
+
 def test_a_token_signed_with_another_secret_is_rejected(fake_settings, monkeypatch):
     token = make_survey_token(42, 1900)
     other = _FakeSettings()

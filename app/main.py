@@ -170,6 +170,47 @@ async def security_headers_middleware(request: Request, call_next):
     return response
 
 
+# The largest body any legitimate endpoint accepts is a 20 MiB headshot
+# (`alumni._HEADSHOT_MAX_BYTES`); every other upload (CSV / donations / events
+# imports) caps at 4 MiB, and the JSON routes far lower. This ingress guard sits
+# above that single largest legitimate body, so it never refuses a real request
+# — it only bounds the absolute worst case.
+#
+# Defense-in-depth for a self-hosted / local deploy: in production Vercel's
+# ~4.5 MB Function request-body cap already rejects oversized bodies at the edge
+# before the function runs, but that edge cap does not exist off-Vercel, where
+# an unbounded body would be read and (for JSON) fully parsed before any
+# per-route size check applied. Checking Content-Length here short-circuits
+# before the route ever reads the body. A client that omits Content-Length
+# (streamed/chunked) slips past this one check and is still bounded by the
+# per-route `_read_capped` / field-byte caps downstream.
+_MAX_REQUEST_BODY_BYTES = 24 * 1024 * 1024  # 24 MiB — just above the 20 MiB headshot
+
+
+@app.middleware("http")
+async def request_body_size_limit_middleware(request: Request, call_next):
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > _MAX_REQUEST_BODY_BYTES:
+                mib = _MAX_REQUEST_BODY_BYTES // (1024 * 1024)
+                return JSONResponse(
+                    status_code=413,  # Content Too Large
+                    content={
+                        "error": {
+                            "code": "payload_too_large",
+                            "message": f"Request body is too large (limit {mib} MiB).",
+                        }
+                    },
+                    headers={"X-Content-Type-Options": "nosniff"},
+                )
+        except ValueError:
+            # A non-numeric Content-Length is malformed; let the server stack
+            # reject it rather than guessing at a size here.
+            pass
+    return await call_next(request)
+
+
 # Registered LAST, so it is the OUTERMOST middleware (Starlette wraps in reverse
 # registration order). That position is deliberate: it must see the final status
 # code of every response, and it must also see an exception that escaped the

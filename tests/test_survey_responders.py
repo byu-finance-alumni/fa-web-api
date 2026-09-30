@@ -98,7 +98,15 @@ def test_the_lists_hold_the_right_people_sorted_by_name(db):
 
 def test_only_the_minimal_fields_are_returned(db):
     _world(db)
-    assert set(_responders(db).replied[0].model_dump()) == {"alumni_id", "name"}
+    # id, display name, and the median-hover fill time (#543 follow-on) — and
+    # nothing that would need contacting the alum. On SQLite the fill time has
+    # no column, so it comes back None, but the field is always present.
+    assert set(_responders(db).replied[0].model_dump()) == {
+        "alumni_id",
+        "name",
+        "fill_seconds",
+    }
+    assert _responders(db).replied[0].fill_seconds is None
 
 
 def test_a_reply_superseded_by_a_reset_is_excluded_from_list_and_count(db):
@@ -182,21 +190,103 @@ def test_route_returns_both_lists_for_full_access(db):
     _world(db)
     resp = _get(_path(), db.session, _ctx("full_access"))
     assert resp.status_code == 200
+    # `fill_seconds` is None throughout: the SQLite test world has no timer
+    # column, so the median-hover field falls back exactly as it does for a
+    # cycle with no usable times yet (see the Postgres-shape tests below).
     assert resp.json() == {
         "replied": [
-            {"alumni_id": 2, "name": "A2 Adams"},
-            {"alumni_id": 3, "name": "A3 Moss"},
-            {"alumni_id": 1, "name": "A1 Young"},
+            {"alumni_id": 2, "name": "A2 Adams", "fill_seconds": None},
+            {"alumni_id": 3, "name": "A3 Moss", "fill_seconds": None},
+            {"alumni_id": 1, "name": "A1 Young", "fill_seconds": None},
         ],
         "confirmed": [
-            {"alumni_id": 2, "name": "A2 Adams"},
-            {"alumni_id": 3, "name": "A3 Moss"},
+            {"alumni_id": 2, "name": "A2 Adams", "fill_seconds": None},
+            {"alumni_id": 3, "name": "A3 Moss", "fill_seconds": None},
         ],
     }
 
 
 def test_route_404s_for_a_year_with_no_campaign(db):
     assert _get(_path(1999), db.session, _ctx("full_access")).status_code == 404
+
+
+# ----------------------------------------- median-hover fill time (#543) ------
+#
+# Each `replied` responder also carries the representative fill time behind the
+# "Median time to complete" hover. The value reads `survey_responses.fill_seconds`
+# / `cycle_seq`, columns the SQLite world above does not have, so the population
+# is proven by compiling the Postgres subquery (as the median's own tests do) and
+# the mapping is proven through the fake session — never both against a
+# hand-picked SQLite row.
+
+from sqlalchemy.dialects import postgresql  # noqa: E402
+
+from tests.test_survey_scheduler import QueueSession, _Res, _sched  # noqa: E402
+
+
+def _fill_sql(year=_YEAR):
+    return str(
+        ss._representative_fill_seconds(year).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+
+def test_representative_fill_time_uses_the_same_population_as_the_median():
+    sql = _fill_sql()
+    # The response's own `cycle_seq` joined to the schedule's current cycle —
+    # identical to `_cycle_fill_times`, so the hover never shows a time the
+    # median did not count.
+    assert (
+        "survey_schedule.graduation_year = survey_responses.graduation_year AND "
+        "survey_schedule.cycle_seq = survey_responses.cycle_seq" in sql
+    )
+    # A reply, by the shared definition: RESPONDED_STATUSES, in-window, not reset.
+    assert "IN ('pending', 'applied', 'confirmed')" in sql
+    assert "survey_responses.submitted_at >=" in sql
+    assert "survey_reset_log" in sql
+    # Only a usable value can be shown — a confirmation (no timer) and pre-column
+    # history are NULL and drop out, exactly as in the median.
+    assert "survey_responses.fill_seconds IS NOT NULL" in sql
+    assert "survey_responses.fill_seconds > 0" in sql
+    assert str(ss._FILL_SECONDS_MAX) in sql
+
+
+def test_representative_fill_time_is_the_most_recent_qualifying_response():
+    # One row per person, picked deterministically: the latest qualifying
+    # response's time. The median aggregates every qualifying row; the hover
+    # shows this one representative of them.
+    sql = _fill_sql()
+    assert "survey_responses.alumni_id = alumni.alumni_id" in sql
+    assert "ORDER BY survey_responses.submitted_at DESC" in sql
+    assert "LIMIT 1" in sql
+
+
+def test_fill_times_flow_through_to_the_repliers():
+    # Postgres path (QueueSession reports the pg dialect): `list_responders`
+    # runs the schedule lookup, then the replied names, then the confirmed
+    # names. A non-null time maps straight through; a null (no usable timer)
+    # becomes None so the hover omits that person.
+    session = QueueSession(
+        [
+            _Res(one=_sched(_YEAR, datetime.date(2026, 7, 1), status="active")),
+            _Res(
+                rows=[
+                    (2, None, "A2", "Adams", None),
+                    (3, None, "A3", "Moss", 200),
+                    (1, None, "A1", "Young", 45),
+                ]
+            ),  # replied
+            _Res(rows=[(2, None, "A2", "Adams", None)]),  # confirmed
+        ]
+    )
+    got = asyncio.run(ss.list_responders(session, _YEAR))
+    assert [(r.name, r.fill_seconds) for r in got.replied] == [
+        ("A2 Adams", None),
+        ("A3 Moss", 200),
+        ("A1 Young", 45),
+    ]
+    assert got.confirmed[0].fill_seconds is None
 
 
 # ------------------------------------------------- "No reply yet" export ------

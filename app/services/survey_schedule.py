@@ -70,7 +70,7 @@ import io
 import logging
 from collections.abc import Sequence
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, null, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import email_reach
@@ -627,9 +627,66 @@ def _display_name(
     return name or f"Alum #{alumni_id}"
 
 
+def _representative_fill_seconds(graduation_year: int):
+    """Correlated scalar subquery: the fill time to SHOW for ONE alum in the
+    "Median time to complete" hover (#543 follow-on), or NULL when they have no
+    usable recorded time for this cycle.
+
+    The population is :func:`_cycle_fill_times`'s exactly — the very rows the
+    median aggregates: a reply in :data:`survey_email.RESPONDED_STATUSES`, inside
+    the re-survey window, not superseded by a reset (#395), stamped to the year's
+    current ``cycle_seq`` (joined to ``survey_schedule`` the same way the median
+    is), with a non-null, in-range ``fill_seconds``. So every value this can
+    surface is itself one of the values behind the median.
+
+    An alum can have several qualifying timed responses and the median counts
+    them all; the hover shows ONE row per person, so the representative is picked
+    deterministically as the MOST RECENT of them (``max(submitted_at)``). NULL
+    (dropped from the hover) means the alum has no usable timed response at all
+    for this cycle — only confirmations (no timer) or history predating the
+    column. Correlated to :class:`Alumni` so it evaluates per responder row.
+
+    Postgres-only: it reads ``survey_responses.fill_seconds`` /
+    ``cycle_seq``, columns the lightweight SQLite test tables do not have, so
+    :func:`_responder_names` selects it only when :func:`_is_postgres`."""
+    return (
+        select(SurveyResponse.fill_seconds)
+        .join(
+            SurveySchedule,
+            (SurveySchedule.graduation_year == SurveyResponse.graduation_year)
+            & (SurveySchedule.cycle_seq == SurveyResponse.cycle_seq),
+        )
+        .where(
+            SurveyResponse.alumni_id == Alumni.alumni_id,
+            SurveyResponse.graduation_year == graduation_year,
+            SurveyResponse.fill_seconds.is_not(None),
+            SurveyResponse.fill_seconds > 0,
+            SurveyResponse.fill_seconds <= _FILL_SECONDS_MAX,
+            SurveyResponse.status.in_(_REPLIED_STATUSES),
+            SurveyResponse.submitted_at >= survey_email._resurvey_cutoff(),
+            survey_email.response_not_superseded(),
+        )
+        .order_by(SurveyResponse.submitted_at.desc())
+        .limit(1)
+        .correlate(Alumni)
+        .scalar_subquery()
+    )
+
+
 async def _responder_names(
     session: AsyncSession, graduation_year: int, status_filter: tuple[str, ...]
 ) -> list[SurveyResponder]:
+    # The per-person fill time behind the median hover rides on this same query
+    # so the year's names and their times come back in ONE round trip. It is a
+    # property of the response, not the send, and its column only exists on
+    # Postgres (see `_representative_fill_seconds`), so elsewhere — the SQLite
+    # service tests — every responder carries a NULL time, exactly as the median
+    # itself is skipped off Postgres.
+    fill_seconds_col = (
+        _representative_fill_seconds(graduation_year)
+        if _is_postgres(session)
+        else null()
+    ).label("fill_seconds")
     sub = (
         _cycle_responders(status_filter)
         .where(SurveySendLog.graduation_year == graduation_year)
@@ -641,6 +698,7 @@ async def _responder_names(
             Alumni.preferred_first_name,
             Alumni.first_name,
             Alumni.last_name,
+            fill_seconds_col,
         )
         .join(sub, sub.c.alumni_id == Alumni.alumni_id)
         # Archived alumni are NOT dropped, unlike the follow-up call sheet: the
@@ -651,21 +709,27 @@ async def _responder_names(
     rows = (await session.execute(stmt)).all()
     return [
         SurveyResponder(
-            alumni_id=alumni_id, name=_display_name(alumni_id, preferred, first, last)
+            alumni_id=alumni_id,
+            name=_display_name(alumni_id, preferred, first, last),
+            fill_seconds=int(fill_seconds) if fill_seconds is not None else None,
         )
-        for alumni_id, preferred, first, last in rows
+        for alumni_id, preferred, first, last, fill_seconds in rows
     ]
 
 
 async def list_responders(
     session: AsyncSession, graduation_year: int
 ) -> SurveyResponders | None:
-    """WHO is behind this year's ``replied`` and ``confirmed`` counts (#836).
+    """WHO is behind this year's ``replied`` and ``confirmed`` counts (#836),
+    and how long each took (the median hover, #543 follow-on).
 
     The Progress tab shows the counts; hovering one shows these names. Same
     population as the counts by construction (see :func:`_cycle_responders`).
-    Returns ``None`` when the year has no schedule (the route 404s), distinct
-    from a campaign nobody has answered yet (two empty lists).
+    Each ``replied`` responder also carries ``fill_seconds`` — the representative
+    time behind the "Median time to complete" hover, or ``None`` when they have
+    no usable recorded time (see :func:`_representative_fill_seconds`). Returns
+    ``None`` when the year has no schedule (the route 404s), distinct from a
+    campaign nobody has answered yet (two empty lists).
 
     Ordered by name — last, then first, then id — so a hover list is stable
     between refreshes and reads the way the follow-up call sheet does."""

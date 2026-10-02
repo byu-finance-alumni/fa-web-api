@@ -11,7 +11,6 @@ legacy `surveys` table — see `models.crm.Survey`.
 
 import contextlib
 import datetime
-import hmac
 from typing import Annotated, Literal
 
 from fastapi import (
@@ -19,7 +18,6 @@ from fastapi import (
     Depends,
     File,
     Form,
-    HTTPException,
     Path,
     Query,
     Request,
@@ -40,7 +38,7 @@ from app.api.routes.alumni import (
     _sniff_image_mime,
     _too_large_response,
 )
-from app.core.config import get_settings
+from app.core.cron import verify_cron_secret
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
 from app.core.rate_limit import (
@@ -1216,10 +1214,7 @@ async def _run_cron(request: Request, session: AsyncSession) -> SurveyScheduleRu
     absent) credential → 401. When ``CRON_SECRET`` is unset the endpoint rejects
     everything, so it is never open by default.
     """
-    expected = get_settings().cron_secret
-    provided = request.headers.get("Authorization", "")
-    if not expected or not hmac.compare_digest(provided, f"Bearer {expected}"):
-        raise HTTPException(status_code=401, detail="Invalid cron credentials.")
+    verify_cron_secret(request)
     return await survey_schedule.run_due_schedules(session)
 
 

@@ -8,6 +8,7 @@ can detect it and sign out cleanly. All exercised with fakes — no DB.
 """
 
 import asyncio
+import datetime
 import uuid
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from app.core.security import SessionSupersededError
 from app.main import app
 from app.models.user import User
 from app.schemas.auth import UserContext
+from app.services import auth_sessions
 
 _AUTH_UUID = "33333333-3333-3333-3333-333333333333"
 
@@ -142,7 +144,7 @@ class _RecordSession:
         self.commits += 1
 
 
-def test_record_login_claims_active_session():
+def test_record_login_claims_active_session(monkeypatch):
     db_user = SimpleNamespace(
         user_id=7,
         email="boss@byu.edu",
@@ -154,6 +156,13 @@ def test_record_login_claims_active_session():
 
     async def _session():
         yield session
+
+    # The claim is gated on the token's session being live in auth.sessions; the
+    # fakes have no such table, so stub the boundary helper to report it live.
+    async def _live(_session, _sid):
+        return datetime.datetime.now(datetime.UTC)
+
+    monkeypatch.setattr(auth_sessions, "live_session_created_at", _live)
 
     app.dependency_overrides[get_session] = _session
     app.dependency_overrides[get_current_db_user_allow_must_change] = (
@@ -171,6 +180,47 @@ def test_record_login_claims_active_session():
     assert resp.status_code == 200
     assert db_user.active_session_id == "sess-new"
     assert db_user.active_session_at is not None
+
+
+def test_record_login_does_not_claim_a_revoked_session(monkeypatch):
+    # Regression: after an engineer revokes an intruder's session (auth.sessions
+    # row deleted, sentinel stamped), the intruder's still-valid access token
+    # must NOT be able to re-claim the account via POST /auth/login. A revoked
+    # session is no longer live, so live_session_created_at returns None and the
+    # claim is refused — the sentinel stands and every data route keeps rejecting
+    # the token.
+    db_user = SimpleNamespace(
+        user_id=7,
+        email="boss@byu.edu",
+        last_login_at=None,
+        active_session_id="revoked:deadbeef",
+        active_session_at=datetime.datetime.now(datetime.UTC),
+    )
+    session = _RecordSession(db_user)
+
+    async def _session():
+        yield session
+
+    async def _not_live(_session, _sid):
+        return None
+
+    monkeypatch.setattr(auth_sessions, "live_session_created_at", _not_live)
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user_allow_must_change] = (
+        lambda: UserContext(
+            user_id=7,
+            auth_user_id=uuid.UUID(_AUTH_UUID),
+            roles=["view_only"],
+            session_id="sess-intruder",
+        )
+    )
+    with TestClient(app) as client:
+        resp = client.post("/auth/login")
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200  # best-effort endpoint never hard-fails
+    assert db_user.active_session_id == "revoked:deadbeef"  # sentinel unchanged
 
 
 # --- GET /auth/session/active reports without rejecting -----------------------

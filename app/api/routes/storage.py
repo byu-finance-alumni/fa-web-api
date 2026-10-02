@@ -14,11 +14,9 @@ change the frontend has no business knowing about.
 
 from __future__ import annotations
 
-import hmac
+from fastapi import APIRouter, Request
 
-from fastapi import APIRouter, HTTPException, Request
-
-from app.core.config import get_settings
+from app.core.cron import verify_cron_secret
 from app.schemas.storage import HeadshotSweepSummary
 from app.services import headshot_sweep
 
@@ -40,10 +38,7 @@ async def _run_headshot_sweep(request: Request) -> HeadshotSweepSummary:
     could trigger it would be able to spend the function's whole budget churning
     real alumni images.
     """
-    expected = get_settings().cron_secret
-    provided = request.headers.get("Authorization", "")
-    if not expected or not hmac.compare_digest(provided, f"Bearer {expected}"):
-        raise HTTPException(status_code=401, detail="Invalid cron credentials.")
+    verify_cron_secret(request)
     return await headshot_sweep.run_sweep()
 
 

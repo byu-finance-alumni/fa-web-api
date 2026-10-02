@@ -932,3 +932,78 @@ def test_delete_user_auth_failure_still_succeeds(monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
     assert session.deleted == [user]  # DB delete committed despite auth failure
+
+
+# --- privilege ceiling on reset / deactivate / rename (#178, takeover fix) ---
+#
+# These three account-mutating routes previously checked only the USER_ADMIN
+# capability, so a super_admin could reset the ENGINEER's password (and read the
+# temp password back), deactivate it, or rename it — i.e. take over or lock out
+# the top tier. They now apply the same _outranks_actor ceiling delete_user uses.
+
+
+def _engineer_target(user_id=5):
+    u = _fake_user(user_id)
+    u.roles = [SimpleNamespace(role_name="engineer")]
+    return u
+
+
+def test_reset_password_blocked_on_a_higher_tier():
+    """A super_admin cannot reset the password of a user holding engineer."""
+    user = _engineer_target(5)
+    session = _NameSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.post("/admin/users/5/reset-password")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    # Nothing was written (the reset is refused before touching auth/DB).
+    assert session.commits == 0
+    assert session.added == []
+
+
+def test_deactivate_blocked_on_a_higher_tier():
+    """A super_admin cannot deactivate a user holding engineer."""
+    user = _engineer_target(5)
+    session = _NameSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.patch("/admin/users/5", json={"active": False})
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    assert user.active is True  # unchanged
+    assert session.commits == 0
+
+
+def test_rename_blocked_on_a_higher_tier():
+    """A super_admin cannot rename a user holding engineer (audit-identity spoof)."""
+    user = _engineer_target(5)
+    session = _NameSession(user)
+
+    async def _session():
+        yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(
+        "super_admin", user_id=1
+    )
+    with TestClient(app) as client:
+        resp = client.patch("/admin/users/5/name", json={"first_name": "Mallory"})
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+    assert user.first_name == "Test"  # unchanged
+    assert session.commits == 0

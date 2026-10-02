@@ -307,6 +307,24 @@ def check_cron_auth(_routes) -> list[dict]:
     except Exception:  # already reported by check_unauthenticated_routes
         return []
     sources = {p: p.read_text(encoding="utf-8") for p in _py_files(ROUTES)}
+    # The cron routes may delegate their guard to the shared app/core/cron.py
+    # helper (verify_cron_secret) instead of inlining the check. Trust that name
+    # only after proving the helper itself verifies the secret in constant time —
+    # otherwise an empty stub named verify_cron_secret would read as guarded.
+    _cron_helper = ROOT / "app" / "core" / "cron.py"
+    _helper_src = (
+        _cron_helper.read_text(encoding="utf-8") if _cron_helper.exists() else ""
+    )
+    helper_sound = (
+        "def verify_cron_secret(" in _helper_src
+        and "cron_secret" in _helper_src
+        and "compare_digest" in _helper_src
+    )
+
+    def _is_guarded(text: str) -> bool:
+        if "cron_secret" in text and "compare_digest" in text:
+            return True
+        return helper_sound and "verify_cron_secret(" in text
     for verb, path, fn, _deps in live:
         if "/cron/" not in path:
             continue
@@ -336,12 +354,12 @@ def check_cron_auth(_routes) -> list[dict]:
         # route for a week when it verifies the secret via its POST twin.
         # A helper we cannot find in this file leaves guarded False, so an
         # unresolvable delegation still fails CLOSED.
-        guarded = "cron_secret" in body and "compare_digest" in body
+        guarded = _is_guarded(body)
         if not guarded:
             helper = re.search(r"return await (\w+)\(", body)
             if helper:
                 h = src[src.find(f"async def {helper.group(1)}(") :][:4000]
-                guarded = "cron_secret" in h and "compare_digest" in h
+                guarded = _is_guarded(h)
         if not guarded:
             findings.append(
                 {

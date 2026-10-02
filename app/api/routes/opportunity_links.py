@@ -41,10 +41,9 @@ routes and under the same style of rate limiter.
 """
 
 import datetime
-import hmac
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,7 +55,7 @@ from app.api.dependencies.auth import (
 )
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
-from app.core.config import get_settings
+from app.core.cron import verify_cron_secret
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError
 from app.core.security import AuthorizationError
@@ -371,10 +370,7 @@ async def opportunity_link_digest_cron(request: Request, session: SessionDep) ->
     ``include_in_schema=False``: no browser client calls it, so it stays out of
     the OpenAPI document and out of the generated frontend types.
     """
-    expected = get_settings().cron_secret
-    provided = request.headers.get("Authorization", "")
-    if not expected or not hmac.compare_digest(provided, f"Bearer {expected}"):
-        raise HTTPException(status_code=401, detail="Invalid cron credentials.")
+    verify_cron_secret(request)
     if not opportunity_link_alert.digest_due():
         # The twin entry's call, an hour off 6pm Mountain. A no-op, not an error:
         # a non-2xx here would read as a failing cron in the Vercel dashboard.

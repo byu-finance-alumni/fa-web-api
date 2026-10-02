@@ -317,10 +317,11 @@ def client():
 def _set_cron_secret(monkeypatch, value):
     from types import SimpleNamespace
 
-    import app.api.routes.storage as storage_routes
+    # The cron guard now lives in the shared app/core/cron.py helper.
+    import app.core.cron as cron_mod
 
     monkeypatch.setattr(
-        storage_routes, "get_settings", lambda: SimpleNamespace(cron_secret=value)
+        cron_mod, "get_settings", lambda: SimpleNamespace(cron_secret=value)
     )
 
 

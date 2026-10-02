@@ -30,7 +30,13 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.user import User
 from app.schemas.auth import AuthenticatedUser, UserContext
-from app.services import login_abuse, login_block, login_lockout, maintenance
+from app.services import (
+    auth_sessions,
+    login_abuse,
+    login_block,
+    login_lockout,
+    maintenance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +164,17 @@ def _clean(value: str | None) -> str | None:
     return value or None
 
 
+def _as_utc(value: datetime.datetime) -> datetime.datetime:
+    """Coerce a datetime to timezone-aware UTC so two sources can be compared.
+
+    ``active_session_at`` is stored tz-aware and ``auth.sessions.created_at`` is
+    timestamptz, so both normally arrive aware; this just guards against a naive
+    value slipping through and raising on the comparison."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.UTC)
+    return value
+
+
 class LoginRecordedResponse(BaseModel):
     """Acknowledgement that a successful sign-in was recorded, echoing the
     stamped time so a client could display it."""
@@ -219,9 +236,27 @@ async def record_login(
         # active session. A newer login overwrites it, so any earlier device's
         # session no longer matches and is rejected (forced logout) on the data
         # routes. Only claims when the token carried a session_id.
+        #
+        # The claim is GATED on the token's session still being live in
+        # auth.sessions (and not older than the current active session). Without
+        # this, a still-valid access token whose session an engineer just revoked
+        # (row deleted + sentinel stamped) could POST here and overwrite the
+        # sentinel with its own id — re-accepting the revoked session for up to
+        # an hour and undoing the revoke in one request. A genuine fresh sign-in
+        # always has a live, newer auth.sessions row, so it still passes; a
+        # revoked session's row is gone, and an older surviving device cannot
+        # evict a newer one by replaying this call.
         if user.session_id:
-            db_user.active_session_id = user.session_id
-            db_user.active_session_at = now
+            claimed_at = await auth_sessions.live_session_created_at(
+                session, user.session_id
+            )
+            if claimed_at is not None and (
+                db_user.active_session_at is None
+                or user.session_id == db_user.active_session_id
+                or _as_utc(claimed_at) >= _as_utc(db_user.active_session_at)
+            ):
+                db_user.active_session_id = user.session_id
+                db_user.active_session_at = now
         session.add(
             LoginEvent(
                 user_id=db_user.user_id,

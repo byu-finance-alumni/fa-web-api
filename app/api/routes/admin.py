@@ -127,6 +127,26 @@ def _outranks_actor(actor: UserContext, role_name: str) -> bool:
     return _role_rank(role_name) < _actor_ceiling_rank(actor)
 
 
+def _enforce_actor_ceiling(actor: UserContext, user: "User", action: str) -> None:
+    """Refuse an admin action on a target whose highest role outranks the actor.
+
+    The same #178 privilege ceiling ``delete_user``/``assign_role`` apply, factored
+    out so every account-mutating endpoint enforces it: ranking the target's
+    highest role via ROLE_ORDER stops a lower role that was delegated USER_ADMIN
+    from acting on a super_admin/engineer (e.g. a super_admin resetting the
+    engineer's password and taking the account over). ``action`` is a short verb
+    phrase for the message, e.g. ``"reset the password for"``.
+    """
+    target_roles = {r.role_name for r in user.roles}
+    highest_target = min(target_roles, key=_role_rank, default=None)
+    if highest_target is not None and _outranks_actor(actor, highest_target):
+        label = ROLE_LABELS.get(highest_target, highest_target)
+        raise AuthorizationError(
+            f"You cannot {action} a user who holds the {label} role; "
+            "it is above your privilege tier."
+        )
+
+
 # --- Name validation ---------------------------------------------------------
 #
 # Mirror the alumni NAME rules (app/schemas/alumni.py): a permissive deny-list so
@@ -1837,6 +1857,7 @@ async def set_user_active(
         raise ConflictError("You cannot deactivate your own account.")
 
     user = await _load_user(session, user_id)
+    _enforce_actor_ceiling(actor, user, "change the active status of")
 
     if user.active != payload.active:
         old_active = user.active
@@ -2143,6 +2164,7 @@ async def reset_password(
     hand to the user; the user should change it on next login.
     """
     user = await _load_user(session, user_id)
+    _enforce_actor_ceiling(actor, user, "reset the password for")
 
     temp_password = _generate_temp_password()
 
@@ -2313,6 +2335,7 @@ async def update_user_name(
     fields sent) is idempotent and not audited. 404 if the user doesn't exist.
     """
     user = await _load_user(session, user_id)
+    _enforce_actor_ceiling(actor, user, "rename")
 
     changes = payload.model_dump(exclude_unset=True)
     audited = False

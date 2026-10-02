@@ -197,6 +197,55 @@ async def list_active(
     return mappings, int(total or 0)
 
 
+# --- liveness (for the single-session CLAIM) ---------------------------------
+
+# One LIVE session by id. Same ``not_after`` liveness filter as the listing, so a
+# revoked row (deleted) or an expired one both read as "not live".
+_SQL_SESSION_LIVE = text(
+    """
+    SELECT s.created_at AS created_at
+      FROM auth.sessions s
+     WHERE s.id = CAST(:session_id AS uuid)
+       AND (s.not_after IS NULL OR s.not_after > now())
+    """
+)
+
+
+async def live_session_created_at(
+    session: AsyncSession, session_id: str
+) -> datetime.datetime | None:
+    """Creation time of the LIVE ``auth.sessions`` row for ``session_id``, else None.
+
+    ``None`` means the id is not a currently-live session — it was revoked (row
+    deleted), has expired, or never existed. The single-session CLAIM
+    (``POST /auth/login``) uses this to refuse claiming a session that is not
+    live, so a revoked-but-not-yet-expired access token can no longer re-claim
+    the account and undo a revoke, and (via the returned timestamp) an older
+    surviving device cannot evict a newer one by replaying the claim.
+
+    A missing/malformed (non-UUID) id returns ``None`` WITHOUT touching the DB —
+    validating in Python first avoids a failed CAST poisoning the caller's
+    transaction. A store that genuinely cannot be read raises ServiceError, like
+    the other readers here.
+    """
+    if not session_id:
+        return None
+    try:
+        uuid.UUID(session_id)
+    except (ValueError, TypeError):
+        return None
+    try:
+        return await session.scalar(_SQL_SESSION_LIVE, {"session_id": session_id})
+    except SQLAlchemyError as exc:
+        logger.error(
+            "Could not read auth.sessions for a login claim", exc_info=True
+        )
+        raise ServiceError(
+            "The sign-in could not be verified: the authentication session "
+            "store could not be read."
+        ) from exc
+
+
 # --- revocation --------------------------------------------------------------
 
 # Deleting the session row cascades to auth.refresh_tokens (and

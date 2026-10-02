@@ -129,6 +129,7 @@ def _db_user(*roles: str, user_id: int = 1, active_session_id: str | None = None
         active=True,
         must_change_password=False,
         active_session_id=active_session_id,
+        active_session_at=None,
         roles=[SimpleNamespace(role_name=r) for r in roles],
     )
 
@@ -233,6 +234,17 @@ def test_engineer_can_record_a_fresh_login_while_maintenance_is_active(
         maintenance_row=_row(enabled=True),
         user_row=_db_user("engineer"),
     )
+
+    # The claim reads auth.sessions to confirm the token's session is live; the
+    # fake session has no such table, so stub that boundary helper.
+    import datetime as _dt
+
+    from app.services import auth_sessions
+
+    async def _live(_session, _sid):
+        return _dt.datetime.now(_dt.UTC)
+
+    monkeypatch.setattr(auth_sessions, "live_session_created_at", _live)
 
     with _client(
         session, roles=("engineer",), monkeypatch=monkeypatch, token_session="sess-new"

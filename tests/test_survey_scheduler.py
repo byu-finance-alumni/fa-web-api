@@ -1813,10 +1813,12 @@ def client():
 
 
 def _set_cron_secret(monkeypatch, value):
-    import app.api.routes.survey as survey_routes
+    # The cron guard now lives in the shared app/core/cron.py helper, so the
+    # secret is read there, not in the route module.
+    import app.core.cron as cron_mod
 
     monkeypatch.setattr(
-        survey_routes, "get_settings", lambda: SimpleNamespace(cron_secret=value)
+        cron_mod, "get_settings", lambda: SimpleNamespace(cron_secret=value)
     )
 
 
@@ -1843,6 +1845,24 @@ def test_cron_rejects_wrong_secret(client, monkeypatch):
     _stub_run(monkeypatch, ran)
     resp = client.post(
         "/survey/cron/run", headers={"Authorization": "Bearer nope"}
+    )
+    assert resp.status_code == 401
+    assert ran == []
+
+
+def test_cron_rejects_non_ascii_authorization_header(client, monkeypatch):
+    # Regression: a non-ASCII Authorization header once reached
+    # hmac.compare_digest as a str and raised TypeError -> an unauthenticated
+    # 500 (and a false "outage" alert) instead of a clean 401. The guard now
+    # compares bytes, so this is a plain 401 and the job never runs.
+    ran = []
+    _set_cron_secret(monkeypatch, "topsecret")
+    _stub_run(monkeypatch, ran)
+    # Sent as RAW BYTES: a real client can put a 0xE9 byte in the header, which
+    # Starlette decodes as latin-1. (httpx refuses to ascii-encode a str with it,
+    # so bytes is the only way to reproduce what reaches the server.)
+    resp = client.post(
+        "/survey/cron/run", headers={"Authorization": b"Bearer caf\xe9"}
     )
     assert resp.status_code == 401
     assert ran == []

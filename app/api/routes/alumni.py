@@ -57,6 +57,7 @@ from app.core.rate_limit import (
     HeadshotWriteRateLimit,
     InteractionWriteRateLimit,
     TaskWriteRateLimit,
+    read_rate_limiter,
 )
 from app.core.security import AuthorizationError
 from app.models.alumni import Alumni
@@ -798,6 +799,54 @@ _HEADSHOT_BULK_CONCURRENCY = 8
 # single invocation can be asked to do.
 _HEADSHOT_BATCH_MAX = 100
 
+# --- Headshots for non-editors: served THROUGH the site, never signed ---------
+#
+# A headshot's object key IS the alumnus's net ID, and a Supabase signed URL
+# carries that key twice (in the path and inside the token's payload). Net ID is
+# a VIEW_ONLY_HIDDEN_FIELD — nulled on every read for a caller without
+# ``can_edit_alumni`` — so handing such a caller a signed URL leaked the very
+# field the rest of the API hides (2026-10-02 breach test). For them the two URL
+# routes below return an APP-RELATIVE proxy path instead; the app's route handler
+# at that path calls :func:`get_headshot_image` with the viewer's own token and
+# streams the bytes back. Editors keep direct signed URLs: they can read the net
+# ID anyway, and a direct URL costs no function invocation or egress through us.
+#
+# The path is the app's route (fa-web-app ``src/app/api/headshot/[id]``), not an
+# API route, so the browser only ever talks to the app's own origin ('self' in
+# its CSP) and never sees the API host, the bucket or a token.
+_HEADSHOT_PROXY_PATH = "/api/headshot/{alumni_id}"
+# Mirrors the app's HEADSHOT_CACHE_SECONDS (the 10-minute signed-URL cache), so a
+# browser holds a proxied photo exactly as long as it would a signed URL. PRIVATE:
+# the response is per-viewer authenticated content and must never sit in a
+# shared cache (CDN / proxy).
+_HEADSHOT_IMAGE_CACHE_CONTROL = "private, max-age=600"
+# Vercel caps a function RESPONSE body at ~4.5 MB, the same as a request body
+# (see the bulk-import note below). Stored headshots are normally our own
+# ~1024px re-encode (well under 1 MB), but a bulk import lands the raw upload and
+# the nightly sweep only shrinks it later — so anything over this is re-encoded
+# on the fly (NOT written back; the sweep owns that) rather than failing at the
+# platform edge.
+_HEADSHOT_IMAGE_MAX_PASSTHROUGH_BYTES = 4 * 1024 * 1024
+# Its own read budget rather than the browse one: a roster page renders 25
+# photos, so counting each against ``read:browse`` (240/min, 2,400/h, sized for
+# ~2 hits per page) would 429 an ordinary non-editor paging the roster — and a
+# browse 429 pages the security channel. Sized the same way that budget was:
+# clicking through roster pages as fast as they render (~40/min x 25 photos) is
+# ~1,000/min, a physical ceiling; 600/min and 6,000/h (the whole ~1,800-row
+# roster three times an hour) clear any real session while still braking a
+# loop. Same per-user, per-instance, alert-on-trip semantics as every read
+# limiter (``read_rate_limiter``).
+_HEADSHOT_IMAGE_WINDOWS: tuple[tuple[int, float], ...] = ((600, 60.0), (6000, 3600.0))
+HeadshotImageReadRateLimit = Annotated[
+    UserContext,
+    Depends(read_rate_limiter("read:headshot-image", windows=_HEADSHOT_IMAGE_WINDOWS)),
+]
+
+
+def _headshot_proxy_path(alumni_id: int) -> str:
+    """The app-relative URL a non-editor is given in place of a signed URL."""
+    return _HEADSHOT_PROXY_PATH.format(alumni_id=int(alumni_id))
+
 
 def _net_id_from_filename(name: str) -> str:
     """Derive the net_id from an image file name: basename minus extension.
@@ -1239,7 +1288,14 @@ async def get_headshot_urls(
                     return None
 
         signed = await asyncio.gather(*(_sign(net_id) for _, net_id in targets))
+        # A non-editor must never receive the signed URL — its path and token
+        # both carry the net ID (see ``_HEADSHOT_PROXY_PATH``). The signing call
+        # still runs for them: it is the existence check, so a row with no image
+        # stays ``null`` (initials) instead of a proxy path that would 404.
+        can_see_key = user.can_edit_alumni
         for (alumni_id, _), url in zip(targets, signed, strict=True):
+            if url is not None and not can_see_key:
+                url = _headshot_proxy_path(alumni_id)
             urls[alumni_id] = url
     return HeadshotUrls(urls=urls)
 
@@ -1253,16 +1309,93 @@ async def get_headshot(
     """Return a short-lived signed URL for the alumnus's headshot, or
     ``{"url": null}`` when none is set. Any authenticated view role may fetch it
     (the headshot shows on the profile); the bucket is private so the signed URL
-    is the only way to view the image and it expires within the hour."""
-    # An archived alumnus 404s below full_access, like the profile/core reads
-    # and the batch route above.
-    alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
-    if alumnus is None or (alumnus.archived and not _has_full_access(user)):
-        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    is the only way to view the image and it expires within the hour.
+
+    A caller without ``can_edit_alumni`` gets the app-relative proxy path
+    (``/api/headshot/<id>``) instead of the signed URL, which would disclose the
+    net ID — see ``_HEADSHOT_PROXY_PATH``."""
+    alumnus = await _readable_headshot_alumnus(session, user, alumni_id)
     net_id = (alumnus.net_id or "").strip()
     if not net_id:
         return {"url": None}
-    return {"url": await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id)}
+    signed = await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id)
+    if signed is not None and not user.can_edit_alumni:
+        return {"url": _headshot_proxy_path(alumni_id)}
+    return {"url": signed}
+
+
+async def _readable_headshot_alumnus(
+    session: AsyncSession, user: UserContext, alumni_id: int
+) -> Alumni:
+    """The alumnus whose headshot ``user`` may read, or 404.
+
+    An archived alumnus 404s below full_access, like the profile/core reads and
+    the batch route above — one rule shared by the URL read and the image read so
+    the proxy can't become a way round it."""
+    alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
+    if alumnus is None or (alumnus.archived and not _has_full_access(user)):
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    return alumnus
+
+
+@router.get(
+    "/{alumni_id}/headshot/image",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"image/jpeg": {}, "image/png": {}, "image/webp": {}},
+            "description": "The headshot image bytes.",
+        },
+        404: {"description": "No such (readable) alumnus, or no headshot on file."},
+    },
+)
+async def get_headshot_image(
+    alumni_id: IdPath,
+    user: HeadshotImageReadRateLimit,
+    session: SessionDep,
+) -> Response:
+    """Stream the alumnus's headshot IMAGE itself (any view role).
+
+    The backing read for the app's ``/api/headshot/<id>`` route handler, which
+    is what a non-editor's ``<img src>`` points at (see ``_HEADSHOT_PROXY_PATH``).
+    Same gate and archived rule as ``GET /alumni/{id}/headshot``. Every "nothing
+    to show" case — no net ID, nothing stored, bytes that are not a JPEG/PNG/WebP
+    — is a plain 404 so the avatar falls back to initials, and nothing in the
+    response (body, headers, error message) names the net ID or the bucket.
+
+    The bytes are SNIFFED, never trusted: the served ``Content-Type`` comes from
+    the magic bytes, and anything else is refused rather than sent with a label
+    a browser might act on. ``nosniff`` pins that."""
+    alumnus = await _readable_headshot_alumnus(session, user, alumni_id)
+    net_id = (alumnus.net_id or "").strip()
+    not_found = NotFoundError("No headshot is on file for this alumnus.")
+    if not net_id:
+        raise not_found
+    data = await supabase_storage.download_object_or_none(_HEADSHOT_BUCKET, net_id)
+    if not data:
+        raise not_found
+    mime = _sniff_image_mime(data)
+    if mime is None:
+        raise not_found
+    if len(data) > _HEADSHOT_IMAGE_MAX_PASSTHROUGH_BYTES:
+        # An un-swept raw bulk upload: too big to pass through the platform's
+        # response cap, so serve our standard re-encode instead (Pillow work is
+        # CPU-bound — off the event loop). Unreadable -> initials, like missing.
+        try:
+            data = await asyncio.to_thread(images.normalise_headshot, data)
+        except InvalidRequestError:
+            raise not_found from None
+        mime = _HEADSHOT_NORMALISED_MIME
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": _HEADSHOT_IMAGE_CACHE_CONTROL,
+            "X-Content-Type-Options": "nosniff",
+            # Deliberately no filename: the object key is the net ID.
+            "Content-Disposition": "inline",
+        },
+    )
 
 
 @router.delete("/{alumni_id}/headshot", status_code=204)

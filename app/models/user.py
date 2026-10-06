@@ -54,9 +54,11 @@ class User(TimestampMixin, Base):
         Boolean, nullable=False, server_default=text("false")
     )
     # Hard account lock set after too many failed logins (see
-    # app/services/login_lockout.py). While ``locked_at`` is non-null the account
-    # is denied at the pre-login precheck regardless of credentials; only a
-    # super_admin password reset clears it.
+    # app/services/login_lockout.py). While ``locked_at`` is non-null every
+    # authenticated request from the account is refused (403 / account_locked,
+    # engineers exempt — see app/api/dependencies/auth.py); the unauthenticated
+    # pre-login routes deliberately never reveal it. Only a super_admin password
+    # reset clears it.
     locked_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )

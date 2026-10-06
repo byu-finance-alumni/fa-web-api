@@ -20,7 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit_context import set_audit_actor
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
+from app.core.roles import RoleName
 from app.core.security import (
+    AccountLockedError,
     AuthError,
     AuthorizationError,
     DeactivatedAccountError,
@@ -86,6 +88,24 @@ async def get_current_db_user_allow_must_change(
     the user exists but has been deactivated — the latter is enforced here so a
     deactivated account is blocked on EVERY authenticated route, not just at the
     point of deactivation, and surfaces as its own security event.
+
+    Also raises AccountLockedError (403 / ``account_locked``) for a HARD-LOCKED
+    account (``users.locked_at`` set), on the same every-route basis and for the
+    same reason. The lock used to be enforced only by the frontend's pre-login
+    check, so a locked user who already held a token, or who signed in directly
+    against Supabase, was never refused by the API. Enforcing it here (and NOT in
+    the unauthenticated pre-login routes) is also what lets those routes stay
+    identical for real and unknown emails. It sits on this BASE resolver, so
+    ``POST /auth/login`` is refused too: a locked account can neither claim the
+    single active session (#147) nor clear its failed-login counter.
+
+    ENGINEERS ARE EXEMPT from the lock, for the same reason they are exempt from
+    maintenance mode: the #178 ceiling stops anyone else resetting an engineer's
+    password, which is the only thing that clears a lock — and the lock can be
+    armed by anonymous failed-login reports. Enforcing it on the engineer would
+    let a stranger lock the one account that can recover everything else, with
+    no way back but hand-run SQL. The lock is still RECORDED on the engineer's
+    row (visible in user management); it just doesn't refuse them.
     """
     try:
         auth_uuid = uuid.UUID(current.auth_user_id)
@@ -97,6 +117,10 @@ async def get_current_db_user_allow_must_change(
         raise AuthorizationError("Your account is not provisioned for access.")
     if not user.active:
         raise DeactivatedAccountError()
+    if user.locked_at is not None and not any(
+        role.role_name == RoleName.ENGINEER.value for role in user.roles
+    ):
+        raise AccountLockedError()
 
     # NOTE (#182): the rolling failed-login counter is NO LONGER cleared here.
     # This resolver runs on EVERY authenticated request (data routes, the

@@ -204,8 +204,11 @@ def test_lockout_still_trips_through_the_route(client):
     body = _record(c, email="alum@byu.edu").json()
     assert user.locked_at is not None
     assert user.locked_reason == login_lockout.LOCK_REASON_TOO_MANY_FAILED
-    assert body["reason"] == "locked"
+    # The lock is armed, but the anonymous caller is told only "cooldown" — the
+    # same thing an address with no account gets (see the test below).
+    assert body["reason"] == "cooldown"
     assert body["allowed"] is False
+    assert body["retry_after_seconds"] is not None
 
 
 def test_cooldown_still_trips_through_the_route(client):
@@ -243,24 +246,62 @@ def _responses_for(user, email, n):
 
 
 def test_registered_and_unregistered_emails_are_indistinguishable():
-    """Anti-enumeration. Below the lock threshold the two must be byte-identical:
-    `locked` is never echoed, and the cooldown path applies to an address with no
-    account too. (At and above LOCK_THRESHOLD the reason legitimately becomes
-    `locked` for a real account — that distinction is INTERNAL, and the frontend
-    collapses both reasons into one message; see login_lockout's module docstring.)
+    """Anti-enumeration. Driven PAST the lock threshold, a real account, an
+    already-locked account and an address with no account must produce
+    byte-identical responses, failure for failure, and on the precheck after.
+    The real account does get hard-locked along the way — it just isn't said
+    here; the lock is enforced after authentication (403 / account_locked).
+
+    This used to stop one short of the threshold, because at the threshold the
+    real account answered `locked` (no timer) while the unknown one answered
+    `cooldown` (with a timer) — an anonymous "this is a real staff account" probe.
     """
-    n = login_lockout.LOCK_THRESHOLD - 1
-    registered = _responses_for(
-        SimpleNamespace(user_id=2, email="alum@byu.edu", locked_at=None, locked_reason=None),
-        "alum@byu.edu",
+    n = login_lockout.LOCK_THRESHOLD + 2
+    fresh = SimpleNamespace(user_id=2, email="alum@byu.edu", locked_at=None, locked_reason=None)
+    registered = _responses_for(fresh, "alum@byu.edu", n)
+    rate_limit.reset()
+    already_locked = _responses_for(
+        SimpleNamespace(
+            user_id=3,
+            email="locked@byu.edu",
+            locked_at=_now(),
+            locked_reason=login_lockout.LOCK_REASON_TOO_MANY_FAILED,
+        ),
+        "locked@byu.edu",
         n,
     )
     rate_limit.reset()
     unknown = _responses_for(None, "nobody@example.com", n)
 
+    assert fresh.locked_at is not None  # the sticky lock still trips
     assert registered == unknown
-    # And the shape never leaks the internal flag.
-    assert all(set(b) == {"allowed", "reason", "retry_after_seconds"} for b in registered)
+    assert already_locked == unknown
+    # And no body ever says "locked" or leaks the internal flag.
+    for body in registered + already_locked:
+        assert set(body) == {"allowed", "reason", "retry_after_seconds"}
+        assert body["reason"] in {"ok", "cooldown"}
+
+
+def test_precheck_for_a_locked_account_matches_an_unknown_address(client):
+    """The cold probe: no failures recorded, just ask. A hard-locked real account
+    must answer exactly like an address that has never existed."""
+    c, session = client
+    session.user = SimpleNamespace(
+        user_id=2,
+        email="alum@byu.edu",
+        locked_at=_now(),
+        locked_reason=login_lockout.LOCK_REASON_TOO_MANY_FAILED,
+    )
+    locked = _precheck(c, email="alum@byu.edu")
+    session.user = None
+    unknown = _precheck(c, email="nobody@example.com")
+
+    assert locked.status_code == unknown.status_code == 200
+    assert locked.json() == unknown.json() == {
+        "allowed": True,
+        "reason": "ok",
+        "retry_after_seconds": None,
+    }
 
 
 def test_a_throttled_request_says_nothing_about_the_email(client):

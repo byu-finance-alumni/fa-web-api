@@ -376,6 +376,7 @@ def test_authenticated_read_path_does_not_clear_login_attempts(monkeypatch):
         last_name="B",
         active=True,
         must_change_password=False,
+        locked_at=None,
         active_session_id=None,
         roles=[SimpleNamespace(role_name="view_only")],
     )

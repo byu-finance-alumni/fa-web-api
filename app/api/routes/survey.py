@@ -27,7 +27,6 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
-    RequireAlumniExport,
     RequireEngineer,
     RequireSurveysManage,
 )
@@ -47,6 +46,7 @@ from app.core.rate_limit import (
     SURVEY_PHOTO_LIMITER,
     SURVEY_RESPOND_READ_LIMITER,
     SURVEY_SUBMIT_LIMITER,
+    ExportReadRateLimit,
 )
 from app.models.audit import AuditLog
 from app.schemas.opportunity_link import (
@@ -920,7 +920,7 @@ def _no_reply_csv_response(csv_text: str, scope: str) -> Response:
 # that way — FastAPI matches in declaration order and would 422 on the int.
 @router.get("/schedules/no-reply/export", response_model=None)
 async def export_survey_no_reply_all(
-    user: RequireAlumniExport, session: SessionDep
+    user: ExportReadRateLimit, session: SessionDep
 ) -> Response:
     """Every year's "No reply yet" people as one CSV (#836).
 
@@ -939,7 +939,7 @@ async def export_survey_no_reply_all(
 @router.get("/schedules/{grad_year}/no-reply/export", response_model=None)
 async def export_survey_no_reply(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireAlumniExport,
+    user: ExportReadRateLimit,
     session: SessionDep,
 ) -> Response:
     """This year's "No reply yet" people as a CSV download (#836).

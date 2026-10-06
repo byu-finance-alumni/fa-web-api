@@ -49,8 +49,10 @@ from app.core.database import get_session
 from app.core.dropdowns import EMPLOYMENT_STATUSES, parse_designation_tokens
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.core.rate_limit import (
+    BrowseReadRateLimit,
     BulkHeadshotRateLimit,
     EmploymentWriteRateLimit,
+    ExportReadRateLimit,
     HeadshotWriteRateLimit,
     InteractionWriteRateLimit,
     TaskWriteRateLimit,
@@ -137,7 +139,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("", response_model=AlumniPage)
 async def list_alumni(
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     session: SessionDep,
     q: Annotated[
         str | None,
@@ -1154,7 +1156,7 @@ async def confirm_headshot_upload(
 
 @router.get("/headshots/urls", response_model=HeadshotUrls)
 async def get_headshot_urls(
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     session: SessionDep,
     alumni_ids: Annotated[list[int], Query()],
 ) -> HeadshotUrls:
@@ -1214,7 +1216,7 @@ async def get_headshot_urls(
 @router.get("/{alumni_id}/headshot")
 async def get_headshot(
     alumni_id: IdPath,
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     session: SessionDep,
 ) -> dict:
     """Return a short-lived signed URL for the alumnus's headshot, or
@@ -1863,7 +1865,7 @@ async def update_import_alumni(
 
 @router.get("/import/update/export", response_model=None)
 async def export_cohort_update_template(
-    user: RequireAlumniExport,
+    user: ExportReadRateLimit,
     session: SessionDep,
     grad_year: Annotated[int | None, Query(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)] = None,
     class_year: Annotated[
@@ -1930,7 +1932,7 @@ async def alumni_export_columns(_: RequireAlumniExport) -> ExportColumnCatalog:
 @router.post("/export", response_model=None)
 async def export_alumni(
     payload: AlumniExportRequest,
-    user: RequireAlumniExport,
+    user: ExportReadRateLimit,
     session: SessionDep,
 ) -> Response | JSONResponse:
     """Export the filtered alumni list as CSV with the chosen columns
@@ -1980,7 +1982,9 @@ async def export_alumni(
 
 
 @router.get("/{alumni_id}", response_model=AlumniRead)
-async def get_alumni(alumni_id: IdPath, user: RequireViewAccess, session: SessionDep) -> AlumniRead:
+async def get_alumni(
+    alumni_id: IdPath, user: BrowseReadRateLimit, session: SessionDep
+) -> AlumniRead:
     """Single lightweight alumni core record.
 
     Archived records 404 (they were removed from the directory). view_only
@@ -1994,7 +1998,7 @@ async def get_alumni(alumni_id: IdPath, user: RequireViewAccess, session: Sessio
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
 async def get_alumni_profile(
     alumni_id: IdPath,
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     config: PermissionConfig,
     session: SessionDep,
 ) -> ProfileRead:
@@ -2036,7 +2040,7 @@ async def get_alumni_profile(
     response_model_exclude={"audit"},
 )
 async def export_alumni_profile(
-    alumni_id: IdPath, user: RequireAlumniExport, session: SessionDep
+    alumni_id: IdPath, user: ExportReadRateLimit, session: SessionDep
 ) -> dict:
     """Server-side, audited profile export (full_access).
 

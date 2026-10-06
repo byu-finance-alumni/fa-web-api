@@ -30,7 +30,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     RequireAlumniCreate,
-    RequireAlumniExport,
     RequireEventsCreate,
     RequireEventsImport,
     RequireEventsManage,
@@ -40,6 +39,7 @@ from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.friend_id import friend_id_for
+from app.core.rate_limit import ExportReadRateLimit
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -522,7 +522,7 @@ async def list_event_attendees(
 
 @router.get("/{event_id}/attendees/export")
 async def export_event_attendees(
-    event_id: IdPath, user: RequireAlumniExport, session: SessionDep
+    event_id: IdPath, user: ExportReadRateLimit, session: SessionDep
 ) -> Response:
     """Download an event's attendee list as CSV — columns **Name, Email, Net ID**
     (#219). Gated at ``full_access`` (a rung above the view-only attendee list)

@@ -48,6 +48,7 @@ from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.dropdowns import EMPLOYMENT_STATUSES, parse_designation_tokens
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
+from app.core.friend_id import parse_friend_id
 from app.core.rate_limit import (
     BulkHeadshotRateLimit,
     EmploymentWriteRateLimit,
@@ -65,6 +66,7 @@ from app.schemas.alumni import (
     _YEAR_MIN as _GRAD_YEAR_MIN,
 )
 from app.schemas.alumni import (
+    VIEW_ONLY_HIDDEN_FIELDS,
     AlumniCreateFull,
     AlumniListItem,
     AlumniLocation,
@@ -75,7 +77,11 @@ from app.schemas.alumni import (
     HeadshotUrls,
     minimize_alumni_read,
 )
-from app.schemas.alumni_export import AlumniExportRequest, ExportColumnCatalog
+from app.schemas.alumni_export import (
+    AlumniExportFilters,
+    AlumniExportRequest,
+    ExportColumnCatalog,
+)
 from app.schemas.auth import UserContext
 from app.schemas.filters import FilterOptions
 from app.schemas.imports import (
@@ -128,6 +134,13 @@ from app.services import profile as profile_service
 router = APIRouter(prefix="/alumni", tags=["alumni"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+def _has_full_access(user: UserContext) -> bool:
+    """full_access-and-up (engineer / super_admin / full_access): the tier that
+    may see archived rows and use the contact-PII filters."""
+    return user.is_full_access or user.is_super_admin or user.is_engineer
+
 
 # The repeatable/CSV ``designations`` query param (#404) is normalized +
 # validated by ``dropdowns.parse_designation_tokens`` (values: DESIGNATION_TOKENS
@@ -496,7 +509,7 @@ async def list_alumni(
 ) -> AlumniPage:
     # Archived rows are full_access-and-up only: a view_only / student caller
     # passing ``include_archived=true`` must NOT receive soft-deleted records.
-    has_full_access = user.is_full_access or user.is_super_admin or user.is_engineer
+    has_full_access = _has_full_access(user)
     effective_include_archived = include_archived and has_full_access
     # The exact-email filter is a contact-PII enumeration oracle: a low-privilege
     # (view_only / student) caller could confirm an email belongs to a specific
@@ -504,6 +517,18 @@ async def list_alumni(
     # full_access-and-up; below that it's silently ignored (AND'd away like
     # include_archived) rather than 422'd, so a stray param can't leak.
     email = email if has_full_access else None
+    # Same rule for the fields a non-editor gets NULLED (VIEW_ONLY_HIDDEN_FIELDS:
+    # net_id, gender, byu_id via ``q``): a response that hides the value but a
+    # filter / sort / total that still reacts to it recovers the value anyway
+    # (``net_id=a`` -> 3 hits, ``net_id=ab`` -> 1 ...). Gated on
+    # ``can_edit_alumni`` — the same test ``minimize_alumni_read`` uses to null
+    # them — and silently ignored like ``email``. A friend id typed in the Net ID
+    # box (#538) is kept: it names a primary key, which every caller can see.
+    can_see_hidden = user.can_edit_alumni
+    if not can_see_hidden:
+        net_id = net_id if parse_friend_id(net_id) is not None else None
+        gender = None
+        sort = None if sort in VIEW_ONLY_HIDDEN_FIELDS else sort
     # "Needs surveying" is an admin-tier view (engineer / super_admin /
     # full_access = "admin"). student and view_only ("professor") are denied
     # server-side — a 403, not a silent ignore, so the access decision is
@@ -604,6 +629,7 @@ async def list_alumni(
         duplicate=duplicate,
         is_alumni=is_alumni_filter,
         include_archived=effective_include_archived,
+        match_ids=can_see_hidden,
         sort=sort,
     )
     # Search/disclosure audit: record the actor + a short filter summary (never
@@ -1179,9 +1205,14 @@ async def get_headshot_urls(
             f"At most {_HEADSHOT_BATCH_MAX} alumni ids may be requested at once."
         )
 
-    rows = (
-        await session.scalars(select(Alumni).where(Alumni.alumni_id.in_(unique_ids)))
-    ).all()
+    stmt = select(Alumni).where(Alumni.alumni_id.in_(unique_ids))
+    # Archived rows are full_access-and-up only, exactly as on GET /alumni
+    # (``include_archived`` is honored only for that tier) and the profile/core
+    # reads (404). Below that tier an archived id resolves to null like an
+    # unknown one, so this batch can't be used to probe removed records.
+    if not _has_full_access(user):
+        stmt = stmt.where(Alumni.archived.is_(False))
+    rows = (await session.scalars(stmt)).all()
     # Only alumni with a net ID have an object key at all; the rest resolve to
     # null WITHOUT a storage round-trip.
     targets: list[tuple[int, str]] = []
@@ -1221,8 +1252,10 @@ async def get_headshot(
     ``{"url": null}`` when none is set. Any authenticated view role may fetch it
     (the headshot shows on the profile); the bucket is private so the signed URL
     is the only way to view the image and it expires within the hour."""
+    # An archived alumnus 404s below full_access, like the profile/core reads
+    # and the batch route above.
     alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
-    if alumnus is None:
+    if alumnus is None or (alumnus.archived and not _has_full_access(user)):
         raise NotFoundError(f"Alumni {alumni_id} not found.")
     net_id = (alumnus.net_id or "").strip()
     if not net_id:
@@ -1951,7 +1984,26 @@ async def export_alumni(
             status_code=422,
             content={"error": {"code": "validation_error", "message": str(exc)}},
         )
-    total = await alumni_export.count_matching(session, payload.filters)
+    # Filter-oracle gate, as on GET /alumni: the export route is full_access by
+    # default, but the capability is assignable, so a non-editor who is granted
+    # it must not be able to filter on a field their reads null. The hidden keys
+    # are DROPPED from the body (re-validated with only the fields the caller
+    # set) rather than overwritten with ``None`` — ``_filters_dict`` dumps with
+    # ``exclude_unset``, where an explicit ``None`` counts as SET and would
+    # override a builder default. A friend id in the Net ID box survives, as on
+    # the list.
+    filters = payload.filters
+    can_see_hidden = user.can_edit_alumni
+    if not can_see_hidden:
+        hidden = set(VIEW_ONLY_HIDDEN_FIELDS)
+        if parse_friend_id(filters.net_id) is not None:
+            hidden.discard("net_id")
+        filters = AlumniExportFilters.model_validate(
+            filters.model_dump(exclude_unset=True, exclude=hidden)
+        )
+    total = await alumni_export.count_matching(
+        session, filters, match_ids=can_see_hidden
+    )
     if total > alumni_export.MAX_EXPORT_ROWS:
         return JSONResponse(
             status_code=413,
@@ -1969,8 +2021,9 @@ async def export_alumni(
     csv_text = await alumni_export.export_csv(
         session,
         columns=columns,
-        filters=payload.filters,
+        filters=filters,
         actor_user_id=user.user_id,
+        match_ids=can_see_hidden,
     )
     return Response(
         content=csv_text,

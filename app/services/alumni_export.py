@@ -428,7 +428,7 @@ def _filters_dict(filters: AlumniExportFilters) -> dict:
 
 
 async def build_export_query(
-    session: AsyncSession, filters: AlumniExportFilters
+    session: AsyncSession, filters: AlumniExportFilters, *, match_ids: bool = True
 ) -> Select:
     """The ``SELECT alumni`` statement the export runs (no limit/order).
 
@@ -443,8 +443,13 @@ async def build_export_query(
     operator SEES the widened result and a "couldn't pinpoint" note; an export
     cannot — a silent fallback would hand over a nationwide CSV for a "near
     Provo" view, which is the exact disclosure this issue exists to close.
+
+    ``match_ids`` is ``build_alumni_query``'s free-text id switch, passed as
+    ``False`` for a caller who can't edit alumni — the same value the list
+    route passes for that caller, so the two still describe one population.
     """
     kwargs = _filters_dict(filters)
+    kwargs["match_ids"] = match_ids
     location_filter, envelope = await geo_search.resolve_near(
         session, filters.near, filters.radius
     )
@@ -468,10 +473,12 @@ async def build_export_query(
     return build_alumni_query(**kwargs)
 
 
-async def count_matching(session: AsyncSession, filters: AlumniExportFilters) -> int:
+async def count_matching(
+    session: AsyncSession, filters: AlumniExportFilters, *, match_ids: bool = True
+) -> int:
     from sqlalchemy import func
 
-    base = await build_export_query(session, filters)
+    base = await build_export_query(session, filters, match_ids=match_ids)
     total = await session.scalar(select(func.count()).select_from(base.subquery()))
     return int(total or 0)
 
@@ -542,6 +549,7 @@ async def export_csv(
     columns: list[_Col],
     filters: AlumniExportFilters,
     actor_user_id: int | None,
+    match_ids: bool = True,
 ) -> str:
     """Build the CSV text for *columns* over every alumnus matching *filters*.
 
@@ -551,7 +559,7 @@ async def export_csv(
     # so the export population is identical to count_matching's — just ordered
     # and capped. Don't rebuild from .whereclause; that risks dropping query
     # structure for join/EXISTS-based filters.
-    base = await build_export_query(session, filters)
+    base = await build_export_query(session, filters, match_ids=match_ids)
     stmt = base.order_by(Alumni.last_name.asc(), Alumni.alumni_id.asc()).limit(MAX_EXPORT_ROWS)
     alumni = (await session.execute(stmt)).scalars().all()
     ids = [a.alumni_id for a in alumni]

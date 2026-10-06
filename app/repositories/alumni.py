@@ -484,6 +484,10 @@ def build_alumni_query(
     # so the Alumni page is unchanged; friends are opt-in.
     is_alumni: bool | None = True,
     include_archived: bool = False,
+    # Whether free-text ``q`` may match the BYU ID / Net ID columns. The routes
+    # pass ``False`` for a caller who can't edit alumni: those ids are nulled in
+    # that caller's responses, so a match on them would be a value oracle.
+    match_ids: bool = True,
 ) -> Select:
     """Build the filtered ``SELECT alumni`` statement (without limit/offset).
 
@@ -520,7 +524,9 @@ def build_alumni_query(
     # and touches no predicate.
     parsed_q = parse_free_text(q)
     if parsed_q:
-        conditions.extend(q_conditions(parsed_q, extra=_designation_holder_exists))
+        conditions.extend(
+            q_conditions(parsed_q, extra=_designation_holder_exists, match_ids=match_ids)
+        )
     # Per-field partial matches (AND-combined; blanks ignored).
     def _field_like(value: str | None, column) -> None:
         if value and value.strip():

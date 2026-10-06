@@ -62,6 +62,7 @@ def _target_user(active_session_id: str | None, user_id: int = 9):
         last_name="W",
         active=True,
         must_change_password=False,
+        locked_at=None,
         active_session_id=active_session_id,
         active_session_at=None,
         roles=[SimpleNamespace(role_name="full_access")],

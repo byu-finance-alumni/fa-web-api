@@ -105,11 +105,16 @@ class LoginRecordRequest(BaseModel):
 class LoginThrottleStatus(BaseModel):
     """Pre-login throttle status.
 
-    ``reason`` is intentionally coarse and the frontend MUST collapse
-    ``cooldown`` and ``locked`` into ONE generic user-facing message
-    (anti-enumeration — see app/services/login_lockout.py). ``retry_after_seconds``
-    is set for ``cooldown`` only; ``locked`` has no self-clearing timer (a
-    super_admin reset is required).
+    ``reason`` is ``ok`` or ``cooldown`` and nothing else, and
+    ``retry_after_seconds`` is set for ``cooldown`` only. Every field is derived
+    from the per-email failure counter (or, for a #457 block, from the source
+    address) — never from whether the email is a real account or whether that
+    account is hard-locked — so the body is identical for all of them
+    (anti-enumeration, see app/services/login_lockout.py). A hard-locked account
+    is refused AFTER authentication instead, with 403 / ``account_locked``.
+
+    These routes no longer emit ``locked``; the frontend still shows one generic
+    message for any refusal, so an older client is unaffected either way.
     """
 
     allowed: bool
@@ -357,8 +362,10 @@ async def password_complete(
 # is the accepted, intended behaviour of the feature (see the "Lockout
 # denial-of-service" note in app/services/login_lockout.py) and is deliberately
 # NOT what the brakes below try to prevent. They never reveal whether an email is
-# registered — see the anti-enumeration note in that same module and the single
-# generic message the frontend shows for both `cooldown` and `locked`.
+# registered OR LOCKED: both routes answer from the per-email counter alone, so
+# the response is the same for an unknown address, a real account, and a
+# hard-locked one — see the anti-enumeration note in that same module. The lock
+# itself is enforced after authentication (403 / `account_locked`).
 #
 # What WAS unbounded (#423), and is now braked here rather than only at the edge:
 #
@@ -599,7 +606,9 @@ async def login_record(
     signed-in user can reach.
 
     The ``locked`` flag the service returns is intentionally NOT echoed to the
-    client (anti-enumeration); only the coarse ``reason`` is.
+    client (anti-enumeration), and the ``reason`` is counter-derived: the failure
+    that hard-locks a real account returns the same ``cooldown`` body an unknown
+    address gets on the same failure count.
 
     On a failure, in addition to bumping the rolling counter, a per-attempt
     ``login_failures`` row is logged (attempted email snapshotted + forwarded IP /

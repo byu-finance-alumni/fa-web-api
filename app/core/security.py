@@ -63,6 +63,29 @@ class DeactivatedAccountError(AuthorizationError):
         super().__init__(message)
 
 
+class AccountLockedError(AuthorizationError):
+    """Raised when a valid token belongs to a HARD-LOCKED account
+    (``users.locked_at`` set after too many failed sign-ins, see
+    app/services/login_lockout.py).
+
+    A subclass of AuthorizationError so it maps to 403 exactly like a
+    deactivated account, but with its own machine code (``account_locked``) so
+    the frontend can sign the user out with the generic lockout message, and its
+    own ``account_locked`` security event. Safe to reveal: it is only reachable
+    with a valid token, i.e. after the caller proved the password — the
+    unauthenticated pre-login routes never say an account is locked.
+    """
+
+    def __init__(
+        self,
+        message: str = (
+            "Your account is locked after too many failed sign-in attempts. "
+            "Contact an administrator to reset your password."
+        ),
+    ) -> None:
+        super().__init__(message)
+
+
 class MustChangePasswordError(AuthorizationError):
     """Raised when a valid token belongs to a user who must change their
     (admin-issued temp) password before doing anything else.

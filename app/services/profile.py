@@ -40,7 +40,11 @@ from app.models.survey_response import SurveyResponse
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import User
-from app.schemas.alumni import AlumniRead, minimize_alumni_read
+from app.schemas.alumni import (
+    VIEW_ONLY_HIDDEN_CONTACT_FIELDS,
+    AlumniRead,
+    minimize_alumni_read,
+)
 from app.schemas.profile import (
     AttachmentRead,
     AuditEntryRead,
@@ -673,7 +677,12 @@ async def get_profile(
 
 
 async def export_profile(
-    session: AsyncSession, alumni_id: int, *, actor_user_id: int | None
+    session: AsyncSession,
+    alumni_id: int,
+    *,
+    actor_user_id: int | None,
+    can_edit: bool = True,
+    show_pay_it_forward_amounts: bool = True,
 ) -> dict:
     """Server-side, audited export of one alumnus's profile (full_access).
 
@@ -687,11 +696,18 @@ async def export_profile(
     This is the contract the frontend calls instead of doing a client-side
     export: ``GET /alumni/{id}/export`` -> JSON body of the minimized profile.
     """
-    # Build the full aggregate (full_access caller -> can_edit=True, so no
-    # view_only field-stripping; we do our own minimization below). No view
-    # audit here — the export audit row is the disclosure record.
+    # Build the aggregate with the SAME scoping the profile read applies to this
+    # caller: an editor gets it whole (we do our own minimization below); a
+    # non-editor holding the assignable ``alumni.export`` gets the view_only
+    # minimized aggregate and no tasks, exactly as ``GET /{id}/profile`` gives
+    # them — an export must not reveal more than the read. No view audit here —
+    # the export audit row is the disclosure record.
     profile = await get_profile(
-        session, alumni_id, include_tasks=True, can_edit=True
+        session,
+        alumni_id,
+        include_tasks=can_edit,
+        can_edit=can_edit,
+        show_pay_it_forward_amounts=show_pay_it_forward_amounts,
     )
     # Drop the audit trail; internal user PKs are already absent from the read
     # schemas. exclude is belt-and-suspenders for the PK fields.
@@ -758,23 +774,16 @@ def _minimize_profile_for_view_only(profile: ProfileRead) -> ProfileRead:
     # (#166) so view_only can contact alumni for outreach — do NOT re-add
     # personal_email/work_email/phone here. The employer's location on
     # ``current_career`` is likewise untouched; outreach depends on it.
+    #
+    # The field list is VIEW_ONLY_HIDDEN_CONTACT_FIELDS (shared with the exports).
+    # It also nulls best_contact: a raw phone-or-email value straight off the
+    # intake sheet — which may be a HOME number the address redaction is meant
+    # to withhold. The frontend never renders it at all (it only round-trips
+    # through the edit form and CSV export), so nulling it here costs view_only
+    # nothing and keeps the unreviewed free text out of the payload.
     contact = (
         profile.contact.model_copy(
-            update={
-                "address_line_1": None,
-                "address_line_2": None,
-                "zip": None,
-                "city": None,
-                "state": None,
-                "country": None,
-                # best_contact holds a raw phone-or-email value straight off the
-                # intake sheet — which may be a HOME number the address redaction
-                # above is meant to withhold. The frontend never renders it at
-                # all (it only round-trips through the edit form and CSV export),
-                # so nulling it here costs view_only nothing and keeps the
-                # unreviewed free text out of the payload.
-                "best_contact": None,
-            }
+            update={field: None for field in VIEW_ONLY_HIDDEN_CONTACT_FIELDS}
         )
         if profile.contact is not None
         else None

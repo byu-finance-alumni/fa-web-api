@@ -30,7 +30,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     RequireAlumniCreate,
-    RequireAlumniExport,
     RequireEventsCreate,
     RequireEventsImport,
     RequireEventsManage,
@@ -40,6 +39,7 @@ from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.friend_id import friend_id_for
+from app.core.rate_limit import ExportReadRateLimit
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -522,7 +522,7 @@ async def list_event_attendees(
 
 @router.get("/{event_id}/attendees/export")
 async def export_event_attendees(
-    event_id: IdPath, user: RequireAlumniExport, session: SessionDep
+    event_id: IdPath, user: ExportReadRateLimit, session: SessionDep
 ) -> Response:
     """Download an event's attendee list as CSV — columns **Name, Email, Net ID**
     (#219). Gated at ``full_access`` (a rung above the view-only attendee list)
@@ -531,7 +531,11 @@ async def export_event_attendees(
     data itself). 404 if the event is unknown.
 
     Email is the alumnus's personal email, falling back to the work email. Rows
-    are ordered by name, matching the on-screen roster."""
+    are ordered by name, matching the on-screen roster.
+
+    A non-editor holding the assignable ``alumni.export`` gets **Name, Email**
+    only: Net ID is nulled on every read they make (VIEW_ONLY_HIDDEN_FIELDS), so
+    the column is dropped rather than the export refused."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
@@ -551,19 +555,20 @@ async def export_event_attendees(
         )
     ).all()
 
+    include_net_id = user.can_edit_alumni
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["Name", "Email", "Net ID"])
+    writer.writerow(["Name", "Email", "Net ID"] if include_net_id else ["Name", "Email"])
     for alumni, personal_email, work_email in rows:
         # Neutralize every free-text cell (#169) — a name/email/net_id starting
         # with a formula lead char would otherwise export as an executable cell.
-        writer.writerow(
-            [
-                _fmt(_attendee_name(alumni), "str"),
-                _fmt(personal_email or work_email or "", "str"),
-                _fmt(alumni.net_id or "", "str"),
-            ]
-        )
+        cells = [
+            _fmt(_attendee_name(alumni), "str"),
+            _fmt(personal_email or work_email or "", "str"),
+        ]
+        if include_net_id:
+            cells.append(_fmt(alumni.net_id or "", "str"))
+        writer.writerow(cells)
 
     # Disclosure record: WHAT left the system (row count + the fixed column set)
     # and WHICH event — never the data itself. Mirrors the alumni export's
@@ -576,7 +581,8 @@ async def export_event_attendees(
             entity_type="event",
             entity_id=event_id,
             new_value=(
-                f"rows={len(rows)}; columns=name,email,net_id; "
+                f"rows={len(rows)}; "
+                f"columns={'name,email,net_id' if include_net_id else 'name,email'}; "
                 f"event={event.event_name!r}"
             ),
         )

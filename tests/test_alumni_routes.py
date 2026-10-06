@@ -1797,7 +1797,9 @@ def test_headshot_urls_signs_once_per_alumnus_with_a_net_id(monkeypatch):
     urls = resp.json()["urls"]
     # Every requested id is answered, so the caller never has to guess.
     assert set(urls) == {"5", "6", "7"}
-    assert urls["5"].startswith("https://storage.test/sign/headshots/jdoe12")
+    # view_only gets the app proxy path, never the signed URL (it carries the
+    # net ID) — but the signature is still minted once, as the existence check.
+    assert urls["5"] == "/api/headshot/5"
     assert urls["6"] is None  # no net_id -> no object key
     assert urls["7"] is None  # unknown alumnus -> null, not 404
     assert calls == [("headshots", "jdoe12")]

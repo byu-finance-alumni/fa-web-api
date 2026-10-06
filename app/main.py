@@ -46,6 +46,7 @@ from app.core.errors import (
     ServiceError,
 )
 from app.core.security import (
+    AccountLockedError,
     AuthError,
     AuthorizationError,
     DeactivatedAccountError,
@@ -325,6 +326,27 @@ async def deactivated_account_handler(
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={"error": {"code": "forbidden", "message": exc.message}},
+    )
+
+
+@app.exception_handler(AccountLockedError)
+async def account_locked_handler(
+    request: Request, exc: AccountLockedError
+) -> JSONResponse:
+    """Return 403 / ``account_locked`` for a hard-locked account presenting a
+    valid token.
+
+    Mirrors the deactivated-account handler, with its own code so the frontend
+    can undo the sign-in cleanly, and its own ``account_locked`` security event:
+    a locked account still holding a token (an old session, or a sign-in made
+    directly against Supabase around the pre-login throttle) is high signal.
+    """
+    log_security_event(
+        request, "account_locked", status_code=403, detail=exc.message
+    )
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"error": {"code": "account_locked", "message": exc.message}},
     )
 
 

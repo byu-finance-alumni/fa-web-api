@@ -77,6 +77,28 @@ async def download_object(bucket: str, path: str) -> bytes:
     return response.content
 
 
+async def download_object_or_none(bucket: str, path: str) -> bytes | None:
+    """Like :func:`download_object`, but a MISSING object is ``None``, not an error.
+
+    For read paths where "nothing stored" is an ordinary answer (the headshot
+    image proxy: no photo -> initials). Storage reports a missing object as a
+    404 or as a 400 carrying a not-found marker (:func:`_is_missing_object`);
+    anything else unsuccessful is still a ``ServiceError`` (-> 502), never
+    silently empty."""
+    base, key = _base_and_key()
+    url = f"{base}/object/{bucket}/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            response = await client.get(url, headers=_headers(key))
+    except httpx.HTTPError as exc:
+        raise ServiceError("Could not reach the file storage service to download.") from exc
+    if response.status_code == 404 or _is_missing_object(response):
+        return None
+    if not response.is_success:
+        raise ServiceError("The file storage service rejected the download.")
+    return response.content
+
+
 async def list_objects(
     bucket: str, *, prefix: str = "", limit: int = 100, offset: int = 0
 ) -> list[dict]:

@@ -14,9 +14,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import RequireNotesManage, RequireViewAccess
+from app.api.dependencies.auth import RequireNotesManage
 from app.api.params import IdPath
 from app.core.database import get_session
+from app.core.rate_limit import BrowseReadRateLimit
 from app.schemas.note import NoteCreate, NoteEntityType, NoteRead, NoteUpdate
 from app.services import notes as service
 
@@ -27,7 +28,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("", response_model=list[NoteRead])
 async def list_notes(
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     session: SessionDep,
     entity_type: Annotated[
         NoteEntityType,

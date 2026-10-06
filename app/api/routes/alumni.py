@@ -48,12 +48,16 @@ from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.dropdowns import EMPLOYMENT_STATUSES, parse_designation_tokens
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
+from app.core.friend_id import parse_friend_id
 from app.core.rate_limit import (
+    BrowseReadRateLimit,
     BulkHeadshotRateLimit,
     EmploymentWriteRateLimit,
+    ExportReadRateLimit,
     HeadshotWriteRateLimit,
     InteractionWriteRateLimit,
     TaskWriteRateLimit,
+    read_rate_limiter,
 )
 from app.core.security import AuthorizationError
 from app.models.alumni import Alumni
@@ -65,6 +69,7 @@ from app.schemas.alumni import (
     _YEAR_MIN as _GRAD_YEAR_MIN,
 )
 from app.schemas.alumni import (
+    VIEW_ONLY_HIDDEN_FIELDS,
     AlumniCreateFull,
     AlumniListItem,
     AlumniLocation,
@@ -75,7 +80,11 @@ from app.schemas.alumni import (
     HeadshotUrls,
     minimize_alumni_read,
 )
-from app.schemas.alumni_export import AlumniExportRequest, ExportColumnCatalog
+from app.schemas.alumni_export import (
+    AlumniExportFilters,
+    AlumniExportRequest,
+    ExportColumnCatalog,
+)
 from app.schemas.auth import UserContext
 from app.schemas.filters import FilterOptions
 from app.schemas.imports import (
@@ -129,6 +138,13 @@ router = APIRouter(prefix="/alumni", tags=["alumni"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
+
+def _has_full_access(user: UserContext) -> bool:
+    """full_access-and-up (engineer / super_admin / full_access): the tier that
+    may see archived rows and use the contact-PII filters."""
+    return user.is_full_access or user.is_super_admin or user.is_engineer
+
+
 # The repeatable/CSV ``designations`` query param (#404) is normalized +
 # validated by ``dropdowns.parse_designation_tokens`` (values: DESIGNATION_TOKENS
 # = CFP / CFA / CPA) — the SAME parser the export body runs, so the list and the
@@ -137,7 +153,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("", response_model=AlumniPage)
 async def list_alumni(
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     session: SessionDep,
     q: Annotated[
         str | None,
@@ -496,7 +512,7 @@ async def list_alumni(
 ) -> AlumniPage:
     # Archived rows are full_access-and-up only: a view_only / student caller
     # passing ``include_archived=true`` must NOT receive soft-deleted records.
-    has_full_access = user.is_full_access or user.is_super_admin or user.is_engineer
+    has_full_access = _has_full_access(user)
     effective_include_archived = include_archived and has_full_access
     # The exact-email filter is a contact-PII enumeration oracle: a low-privilege
     # (view_only / student) caller could confirm an email belongs to a specific
@@ -504,6 +520,18 @@ async def list_alumni(
     # full_access-and-up; below that it's silently ignored (AND'd away like
     # include_archived) rather than 422'd, so a stray param can't leak.
     email = email if has_full_access else None
+    # Same rule for the fields a non-editor gets NULLED (VIEW_ONLY_HIDDEN_FIELDS:
+    # net_id, gender, byu_id via ``q``): a response that hides the value but a
+    # filter / sort / total that still reacts to it recovers the value anyway
+    # (``net_id=a`` -> 3 hits, ``net_id=ab`` -> 1 ...). Gated on
+    # ``can_edit_alumni`` — the same test ``minimize_alumni_read`` uses to null
+    # them — and silently ignored like ``email``. A friend id typed in the Net ID
+    # box (#538) is kept: it names a primary key, which every caller can see.
+    can_see_hidden = user.can_edit_alumni
+    if not can_see_hidden:
+        net_id = net_id if parse_friend_id(net_id) is not None else None
+        gender = None
+        sort = None if sort in VIEW_ONLY_HIDDEN_FIELDS else sort
     # "Needs surveying" is an admin-tier view (engineer / super_admin /
     # full_access = "admin"). student and view_only ("professor") are denied
     # server-side — a 403, not a silent ignore, so the access decision is
@@ -604,6 +632,7 @@ async def list_alumni(
         duplicate=duplicate,
         is_alumni=is_alumni_filter,
         include_archived=effective_include_archived,
+        match_ids=can_see_hidden,
         sort=sort,
     )
     # Search/disclosure audit: record the actor + a short filter summary (never
@@ -769,6 +798,54 @@ _HEADSHOT_BULK_CONCURRENCY = 8
 # The roster asks for one page (25 rows); this bounds how much storage fan-out a
 # single invocation can be asked to do.
 _HEADSHOT_BATCH_MAX = 100
+
+# --- Headshots for non-editors: served THROUGH the site, never signed ---------
+#
+# A headshot's object key IS the alumnus's net ID, and a Supabase signed URL
+# carries that key twice (in the path and inside the token's payload). Net ID is
+# a VIEW_ONLY_HIDDEN_FIELD — nulled on every read for a caller without
+# ``can_edit_alumni`` — so handing such a caller a signed URL leaked the very
+# field the rest of the API hides (2026-10-02 breach test). For them the two URL
+# routes below return an APP-RELATIVE proxy path instead; the app's route handler
+# at that path calls :func:`get_headshot_image` with the viewer's own token and
+# streams the bytes back. Editors keep direct signed URLs: they can read the net
+# ID anyway, and a direct URL costs no function invocation or egress through us.
+#
+# The path is the app's route (fa-web-app ``src/app/api/headshot/[id]``), not an
+# API route, so the browser only ever talks to the app's own origin ('self' in
+# its CSP) and never sees the API host, the bucket or a token.
+_HEADSHOT_PROXY_PATH = "/api/headshot/{alumni_id}"
+# Mirrors the app's HEADSHOT_CACHE_SECONDS (the 10-minute signed-URL cache), so a
+# browser holds a proxied photo exactly as long as it would a signed URL. PRIVATE:
+# the response is per-viewer authenticated content and must never sit in a
+# shared cache (CDN / proxy).
+_HEADSHOT_IMAGE_CACHE_CONTROL = "private, max-age=600"
+# Vercel caps a function RESPONSE body at ~4.5 MB, the same as a request body
+# (see the bulk-import note below). Stored headshots are normally our own
+# ~1024px re-encode (well under 1 MB), but a bulk import lands the raw upload and
+# the nightly sweep only shrinks it later — so anything over this is re-encoded
+# on the fly (NOT written back; the sweep owns that) rather than failing at the
+# platform edge.
+_HEADSHOT_IMAGE_MAX_PASSTHROUGH_BYTES = 4 * 1024 * 1024
+# Its own read budget rather than the browse one: a roster page renders 25
+# photos, so counting each against ``read:browse`` (240/min, 2,400/h, sized for
+# ~2 hits per page) would 429 an ordinary non-editor paging the roster — and a
+# browse 429 pages the security channel. Sized the same way that budget was:
+# clicking through roster pages as fast as they render (~40/min x 25 photos) is
+# ~1,000/min, a physical ceiling; 600/min and 6,000/h (the whole ~1,800-row
+# roster three times an hour) clear any real session while still braking a
+# loop. Same per-user, per-instance, alert-on-trip semantics as every read
+# limiter (``read_rate_limiter``).
+_HEADSHOT_IMAGE_WINDOWS: tuple[tuple[int, float], ...] = ((600, 60.0), (6000, 3600.0))
+HeadshotImageReadRateLimit = Annotated[
+    UserContext,
+    Depends(read_rate_limiter("read:headshot-image", windows=_HEADSHOT_IMAGE_WINDOWS)),
+]
+
+
+def _headshot_proxy_path(alumni_id: int) -> str:
+    """The app-relative URL a non-editor is given in place of a signed URL."""
+    return _HEADSHOT_PROXY_PATH.format(alumni_id=int(alumni_id))
 
 
 def _net_id_from_filename(name: str) -> str:
@@ -1154,7 +1231,7 @@ async def confirm_headshot_upload(
 
 @router.get("/headshots/urls", response_model=HeadshotUrls)
 async def get_headshot_urls(
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     session: SessionDep,
     alumni_ids: Annotated[list[int], Query()],
 ) -> HeadshotUrls:
@@ -1179,9 +1256,14 @@ async def get_headshot_urls(
             f"At most {_HEADSHOT_BATCH_MAX} alumni ids may be requested at once."
         )
 
-    rows = (
-        await session.scalars(select(Alumni).where(Alumni.alumni_id.in_(unique_ids)))
-    ).all()
+    stmt = select(Alumni).where(Alumni.alumni_id.in_(unique_ids))
+    # Archived rows are full_access-and-up only, exactly as on GET /alumni
+    # (``include_archived`` is honored only for that tier) and the profile/core
+    # reads (404). Below that tier an archived id resolves to null like an
+    # unknown one, so this batch can't be used to probe removed records.
+    if not _has_full_access(user):
+        stmt = stmt.where(Alumni.archived.is_(False))
+    rows = (await session.scalars(stmt)).all()
     # Only alumni with a net ID have an object key at all; the rest resolve to
     # null WITHOUT a storage round-trip.
     targets: list[tuple[int, str]] = []
@@ -1206,7 +1288,14 @@ async def get_headshot_urls(
                     return None
 
         signed = await asyncio.gather(*(_sign(net_id) for _, net_id in targets))
+        # A non-editor must never receive the signed URL — its path and token
+        # both carry the net ID (see ``_HEADSHOT_PROXY_PATH``). The signing call
+        # still runs for them: it is the existence check, so a row with no image
+        # stays ``null`` (initials) instead of a proxy path that would 404.
+        can_see_key = user.can_edit_alumni
         for (alumni_id, _), url in zip(targets, signed, strict=True):
+            if url is not None and not can_see_key:
+                url = _headshot_proxy_path(alumni_id)
             urls[alumni_id] = url
     return HeadshotUrls(urls=urls)
 
@@ -1214,20 +1303,99 @@ async def get_headshot_urls(
 @router.get("/{alumni_id}/headshot")
 async def get_headshot(
     alumni_id: IdPath,
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     session: SessionDep,
 ) -> dict:
     """Return a short-lived signed URL for the alumnus's headshot, or
     ``{"url": null}`` when none is set. Any authenticated view role may fetch it
     (the headshot shows on the profile); the bucket is private so the signed URL
-    is the only way to view the image and it expires within the hour."""
-    alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
-    if alumnus is None:
-        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    is the only way to view the image and it expires within the hour.
+
+    A caller without ``can_edit_alumni`` gets the app-relative proxy path
+    (``/api/headshot/<id>``) instead of the signed URL, which would disclose the
+    net ID — see ``_HEADSHOT_PROXY_PATH``."""
+    alumnus = await _readable_headshot_alumnus(session, user, alumni_id)
     net_id = (alumnus.net_id or "").strip()
     if not net_id:
         return {"url": None}
-    return {"url": await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id)}
+    signed = await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id)
+    if signed is not None and not user.can_edit_alumni:
+        return {"url": _headshot_proxy_path(alumni_id)}
+    return {"url": signed}
+
+
+async def _readable_headshot_alumnus(
+    session: AsyncSession, user: UserContext, alumni_id: int
+) -> Alumni:
+    """The alumnus whose headshot ``user`` may read, or 404.
+
+    An archived alumnus 404s below full_access, like the profile/core reads and
+    the batch route above — one rule shared by the URL read and the image read so
+    the proxy can't become a way round it."""
+    alumnus = await session.scalar(select(Alumni).where(Alumni.alumni_id == alumni_id))
+    if alumnus is None or (alumnus.archived and not _has_full_access(user)):
+        raise NotFoundError(f"Alumni {alumni_id} not found.")
+    return alumnus
+
+
+@router.get(
+    "/{alumni_id}/headshot/image",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"image/jpeg": {}, "image/png": {}, "image/webp": {}},
+            "description": "The headshot image bytes.",
+        },
+        404: {"description": "No such (readable) alumnus, or no headshot on file."},
+    },
+)
+async def get_headshot_image(
+    alumni_id: IdPath,
+    user: HeadshotImageReadRateLimit,
+    session: SessionDep,
+) -> Response:
+    """Stream the alumnus's headshot IMAGE itself (any view role).
+
+    The backing read for the app's ``/api/headshot/<id>`` route handler, which
+    is what a non-editor's ``<img src>`` points at (see ``_HEADSHOT_PROXY_PATH``).
+    Same gate and archived rule as ``GET /alumni/{id}/headshot``. Every "nothing
+    to show" case — no net ID, nothing stored, bytes that are not a JPEG/PNG/WebP
+    — is a plain 404 so the avatar falls back to initials, and nothing in the
+    response (body, headers, error message) names the net ID or the bucket.
+
+    The bytes are SNIFFED, never trusted: the served ``Content-Type`` comes from
+    the magic bytes, and anything else is refused rather than sent with a label
+    a browser might act on. ``nosniff`` pins that."""
+    alumnus = await _readable_headshot_alumnus(session, user, alumni_id)
+    net_id = (alumnus.net_id or "").strip()
+    not_found = NotFoundError("No headshot is on file for this alumnus.")
+    if not net_id:
+        raise not_found
+    data = await supabase_storage.download_object_or_none(_HEADSHOT_BUCKET, net_id)
+    if not data:
+        raise not_found
+    mime = _sniff_image_mime(data)
+    if mime is None:
+        raise not_found
+    if len(data) > _HEADSHOT_IMAGE_MAX_PASSTHROUGH_BYTES:
+        # An un-swept raw bulk upload: too big to pass through the platform's
+        # response cap, so serve our standard re-encode instead (Pillow work is
+        # CPU-bound — off the event loop). Unreadable -> initials, like missing.
+        try:
+            data = await asyncio.to_thread(images.normalise_headshot, data)
+        except InvalidRequestError:
+            raise not_found from None
+        mime = _HEADSHOT_NORMALISED_MIME
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": _HEADSHOT_IMAGE_CACHE_CONTROL,
+            "X-Content-Type-Options": "nosniff",
+            # Deliberately no filename: the object key is the net ID.
+            "Content-Disposition": "inline",
+        },
+    )
 
 
 @router.delete("/{alumni_id}/headshot", status_code=204)
@@ -1863,7 +2031,7 @@ async def update_import_alumni(
 
 @router.get("/import/update/export", response_model=None)
 async def export_cohort_update_template(
-    user: RequireAlumniExport,
+    user: ExportReadRateLimit,
     session: SessionDep,
     grad_year: Annotated[int | None, Query(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)] = None,
     class_year: Annotated[
@@ -1879,7 +2047,11 @@ async def export_cohort_update_template(
     /alumni/import/update`` (which matches by BYU ID / Net ID and applies only
     the changed cells). Both years are validated to the alumni-schema bounds. A
     cohort larger than the export cap is a 413 asking the caller to narrow it
-    down. Audit-logged (``export_alumni``) like the other exports."""
+    down. Audit-logged (``export_alumni``) like the other exports.
+
+    A non-editor holding ``alumni.export`` gets the file WITHOUT the columns
+    their reads null (Net ID, BYU ID, birthday, residence, ...) — it can't be
+    re-uploaded by them anyway (that needs ``alumni.import``)."""
     if (grad_year is None) == (class_year is None):
         return JSONResponse(
             status_code=422,
@@ -1896,6 +2068,7 @@ async def export_cohort_update_template(
             graduation_year=grad_year,
             graduation_class=class_year,
             actor_user_id=user.user_id,
+            can_edit=user.can_edit_alumni,
         )
     except import_csv.CohortTooLargeError as exc:
         return JSONResponse(
@@ -1921,16 +2094,18 @@ async def export_cohort_update_template(
 
 
 @router.get("/export/columns", response_model=ExportColumnCatalog)
-async def alumni_export_columns(_: RequireAlumniExport) -> ExportColumnCatalog:
+async def alumni_export_columns(user: RequireAlumniExport) -> ExportColumnCatalog:
     """The catalog of exportable columns + the default-checked selection, for the
-    export column picker (full_access)."""
-    return alumni_export.build_catalog()
+    export column picker (full_access). A non-editor holding ``alumni.export`` is
+    not offered the columns their reads null (see
+    ``alumni_export.visible_columns``)."""
+    return alumni_export.build_catalog(can_edit=user.can_edit_alumni)
 
 
 @router.post("/export", response_model=None)
 async def export_alumni(
     payload: AlumniExportRequest,
-    user: RequireAlumniExport,
+    user: ExportReadRateLimit,
     session: SessionDep,
 ) -> Response | JSONResponse:
     """Export the filtered alumni list as CSV with the chosen columns
@@ -1943,7 +2118,11 @@ async def export_alumni(
     ``near`` phrase that can't be pinpointed — both fail closed rather than
     dropping the predicate and handing back a wider population than the list
     showed. A result set larger than the export cap is a 413 asking the caller to
-    narrow filters. Audit-logged (``export_alumni``)."""
+    narrow filters. Audit-logged (``export_alumni``).
+
+    A non-editor holding ``alumni.export`` gets the columns their reads null
+    STRIPPED from the selection (not a 403 — the rest of the export still
+    works); a selection with nothing left after that is a 422."""
     try:
         columns = alumni_export.validate_columns(payload.columns)
     except ValueError as exc:
@@ -1951,7 +2130,37 @@ async def export_alumni(
             status_code=422,
             content={"error": {"code": "validation_error", "message": str(exc)}},
         )
-    total = await alumni_export.count_matching(session, payload.filters)
+    columns = alumni_export.visible_columns(columns, can_edit=user.can_edit_alumni)
+    if not columns:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "validation_error",
+                    "message": "None of the selected columns can be exported.",
+                }
+            },
+        )
+    # Filter-oracle gate, as on GET /alumni: the export route is full_access by
+    # default, but the capability is assignable, so a non-editor who is granted
+    # it must not be able to filter on a field their reads null. The hidden keys
+    # are DROPPED from the body (re-validated with only the fields the caller
+    # set) rather than overwritten with ``None`` — ``_filters_dict`` dumps with
+    # ``exclude_unset``, where an explicit ``None`` counts as SET and would
+    # override a builder default. A friend id in the Net ID box survives, as on
+    # the list.
+    filters = payload.filters
+    can_see_hidden = user.can_edit_alumni
+    if not can_see_hidden:
+        hidden = set(VIEW_ONLY_HIDDEN_FIELDS)
+        if parse_friend_id(filters.net_id) is not None:
+            hidden.discard("net_id")
+        filters = AlumniExportFilters.model_validate(
+            filters.model_dump(exclude_unset=True, exclude=hidden)
+        )
+    total = await alumni_export.count_matching(
+        session, filters, match_ids=can_see_hidden
+    )
     if total > alumni_export.MAX_EXPORT_ROWS:
         return JSONResponse(
             status_code=413,
@@ -1969,8 +2178,9 @@ async def export_alumni(
     csv_text = await alumni_export.export_csv(
         session,
         columns=columns,
-        filters=payload.filters,
+        filters=filters,
         actor_user_id=user.user_id,
+        match_ids=can_see_hidden,
     )
     return Response(
         content=csv_text,
@@ -1980,7 +2190,9 @@ async def export_alumni(
 
 
 @router.get("/{alumni_id}", response_model=AlumniRead)
-async def get_alumni(alumni_id: IdPath, user: RequireViewAccess, session: SessionDep) -> AlumniRead:
+async def get_alumni(
+    alumni_id: IdPath, user: BrowseReadRateLimit, session: SessionDep
+) -> AlumniRead:
     """Single lightweight alumni core record.
 
     Archived records 404 (they were removed from the directory). view_only
@@ -1994,7 +2206,7 @@ async def get_alumni(alumni_id: IdPath, user: RequireViewAccess, session: Sessio
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
 async def get_alumni_profile(
     alumni_id: IdPath,
-    user: RequireViewAccess,
+    user: BrowseReadRateLimit,
     config: PermissionConfig,
     session: SessionDep,
 ) -> ProfileRead:
@@ -2036,7 +2248,10 @@ async def get_alumni_profile(
     response_model_exclude={"audit"},
 )
 async def export_alumni_profile(
-    alumni_id: IdPath, user: RequireAlumniExport, session: SessionDep
+    alumni_id: IdPath,
+    user: ExportReadRateLimit,
+    config: PermissionConfig,
+    session: SessionDep,
 ) -> dict:
     """Server-side, audited profile export (full_access).
 
@@ -2044,8 +2259,22 @@ async def export_alumni_profile(
     ``audit`` trail is excluded and internal user PKs (interaction ``user_id``,
     task ``assigned_to_user_id``) are never present. Writes an ``export_profile``
     audit row before returning. Archived records 404. The frontend calls this
-    instead of doing a client-side export."""
-    return await profile_service.export_profile(session, alumni_id, actor_user_id=user.user_id)
+    instead of doing a client-side export.
+
+    Scoped exactly like ``GET /{alumni_id}/profile``: a non-editor holding
+    ``alumni.export`` gets the same view_only-minimized aggregate (no tasks,
+    sensitive PII / residence / notes nulled), and the Pay It Forward dollar
+    amounts only with ``donations.view``."""
+    show_amounts = Capability.DONATIONS_VIEW in effective_capabilities(
+        config, user.roles
+    )
+    return await profile_service.export_profile(
+        session,
+        alumni_id,
+        actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
+        show_pay_it_forward_amounts=show_amounts,
+    )
 
 
 @router.post(

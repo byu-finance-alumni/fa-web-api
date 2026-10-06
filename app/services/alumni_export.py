@@ -34,6 +34,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment, EducationHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.repositories.alumni import SURVEY_CADENCE, build_alumni_query
+from app.schemas.alumni import VIEW_ONLY_HIDDEN_CONTACT_FIELDS, VIEW_ONLY_HIDDEN_FIELDS
 from app.schemas.alumni_export import (
     AlumniExportFilters,
     ExportColumn,
@@ -371,10 +372,46 @@ DEFAULT_SELECTED: list[str] = [
 ]
 
 
-def build_catalog() -> ExportColumnCatalog:
+# --- Non-editor column stripping ----------------------------------------------
+#
+# ``alumni.export`` is assignable, so a NON-editor (``can_edit_alumni`` false —
+# view_only by default) can hold it. Such a caller must not get, in a CSV, a
+# field their reads null. Mirrors exactly what they lose on a read, per source:
+# the core-record fields ``minimize_alumni_read`` nulls, the residence/contact
+# fields and the program-engagement notes ``_minimize_profile_for_view_only``
+# nulls. Career / education stay whole, as on the profile. These are STRIPPED
+# (dropped from the catalog and the selection), never a 403, so the export
+# itself keeps working for them.
+VIEW_ONLY_HIDDEN_BY_SOURCE: dict[str, frozenset[str]] = {
+    _ALUMNI: VIEW_ONLY_HIDDEN_FIELDS,
+    _CONTACT: VIEW_ONLY_HIDDEN_CONTACT_FIELDS,
+    _ENGAGEMENT: frozenset({"engagement_notes"}),
+}
+
+
+def hidden_from_non_editor(source: str, attr: str) -> bool:
+    """True when a value read from ``source``.``attr`` is nulled on a
+    non-editor's reads, so it must not be exported to them either."""
+    return attr in VIEW_ONLY_HIDDEN_BY_SOURCE.get(source, frozenset())
+
+
+def visible_columns(columns: list[_Col], *, can_edit: bool) -> list[_Col]:
+    """``columns`` minus the ones a non-editor may not export (unchanged for an
+    editor)."""
+    if can_edit:
+        return columns
+    return [c for c in columns if not hidden_from_non_editor(c.source, c.attr)]
+
+
+def build_catalog(*, can_edit: bool = True) -> ExportColumnCatalog:
+    """The column-picker catalog. A non-editor is never OFFERED a column the
+    export would strip for them, and its default selection is trimmed to
+    match."""
+    offered = visible_columns(CATALOG, can_edit=can_edit)
+    offered_keys = {c.key for c in offered}
     return ExportColumnCatalog(
-        columns=[ExportColumn(key=c.key, label=c.label, group=c.group) for c in CATALOG],
-        default_selected=list(DEFAULT_SELECTED),
+        columns=[ExportColumn(key=c.key, label=c.label, group=c.group) for c in offered],
+        default_selected=[k for k in DEFAULT_SELECTED if k in offered_keys],
     )
 
 
@@ -428,7 +465,7 @@ def _filters_dict(filters: AlumniExportFilters) -> dict:
 
 
 async def build_export_query(
-    session: AsyncSession, filters: AlumniExportFilters
+    session: AsyncSession, filters: AlumniExportFilters, *, match_ids: bool = True
 ) -> Select:
     """The ``SELECT alumni`` statement the export runs (no limit/order).
 
@@ -443,8 +480,13 @@ async def build_export_query(
     operator SEES the widened result and a "couldn't pinpoint" note; an export
     cannot — a silent fallback would hand over a nationwide CSV for a "near
     Provo" view, which is the exact disclosure this issue exists to close.
+
+    ``match_ids`` is ``build_alumni_query``'s free-text id switch, passed as
+    ``False`` for a caller who can't edit alumni — the same value the list
+    route passes for that caller, so the two still describe one population.
     """
     kwargs = _filters_dict(filters)
+    kwargs["match_ids"] = match_ids
     location_filter, envelope = await geo_search.resolve_near(
         session, filters.near, filters.radius
     )
@@ -468,10 +510,12 @@ async def build_export_query(
     return build_alumni_query(**kwargs)
 
 
-async def count_matching(session: AsyncSession, filters: AlumniExportFilters) -> int:
+async def count_matching(
+    session: AsyncSession, filters: AlumniExportFilters, *, match_ids: bool = True
+) -> int:
     from sqlalchemy import func
 
-    base = await build_export_query(session, filters)
+    base = await build_export_query(session, filters, match_ids=match_ids)
     total = await session.scalar(select(func.count()).select_from(base.subquery()))
     return int(total or 0)
 
@@ -542,6 +586,7 @@ async def export_csv(
     columns: list[_Col],
     filters: AlumniExportFilters,
     actor_user_id: int | None,
+    match_ids: bool = True,
 ) -> str:
     """Build the CSV text for *columns* over every alumnus matching *filters*.
 
@@ -551,7 +596,7 @@ async def export_csv(
     # so the export population is identical to count_matching's — just ordered
     # and capped. Don't rebuild from .whereclause; that risks dropping query
     # structure for join/EXISTS-based filters.
-    base = await build_export_query(session, filters)
+    base = await build_export_query(session, filters, match_ids=match_ids)
     stmt = base.order_by(Alumni.last_name.asc(), Alumni.alumni_id.asc()).limit(MAX_EXPORT_ROWS)
     alumni = (await session.execute(stmt)).scalars().all()
     ids = [a.alumni_id for a in alumni]

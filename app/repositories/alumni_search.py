@@ -376,7 +376,7 @@ def segment_predicate(segment: QuerySegment, *, include_ids: bool = False, extra
     return or_(phrase_leg, tokens_leg)
 
 
-def q_conditions(parsed: ParsedQuery, *, extra=None) -> list:
+def q_conditions(parsed: ParsedQuery, *, extra=None, match_ids: bool = True) -> list:
     """The WHERE conditions for a parsed free-text query (segments AND-ed).
 
     Shared verbatim by ``GET /alumni`` and ``POST /alumni/export`` because both
@@ -384,9 +384,15 @@ def q_conditions(parsed: ParsedQuery, *, extra=None) -> list:
     describe different populations, which is the parity bug class this codebase
     keeps hitting. Ranking lives in :func:`relevance_expression` and is applied
     only by the list's ORDER BY, so it cannot affect the exported population.
+
+    ``match_ids=False`` drops the BYU ID / Net ID leg. Both ids are nulled for a
+    caller who can't edit alumni (``VIEW_ONLY_HIDDEN_FIELDS``), so letting that
+    caller's ``q`` match them would turn the total into an oracle that recovers
+    the hidden value one character at a time.
     """
+    include_ids = parsed.single_token and match_ids
     conditions = [
-        segment_predicate(segment, include_ids=parsed.single_token, extra=extra)
+        segment_predicate(segment, include_ids=include_ids, extra=extra)
         for segment in parsed.segments
     ]
     # A typed friend id (#538) -- "FRIEND-00042" -- is atomic like a Net ID, so

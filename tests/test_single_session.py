@@ -90,6 +90,7 @@ def _db_user(active_session_id):
         last_name="W",
         active=True,
         must_change_password=False,
+        locked_at=None,
         active_session_id=active_session_id,
         roles=[SimpleNamespace(role_name="view_only")],
     )

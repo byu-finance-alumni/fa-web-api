@@ -58,6 +58,7 @@ from app.core.capabilities import Capability, effective_capabilities
 from app.core.cron import verify_cron_secret
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError
+from app.core.rate_limit import ViewExportReadRateLimit
 from app.core.security import AuthorizationError
 from app.schemas.auth import UserContext
 from app.schemas.opportunity_link import (
@@ -236,7 +237,7 @@ async def list_opportunity_links(
 
 @router.get("/export", response_model=None)
 async def export_opportunity_links(
-    user: RequireViewAccess,
+    user: ViewExportReadRateLimit,
     config: PermissionConfig,
     session: SessionDep,
     status_filter: StatusParam = None,

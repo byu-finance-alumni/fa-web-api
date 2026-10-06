@@ -2250,6 +2250,7 @@ async def build_cohort_update_csv(
     graduation_year: int | None = None,
     graduation_class: int | None = None,
     actor_user_id: int | None = None,
+    can_edit: bool = True,
 ) -> str:
     """Build a FILLED intake-template CSV for one active graduation-year cohort.
 
@@ -2264,7 +2265,12 @@ async def build_cohort_update_csv(
     (:data:`alumni_export.MAX_EXPORT_ROWS`); over the cap it raises
     :class:`CohortTooLargeError` (the route maps that to a 413). Writes an
     ``export_alumni`` disclosure audit row (actor + cohort + row count, never the
-    data) and commits, mirroring the export path."""
+    data) and commits, mirroring the export path.
+
+    ``can_edit=False`` (a non-editor holding the assignable ``alumni.export``)
+    DROPS every template column whose value their reads null — the same rule as
+    the customizable export (``alumni_export.hidden_from_non_editor``) — so the
+    header is ``TEMPLATE_HEADERS`` minus those columns."""
     if (graduation_year is None) == (graduation_class is None):
         raise ValueError("Pass exactly one of graduation_year or graduation_class.")
     base = build_alumni_query(
@@ -2290,12 +2296,18 @@ async def build_cohort_update_csv(
         session, EducationHistory, ids, latest_by="degree_year", pk_attr="education_id"
     )
 
+    headers = (
+        list(TEMPLATE_HEADERS)
+        if can_edit
+        else [h for h in TEMPLATE_HEADERS if not _cohort_header_hidden(h)]
+    )
+
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(TEMPLATE_HEADERS)
+    writer.writerow(headers)
     for alumnus in alumni:
         row_out: list[str] = []
-        for header in TEMPLATE_HEADERS:
+        for header in headers:
             target = _MAPPING.get(header)
             if target is None:
                 row_out.append("")  # no clean single-field source -> blank
@@ -2324,6 +2336,26 @@ async def build_cohort_update_csv(
     _audit_cohort_export(session, actor_user_id, cohort_label, len(alumni))
     await session.commit()
     return buffer.getvalue()
+
+
+# Template section -> customizable-export source, for the non-editor strip. Only
+# the sections that hold a hidden field need an entry; "core" is the alumni row.
+_COHORT_SECTION_SOURCE = {
+    "core": alumni_export._ALUMNI,
+    "contact": alumni_export._CONTACT,
+    "engagement": alumni_export._ENGAGEMENT,
+}
+
+
+def _cohort_header_hidden(header: str) -> bool:
+    """True when a non-editor's cohort file must leave ``header`` out. "Spouse
+    Name" maps to ``spouse_first_name``, so it is covered like the rest."""
+    target = _MAPPING.get(header)
+    if target is None:
+        return False  # always-blank column, nothing to leak
+    section, field, _kind = target
+    source = _COHORT_SECTION_SOURCE.get(section)
+    return source is not None and alumni_export.hidden_from_non_editor(source, field)
 
 
 def _audit_cohort_export(

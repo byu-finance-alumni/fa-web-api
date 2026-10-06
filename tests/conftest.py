@@ -43,6 +43,23 @@ def _fresh_rate_limit_windows():
 
 
 @pytest.fixture(autouse=True)
+def _no_global_export_count(monkeypatch):
+    """Answer the export throttle's cross-instance COUNT with zero.
+
+    The export limiter counts the caller's recent ``export_*`` audit rows (one
+    query per export call). Like the permission-config read above, that query
+    would collide with the canned rows every fake session returns, so it is
+    stubbed by default; tests/test_read_throttle.py drives the real one.
+    """
+
+    async def _zero(_session, _actor, windows):
+        return [0] * len(windows)
+
+    monkeypatch.setattr(rate_limit, "_recent_export_counts", _zero)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _fresh_failure_monitor():
     """Start every test with an empty failure-alert gate (#444).
 

@@ -65,6 +65,7 @@ from app.services import (
     login_abuse,
     login_block,
     login_campaign,
+    login_lockout,
     opportunity_link_digest,
 )
 from app.services.supabase_admin import create_user as create_auth_user
@@ -550,6 +551,7 @@ class UserActiveUpdate(BaseModel):
 
 
 def _serialize(u: User) -> dict:
+    lock_active = login_lockout.is_lock_active(u.locked_at)
     return {
         "user_id": u.user_id,
         "email": u.email,
@@ -558,9 +560,12 @@ def _serialize(u: User) -> dict:
         "active": u.active,
         # Lock state so the Admin -> Users page can show a "Locked" badge. The
         # boolean is derived from locked_at so the UI doesn't need to interpret
-        # the timestamp; locked_at is exposed for display/sorting.
-        "locked": u.locked_at is not None,
-        "locked_at": u.locked_at,
+        # the timestamp; locked_at is exposed for display/sorting. A lock past
+        # its 24h expiry (login_lockout.HARD_LOCK_DURATION) no longer refuses
+        # the account, so it reads as unlocked: ``locked`` false and
+        # ``locked_at`` null, keeping the pair consistent for the UI.
+        "locked": lock_active,
+        "locked_at": u.locked_at if lock_active else None,
         # When the account was provisioned — shown in the Users tab.
         "created_at": u.created_at,
         "roles": [r.role_name for r in u.roles],
@@ -2172,7 +2177,8 @@ async def reset_password(
     # touching our DB, so we never clear a lock for a reset that didn't happen.
     await set_user_password(user.auth_user_id, temp_password)
 
-    was_locked = user.locked_at is not None
+    # An expired lock was no longer refusing the account; audit it as active.
+    was_locked = login_lockout.is_lock_active(user.locked_at)
     user.locked_at = None
     user.locked_reason = None
     # The user is now on a temp password — force them to set their own on next

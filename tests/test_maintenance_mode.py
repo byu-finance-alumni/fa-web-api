@@ -128,6 +128,7 @@ def _db_user(*roles: str, user_id: int = 1, active_session_id: str | None = None
         last_name="Engineer",
         active=True,
         must_change_password=False,
+        locked_at=None,
         active_session_id=active_session_id,
         active_session_at=None,
         roles=[SimpleNamespace(role_name=r) for r in roles],

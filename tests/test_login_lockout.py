@@ -231,3 +231,86 @@ def test_email_keying_is_case_insensitive():
     # Both failures land on the same lowercased key.
     assert set(session.attempts) == {"alum@byu.edu"}
     assert session.attempts["alum@byu.edu"].failed_count == 2
+
+
+# --- expiry and re-lock (HARD_LOCK_DURATION) ----------------------------------
+
+
+def _ago(**kw) -> datetime.datetime:
+    return _now() - datetime.timedelta(**kw)
+
+
+def test_is_lock_active_boundaries():
+    now = _now()
+    assert ll.is_lock_active(None, now) is False
+    assert ll.is_lock_active(now - datetime.timedelta(hours=23, minutes=59), now)
+    assert not ll.is_lock_active(now - ll.HARD_LOCK_DURATION, now)
+    assert not ll.is_lock_active(now - datetime.timedelta(hours=25), now)
+
+
+def test_more_failures_do_not_extend_a_live_lock():
+    original = _ago(hours=2)
+    user = _registered_user(locked_at=original)
+    session = FakeSession(user=user)
+    status = _fail_n(session, REGISTERED_EMAIL, ll.LOCK_THRESHOLD + 5)
+    assert status["locked"] is True
+    assert user.locked_at == original
+
+
+def test_expired_lock_re_locks_after_a_fresh_burst_with_a_new_timestamp():
+    stale = _ago(hours=30)
+    user = _registered_user(locked_at=stale)
+    session = FakeSession(user=user)
+    status = _fail_n(session, REGISTERED_EMAIL, ll.LOCK_THRESHOLD - 1)
+    assert status["locked"] is False
+    assert user.locked_at == stale  # not re-armed yet
+    status = run(ll.record_attempt(session, REGISTERED_EMAIL, success=False))
+    assert status["locked"] is True
+    assert user.locked_at is not None and user.locked_at > stale
+    assert ll.is_lock_active(user.locked_at)
+    assert user.locked_reason == ll.LOCK_REASON_TOO_MANY_FAILED
+
+
+def test_one_failure_after_expiry_does_not_instantly_re_lock():
+    """An attacker hammering all day keeps the rolling counter past the lock
+    threshold; the first failure after the 24h runs out must restart that burst
+    instead of re-locking on the spot."""
+    stale = _ago(hours=24, minutes=5)
+    user = _registered_user(locked_at=stale)
+    session = FakeSession(user=user)
+    # A burst that started before the lock expired and is still inside the
+    # rolling window (last failure a minute ago).
+    session.attempts[REGISTERED_EMAIL.lower()] = ll.LoginAttempt(
+        email_lc=REGISTERED_EMAIL.lower(),
+        failed_count=ll.LOCK_THRESHOLD + 40,
+        first_failed_at=_ago(hours=26),
+        last_failed_at=_ago(minutes=1),
+        cooldown_until=None,
+    )
+    status = run(ll.record_attempt(session, REGISTERED_EMAIL, success=False))
+    assert status["locked"] is False
+    assert user.locked_at == stale
+    attempt = session.attempts[REGISTERED_EMAIL.lower()]
+    assert attempt.failed_count == 1
+    # ...and the restarted burst still re-locks at the threshold.
+    status = _fail_n(session, REGISTERED_EMAIL, ll.LOCK_THRESHOLD - 1)
+    assert status["locked"] is True
+    assert ll.is_lock_active(user.locked_at)
+
+
+def test_burst_started_after_expiry_is_not_restarted():
+    """Only a burst carried over from BEFORE the expiry is restarted; failures
+    counted after it accumulate normally."""
+    stale = _ago(hours=30)
+    user = _registered_user(locked_at=stale)
+    session = FakeSession(user=user)
+    session.attempts[REGISTERED_EMAIL.lower()] = ll.LoginAttempt(
+        email_lc=REGISTERED_EMAIL.lower(),
+        failed_count=ll.LOCK_THRESHOLD - 1,
+        first_failed_at=_ago(minutes=30),
+        last_failed_at=_ago(minutes=1),
+        cooldown_until=None,
+    )
+    status = run(ll.record_attempt(session, REGISTERED_EMAIL, success=False))
+    assert status["locked"] is True
+    assert ll.is_lock_active(user.locked_at)

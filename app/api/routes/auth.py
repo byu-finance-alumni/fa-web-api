@@ -358,7 +358,7 @@ async def password_complete(
 # before the user has a session. They are therefore abusable: anyone who knows a
 # victim's email can spam `/auth/login/record` with `success=false` to drive a
 # registered account into hard lockout (inherent lockout-DoS), or hammer
-# `/auth/login/precheck` for probing. Driving a REAL account into a sticky lock
+# `/auth/login/precheck` for probing. Driving a REAL account into a 24h hard lock
 # is the accepted, intended behaviour of the feature (see the "Lockout
 # denial-of-service" note in app/services/login_lockout.py) and is deliberately
 # NOT what the brakes below try to prevent. They never reveal whether an email is
@@ -426,7 +426,8 @@ async def _purge_expired_login_records(session: AsyncSession) -> None:
 
     THIS MUST NOT WEAKEN THE LOCKOUT. It cannot: the hard lock lives on
     ``users.locked_at``/``locked_reason``, which this never touches, so a locked
-    account stays locked (only a super_admin password reset clears it). What it
+    account stays locked (until its 24h expiry or a super_admin password reset
+    — expiry is computed from ``locked_at``, not by deleting anything). What it
     removes from `login_attempts` is only rows the service already treats as
     expired, and never one carrying a live cooldown — the second predicate is
     belt-and-braces (COOLDOWN_MINUTES is far shorter than ATTEMPT_WINDOW_MINUTES,

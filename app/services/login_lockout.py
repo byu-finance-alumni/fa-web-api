@@ -14,10 +14,14 @@ Two layered defenses, by failed-attempt count within a rolling window:
     itself when the timer elapses. This is the first-line brake on online
     password guessing.
 
-  * HARD LOCK (sticky): at ``LOCK_THRESHOLD`` failures, AND only when the email
-    belongs to a REGISTERED user, we set ``users.locked_at``. This does not
-    clear on its own — a super_admin must reset the password (which clears it).
-    Unregistered emails are never hard-locked (there is no account to lock).
+  * HARD LOCK (long, time-boxed): at ``LOCK_THRESHOLD`` failures, AND only when
+    the email belongs to a REGISTERED user, we set ``users.locked_at``. The lock
+    EXPIRES on its own ``HARD_LOCK_DURATION`` (24 hours) after ``locked_at``
+    (owner decision, 2026-10-06) — no schema change: ``locked_at`` stays as the
+    record of when it was armed and every consumer asks :func:`is_lock_active`
+    instead of testing it for NULL. A super_admin password reset still clears it
+    early. Unregistered emails are never hard-locked (there is no account to
+    lock).
 
 The rolling counter resets if the most recent failure is older than
 ``ATTEMPT_WINDOW_MINUTES`` — so sparse, occasional typos never accumulate into a
@@ -48,15 +52,17 @@ Security tradeoffs (documented for the appsec review):
 
   * Lockout denial-of-service: because the hard lock keys on the (registered)
     email and not the attacker's IP, an attacker who knows a victim's email can
-    deliberately burn failed attempts to lock that victim out until an admin
-    resets it. This is an accepted, deliberate tradeoff (a sticky lock is the
-    point); it is bounded by (1) the per-IP limiter and the #457 automatic
-    source block on ``/auth/login/record``, and (2) super_admin self-service
-    reset. Engineers are exempt from lock ENFORCEMENT (see the auth resolver):
-    no other role may reset an engineer's password (#178 ceiling), so an
-    enforced lock on the engineer would have no recovery path. The cooldown layer
-    alone (which auto-clears) handles the common typo case without admin
-    involvement.
+    deliberately burn failed attempts to lock that victim out for up to
+    ``HARD_LOCK_DURATION`` (or until an admin resets it). This is an accepted,
+    deliberate tradeoff (a long lock is the point); it is bounded by (1) the
+    per-IP limiter and the #457 automatic source block on
+    ``/auth/login/record``, (2) super_admin self-service reset, and (3) the
+    24-hour expiry. Engineers are exempt from lock ENFORCEMENT (see the auth
+    resolver): no other role may reset an engineer's password (#178 ceiling),
+    so an enforced lock on the engineer would have no recovery path short of
+    waiting out the expiry — and a stranger could re-arm it every day. The
+    cooldown layer alone (which auto-clears) handles the common typo case
+    without admin involvement.
 """
 
 from __future__ import annotations
@@ -79,12 +85,31 @@ COOLDOWN_MINUTES = 5
 LOCK_THRESHOLD = 20
 # The rolling counter resets if the last failure is older than this.
 ATTEMPT_WINDOW_MINUTES = 60
+# How long a hard lock refuses the account before it expires on its own (owner
+# decision, 2026-10-06). The single source for every consumer of ``locked_at``:
+# the auth resolver, the re-lock logic below, and the admin user list.
+HARD_LOCK_DURATION = datetime.timedelta(hours=24)
 
 LOCK_REASON_TOO_MANY_FAILED = "too_many_failed_logins"
 
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
+
+
+def is_lock_active(
+    locked_at: datetime.datetime | None, now: datetime.datetime | None = None
+) -> bool:
+    """True while a hard lock armed at ``locked_at`` is still in force.
+
+    A NULL ``locked_at`` (never locked, or reset) and one older than
+    ``HARD_LOCK_DURATION`` both read as unlocked. Ask this rather than testing
+    ``locked_at`` for NULL — an expired timestamp is deliberately left on the row
+    (no writer needs to run for the lock to lapse).
+    """
+    if locked_at is None:
+        return False
+    return (now or _now()) < locked_at + HARD_LOCK_DURATION
 
 
 def _normalize(email: str) -> str:
@@ -171,6 +196,22 @@ async def record_attempt(
     # --- failure path --------------------------------------------------------
     attempt = await _get_attempt(session, email_lc)
     window = datetime.timedelta(minutes=ATTEMPT_WINDOW_MINUTES)
+    # Looked up on EVERY failure, registered or not, so the query pattern is the
+    # same for every email (anti-enumeration).
+    user = await _get_user_by_email_lc(session, email_lc)
+    # When an expired hard lock's 24h ran out. A burst that STARTED before then
+    # belongs to the old lock: if failures kept arriving inside the rolling
+    # window all day (an attacker still hammering), the counter is already past
+    # LOCK_THRESHOLD and the very first failure after expiry would re-lock at
+    # once. Such a burst is restarted below, so a re-lock needs a fresh
+    # LOCK_THRESHOLD failures counted from after the expiry.
+    expired_lock_ended_at = (
+        user.locked_at + HARD_LOCK_DURATION
+        if user is not None
+        and user.locked_at is not None
+        and not is_lock_active(user.locked_at, now)
+        else None
+    )
 
     if attempt is None:
         attempt = LoginAttempt(email_lc=email_lc, failed_count=0)
@@ -182,6 +223,14 @@ async def record_attempt(
         attempt.failed_count = 0
         attempt.first_failed_at = now
         attempt.cooldown_until = None
+    elif expired_lock_ended_at is not None and (
+        attempt.first_failed_at is None
+        or attempt.first_failed_at < expired_lock_ended_at
+    ):
+        # Burst carried over from an expired lock — restart it (see above). A
+        # still-live cooldown is kept: it times out on its own in minutes.
+        attempt.failed_count = 0
+        attempt.first_failed_at = now
 
     attempt.failed_count += 1
     attempt.last_failed_at = now
@@ -191,11 +240,11 @@ async def record_attempt(
         attempt.cooldown_until = now + datetime.timedelta(minutes=COOLDOWN_MINUTES)
 
     locked = False
-    user = await _get_user_by_email_lc(session, email_lc)
     if user is not None and attempt.failed_count >= LOCK_THRESHOLD:
         # Hard lock — registered accounts only. Idempotent: keep the original
-        # lock timestamp if already locked.
-        if user.locked_at is None:
+        # lock timestamp while the lock is live (more failures must not extend
+        # it); an EXPIRED lock is re-armed with a fresh timestamp.
+        if not is_lock_active(user.locked_at, now):
             user.locked_at = now
             user.locked_reason = LOCK_REASON_TOO_MANY_FAILED
         locked = True

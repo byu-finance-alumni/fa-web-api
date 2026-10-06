@@ -16,8 +16,9 @@ the resolver half:
     (#147) or clear its failed-login counter;
   * ENGINEERS ARE NEVER REFUSED for a lock — no one else can reset their
     password (#178 ceiling), so an enforced lock would have no way back;
-  * the super_admin password reset — the documented unlock — still restores
-    access.
+  * the super_admin password reset — the early unlock — still restores
+    access;
+  * the lock EXPIRES 24 hours (``HARD_LOCK_DURATION``) after ``locked_at``.
 
 Like test_maintenance_mode.py, these override only the TOKEN layer and patch the
 user lookup, so the real resolver chain runs.
@@ -42,7 +43,9 @@ from app.schemas.auth import AuthenticatedUser
 from app.services import auth_sessions, login_lockout, maintenance
 
 AUTH_UUID = "44444444-4444-4444-4444-444444444444"
-LOCKED_AT = datetime.datetime(2026, 10, 2, 3, 0, tzinfo=datetime.UTC)
+# Relative to now: the lock expires after login_lockout.HARD_LOCK_DURATION, so a
+# fixed date would silently turn into an EXPIRED lock as the calendar moves on.
+LOCKED_AT = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
 
 
 @pytest.fixture(autouse=True)
@@ -55,7 +58,9 @@ def _clean():
     rate_limit.reset()
 
 
-def _db_user(*roles: str, locked: bool = True, active: bool = True):
+def _db_user(
+    *roles: str, locked: bool = True, active: bool = True, locked_at=None
+):
     return SimpleNamespace(
         user_id=4,
         auth_user_id=uuid.UUID(AUTH_UUID),
@@ -64,11 +69,12 @@ def _db_user(*roles: str, locked: bool = True, active: bool = True):
         last_name="U",
         active=active,
         must_change_password=False,
-        locked_at=LOCKED_AT if locked else None,
+        locked_at=(locked_at or LOCKED_AT) if locked else None,
         locked_reason=login_lockout.LOCK_REASON_TOO_MANY_FAILED if locked else None,
         active_session_id="sess-old",
         active_session_at=None,
         last_login_at=None,
+        created_at=None,
         roles=[SimpleNamespace(role_name=r) for r in roles],
     )
 
@@ -255,3 +261,71 @@ def test_super_admin_reset_restores_access(monkeypatch):
     ctx = _resolve(user, monkeypatch, auth_deps.get_current_db_user_allow_must_change)
     assert ctx.user_id == 4
     assert ctx.must_change_password is True
+
+
+# --- the lock expires after HARD_LOCK_DURATION (24h) --------------------------
+
+
+def _locked_ago(delta: datetime.timedelta) -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC) - delta
+
+
+def test_lock_duration_is_24_hours():
+    assert login_lockout.HARD_LOCK_DURATION == datetime.timedelta(hours=24)
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [
+        auth_deps.get_current_db_user_allow_must_change,
+        auth_deps.get_current_db_user,
+    ],
+)
+def test_still_refused_just_before_expiry(monkeypatch, resolver):
+    user = _db_user(
+        "full_access",
+        locked_at=_locked_ago(datetime.timedelta(hours=23, minutes=59)),
+    )
+    with pytest.raises(AccountLockedError):
+        _resolve(user, monkeypatch, resolver)
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [
+        auth_deps.get_current_db_user_allow_must_change,
+        auth_deps.get_current_db_user,
+    ],
+)
+def test_allowed_once_the_lock_has_expired(monkeypatch, resolver):
+    stale = _locked_ago(datetime.timedelta(hours=24, seconds=1))
+    user = _db_user("full_access", locked_at=stale)
+    ctx = _resolve(user, monkeypatch, resolver)
+    assert ctx.user_id == 4
+    # Nothing has to run for the lock to lapse — the timestamp is left as is.
+    assert user.locked_at == stale
+
+
+def test_an_expired_lock_can_sign_in_and_claim_the_session(monkeypatch):
+    user = _db_user(
+        "full_access", locked_at=_locked_ago(datetime.timedelta(hours=25))
+    )
+    with _client(_Session(user), user, monkeypatch) as client:
+        resp = client.post("/auth/login")
+    assert resp.status_code == 200, resp.text
+    assert user.active_session_id == "sess-new"
+
+
+def test_admin_user_list_reads_an_expired_lock_as_unlocked():
+    """The Users page badge follows enforcement: a live lock shows, an expired
+    one does not (and its stale timestamp is not presented as a lock)."""
+    from app.api.routes.admin import _serialize
+
+    live = _db_user("full_access")
+    expired = _db_user(
+        "full_access", locked_at=_locked_ago(datetime.timedelta(hours=24, seconds=1))
+    )
+    assert _serialize(live)["locked"] is True
+    assert _serialize(live)["locked_at"] == LOCKED_AT
+    assert _serialize(expired)["locked"] is False
+    assert _serialize(expired)["locked_at"] is None

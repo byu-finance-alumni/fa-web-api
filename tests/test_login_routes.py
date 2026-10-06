@@ -7,6 +7,7 @@ the Supabase Admin API call mocked — that a success clears the lock, drops the
 login_attempts row, audits the action, and returns a one-time temp password.
 """
 
+import datetime
 import uuid
 from types import SimpleNamespace
 
@@ -177,6 +178,12 @@ def test_record_success_does_not_clear_existing_cooldown(throttle_client):
 # --- super_admin reset-password ----------------------------------------------
 
 
+# A LIVE lock: it expires HARD_LOCK_DURATION (24h) after locked_at, so a fixed
+# date would read as an expired lock and the reset would audit it as "active".
+def _recent_lock():
+    return datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
+
+
 def _fake_user(user_id=2, *, locked_at=None, roles=("full_access",)):
     return SimpleNamespace(
         user_id=user_id,
@@ -245,7 +252,7 @@ def test_reset_password_requires_auth():
 def test_reset_password_clears_lock_and_audits(monkeypatch):
     import uuid as _uuid
 
-    user = _fake_user(2, locked_at="2026-06-13T00:00:00Z")
+    user = _fake_user(2, locked_at=_recent_lock())
     session = _ResetSession(user)
 
     # Mock the Supabase Admin API call so no network happens; capture the args.
@@ -307,7 +314,7 @@ def test_reset_password_clears_lock_and_audits(monkeypatch):
 def test_reset_password_upstream_failure_is_502_and_does_not_clear_lock(monkeypatch):
     from app.core.errors import ServiceError
 
-    user = _fake_user(2, locked_at="2026-06-13T00:00:00Z")
+    user = _fake_user(2, locked_at=_recent_lock())
     session = _ResetSession(user)
 
     async def _boom(auth_user_id, new_password):

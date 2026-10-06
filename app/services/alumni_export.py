@@ -34,6 +34,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment, EducationHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.repositories.alumni import SURVEY_CADENCE, build_alumni_query
+from app.schemas.alumni import VIEW_ONLY_HIDDEN_CONTACT_FIELDS, VIEW_ONLY_HIDDEN_FIELDS
 from app.schemas.alumni_export import (
     AlumniExportFilters,
     ExportColumn,
@@ -371,10 +372,46 @@ DEFAULT_SELECTED: list[str] = [
 ]
 
 
-def build_catalog() -> ExportColumnCatalog:
+# --- Non-editor column stripping ----------------------------------------------
+#
+# ``alumni.export`` is assignable, so a NON-editor (``can_edit_alumni`` false —
+# view_only by default) can hold it. Such a caller must not get, in a CSV, a
+# field their reads null. Mirrors exactly what they lose on a read, per source:
+# the core-record fields ``minimize_alumni_read`` nulls, the residence/contact
+# fields and the program-engagement notes ``_minimize_profile_for_view_only``
+# nulls. Career / education stay whole, as on the profile. These are STRIPPED
+# (dropped from the catalog and the selection), never a 403, so the export
+# itself keeps working for them.
+VIEW_ONLY_HIDDEN_BY_SOURCE: dict[str, frozenset[str]] = {
+    _ALUMNI: VIEW_ONLY_HIDDEN_FIELDS,
+    _CONTACT: VIEW_ONLY_HIDDEN_CONTACT_FIELDS,
+    _ENGAGEMENT: frozenset({"engagement_notes"}),
+}
+
+
+def hidden_from_non_editor(source: str, attr: str) -> bool:
+    """True when a value read from ``source``.``attr`` is nulled on a
+    non-editor's reads, so it must not be exported to them either."""
+    return attr in VIEW_ONLY_HIDDEN_BY_SOURCE.get(source, frozenset())
+
+
+def visible_columns(columns: list[_Col], *, can_edit: bool) -> list[_Col]:
+    """``columns`` minus the ones a non-editor may not export (unchanged for an
+    editor)."""
+    if can_edit:
+        return columns
+    return [c for c in columns if not hidden_from_non_editor(c.source, c.attr)]
+
+
+def build_catalog(*, can_edit: bool = True) -> ExportColumnCatalog:
+    """The column-picker catalog. A non-editor is never OFFERED a column the
+    export would strip for them, and its default selection is trimmed to
+    match."""
+    offered = visible_columns(CATALOG, can_edit=can_edit)
+    offered_keys = {c.key for c in offered}
     return ExportColumnCatalog(
-        columns=[ExportColumn(key=c.key, label=c.label, group=c.group) for c in CATALOG],
-        default_selected=list(DEFAULT_SELECTED),
+        columns=[ExportColumn(key=c.key, label=c.label, group=c.group) for c in offered],
+        default_selected=[k for k in DEFAULT_SELECTED if k in offered_keys],
     )
 
 

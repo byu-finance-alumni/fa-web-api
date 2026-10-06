@@ -1914,7 +1914,11 @@ async def export_cohort_update_template(
     /alumni/import/update`` (which matches by BYU ID / Net ID and applies only
     the changed cells). Both years are validated to the alumni-schema bounds. A
     cohort larger than the export cap is a 413 asking the caller to narrow it
-    down. Audit-logged (``export_alumni``) like the other exports."""
+    down. Audit-logged (``export_alumni``) like the other exports.
+
+    A non-editor holding ``alumni.export`` gets the file WITHOUT the columns
+    their reads null (Net ID, BYU ID, birthday, residence, ...) — it can't be
+    re-uploaded by them anyway (that needs ``alumni.import``)."""
     if (grad_year is None) == (class_year is None):
         return JSONResponse(
             status_code=422,
@@ -1931,6 +1935,7 @@ async def export_cohort_update_template(
             graduation_year=grad_year,
             graduation_class=class_year,
             actor_user_id=user.user_id,
+            can_edit=user.can_edit_alumni,
         )
     except import_csv.CohortTooLargeError as exc:
         return JSONResponse(
@@ -1956,10 +1961,12 @@ async def export_cohort_update_template(
 
 
 @router.get("/export/columns", response_model=ExportColumnCatalog)
-async def alumni_export_columns(_: RequireAlumniExport) -> ExportColumnCatalog:
+async def alumni_export_columns(user: RequireAlumniExport) -> ExportColumnCatalog:
     """The catalog of exportable columns + the default-checked selection, for the
-    export column picker (full_access)."""
-    return alumni_export.build_catalog()
+    export column picker (full_access). A non-editor holding ``alumni.export`` is
+    not offered the columns their reads null (see
+    ``alumni_export.visible_columns``)."""
+    return alumni_export.build_catalog(can_edit=user.can_edit_alumni)
 
 
 @router.post("/export", response_model=None)
@@ -1978,13 +1985,28 @@ async def export_alumni(
     ``near`` phrase that can't be pinpointed — both fail closed rather than
     dropping the predicate and handing back a wider population than the list
     showed. A result set larger than the export cap is a 413 asking the caller to
-    narrow filters. Audit-logged (``export_alumni``)."""
+    narrow filters. Audit-logged (``export_alumni``).
+
+    A non-editor holding ``alumni.export`` gets the columns their reads null
+    STRIPPED from the selection (not a 403 — the rest of the export still
+    works); a selection with nothing left after that is a 422."""
     try:
         columns = alumni_export.validate_columns(payload.columns)
     except ValueError as exc:
         return JSONResponse(
             status_code=422,
             content={"error": {"code": "validation_error", "message": str(exc)}},
+        )
+    columns = alumni_export.visible_columns(columns, can_edit=user.can_edit_alumni)
+    if not columns:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "validation_error",
+                    "message": "None of the selected columns can be exported.",
+                }
+            },
         )
     # Filter-oracle gate, as on GET /alumni: the export route is full_access by
     # default, but the capability is assignable, so a non-editor who is granted
@@ -2093,7 +2115,10 @@ async def get_alumni_profile(
     response_model_exclude={"audit"},
 )
 async def export_alumni_profile(
-    alumni_id: IdPath, user: ExportReadRateLimit, session: SessionDep
+    alumni_id: IdPath,
+    user: ExportReadRateLimit,
+    config: PermissionConfig,
+    session: SessionDep,
 ) -> dict:
     """Server-side, audited profile export (full_access).
 
@@ -2101,8 +2126,22 @@ async def export_alumni_profile(
     ``audit`` trail is excluded and internal user PKs (interaction ``user_id``,
     task ``assigned_to_user_id``) are never present. Writes an ``export_profile``
     audit row before returning. Archived records 404. The frontend calls this
-    instead of doing a client-side export."""
-    return await profile_service.export_profile(session, alumni_id, actor_user_id=user.user_id)
+    instead of doing a client-side export.
+
+    Scoped exactly like ``GET /{alumni_id}/profile``: a non-editor holding
+    ``alumni.export`` gets the same view_only-minimized aggregate (no tasks,
+    sensitive PII / residence / notes nulled), and the Pay It Forward dollar
+    amounts only with ``donations.view``."""
+    show_amounts = Capability.DONATIONS_VIEW in effective_capabilities(
+        config, user.roles
+    )
+    return await profile_service.export_profile(
+        session,
+        alumni_id,
+        actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
+        show_pay_it_forward_amounts=show_amounts,
+    )
 
 
 @router.post(

@@ -1018,6 +1018,27 @@ VIEW_ONLY_HIDDEN_FIELDS: frozenset[str] = frozenset(
 )
 
 
+# The CONTACT-row fields the profile minimizer (``_minimize_profile_for_view_only``
+# in app/services/profile.py) nulls for the same callers: the whole RESIDENCE
+# (street lines, ZIP and — since #440 — city/state/country, which the survey
+# fills with a HOME address) plus ``best_contact``, a raw phone-or-email cell
+# off the intake sheet that may be a home number. Email/phone stay visible
+# (#166 outreach) and ``region`` stays (derived from the WORK state, #283).
+# Shared with the exports so a non-editor's CSV can't carry what their reads
+# null.
+VIEW_ONLY_HIDDEN_CONTACT_FIELDS: frozenset[str] = frozenset(
+    {
+        "address_line_1",
+        "address_line_2",
+        "zip",
+        "city",
+        "state",
+        "country",
+        "best_contact",
+    }
+)
+
+
 def minimize_alumni_read[T: AlumniRead](read: T, *, can_edit: bool) -> T:
     """Null the FERPA-sensitive fields for a ``view_only`` caller.
 

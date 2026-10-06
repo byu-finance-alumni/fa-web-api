@@ -24,13 +24,15 @@ client IP. See the "#360" block at the bottom of this module.
 The unauthenticated pre-login routes have neither an actor nor a token, so they
 use ``client_ip_rate_limiter(...)`` — client IP only. See the "#423" block.
 
-The bulk-READ surfaces (alumni list/search, profile, notes, headshot URLs, and
-every CSV/export route) use ``read_rate_limiter(...)``: per authenticated user,
-several windows at once, and a SECURITY alert the first time a user trips it.
-See the "read throttle" block.
+The bulk-READ surfaces (alumni list/search, profile, notes, headshot URLs, the
+named-alumni geography lists, and every CSV/export route) use
+``read_rate_limiter(...)``: per authenticated user, several windows at once,
+and a SECURITY alert the first time a user trips it. The export bucket is also
+counted across instances from the audit trail. See the "read throttle" block.
 """
 
 import asyncio
+import datetime
 import hashlib
 import json
 import logging
@@ -39,6 +41,8 @@ from collections import OrderedDict, defaultdict
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
     get_current_db_user_allow_must_change,
@@ -47,11 +51,15 @@ from app.api.dependencies.auth import (
     require_alumni_photos,
     require_engineer,
     require_interactions_create,
+    require_reports_advanced,
     require_super_admin,
     require_view_only,
 )
 from app.core.config import get_settings
+from app.core.database import get_session
 from app.core.failure_monitor import route_template
+from app.models.audit import AuditLog
+from app.models.engineer_action import EngineerActionLog
 from app.schemas.auth import UserContext
 from app.services import failure_alert
 
@@ -629,9 +637,10 @@ LOGIN_RECORD_LIMITER = client_ip_rate_limiter(
 # request.
 #
 # TWO BUCKETS, so browsing a profile never spends export allowance and vice
-# versa: `read:browse` (list/search, profile, notes, headshot URLs) and
-# `read:export` (every CSV / export route), the latter much tighter because a
-# single call returns a whole population.
+# versa: `read:browse` (list/search, profile, notes, headshot URLs, the
+# geography lists of named alumni) and `read:export` (every CSV / export
+# route), the latter much tighter because a single call returns a whole
+# population.
 #
 # TWO WINDOWS PER BUCKET. The short one stops a script within a minute of it
 # starting (and raises the alert while it is still small); the long one stops a
@@ -670,8 +679,15 @@ LOGIN_RECORD_LIMITER = client_ip_rate_limiter(
 # windows live in ONE warm instance's memory, so N instances allow up to N times
 # the nominal budget and a cold start begins at zero. On Fluid Compute a single
 # caller's sequential requests mostly reuse a warm instance, which is what makes
-# this a real brake on a naive loop — but it is NOT a global ceiling. The audit
-# log remains the record of what was read.
+# this a real brake on a naive loop — but it is NOT a global ceiling for BROWSE.
+#
+# The EXPORT bucket IS global (2026-10-06): on top of the in-memory windows it
+# counts the caller's own completed exports in the audit trail — every export
+# route writes one ``export_*`` row per call (:data:`EXPORT_AUDIT_ACTIONS`) — so
+# the same 10-minute / 1-hour budgets hold across every instance and survive a
+# cold start. One COUNT per export call; see :func:`_recent_export_counts`.
+# Browse gets no such check: it runs on every page view and its reads are not
+# all audited, so a query per call there is cost without a reliable count.
 
 _BROWSE_WINDOWS: tuple[tuple[int, float], ...] = ((240, 60.0), (2400, 3600.0))
 _EXPORT_WINDOWS: tuple[tuple[int, float], ...] = ((20, 600.0), (60, 3600.0))
@@ -719,6 +735,88 @@ def _check_windows(
         )
 
 
+# The audit ``action_type`` every export route writes, one row per completed
+# call. A NEW export route must add its action here, or it spends only the
+# per-instance budget (tests/test_read_throttle.py scans the code for
+# ``export_*`` actions and fails until it is listed).
+EXPORT_AUDIT_ACTIONS: frozenset[str] = frozenset(
+    {
+        "export_alumni",  # POST /alumni/export + the cohort template
+        "export_profile",  # GET /alumni/{id}/export
+        "export_event_attendees",
+        "export_survey_no_reply",  # both no-reply CSVs
+        "export_opportunity_links",
+    }
+)
+
+
+async def _recent_export_counts(
+    session: AsyncSession, actor: UserContext, windows: tuple[tuple[int, float], ...]
+) -> list[int]:
+    """The caller's completed exports inside each of ``windows``, ACROSS ALL
+    INSTANCES — one COUNT with a FILTER per window, over the longest window.
+
+    Counted from the audit trail the export routes already write, so it needs no
+    new table or migration. An engineer's audit rows are rerouted into
+    ``engineer_action_log`` (#199), so theirs are counted there instead.
+
+    ⚠️ INDEXES: neither table has a (user, time) composite index. ``audit_logs``
+    is scanned through ``idx_audit_logs_created_at`` (the last hour of rows, all
+    actors) and filtered on user/action; ``engineer_action_log`` has separate
+    ``occurred_at`` and ``actor_user_id`` indexes. Fine at this staff size, but a
+    bulk import's per-field audit rows land in that hour too — if this COUNT ever
+    shows up as slow, an ``(user_id, created_at)`` index is the fix.
+    """
+    if actor.is_engineer:
+        table, user_col, time_col = (
+            EngineerActionLog,
+            EngineerActionLog.actor_user_id,
+            EngineerActionLog.occurred_at,
+        )
+    else:
+        table, user_col, time_col = AuditLog, AuditLog.user_id, AuditLog.created_at
+    now = datetime.datetime.now(datetime.UTC)
+    longest = max(window_seconds for _limit, window_seconds in windows)
+    stmt = select(
+        *(
+            func.count().filter(
+                time_col >= now - datetime.timedelta(seconds=window_seconds)
+            )
+            for _limit, window_seconds in windows
+        )
+    ).where(
+        user_col == actor.user_id,
+        table.action_type.in_(sorted(EXPORT_AUDIT_ACTIONS)),
+        time_col >= now - datetime.timedelta(seconds=longest),
+    )
+    row = (await session.execute(stmt)).one()
+    return [int(n or 0) for n in row]
+
+
+async def _global_export_trip(
+    session: AsyncSession, actor: UserContext, windows: tuple[tuple[int, float], ...]
+) -> tuple[int, float] | None:
+    """The (limit, window) the caller's completed exports already fill, or None.
+
+    FAILS OPEN on a database error: the per-instance windows still apply, and an
+    export that cannot read the audit table cannot run its own query either, so
+    refusing here would only change which error the caller sees.
+    """
+    try:
+        counts = await _recent_export_counts(session, actor, windows)
+    except Exception:  # noqa: BLE001 - fail open, see docstring
+        log.warning("rate_limit: global export count failed; per-instance only")
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    for (limit, window_seconds), count in zip(windows, counts, strict=True):
+        if count >= limit:
+            return limit, window_seconds
+    return None
+
+
 def _tripped_window(
     bucket: str, actor_id: int, windows: tuple[tuple[int, float], ...]
 ) -> tuple[int, float]:
@@ -736,6 +834,7 @@ async def _alert_read_throttle(
     bucket: str,
     actor_id: int,
     windows: tuple[tuple[int, float], ...],
+    tripped: tuple[int, float] | None = None,
 ) -> None:
     """Log and alert, at most once per (bucket, user) per cooldown. Never raises.
 
@@ -749,17 +848,30 @@ async def _alert_read_throttle(
     ``opportunity_link_alert``: Vercel freezes the function once the response is
     written, so a detached task often never runs. The cost is one bounded wait on
     one already-refused request per cooldown.
+
+    ``tripped`` is the (limit, window) when the caller already knows it (the
+    global export count); otherwise it is read off the in-memory windows.
+
+    A delivery that FAILS — raises, times out, is cancelled, or lands nowhere —
+    releases the cooldown claim, so the next 429 retries the alert instead of
+    the hour passing in silence. A cancellation is re-raised after the release.
     """
+    now = time.monotonic()
+    key = (bucket, actor_id)
+
+    def _release_claim() -> None:
+        # Only OUR claim: a newer one belongs to a send still in flight.
+        if _READ_ALERTED_AT.get(key) == now:
+            _READ_ALERTED_AT.pop(key, None)
+
     try:
-        now = time.monotonic()
-        key = (bucket, actor_id)
         last = _READ_ALERTED_AT.get(key)
         if last is not None and now - last < _READ_ALERT_COOLDOWN_SECONDS:
             return
         # Claim before sending, same rule as failure_alert: a slow send must not
         # let the next 429 in behind it and send a second copy.
         _READ_ALERTED_AT[key] = now
-        limit, window_seconds = _tripped_window(bucket, actor_id, windows)
+        limit, window_seconds = tripped or _tripped_window(bucket, actor_id, windows)
         route = route_template(request)
         # The stdout security_event line (same shape as app/core/security_log.py,
         # but with the route TEMPLATE rather than the raw path). Once per
@@ -799,7 +911,7 @@ async def _alert_read_throttle(
             f"{int(window_seconds)} s) on {route}. Further requests are refused. "
             "If this was not a person, revoke their session in the engineer console."
         )
-        await asyncio.wait_for(
+        landed = await asyncio.wait_for(
             failure_alert.deliver_alert(
                 subject,
                 "One account read far more than any person browsing could. This "
@@ -811,7 +923,14 @@ async def _alert_read_throttle(
             ),
             timeout=_READ_ALERT_TIMEOUT_SECONDS,
         )
+        if not landed:
+            _release_claim()
+            log.error("rate_limit: the read-throttle alert for %s landed nowhere", bucket)
+    except asyncio.CancelledError:
+        _release_claim()
+        raise
     except Exception:  # noqa: BLE001 - the alert must never change the 429
+        _release_claim()
         log.error("rate_limit: could not deliver the read-throttle alert for %s", bucket)
 
 
@@ -820,6 +939,7 @@ def read_rate_limiter(
     *,
     windows: tuple[tuple[int, float], ...],
     actor_guard=require_view_only,
+    global_count: bool = False,
 ):
     """Build a FastAPI dependency throttling a bulk-READ route per user.
 
@@ -831,6 +951,11 @@ def read_rate_limiter(
     Two factories built with the SAME ``bucket`` share one budget even with
     different guards — that is how the opportunity-link export (view access)
     and the alumni exports (``alumni.export``) count against one export limit.
+
+    ``global_count`` (the export bucket only) adds the cross-instance check:
+    after the in-memory windows pass, the caller's completed exports in the
+    audit trail must also be under every window's limit
+    (:func:`_global_export_trip`). Same 429, same alert.
     """
 
     async def _dependency(
@@ -844,20 +969,56 @@ def read_rate_limiter(
             raise
         return actor
 
-    return _dependency
+    if not global_count:
+        return _dependency
+
+    # A separate dependency so ONLY the export routes resolve a DB session here
+    # (FastAPI caches it per request, so it is the route's own session).
+    async def _global_dependency(
+        request: Request,
+        actor: Annotated[UserContext, Depends(_dependency)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> UserContext:
+        tripped = await _global_export_trip(session, actor, windows)
+        if tripped is not None:
+            await _alert_read_throttle(
+                request, bucket, actor.user_id, windows, tripped=tripped
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=_TOO_MANY_REQUESTS_MESSAGE,
+                headers={"Retry-After": str(int(tripped[1]))},
+            )
+        return actor
+
+    return _global_dependency
 
 
 BROWSE_READ_LIMITER = read_rate_limiter("read:browse", windows=_BROWSE_WINDOWS)
+# The geography drill-downs that list NAMED alumni (state / country / radius /
+# city) are gated by ``reports.advanced``, so they resolve through that guard —
+# but spend the SAME browse budget: paging a map drill-down is the same kind of
+# walk as paging the directory.
+GEO_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_reports_advanced
+)
 EXPORT_READ_LIMITER = read_rate_limiter(
-    "read:export", windows=_EXPORT_WINDOWS, actor_guard=require_alumni_export
+    "read:export",
+    windows=_EXPORT_WINDOWS,
+    actor_guard=require_alumni_export,
+    global_count=True,
 )
 # The opportunity-link export is open to view access (it is the Links tab's own
 # download), so it resolves through that guard — but spends the SAME export
 # budget, because it is the same kind of call.
 VIEW_EXPORT_READ_LIMITER = read_rate_limiter(
-    "read:export", windows=_EXPORT_WINDOWS, actor_guard=require_view_only
+    "read:export",
+    windows=_EXPORT_WINDOWS,
+    actor_guard=require_view_only,
+    global_count=True,
 )
 
 BrowseReadRateLimit = Annotated[UserContext, Depends(BROWSE_READ_LIMITER)]
+GeoBrowseReadRateLimit = Annotated[UserContext, Depends(GEO_BROWSE_READ_LIMITER)]
 ExportReadRateLimit = Annotated[UserContext, Depends(EXPORT_READ_LIMITER)]
 ViewExportReadRateLimit = Annotated[UserContext, Depends(VIEW_EXPORT_READ_LIMITER)]

@@ -11,6 +11,7 @@ legacy `surveys` table — see `models.crm.Survey`.
 
 import contextlib
 import datetime
+import logging
 from typing import Annotated, Literal
 
 from fastapi import (
@@ -59,7 +60,7 @@ from app.schemas.survey import (
     GraduationYearCount,
     SurveyAlumniState,
     SurveyApplyResult,
-    SurveyBouncedAlum,
+    SurveyBouncedPage,
     SurveyHeldOutPage,
     SurveyMessageRead,
     SurveyMessageUpdate,
@@ -106,6 +107,8 @@ _GRAD_YEAR_MAX = 2100
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 router = APIRouter(prefix="/survey", tags=["survey"])
+
+log = logging.getLogger(__name__)
 
 
 async def _log_survey_read(
@@ -163,7 +166,18 @@ async def _log_survey_read(
             )
         )
         await session.commit()
-    except Exception:  # noqa: BLE001 - audit is best-effort
+    except Exception as exc:  # noqa: BLE001 - audit is best-effort
+        # Not silent: a disclosure that leaves no trace must at least leave a
+        # log line. Action, entity and actor id only -- never the scope or any
+        # of the people the read returned.
+        log.warning(
+            "survey read-audit write failed: action=%s entity=%s:%s actor=%s (%s)",
+            action,
+            entity_type,
+            entity_id,
+            actor_user_id,
+            type(exc).__name__,
+        )
         with contextlib.suppress(Exception):
             await session.rollback()
 
@@ -756,13 +770,16 @@ async def list_survey_unreachable(
 
 @router.get(
     "/campaigns/{grad_year}/bounced",
-    response_model=list[SurveyBouncedAlum],
+    response_model=SurveyBouncedPage,
 )
 async def list_survey_bounced(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
     user: RequireSurveysManage,
     session: SessionDep,
-) -> list[SurveyBouncedAlum]:
+    limit: Annotated[
+        int, Query(ge=1, le=survey_bounces.BOUNCED_PAGE_MAX)
+    ] = survey_bounces.BOUNCED_PAGE_DEFAULT,
+) -> SurveyBouncedPage:
     """The alumni whose survey email for this year PERMANENTLY bounced (#858).
 
     Fed by Resend's ``email.bounced`` webhook (``POST /webhooks/resend``). The
@@ -779,16 +796,16 @@ async def list_survey_bounced(
     survey name lists (#422): the row records who asked for which year, never
     who was returned.
     """
-    items = await survey_bounces.list_bounced(session, grad_year)
+    page = await survey_bounces.list_bounced(session, grad_year, limit=limit)
     await _log_survey_read(
         session,
         actor_user_id=user.user_id,
         action="read_survey_bounced",
         entity_type="survey_campaign",
         entity_id=grad_year,
-        scope=f"graduation_year={grad_year}",
+        scope=f"graduation_year={grad_year}; limit={limit}",
     )
-    return items
+    return page
 
 
 @router.get(

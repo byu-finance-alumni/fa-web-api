@@ -39,7 +39,7 @@ from app.models.survey_email_event import (
 )
 from app.models.survey_schedule import SurveySendLog
 from app.repositories.alumni import build_alumni_query
-from app.schemas.survey import SurveyBouncedAlum
+from app.schemas.survey import SurveyBouncedAlum, SurveyBouncedPage
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +51,11 @@ _MAX_ID_LEN = 100
 _MAX_TYPE_LEN = 40
 _MAX_SUBTYPE_LEN = 60
 _GRAD_YEAR_RANGE = (1900, 2100)
+
+#: The bounced list's page size: default and ceiling, the same as the held-out
+#: list (`survey_email.HELD_OUT_PAGE_DEFAULT` / `HELD_OUT_PAGE_MAX`).
+BOUNCED_PAGE_DEFAULT = 200
+BOUNCED_PAGE_MAX = 1000
 
 
 def _short_str(value: Any, limit: int) -> str | None:
@@ -249,9 +254,16 @@ def _display_name(a: Alumni) -> str:
 
 
 async def list_bounced(
-    session: AsyncSession, graduation_year: int
-) -> list[SurveyBouncedAlum]:
+    session: AsyncSession,
+    graduation_year: int,
+    *,
+    limit: int = BOUNCED_PAGE_DEFAULT,
+) -> SurveyBouncedPage:
     """Alumni whose survey email for ``graduation_year`` PERMANENTLY bounced.
+
+    Capped at ``limit`` names (``total`` is the uncapped count). The list is one
+    graduation year's hard bounces, so the uncapped set is small by nature; the
+    cap bounds the disclosure per read regardless.
 
     One row per alumnus -- their most recent permanent bounce -- ordered by name
     so it reads like a worklist. Each row carries the address that bounced (from
@@ -297,7 +309,9 @@ async def list_bounced(
             latest[event.alumni_id] = (event, sent_to)
             alumni[event.alumni_id] = alum
     if not latest:
-        return []
+        return SurveyBouncedPage(
+            graduation_year=graduation_year, total=0, limit=limit, items=[]
+        )
 
     ids = list(latest)
     contacts = {
@@ -339,4 +353,9 @@ async def list_bounced(
             )
         )
     items.sort(key=lambda i: (i.name.lower(), i.alumni_id))
-    return items
+    return SurveyBouncedPage(
+        graduation_year=graduation_year,
+        total=len(items),
+        limit=limit,
+        items=items[: max(limit, 0)],
+    )

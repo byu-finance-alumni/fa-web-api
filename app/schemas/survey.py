@@ -286,6 +286,19 @@ class SurveyBouncedAlum(BaseModel):
     address_still_on_file: bool | None = None
 
 
+class SurveyBouncedPage(BaseModel):
+    """The bounced list, capped, plus the size of the whole set (#858).
+
+    `total` counts every alumnus with a permanent bounce for the year, BEFORE
+    `limit`, so the console can say "showing the first N of M" rather than pass
+    a prefix off as the whole list."""
+
+    graduation_year: int
+    total: int
+    limit: int
+    items: list[SurveyBouncedAlum]
+
+
 class SurveyHeldOutAlum(BaseModel):
     """One alumnus this year's send is holding out, and why (#658).
 

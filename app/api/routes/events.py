@@ -486,28 +486,33 @@ def _attendee_name(a: Alumni) -> str:
 
 @router.get("/{event_id}/attendees", response_model=list[AttendeeRead])
 async def list_event_attendees(
-    event_id: IdPath, _: BrowseReadRateLimit, session: SessionDep
+    event_id: IdPath, user: BrowseReadRateLimit, session: SessionDep
 ) -> list[AttendeeRead]:
     """Alumni who attended an event (view-access read). 404 if the event is
     unknown so callers can distinguish "no attendees" from "no such event".
 
     ``notes`` echoes the per-attendance ``attendance_notes`` (#181) so the notes
-    the bulk importer writes are actually readable on the roster."""
+    the bulk importer writes are actually readable on the roster.
+
+    ARCHIVED attendees are left off below full_access (#591), as on the alumni
+    list — the roster must not be a way to read records removed from the
+    directory. full_access and up still see them."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
-    rows = (
-        await session.execute(
-            select(
-                Alumni,
-                EventAttendance.attendance_status,
-                EventAttendance.attendance_notes,
-            )
-            .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
-            .where(EventAttendance.event_id == event_id)
-            .order_by(Alumni.last_name, Alumni.first_name)
+    stmt = (
+        select(
+            Alumni,
+            EventAttendance.attendance_status,
+            EventAttendance.attendance_notes,
         )
-    ).all()
+        .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
+        .where(EventAttendance.event_id == event_id)
+        .order_by(Alumni.last_name, Alumni.first_name)
+    )
+    if not user.sees_archived:
+        stmt = stmt.where(Alumni.archived.is_(False))
+    rows = (await session.execute(stmt)).all()
     return [
         AttendeeRead(
             alumni_id=a.alumni_id,
@@ -535,25 +540,29 @@ async def export_event_attendees(
 
     A non-editor holding the assignable ``alumni.export`` gets **Name, Email**
     only: Net ID is nulled on every read they make (VIEW_ONLY_HIDDEN_FIELDS), so
-    the column is dropped rather than the export refused."""
+    the column is dropped rather than the export refused.
+
+    Archived attendees are left out below full_access, matching the on-screen
+    roster (#591)."""
     event = await session.get(Event, event_id)
     if event is None:
         raise NotFoundError(f"Event {event_id} not found.")
-    rows = (
-        await session.execute(
-            select(
-                Alumni,
-                AlumniContactInfo.personal_email,
-                AlumniContactInfo.work_email,
-            )
-            .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
-            .outerjoin(
-                AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id
-            )
-            .where(EventAttendance.event_id == event_id)
-            .order_by(Alumni.last_name, Alumni.first_name)
+    stmt = (
+        select(
+            Alumni,
+            AlumniContactInfo.personal_email,
+            AlumniContactInfo.work_email,
         )
-    ).all()
+        .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
+        .outerjoin(
+            AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id
+        )
+        .where(EventAttendance.event_id == event_id)
+        .order_by(Alumni.last_name, Alumni.first_name)
+    )
+    if not user.sees_archived:
+        stmt = stmt.where(Alumni.archived.is_(False))
+    rows = (await session.execute(stmt)).all()
 
     include_net_id = user.can_edit_alumni
     buffer = io.StringIO()

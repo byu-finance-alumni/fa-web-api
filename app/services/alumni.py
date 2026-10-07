@@ -16,6 +16,7 @@ Owns the rules that aren't just data access:
 
 import contextlib
 import datetime
+import re
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit_context import audit_source, new_change_set_id
 from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
+from app.core.security import AuthorizationError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -269,6 +271,15 @@ SECTION_KEYS = frozenset(
 # them from the cleaned payload so `/preview` never shows a checkbox as a stored
 # field. A parity test pins the two together.
 CONTROL_KEYS = frozenset({"archive_previous_role"})
+
+# Identity / status fields that only an ``alumni.archive`` holder may CHANGE on
+# an existing record (fa-web-api#593). ``is_alumni=false`` moves a record out of
+# the alumni directory and ``deceased=true`` drops it from every survey send —
+# each is an archive in all but name — and the two IDs are what imports, the
+# survey, headshots and duplicate detection key on. ``alumni.edit`` (student and
+# up) may still SEND them unchanged, so a full-form save keeps working; only a
+# real change is refused. See ``identity_fields_changed``.
+IDENTITY_FIELDS = ("is_alumni", "deceased", "net_id", "byu_id")
 
 # current_employment column -> employment_history column, for #446's demotion of
 # an outgoing current role. Only the five columns BOTH tables have appear here:
@@ -719,6 +730,41 @@ async def log_search(
             await session.rollback()
 
 
+async def log_read(
+    session: AsyncSession,
+    *,
+    actor_user_id: int | None,
+    action: str,
+    entity_type: str = "alumni",
+    entity_id: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """Record a disclosure-audit row for a sensitive READ (FERPA, #591).
+
+    Same shape and rules as ``log_search``: the actor, WHAT was read (``action``
+    + entity) and an optional short ``detail`` describing the request — never the
+    returned data. BEST EFFORT: the read has already succeeded, so a failed audit
+    write is swallowed and rolled back rather than failing the request. Callers
+    must therefore build their response BEFORE calling this (the commit expires
+    loaded ORM rows). No-op when the actor is unknown."""
+    if actor_user_id is None:
+        return
+    try:
+        session.add(
+            AuditLog(
+                user_id=actor_user_id,
+                action_type=action,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                new_value=detail[:1000] if detail else None,
+            )
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - audit is best-effort
+        with contextlib.suppress(Exception):
+            await session.rollback()
+
+
 async def log_preview(
     session: AsyncSession,
     *,
@@ -974,12 +1020,53 @@ async def _upsert_section(
     }
 
 
+def _identity_norm(field: str, value: object) -> object:
+    """Normalise a stored/incoming identity value the way the write schema does,
+    so a legacy ``"ABC12"`` net ID or a dashed BYU ID re-sent unchanged by the
+    edit form is not mistaken for an edit (the validators lowercase net IDs and
+    strip BYU IDs to digits on the way IN; stored rows may predate that)."""
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if field == "net_id":
+        return value.lower()
+    if field == "byu_id":
+        return re.sub(r"\D", "", value)
+    return value
+
+
+def identity_fields_changed(alumnus: Alumni, changes: dict[str, object]) -> list[str]:
+    """The ``IDENTITY_FIELDS`` this write would actually change on *alumnus*.
+
+    Compared against the STORED value, not "was the key sent": the focused edit
+    forms re-submit what they loaded, and a student saving an untouched field
+    must not be refused for it (#593)."""
+    return [
+        field
+        for field in IDENTITY_FIELDS
+        if field in changes
+        and not _unchanged(
+            _identity_norm(field, getattr(alumnus, field)),
+            _identity_norm(field, changes[field]),
+        )
+    ]
+
+
 async def update_alumni(
     session: AsyncSession,
     alumni_id: int,
     payload: AlumniUpdateFull,
     actor_user_id: int | None = None,
+    *,
+    can_change_identity: bool = True,
 ) -> Alumni:
+    """Apply a partial edit to an existing alumnus.
+
+    ``can_change_identity`` is the caller's ``alumni.archive`` capability
+    (#593). When False, a write that would CHANGE any of ``IDENTITY_FIELDS`` is
+    refused with a 403 before anything is written; re-sending the stored value is
+    allowed. It defaults to True for the trusted non-HTTP callers (importers,
+    survey apply), which are gated by their own capabilities."""
     # Archived records 404 on edit, symmetric with GET /alumni/{id} — an archived
     # record is "removed from the directory", so it must be restored (via
     # POST /alumni/{id}/restore) before it can be edited, not silently mutated.
@@ -1025,6 +1112,14 @@ async def update_alumni(
         for k, v in cleaned.items()
         if k not in SECTION_KEYS and k not in CONTROL_KEYS
     }
+    if not can_change_identity:
+        blocked = identity_fields_changed(alumnus, changes)
+        if blocked:
+            raise AuthorizationError(
+                "Changing "
+                + ", ".join(blocked)
+                + " requires permission to archive alumni."
+            )
     if "spouse_alumni_id" in changes:
         await _validate_spouse_link(
             session, changes["spouse_alumni_id"], self_id=alumni_id

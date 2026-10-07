@@ -931,6 +931,12 @@ async def activity_feed(
     # and is reflected in both the count and the page (shared ``conditions``).
     if mine:
         conditions.append(Interaction.user_id == actor.user_id)
+    # Archived alumni's interactions are full_access-and-up only (#591), as on
+    # the alumni list. ``reports.advanced`` is assignable, so a lower role
+    # granted this feed must not read activity on records removed from the
+    # directory through it.
+    if not actor.sees_archived:
+        conditions.append(Alumni.archived.is_(False))
 
     total = await session.scalar(
         select(func.count())

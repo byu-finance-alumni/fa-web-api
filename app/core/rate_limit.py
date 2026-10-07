@@ -199,6 +199,18 @@ RECORD_LOGIN_LIMITER = rate_limiter(
     window_seconds=600,
     actor_guard=get_current_db_user_allow_must_change,
 )
+# The forced password change (#592) sets a real Supabase password server-side,
+# so it is braked like the other credential-minting calls. Same exempt resolver
+# as login recording: the caller is by definition still flagged
+# must_change_password. A person gets it right in one or two tries; five in ten
+# minutes leaves room for typos and the "too short" retry without letting a
+# stolen temp-password session spin on it.
+CHANGE_PASSWORD_LIMITER = rate_limiter(
+    "auth:change_password",
+    limit=5,
+    window_seconds=600,
+    actor_guard=get_current_db_user_allow_must_change,
+)
 # Turning maintenance mode ON is the most destructive single call in the app: it
 # invalidates every non-engineer session at once and closes the site. A generous
 # budget (an incident may legitimately involve a few flips) that still brakes a
@@ -238,6 +250,7 @@ CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
 AssignRoleRateLimit = Annotated[UserContext, Depends(ASSIGN_ROLE_LIMITER)]
 DeleteUserRateLimit = Annotated[UserContext, Depends(DELETE_USER_LIMITER)]
 RecordLoginRateLimit = Annotated[UserContext, Depends(RECORD_LOGIN_LIMITER)]
+ChangePasswordRateLimit = Annotated[UserContext, Depends(CHANGE_PASSWORD_LIMITER)]
 EnableMaintenanceRateLimit = Annotated[
     UserContext, Depends(ENABLE_MAINTENANCE_LIMITER)
 ]

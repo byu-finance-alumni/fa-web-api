@@ -143,7 +143,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 def _has_full_access(user: UserContext) -> bool:
     """full_access-and-up (engineer / super_admin / full_access): the tier that
     may see archived rows and use the contact-PII filters."""
-    return user.is_full_access or user.is_super_admin or user.is_engineer
+    return user.sees_archived
 
 
 # The repeatable/CSV ``designations`` query param (#404) is normalized +
@@ -1316,6 +1316,18 @@ async def get_headshot_urls(
             if url is not None and not can_see_key:
                 url = _headshot_proxy_path(alumni_id)
             urls[alumni_id] = url
+    # ONE audit row per call, not one per alumnus (#591): this runs on every
+    # roster page, and a row per face would bury the trail in noise. The detail
+    # records how many photos were requested and issued — never which ids.
+    await service.log_read(
+        session,
+        actor_user_id=user.user_id,
+        action="view_headshots",
+        detail=(
+            f"requested={len(unique_ids)}; "
+            f"issued={sum(1 for u in urls.values() if u is not None)}"
+        ),
+    )
     return HeadshotUrls(urls=urls)
 
 
@@ -1338,6 +1350,17 @@ async def get_headshot(
     if not net_id:
         return {"url": None}
     signed = await supabase_storage.create_signed_url(_HEADSHOT_BUCKET, net_id)
+    if signed is not None:
+        # Audited only when a photo is actually handed out (#591). The image
+        # proxy below is NOT separately audited: it serves the bytes behind a
+        # URL this route or the batch route already logged, and auditing every
+        # <img> fetch would write a row per face per roster page.
+        await service.log_read(
+            session,
+            actor_user_id=user.user_id,
+            action="view_headshot",
+            entity_id=alumni_id,
+        )
     if signed is not None and not user.can_edit_alumni:
         return {"url": _headshot_proxy_path(alumni_id)}
     return {"url": signed}
@@ -2170,12 +2193,20 @@ async def export_alumni(
     # the list.
     filters = payload.filters
     can_see_hidden = user.can_edit_alumni
+    dropped: set[str] = set()
     if not can_see_hidden:
-        hidden = set(VIEW_ONLY_HIDDEN_FIELDS)
+        dropped |= set(VIEW_ONLY_HIDDEN_FIELDS)
         if parse_friend_id(filters.net_id) is not None:
-            hidden.discard("net_id")
+            dropped.discard("net_id")
+    # Same tier rule as GET /alumni (#594): archived rows and the exact-email
+    # contact-PII filter are full_access-and-up. ``alumni.export`` is assignable,
+    # so without this a lower role granted it could export what its list view
+    # refuses to show. Dropped silently, exactly as the list ignores them.
+    if not _has_full_access(user):
+        dropped |= {"include_archived", "email"}
+    if dropped:
         filters = AlumniExportFilters.model_validate(
-            filters.model_dump(exclude_unset=True, exclude=hidden)
+            filters.model_dump(exclude_unset=True, exclude=dropped)
         )
     total = await alumni_export.count_matching(
         session, filters, match_ids=can_see_hidden
@@ -2216,10 +2247,18 @@ async def get_alumni(
 
     Archived records 404 (they were removed from the directory). view_only
     ("Professor") callers receive a FERPA-minimized record — sensitive PII,
-    notes, and import provenance are nulled. This lightweight read is not
-    audit-logged (the full profile aggregate is)."""
+    notes, and import provenance are nulled. Audit-logged as ``view_alumni``
+    (#591): for an editor this record carries byu_id, birth date and notes, so
+    it is as much a disclosure as the profile aggregate."""
     alumnus = await service.get_alumni(session, alumni_id)
-    return minimize_alumni_read(AlumniRead.model_validate(alumnus), can_edit=user.can_edit_alumni)
+    # Serialized BEFORE the audit commit, which would expire the loaded row.
+    result = minimize_alumni_read(
+        AlumniRead.model_validate(alumnus), can_edit=user.can_edit_alumni
+    )
+    await service.log_read(
+        session, actor_user_id=user.user_id, action="view_alumni", entity_id=alumni_id
+    )
+    return result
 
 
 @router.get("/{alumni_id}/profile", response_model=ProfileRead)
@@ -2742,15 +2781,29 @@ async def update_alumni(
     alumni_id: IdPath,
     payload: AlumniUpdateFull,
     user: RequireAlumniEdit,
+    config: PermissionConfig,
     session: SessionDep,
 ) -> AlumniWriteResult:
     """Update an alumnus. Returns the saved record plus any soft duplicate
     warnings (``duplicate_warnings``) — the rename case in #627: the checks run
     against the stored row with this patch overlaid, so a partial edit that only
     sends the name fields is still measured against the record's real graduation
-    year. Warnings never block; exact ID collisions still 409."""
+    year. Warnings never block; exact ID collisions still 409.
+
+    CHANGING ``is_alumni`` / ``deceased`` / ``net_id`` / ``byu_id`` additionally
+    needs ``alumni.archive`` (#593): flipping ``is_alumni`` off archives the
+    record out of the directory in all but name, so ``alumni.edit`` alone
+    (student) must not be able to do it. Re-sending the stored value is fine; a
+    real change without the capability is a 403 and nothing is written."""
+    can_change_identity = Capability.ALUMNI_ARCHIVE in effective_capabilities(
+        config, user.roles
+    )
     return await service.update_alumni(
-        session, alumni_id, _drop_manual_updated_date(payload), actor_user_id=user.user_id
+        session,
+        alumni_id,
+        _drop_manual_updated_date(payload),
+        actor_user_id=user.user_id,
+        can_change_identity=can_change_identity,
     )
 
 

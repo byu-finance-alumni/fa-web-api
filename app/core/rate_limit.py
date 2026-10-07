@@ -628,6 +628,16 @@ SURVEY_CONTACT_LIMITER = client_ip_rate_limiter(
     "survey:contact", limit=300, window_seconds=_SURVEY_WINDOW
 )
 
+# Resend's delivery webhook (#858). Unauthenticated by nature -- the Svix
+# signature is the credential, checked in the route -- so it is IP-only. Resend
+# delivers from a small pool of addresses and a single survey batch can produce
+# a burst of bounce events, so the ceiling is loose: it bounds a flood of
+# unsigned junk, not real traffic. A 429 here is harmless to a real event --
+# Svix retries with backoff.
+RESEND_WEBHOOK_LIMITER = client_ip_rate_limiter(
+    "webhook:resend", limit=1200, window_seconds=_SURVEY_WINDOW
+)
+
 LOGIN_PRECHECK_LIMITER = client_ip_rate_limiter(
     "auth:login_precheck", limit=LOGIN_PRECHECK_LIMIT, window_seconds=_LOGIN_WINDOW
 )

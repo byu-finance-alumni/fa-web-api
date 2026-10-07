@@ -147,3 +147,12 @@ class SurveySendLog(Base):
     sent_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Resend's message id for this email and the address it went to (#858).
+    # Written BEST-EFFORT right after a successful batch (see
+    # ``survey_email._record_message_ids``) -- the only post-claim UPDATE this
+    # table ever sees, and it touches these two columns only. NULL for every row
+    # sent before the change (Resend's ids were discarded then, so there is
+    # nothing to backfill) or whose write-back failed. A bounce webhook names
+    # only the message id; this is what ties it back to an alum.
+    resend_email_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    sent_to: Mapped[str | None] = mapped_column(String(320))

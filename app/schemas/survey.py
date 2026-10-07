@@ -263,6 +263,29 @@ class SurveyUnreachableAlum(BaseModel):
     work_email: str | None = None
 
 
+class SurveyBouncedAlum(BaseModel):
+    """One alumnus whose survey email PERMANENTLY bounced (fa-web-app #858).
+
+    From Resend's ``email.bounced`` webhook. Permanent ("hard") bounces only --
+    a temporary one is stored but never listed. Listing someone here changes
+    nothing about them; staff fix the address on the profile by hand.
+
+    One row per alumnus: their most recent permanent bounce for the year.
+    """
+
+    alumni_id: int
+    name: str
+    # The address the bounced email was sent to. None when the message id never
+    # reached the send log (the bounce was matched by its alumni tag instead).
+    bounced_address: str | None = None
+    # Resend's bounce subtype as sent, e.g. "General", "NoEmail", "Suppressed".
+    bounce_subtype: str | None = None
+    bounced_at: datetime.datetime
+    # Whether that address is still one of the two on the profile. False means
+    # someone has already changed it since the bounce. None when unknown.
+    address_still_on_file: bool | None = None
+
+
 class SurveyHeldOutAlum(BaseModel):
     """One alumnus this year's send is holding out, and why (#658).
 

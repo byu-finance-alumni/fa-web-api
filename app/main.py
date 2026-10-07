@@ -36,6 +36,7 @@ from app.api.routes import (
     survey,
     tasks,
     vocabulary,
+    webhooks,
 )
 from app.core import failure_monitor
 from app.core.config import get_settings
@@ -256,6 +257,7 @@ app.include_router(support.router)
 app.include_router(support.admin_router)
 app.include_router(survey.router)
 app.include_router(storage.router)
+app.include_router(webhooks.router)
 
 
 @app.exception_handler(MaintenanceModeError)

@@ -59,6 +59,7 @@ from app.schemas.survey import (
     GraduationYearCount,
     SurveyAlumniState,
     SurveyApplyResult,
+    SurveyBouncedAlum,
     SurveyHeldOutPage,
     SurveyMessageRead,
     SurveyMessageUpdate,
@@ -88,6 +89,7 @@ from app.schemas.survey import (
 )
 from app.services import (
     opportunity_links,
+    survey_bounces,
     survey_email,
     survey_message,
     survey_reset,
@@ -748,6 +750,43 @@ async def list_survey_unreachable(
         entity_type="survey_campaign",
         entity_id=grad_year,
         scope=f"graduation_year={grad_year}; rows={len(items)}",
+    )
+    return items
+
+
+@router.get(
+    "/campaigns/{grad_year}/bounced",
+    response_model=list[SurveyBouncedAlum],
+)
+async def list_survey_bounced(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireSurveysManage,
+    session: SessionDep,
+) -> list[SurveyBouncedAlum]:
+    """The alumni whose survey email for this year PERMANENTLY bounced (#858).
+
+    Fed by Resend's ``email.bounced`` webhook (``POST /webhooks/resend``). The
+    companion to ``/unreachable``: that one lists people with no usable address
+    on file; this one lists people whose address LOOKED usable and was refused
+    by the receiving server, so staff can correct it on the profile.
+
+    Permanent ("hard") bounces only -- a temporary one is stored but not listed
+    (owner decision). Read-only: listing someone changes nothing about them.
+    Emails sent before message ids were recorded cannot be matched, so a year
+    surveyed only before this shipped lists nobody.
+
+    Gated like ``/unreachable`` (``surveys.manage``) and AUDITED like the other
+    survey name lists (#422): the row records who asked for which year, never
+    who was returned.
+    """
+    items = await survey_bounces.list_bounced(session, grad_year)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_bounced",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}",
     )
     return items
 

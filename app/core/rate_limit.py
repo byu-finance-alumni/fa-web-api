@@ -49,10 +49,12 @@ from app.api.dependencies.auth import (
     require_alumni_edit,
     require_alumni_export,
     require_alumni_photos,
+    require_donations_view,
     require_engineer,
     require_interactions_create,
     require_reports_advanced,
     require_super_admin,
+    require_surveys_manage,
     require_view_only,
 )
 from app.core.config import get_settings
@@ -1002,6 +1004,23 @@ BROWSE_READ_LIMITER = read_rate_limiter("read:browse", windows=_BROWSE_WINDOWS)
 GEO_BROWSE_READ_LIMITER = read_rate_limiter(
     "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_reports_advanced
 )
+# The other staff lists of named alumni (#590): the donations lists, an event's
+# attendee list (view access — the plain BROWSE_READ_LIMITER) and the survey
+# console's per-year lists. Each resolves through its route's OWN guard, so the
+# gate is unchanged, but all spend the SAME browse budget: walking the donor list
+# or a year's non-responders is the same kind of read as paging the directory,
+# and one budget means a stolen token cannot get N budgets by switching lists.
+DONATIONS_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_donations_view
+)
+SURVEYS_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_surveys_manage
+)
+# The engineer-only held-out list: same budget, engineer gate kept. Engineers
+# are not exempt from any limiter here (see above).
+ENGINEER_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_engineer
+)
 EXPORT_READ_LIMITER = read_rate_limiter(
     "read:export",
     windows=_EXPORT_WINDOWS,
@@ -1020,5 +1039,14 @@ VIEW_EXPORT_READ_LIMITER = read_rate_limiter(
 
 BrowseReadRateLimit = Annotated[UserContext, Depends(BROWSE_READ_LIMITER)]
 GeoBrowseReadRateLimit = Annotated[UserContext, Depends(GEO_BROWSE_READ_LIMITER)]
+DonationsBrowseReadRateLimit = Annotated[
+    UserContext, Depends(DONATIONS_BROWSE_READ_LIMITER)
+]
+SurveysBrowseReadRateLimit = Annotated[
+    UserContext, Depends(SURVEYS_BROWSE_READ_LIMITER)
+]
+EngineerBrowseReadRateLimit = Annotated[
+    UserContext, Depends(ENGINEER_BROWSE_READ_LIMITER)
+]
 ExportReadRateLimit = Annotated[UserContext, Depends(EXPORT_READ_LIMITER)]
 ViewExportReadRateLimit = Annotated[UserContext, Depends(VIEW_EXPORT_READ_LIMITER)]

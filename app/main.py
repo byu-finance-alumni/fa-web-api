@@ -19,6 +19,7 @@ from app import __version__
 from app.api.routes import (
     admin,
     alumni,
+    alumni_history,
     audit,
     auth,
     dashboard,
@@ -226,6 +227,7 @@ app.include_router(health.router)
 app.include_router(maintenance.router)
 app.include_router(auth.router)
 app.include_router(alumni.router)
+app.include_router(alumni_history.router)
 app.include_router(dashboard.router)
 app.include_router(admin.router)
 app.include_router(engineer.router)

@@ -1018,7 +1018,15 @@ VIEW_EXPORT_READ_LIMITER = read_rate_limiter(
     global_count=True,
 )
 
+# Per-record version history (#45) is an editor-tier read (``alumni.edit``), so
+# it resolves through that guard — and spends the SAME browse budget, because
+# paging one record's history after another is the same kind of walk.
+HISTORY_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_alumni_edit
+)
+
 BrowseReadRateLimit = Annotated[UserContext, Depends(BROWSE_READ_LIMITER)]
+HistoryReadRateLimit = Annotated[UserContext, Depends(HISTORY_READ_LIMITER)]
 GeoBrowseReadRateLimit = Annotated[UserContext, Depends(GEO_BROWSE_READ_LIMITER)]
 ExportReadRateLimit = Annotated[UserContext, Depends(EXPORT_READ_LIMITER)]
 ViewExportReadRateLimit = Annotated[UserContext, Depends(VIEW_EXPORT_READ_LIMITER)]

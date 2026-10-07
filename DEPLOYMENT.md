@@ -47,7 +47,7 @@ public deploy, rotate them in Supabase and use the new values below:
 | `SUPABASE_ANON_KEY` | publishable key (`sb_publishable_…`) |
 | `SUPABASE_SERVICE_ROLE_KEY` | the **rotated** service-role key |
 | `JWT_SECRET` | project JWT secret (HS256 project) — Settings → API → JWT Secret |
-| `ENVIRONMENT` | `production` |
+| `ENVIRONMENT` | `production` on the prod project. **`development` on the dev project (`dev-fa-web-api`) — required.** Unset now means `production` (fail closed, #597): dev would lose `/docs` + `/openapi.json`, which the app's `npm run gen:api-types` fetches. |
 | `DEBUG` | `false` |
 | `CRON_SECRET` | long random string — protects the survey send-scheduler cron (see below). Optional; unset ⇒ the cron endpoint rejects everything. |
 | `ALERT_EMAIL_TO` | engineer address(es), comma-separated, that get the "the API is failing" / "the API recovered" emails (#444). Optional; **unset ⇒ alerting is off entirely**, which is the right setting everywhere except prod. |
@@ -171,14 +171,15 @@ curl https://<your-deployment>.vercel.app/health
 curl https://<your-deployment>.vercel.app/health/db   # expect {"status":"ok","database":"connected"}
 ```
 
-Swagger UI: `https://<your-deployment>.vercel.app/docs`
+Swagger UI (dev only — `ENVIRONMENT=development`): `https://<your-deployment>.vercel.app/docs`
 
 ## Notes & trade-offs
 
 - **Cold starts**: serverless functions sleep when idle; the first request after
   idle is slower. For an internal tool this is usually fine.
-- **`/docs` is public** by default. To hide it in production, set
-  `docs_url=None` in `app/main.py` when `ENVIRONMENT == "production"`.
+- **`/docs`, `/redoc` and `/openapi.json` exist only when
+  `ENVIRONMENT=development`**; they are never mounted in production, and an
+  unset `ENVIRONMENT` counts as production.
 - **If pooling/cold starts become painful**, a container host (Railway, Render,
   Fly.io, Google Cloud Run) keeps the app warm with a persistent connection pool
   and maps more cleanly to this stateful FastAPI app. The code runs unchanged.

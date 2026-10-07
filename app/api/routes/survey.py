@@ -198,10 +198,18 @@ async def survey_contact(session: SessionDep) -> SurveySupportContact | None:
     response_model=SurveyRespondInfo,
     dependencies=[Depends(SURVEY_RESPOND_READ_LIMITER)],
 )
-async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondInfo:
+async def survey_respond_info(
+    token: str, session: SessionDep, response: Response
+) -> SurveyRespondInfo:
     """PUBLIC (token-gated, no login): the alum's current on-file info for the
     confirm page. The signed token is the credential — an invalid or expired one
-    404s with the same message either way."""
+    404s with the same message either way.
+
+    ``Cache-Control: no-store`` (#597): the body is the alum's on-file PII, and
+    the URL carries the bearer token, so no browser, proxy or shared cache may
+    keep a copy. Set here explicitly rather than relying only on the app-wide
+    default in ``app.main`` — this is the one PUBLIC route that returns PII."""
+    response.headers["Cache-Control"] = "no-store"
     info = await survey_email.get_respondent(session, token)
     if info is None:
         raise NotFoundError(survey_email.LINK_DEAD_MESSAGE)

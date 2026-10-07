@@ -11,7 +11,16 @@ with their own config, and ``load_grants`` (the real DB read) is unit-tested
 directly in tests/test_permissions.py.
 """
 
-import pytest
+import os
+
+# ENVIRONMENT now FAILS CLOSED to "production" when unset (#597). The suite was
+# written against development behaviour (localhost CORS, /openapi.json mounted),
+# so pin it explicitly — and BEFORE ``app.main`` is imported below, because the
+# settings are cached and the app is built at import time. ``setdefault`` lets a
+# caller deliberately run the suite as production with ENVIRONMENT=production.
+os.environ.setdefault("ENVIRONMENT", "development")
+
+import pytest  # noqa: E402
 
 from app.api.dependencies.auth import get_permission_config
 from app.core import failure_monitor, rate_limit

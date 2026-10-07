@@ -117,7 +117,11 @@ async def favicon_ico() -> FileResponse:
     image media type. Generate a real multi-size .ico later if legacy IE/older
     Safari support is ever needed (see the favicon notes).
     """
-    return FileResponse(_FAVICON_PATH, media_type="image/svg+xml")
+    return FileResponse(
+        _FAVICON_PATH,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 # Custom docs routes (only when docs are exposed, i.e. non-prod) so Swagger UI
@@ -160,6 +164,12 @@ async def security_headers_middleware(request: Request, call_next):
     - ``Referrer-Policy: no-referrer`` — never leak the request URL (which may
       carry ids/tokens) in an outbound Referer header.
 
+    - ``Cache-Control: no-store`` (#597) — API responses are alumni records,
+      exports and session state; no browser, proxy or shared cache may keep a
+      copy unless the route deliberately says otherwise. Routes that WANT
+      caching set their own header and keep it (the headshot image's
+      ``private, max-age=600``, the vocabulary lists, the favicons).
+
     Runs outside the CORS middleware so it does not interfere with CORS
     negotiation; ``setdefault`` avoids clobbering any header a specific route
     already set.
@@ -168,6 +178,7 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 

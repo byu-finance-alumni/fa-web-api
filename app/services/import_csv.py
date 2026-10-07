@@ -2031,6 +2031,8 @@ async def commit_update(
     session: AsyncSession,
     rows: list[dict],
     actor_user_id: int | None = None,
+    *,
+    can_change_identity: bool = False,
 ) -> dict:
     """Re-evaluate *rows* and apply every matched, changed row in ONE transaction.
 
@@ -2118,8 +2120,15 @@ async def commit_update(
                     # through update_alumni — and a later restore feature has to
                     # be able to tell them apart before it reverts anything.
                     with audit_source_scope(AUDIT_SOURCE_IMPORT):
+                        # The caller's ``alumni.archive`` (#593): a bulk
+                        # update must not be a back door to the identity
+                        # fields the edit form refuses to change.
                         await alumni_service.update_alumni(
-                            session, alumni_id, model, actor_user_id=actor_user_id
+                            session,
+                            alumni_id,
+                            model,
+                            actor_user_id=actor_user_id,
+                            can_change_identity=can_change_identity,
                         )
                 finally:
                     session.commit = real_commit  # type: ignore[method-assign]

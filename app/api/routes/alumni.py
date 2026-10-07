@@ -2013,6 +2013,7 @@ async def preview_update_import_alumni(
 @router.post("/import/update", response_model=AlumniUpdateResult)
 async def update_import_alumni(
     user: RequireAlumniImport,
+    config: PermissionConfig,
     session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> dict | JSONResponse:
@@ -2049,7 +2050,18 @@ async def update_import_alumni(
                 for msg in header_errors
             ],
         }
-    return await import_csv.commit_update(session, rows, actor_user_id=user.user_id)
+    # Identity fields (is_alumni / deceased / net_id / byu_id) need
+    # ``alumni.archive`` here too (#593) — ``alumni.import`` is assignable on its
+    # own. A row that would change one without it fails as a per-row error.
+    can_change_identity = Capability.ALUMNI_ARCHIVE in effective_capabilities(
+        config, user.roles
+    )
+    return await import_csv.commit_update(
+        session,
+        rows,
+        actor_user_id=user.user_id,
+        can_change_identity=can_change_identity,
+    )
 
 
 @router.get("/import/update/export", response_model=None)

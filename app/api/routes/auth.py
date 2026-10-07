@@ -24,8 +24,8 @@ from app.core.errors import ConflictError, InvalidRequestError
 from app.core.rate_limit import (
     LOGIN_PRECHECK_LIMITER,
     LOGIN_RECORD_LIMITER,
-    ChangePasswordRateLimit,
     RecordLoginRateLimit,
+    check_change_password_budget,
 )
 from app.core.security import MaintenanceModeError
 from app.models.audit import AuditLog
@@ -329,8 +329,13 @@ async def password_complete(
     the flag on the caller's word alone, so a user can keep the admin-issued
     temp password and still get through the gate. It is kept ONLY so app builds
     deployed before the switch keep working while both sides roll out.
-    TODO(#592 follow-up): delete this route once the app calling
-    ``/auth/password/change`` is in prod.
+    TODO(#592 follow-up, added 2026-10-07): delete this route once the app
+    calling ``/auth/password/change`` is live in prod.
+
+    Until then it carries the same session + maintenance gates as the new route
+    (appsec review 2026-10-07): it is on the force-change-exempt resolver, so
+    without them a superseded or engineer-REVOKED session could still clear the
+    flag.
 
     EXEMPT from the force-password-change gate (it depends on the exempt
     resolver): this is the very endpoint a flagged user calls to clear the flag,
@@ -345,6 +350,8 @@ async def password_complete(
     Idempotent: a caller whose flag is already false simply gets a 200 and no
     audit row is written.
     """
+    _enforce_single_session(user)
+    await _enforce_maintenance_mode(session, user)
     db_user = await session.scalar(
         select(User).where(User.user_id == user.user_id)
     )
@@ -387,7 +394,7 @@ class PasswordChangeRequest(BaseModel):
 @router.post("/password/change", response_model=PasswordCompleteResponse)
 async def password_change(
     payload: PasswordChangeRequest,
-    user: ChangePasswordRateLimit,
+    user: CurrentDBUserAllowMustChange,
     session: SessionDep,
 ) -> PasswordCompleteResponse:
     """Finish a FORCED password change server-side (#592).
@@ -415,7 +422,9 @@ async def password_change(
         (``supabase_admin.password_matches_current``). 422.
 
     A Supabase failure is a 502 and the flag stays set, so the user can retry.
-    Rate limited per user (``auth:change_password``). Audited as
+    Rate limited per user (``auth:change_password``, 5/10 min), counted only
+    once the request has passed the flag and strength checks — a 409 or a
+    "too short" 422 does not spend the budget; a temp-password guess does. Audited as
     ``password_changed``, like the route it replaces; the password itself is
     never logged or stored here.
     """
@@ -436,10 +445,20 @@ async def password_change(
         raise InvalidRequestError(
             "Your password can't be the same as your email address."
         )
+    check_change_password_budget(user.user_id)
     # Before any ORM load: on failure the helper rolls the session back.
-    if await supabase_admin.password_matches_current(
+    matches = await supabase_admin.password_matches_current(
         session, user.auth_user_id, password
-    ):
+    )
+    if matches is None:
+        # Fail open, but LOUDLY: a reuse check that silently never runs is how
+        # a temp password survives a "change" unnoticed. Never the password.
+        logger.error(
+            "Temp-password reuse check could not run for user_id=%s; "
+            "allowing the change without it.",
+            user.user_id,
+        )
+    if matches:
         raise InvalidRequestError(
             "Choose a new password — it can't be the temporary one you were given."
         )

@@ -241,12 +241,22 @@ def _to_read(
 
 
 async def _project(
-    session: AsyncSession, links: list[OpportunityLink]
+    session: AsyncSession,
+    links: list[OpportunityLink],
+    *,
+    redact_archived: bool = False,
 ) -> list[OpportunityLinkRead]:
     """Resolve the alumni names, employers and reviewer names for a PAGE of rows.
 
     Three bounded queries keyed on the page's ids, never one per row — the list
     is the hot read and an N+1 here would scale with the table.
+
+    ``redact_archived`` (callers below full_access, #591): a link submitted by an
+    ARCHIVED alumnus keeps its row — the posting itself is not alumni data, and
+    dropping rows would make the list and its export disagree on totals — but
+    the submitter's name and their employer (incl. a "my company" link's company
+    name, which IS that employer) come back blank, so the Links tab is not a way
+    to read records removed from the directory.
     """
     if not links:
         return []
@@ -267,11 +277,15 @@ async def _project(
         .scalars()
         .all()
     )
+    hidden = (
+        {a.alumni_id for a in alumni_rows if a.archived} if redact_archived else set()
+    )
     names = {
         a.alumni_id: _display_name(
             a.first_name, a.preferred_first_name, a.last_name, a.alumni_id
         )
         for a in alumni_rows
+        if a.alumni_id not in hidden
     }
     employment_rows = (
         (
@@ -284,7 +298,11 @@ async def _project(
         .scalars()
         .all()
     )
-    employers = {e.alumni_id: e.current_employer for e in employment_rows}
+    employers = {
+        e.alumni_id: e.current_employer
+        for e in employment_rows
+        if e.alumni_id not in hidden
+    }
 
     reviewers: dict[int, str | None] = {}
     if reviewer_ids:
@@ -495,6 +513,7 @@ async def list_links(
     *,
     limit: int = 50,
     offset: int = 0,
+    redact_archived: bool = False,
 ) -> OpportunityLinkPage:
     """The staff Links tab: a filtered, paginated page of links, newest first.
 
@@ -513,7 +532,7 @@ async def list_links(
         .all()
     )
     return OpportunityLinkPage(
-        items=await _project(session, list(rows)),
+        items=await _project(session, list(rows), redact_archived=redact_archived),
         total=total,
         limit=limit,
         offset=offset,
@@ -619,6 +638,7 @@ async def export_csv(
     filters: OpportunityLinkFilters,
     *,
     actor_user_id: int,
+    redact_archived: bool = False,
 ) -> str:
     """The dated report (#771): EXACTLY the filtered list, as CSV.
 
@@ -640,7 +660,7 @@ async def export_csv(
         .scalars()
         .all()
     )
-    items = await _project(session, list(rows))
+    items = await _project(session, list(rows), redact_archived=redact_archived)
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -686,9 +706,11 @@ def describe_filters(filters: OpportunityLinkFilters) -> str:
     return ";".join(f"{k}={v}" for k, v in pairs if v is not None)
 
 
-async def get_link(session: AsyncSession, link_id: int) -> OpportunityLinkRead:
+async def get_link(
+    session: AsyncSession, link_id: int, *, redact_archived: bool = False
+) -> OpportunityLinkRead:
     link = await _load(session, link_id)
-    items = await _project(session, [link])
+    items = await _project(session, [link], redact_archived=redact_archived)
     return items[0]
 
 

@@ -144,6 +144,10 @@ def test_student_can_resend_unchanged_identity_fields():
     assert resp.status_code == 200, resp.text
     assert alumnus.first_name == "Janet"
     assert session.commits == 1
+    # Unchanged after normalisation -> not WRITTEN either: the stored net ID
+    # (the headshot object key) keeps its original form.
+    assert alumnus.net_id == "JDOE12"
+    assert alumnus.byu_id == "123456789"
 
 
 def test_student_can_still_edit_other_fields():
@@ -191,3 +195,69 @@ def test_identity_fields_changed_helper():
     assert alumni_service.identity_fields_changed(
         alumnus, {"first_name": "Q", "deceased": True}
     ) == ["deceased"]
+
+
+def test_service_default_fails_closed():
+    """A caller that forgets to pass the capability gets the restrictive
+    behaviour, not the permissive one."""
+    import asyncio
+
+    from app.core.security import AuthorizationError
+    from app.schemas.alumni import AlumniUpdateFull
+
+    alumnus = _alum()
+    with pytest.raises(AuthorizationError):
+        asyncio.run(
+            alumni_service.update_alumni(
+                _Session(alumnus), 5, AlumniUpdateFull(is_alumni=False), actor_user_id=1
+            )
+        )
+    assert alumnus.is_alumni is True
+
+
+# --- the bulk-update importer passes the caller's alumni.archive --------------
+
+
+@pytest.mark.parametrize(
+    ("grant_archive", "expected"), [(True, True), (False, False)]
+)
+def test_import_update_route_passes_the_archive_capability(monkeypatch, grant_archive, expected):
+    from app.api.routes import alumni as alumni_routes
+
+    seen: dict = {}
+
+    async def _commit(_session, rows, *, actor_user_id, can_change_identity):
+        seen["can_change_identity"] = can_change_identity
+        return {
+            "updated": 0, "unchanged": 0, "unmatched": 0, "errors": 0,
+            "results": [], "updated_ids": [],
+        }
+
+    monkeypatch.setattr(
+        alumni_routes.import_csv, "parse_and_map_partial", lambda *_a, **_k: ([{}], [], [])
+    )
+    monkeypatch.setattr(alumni_routes.import_csv, "commit_update", _commit)
+
+    # A student granted alumni.import (assignable) with or without archive.
+    config = dict(DEFAULT_GRANTS)
+    extra = {Capability.ALUMNI_IMPORT} | ({Capability.ALUMNI_ARCHIVE} if grant_archive else set())
+    config["student"] = frozenset(config["student"]) | extra
+
+    async def _s():
+        yield None
+
+    app.dependency_overrides[get_session] = _s
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
+    app.dependency_overrides[get_permission_config] = lambda: config
+    try:
+        with TestClient(app) as client:
+            resp = client.post(
+                "/alumni/import/update",
+                files={"file": ("u.csv", b"alumni_id\n1\n", "text/csv")},
+            )
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_current_db_user, None)
+        app.dependency_overrides[get_permission_config] = lambda: dict(DEFAULT_GRANTS)
+    assert resp.status_code == 200, resp.text
+    assert seen["can_change_identity"] is expected

@@ -81,6 +81,7 @@ from app.schemas.alumni import (
     minimize_alumni_read,
 )
 from app.schemas.alumni_export import (
+    SEARCH_TEXT_MAX_LENGTH,
     AlumniExportFilters,
     AlumniExportRequest,
     ExportColumnCatalog,
@@ -158,6 +159,7 @@ async def list_alumni(
     q: Annotated[
         str | None,
         Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
             description=(
                 "Free-text search over names, external ids, designations, "
                 "current employer / title / city / state / country / industry "
@@ -170,23 +172,38 @@ async def list_alumni(
     ] = None,
     net_id: Annotated[
         str | None,
-        Query(description="Net ID — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Net ID — case-insensitive partial match.",
+        ),
     ] = None,
     first_name: Annotated[
         str | None,
-        Query(description="First name — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="First name — case-insensitive partial match.",
+        ),
     ] = None,
     last_name: Annotated[
         str | None,
-        Query(description="Last name — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Last name — case-insensitive partial match.",
+        ),
     ] = None,
     preferred_name: Annotated[
         str | None,
-        Query(description="Preferred first name — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Preferred first name — case-insensitive partial match.",
+        ),
     ] = None,
     email: Annotated[
         str | None,
-        Query(description="Email (personal or work) — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Email (personal or work) — case-insensitive partial match.",
+        ),
     ] = None,
     graduation_year: int | None = None,
     grad_year_min: int | None = None,
@@ -463,6 +480,7 @@ async def list_alumni(
     near: Annotated[
         str | None,
         Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
             description=(
                 "Natural-language location search (#358): a place phrase such as "
                 "'near Los Angeles, CA', 'within 50 miles of Provo', or a region "
@@ -974,15 +992,16 @@ async def _normalise_stored_headshot(
         and the caller re-checks ``size > _HEADSHOT_MAX_BYTES`` from the probe
         BEFORE calling this — so at most ~20 MiB of compressed bytes are read;
       * the DECODED buffer, which is the real cost, is capped by
-        ``images._MAX_PIXELS`` (50 Mpx) at ~150 MB, and that check runs off the
-        header while the pixels are still unread.
+        ``images._MAX_PIXELS`` (25 Mpx) at ~75 MB, and that check runs off the
+        header while the pixels are still unread (a JPEG is decoded through
+        ``draft()`` at a reduced scale, so a real phone photo costs far less).
 
-    ~180 MB peak for one object against the function's 2 GB, shared across
+    ~105 MB peak for one object against the function's 2 GB, shared across
     concurrent invocations. One at a time is comfortable. ⚠️ ONE — this is
     deliberately NOT called from ``/alumni/headshots/bulk/confirm``, which
     verifies up to 100 objects with ``_HEADSHOT_BULK_CONCURRENCY`` (8) in
-    flight: 8 x 180 MB is most of the instance, and the batch shares it with
-    every co-tenant request. Bulk normalisation belongs to a background sweep.
+    flight: 8 x ~105 MB is a large slice of the instance, and the batch shares
+    it with every co-tenant request. Bulk normalisation belongs to a background sweep.
 
     ON FAILURE THE OBJECT IS DELETED
     --------------------------------

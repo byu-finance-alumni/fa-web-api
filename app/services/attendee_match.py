@@ -88,6 +88,7 @@ from app.services.import_csv import (
     _canonicalize_header,
     _decode_upload,
     _map_row,
+    unreadable_csv_message,
 )
 
 log = logging.getLogger(__name__)
@@ -338,6 +339,8 @@ def parse_and_map(
         raw_header_row = next(reader)
     except StopIteration:
         return [], ["The file is empty."], []
+    except csv.Error:  # a cell over the 128 KB field limit (#597)
+        return [], [unreadable_csv_message(reader.line_num)], []
 
     if len(raw_header_row) == 1 and (
         raw_header_row[0].count(";") >= 2 or raw_header_row[0].count("\t") >= 2
@@ -374,19 +377,22 @@ def parse_and_map(
         return [], header_errors, ignored
 
     rows: list[dict] = []
-    for offset, raw_row in enumerate(reader, start=2):
-        if not any((cell or "").strip() for cell in raw_row):
-            continue
-        if max_rows is not None and len(rows) >= max_rows:
-            return (
-                [],
-                [
-                    f"File exceeds the {max_rows:,}-row limit. Split it into "
-                    "smaller batches."
-                ],
-                ignored,
-            )
-        rows.append(_build_row(offset, headers, list(raw_row), full_name_index))
+    try:
+        for offset, raw_row in enumerate(reader, start=2):
+            if not any((cell or "").strip() for cell in raw_row):
+                continue
+            if max_rows is not None and len(rows) >= max_rows:
+                return (
+                    [],
+                    [
+                        f"File exceeds the {max_rows:,}-row limit. Split it into "
+                        "smaller batches."
+                    ],
+                    ignored,
+                )
+            rows.append(_build_row(offset, headers, list(raw_row), full_name_index))
+    except csv.Error:
+        return [], [unreadable_csv_message(reader.line_num)], ignored
     return rows, [], ignored
 
 

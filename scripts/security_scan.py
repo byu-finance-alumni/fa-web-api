@@ -93,6 +93,14 @@ EXPECTED_PUBLIC_ROUTES = {
     # failure (checked 2026-08-24) — a mild availability lever, nothing more.
     ("GET", "/maintenance/status"),
     ("GET", "/health/db"),
+    # Resend's delivery webhook (fa-web-app #858): records which survey emails
+    # bounced. Resend has no user, so the credential is the Svix HMAC signature
+    # over the raw body with a 5-minute timestamp window, keyed on
+    # RESEND_WEBHOOK_SECRET; unset -> 503 and nothing is processed. NOT trusted
+    # to this list: check_webhook_auth independently proves every /webhooks/
+    # route calls the verifier and that the verifier is constant-time and fails
+    # CLOSED. Per-IP rate limited, body capped, out of the OpenAPI schema.
+    ("POST", "/webhooks/resend"),
 }
 
 #: Framework and infrastructure paths that were never going to carry a session.
@@ -376,6 +384,55 @@ def check_cron_auth(_routes) -> list[dict]:
     return findings
 
 
+def check_webhook_auth(_routes) -> list[dict]:
+    """Anything under /webhooks/ verifies its provider signature, fail-closed.
+
+    Same shape as :func:`check_cron_auth`: the public allowlist above says a
+    webhook route MAY be unauthenticated; this proves it carries its real
+    credential. The route must call ``verify_resend_webhook(``, and the helper in
+    app/core/webhooks.py must itself use ``hmac.compare_digest``, read
+    ``resend_webhook_secret`` and raise ``WebhookNotConfigured`` when it is
+    unset -- so an empty stub with the right name cannot read as guarded.
+    """
+    findings = []
+    try:
+        live = live_routes()
+    except Exception:  # already reported by check_unauthenticated_routes
+        return []
+    sources = {p: p.read_text(encoding="utf-8") for p in _py_files(ROUTES)}
+    helper_path = ROOT / "app" / "core" / "webhooks.py"
+    helper_src = helper_path.read_text(encoding="utf-8") if helper_path.exists() else ""
+    helper_sound = (
+        "def verify_resend_webhook(" in helper_src
+        and "resend_webhook_secret" in helper_src
+        and "compare_digest" in helper_src
+        and "raise WebhookNotConfigured" in helper_src
+    )
+    for verb, path, fn, _deps in live:
+        if not path.startswith("/webhooks/"):
+            continue
+        src = next((s for s in sources.values() if f"async def {fn}(" in s), None)
+        f = next(
+            (_rel(p) for p, s in sources.items() if f"async def {fn}(" in s),
+            "app/api/routes",
+        )
+        body = src[src.find(f"async def {fn}(") :][:6000] if src else ""
+        if not (helper_sound and "verify_resend_webhook(" in body):
+            findings.append(
+                {
+                    "check": "unguarded-webhook",
+                    "severity": CRITICAL,
+                    "where": f"{f}:{fn}",
+                    "detail": (
+                        f"{verb} {path} does not verify its webhook signature via "
+                        f"app/core/webhooks.verify_resend_webhook (constant-time, "
+                        f"fail-closed when RESEND_WEBHOOK_SECRET is unset)."
+                    ),
+                }
+            )
+    return findings
+
+
 def check_sql_injection() -> list[dict]:
     """No SQL text() built by interpolation, and no `:param::type` casts.
 
@@ -517,6 +574,7 @@ def check_database_defense_in_depth() -> list[dict]:
 CHECKS = (
     ("unauthenticated routes", lambda r: check_unauthenticated_routes(r)),
     ("cron authentication", lambda r: check_cron_auth(r)),
+    ("webhook authentication", lambda r: check_webhook_auth(r)),
     ("sql construction", lambda r: check_sql_injection()),
     ("dangerous calls", lambda r: check_dangerous_calls()),
     ("cors", lambda r: check_cors()),

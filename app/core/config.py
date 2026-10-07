@@ -224,6 +224,13 @@ class Settings(BaseSettings):
     # the endpoint rejects every request (401), so it's never open by default.
     cron_secret: str | None = Field(default=None)  # CRON_SECRET
 
+    # Signing secret for Resend's delivery webhook (POST /webhooks/resend,
+    # fa-web-app #858) -- the `whsec_...` value Resend shows when the endpoint is
+    # registered. Resend signs every delivery with it (Svix scheme). Unset (None)
+    # -> the route answers 503 and processes NOTHING, so it is never open by
+    # default.
+    resend_webhook_secret: str | None = Field(default=None)  # RESEND_WEBHOOK_SECRET
+
     # CORS — comma-separated list of allowed frontend origins.
     cors_origins: str = Field(
         default=(

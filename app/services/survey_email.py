@@ -50,7 +50,18 @@ from dataclasses import dataclass
 from html import escape
 
 import httpx
-from sqlalchemy import and_, case, delete, func, literal, or_, select, text
+from sqlalchemy import (
+    and_,
+    bindparam,
+    case,
+    delete,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+)
+from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1891,9 +1902,37 @@ _INTER_BATCH_DELAY_SECONDS = 0.15
 _MAX_PACE_SLEEP_SECONDS = 5.0
 
 
-async def _send_batch(emails: list[dict]) -> tuple[int | None, int | None]:
-    """Send one ≤100-email batch. Returns ``(ratelimit_remaining, ratelimit_reset)``
-    from Resend's response headers so the caller can pace itself. Raises
+def _resend_message_ids(response: httpx.Response, expected: int) -> list[str] | None:
+    """The message ids from a successful batch response, in REQUEST order (#858).
+
+    Resend answers ``{"data": [{"id": ...}, ...]}`` with one entry per email, in
+    the order they were posted. Anything else -- a missing or malformed body, or a
+    count that does not match what we sent -- returns None: pairing ids with
+    recipients by position is only safe when the lengths agree, and a WRONG
+    pairing would pin a bounce on the wrong alum, which is worse than none.
+
+    Never raises. The batch has already been accepted; failing to read its ids
+    must not turn a delivered send into an error."""
+    try:
+        body = response.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list) or len(data) != expected:
+            return None
+        ids = [item.get("id") if isinstance(item, dict) else None for item in data]
+        if not all(isinstance(i, str) and 0 < len(i) <= 100 for i in ids):
+            return None
+        return ids  # type: ignore[return-value]
+    except Exception:  # noqa: BLE001 - bookkeeping only, never fatal
+        return None
+
+
+async def _send_batch(
+    emails: list[dict],
+) -> tuple[int | None, int | None, list[str] | None]:
+    """Send one ≤100-email batch. Returns ``(ratelimit_remaining, ratelimit_reset,
+    message_ids)``: the first two from Resend's response headers so the caller
+    can pace itself, the third the per-email Resend ids in request order (None
+    when they could not be read safely, see :func:`_resend_message_ids`). Raises
     :class:`ResendRateLimited` on 429 (honoring ``retry-after``) and
     :class:`ServiceError` on other failures. All pacing/stopping is driven by
     Resend's own headers — nothing here is a configured limit."""
@@ -1947,7 +1986,83 @@ async def _send_batch(emails: list[dict]) -> tuple[int | None, int | None]:
     return (
         _int_header(response, "ratelimit-remaining"),
         _int_header(response, "ratelimit-reset"),
+        _resend_message_ids(response, len(emails)),
     )
+
+
+def _unpack_batch_result(
+    result: tuple,
+) -> tuple[int | None, int | None, list[str] | None]:
+    """Read ``_send_batch``'s result, tolerating the pre-#858 two-tuple shape.
+
+    The message ids are an optional extra: a sender (or a stand-in) that does not
+    report them still paces and logs exactly as before, it just records no ids."""
+    remaining = result[0] if len(result) > 0 else None
+    reset = result[1] if len(result) > 1 else None
+    ids = result[2] if len(result) > 2 else None
+    return remaining, reset, ids
+
+
+async def _record_message_ids(
+    session: AsyncSession,
+    *,
+    graduation_year: int,
+    stage: int,
+    cycle_seq: int,
+    claimed: list[Recipient],
+    ids: list[str] | None,
+) -> None:
+    """Write each email's Resend id + recipient address onto its send-log row (#858).
+
+    BEST EFFORT, and it must stay that way: by the time this runs the batch has
+    been accepted by Resend and the claim is already committed, so the send IS
+    recorded. A failure here costs only the ability to name the alum behind a
+    later bounce (and the webhook still has the ``alumni_id`` tag to fall back
+    on). It is swallowed, the session rolled back, and the send carries on.
+
+    Each UPDATE names the full claim key -- year, alum, stage, cycle AND reset
+    generation -- so it only ever touches the row this very send just claimed,
+    never an earlier cycle's or a pre-reset row for the same person.
+    """
+    if not ids or len(ids) != len(claimed):
+        return
+    table = SurveySendLog.__table__
+    stmt = (
+        sa_update(table)
+        .where(
+            table.c.graduation_year == graduation_year,
+            table.c.stage == stage,
+            table.c.cycle_seq == cycle_seq,
+            table.c.alumni_id == bindparam("b_alumni_id"),
+            table.c.reset_seq == bindparam("b_reset_seq"),
+        )
+        .values(
+            resend_email_id=bindparam("b_email_id"),
+            sent_to=bindparam("b_sent_to"),
+        )
+    )
+    params = [
+        {
+            "b_alumni_id": r.alumni_id,
+            "b_reset_seq": r.reset_seq,
+            "b_email_id": email_id,
+            "b_sent_to": (r.email or "")[:320] or None,
+        }
+        for r, email_id in zip(claimed, ids, strict=True)
+    ]
+    try:
+        await session.execute(stmt, params)
+        await session.commit()
+    except Exception:  # noqa: BLE001 - bookkeeping only, never fails a send
+        log.warning(
+            "Could not record Resend message ids for %s survey emails "
+            "(grad_year=%s stage=%s); bounces for them will match by tag only",
+            len(claimed),
+            graduation_year,
+            stage,
+        )
+        with suppress(Exception):
+            await session.rollback()
 
 
 def _survey_link(base_url: str, alumni_id: int, graduation_year: int) -> str:
@@ -1988,6 +2103,15 @@ def _build_survey_email(
         "subject": subject,
         "html": html,
         "text": text,
+        # Echoed back on Resend's webhooks (#858): the fallback for tying a
+        # bounce to an alum when the message id never reached the send log.
+        # Resend tag values allow only ASCII letters, digits, `_` and `-`, which
+        # these always are. No PII -- an internal id, a year and a stage.
+        "tags": [
+            {"name": "alumni_id", "value": str(r.alumni_id)},
+            {"name": "graduation_year", "value": str(graduation_year)},
+            {"name": "stage", "value": str(stage)},
+        ],
     }
 
 
@@ -2323,7 +2447,9 @@ async def _send_and_log(
             for r in claimed
         ]
         try:
-            remaining, reset = await _send_batch(emails)
+            remaining, reset, message_ids = _unpack_batch_result(
+                await _send_batch(emails)
+            )
         except ResendRateLimited as exc:
             await _release_claim(
                 session,
@@ -2357,6 +2483,16 @@ async def _send_and_log(
             error = exc
             break
         sent += len(claimed)
+        # Best effort and non-fatal: the send above already happened and is
+        # already logged. See `_record_message_ids`.
+        await _record_message_ids(
+            session,
+            graduation_year=graduation_year,
+            stage=stage,
+            cycle_seq=cycle_seq,
+            claimed=claimed,
+            ids=message_ids,
+        )
         # Pace from Resend's own headers: if the window is exhausted wait for
         # its reset, otherwise a small gap to stay under the req/s cap.
         if remaining is not None and remaining <= 0 and reset:

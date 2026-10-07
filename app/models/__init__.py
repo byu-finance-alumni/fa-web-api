@@ -39,6 +39,7 @@ from app.models.opportunity_link_digest import (
 )
 from app.models.role_capability import RoleCapability
 from app.models.service_incident import ServiceIncident
+from app.models.survey_email_event import SurveyEmailEvent
 from app.models.survey_email_message import SurveyEmailMessage
 from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
@@ -87,6 +88,7 @@ __all__ = [
     "StatusLabel",
     "Survey",
     "SurveyCampaignRetirement",
+    "SurveyEmailEvent",
     "SurveyEmailMessage",
     "SurveyResetLog",
     "SurveyResponse",

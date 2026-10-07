@@ -732,6 +732,12 @@ CREATE TABLE survey_send_log (
     -- See migrations/2026-08-05_survey_reset_log.sql.
     reset_seq           int NOT NULL DEFAULT 0,
     sent_at             timestamptz NOT NULL DEFAULT now(),
+    -- Resend's message id and the address it went to (#858). Written
+    -- best-effort right after a successful batch; NULL for rows that predate
+    -- it. A bounce webhook names only the message id, so this is how a bounce
+    -- is tied back to an alum. See migrations/2026-10-07_survey_email_bounces.sql.
+    resend_email_id     varchar(100),
+    sent_to             varchar(320),
     CONSTRAINT fk_survey_send_log_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
     CONSTRAINT ck_survey_send_log_cycle_seq CHECK (cycle_seq >= 1),
     CONSTRAINT ck_survey_send_log_reset_seq CHECK (reset_seq >= 0),
@@ -739,6 +745,30 @@ CREATE TABLE survey_send_log (
 );
 CREATE INDEX IF NOT EXISTS idx_survey_send_log_year_stage ON survey_send_log (graduation_year, stage);
 CREATE INDEX IF NOT EXISTS ix_survey_send_log_year_cycle_stage ON survey_send_log (graduation_year, cycle_seq, stage);
+CREATE INDEX IF NOT EXISTS ix_survey_send_log_resend_email_id ON survey_send_log (resend_email_id);
+
+-- Resend delivery events for survey emails (#858): bounces and complaints,
+-- received on POST /webhooks/resend (Svix-signed). `svix_id` UNIQUE makes a
+-- redelivery a no-op. `alumni_id` is resolved at receipt (message id -> send
+-- log, else the email's alumni_id tag). No address and no raw payload is
+-- stored. The console lists PERMANENT bounces only and changes no alumni data.
+-- See migrations/2026-10-07_survey_email_bounces.sql.
+CREATE TABLE survey_email_events (
+    survey_email_event_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    resend_email_id        varchar(100),
+    alumni_id              bigint,
+    graduation_year        int,
+    event_type             varchar(40) NOT NULL,
+    bounce_type            varchar(40),
+    bounce_subtype         varchar(60),
+    occurred_at            timestamptz NOT NULL DEFAULT now(),
+    svix_id                varchar(100) NOT NULL,
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_survey_email_events_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE SET NULL,
+    CONSTRAINT uq_survey_email_events_svix_id UNIQUE (svix_id)
+);
+CREATE INDEX IF NOT EXISTS ix_survey_email_events_year_type ON survey_email_events (graduation_year, event_type, bounce_type);
+CREATE INDEX IF NOT EXISTS ix_survey_email_events_resend_email_id ON survey_email_events (resend_email_id);
 
 -- Per-alumnus survey campaign resets (#395). A reset makes ONE person surveyable
 -- again and DELETES NOTHING: their responses and send-log rows stay exactly as

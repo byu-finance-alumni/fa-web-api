@@ -1405,6 +1405,9 @@ CREATE INDEX idx_surveys_alumni_id               ON surveys (alumni_id);
 CREATE INDEX idx_attachments_alumni_id           ON attachments (alumni_id);
 CREATE INDEX idx_audit_logs_entity              ON audit_logs (entity_type, entity_id);
 CREATE INDEX idx_audit_logs_created_at          ON audit_logs (created_at DESC);
+-- Per-record version history, newest first (#45). Supersedes idx_audit_logs_entity
+-- (same leading columns); that one is kept until a deliberate drop.
+CREATE INDEX idx_audit_logs_entity_created_at   ON audit_logs (entity_type, entity_id, created_at DESC);
 CREATE INDEX idx_duplicate_candidates_alumni_1   ON duplicate_candidates (alumni_id_1);
 CREATE INDEX idx_duplicate_candidates_alumni_2   ON duplicate_candidates (alumni_id_2);
 CREATE INDEX idx_alumni_program_engagement_alumni_id  ON alumni_program_engagement (alumni_id);

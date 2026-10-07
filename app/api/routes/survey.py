@@ -46,7 +46,9 @@ from app.core.rate_limit import (
     SURVEY_PHOTO_LIMITER,
     SURVEY_RESPOND_READ_LIMITER,
     SURVEY_SUBMIT_LIMITER,
+    EngineerBrowseReadRateLimit,
     ExportReadRateLimit,
+    SurveysBrowseReadRateLimit,
 )
 from app.models.audit import AuditLog
 from app.schemas.opportunity_link import (
@@ -428,7 +430,7 @@ async def survey_submit_photo(
 )
 async def survey_pending_responses(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> list[SurveyResponseItem]:
     """Admin review queue: pending responses for a grad year, each with a diff."""
@@ -664,7 +666,7 @@ async def send_survey_campaign(
 )
 async def survey_recipient_breakdown(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> SurveyRecipientBreakdown:
     """Who this year's survey would reach, and who it would not (#392).
@@ -690,7 +692,7 @@ async def survey_recipient_breakdown(
 )
 async def list_survey_unreachable(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> list[SurveyUnreachableAlum]:
     """The alumni this year's survey CANNOT email, by name (#392).
@@ -721,7 +723,7 @@ async def list_survey_unreachable(
 )
 async def list_survey_held_out(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireEngineer,
+    user: EngineerBrowseReadRateLimit,
     session: SessionDep,
     reason: Annotated[
         Literal["suppressed", "already_responded", "unreachable"] | None, Query()
@@ -891,7 +893,7 @@ async def create_survey_schedules_bulk(
 )
 async def list_survey_non_responders(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> list[SurveyNonResponder]:
     """Who needs MANUAL follow-up for this year's current campaign (#359).
@@ -984,7 +986,7 @@ async def export_survey_no_reply(
 )
 async def list_survey_responders(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> SurveyResponders:
     """Who is behind this year's `replied` and `confirmed` counts (#836).

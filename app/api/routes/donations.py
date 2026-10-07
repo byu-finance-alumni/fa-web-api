@@ -38,12 +38,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies.auth import (
     PermissionConfig,
     RequireDonationsManage,
-    RequireDonationsView,
 )
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.errors import InvalidRequestError, NotFoundError
+from app.core.rate_limit import DonationsBrowseReadRateLimit
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.donation import Donation
@@ -83,7 +83,7 @@ def _money(value, show: bool) -> float | None:
 
 @router.get("/donors")
 async def list_donors(
-    user: RequireDonationsView,
+    user: DonationsBrowseReadRateLimit,
     config: PermissionConfig,
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -179,7 +179,7 @@ async def list_donors(
 
 @router.get("/summary")
 async def donations_summary(
-    user: RequireDonationsView,
+    user: DonationsBrowseReadRateLimit,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:
@@ -228,7 +228,7 @@ async def donations_summary(
 @router.get("/alumni/{alumni_id}")
 async def list_alumni_donations(
     alumni_id: IdPath,
-    user: RequireDonationsView,
+    user: DonationsBrowseReadRateLimit,
     config: PermissionConfig,
     session: SessionDep,
 ) -> dict:

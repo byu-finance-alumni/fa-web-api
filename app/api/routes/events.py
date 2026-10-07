@@ -39,7 +39,7 @@ from app.api.params import IdPath
 from app.core.database import get_session
 from app.core.errors import ConflictError, NotFoundError
 from app.core.friend_id import friend_id_for
-from app.core.rate_limit import ExportReadRateLimit
+from app.core.rate_limit import BrowseReadRateLimit, ExportReadRateLimit
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -486,7 +486,7 @@ def _attendee_name(a: Alumni) -> str:
 
 @router.get("/{event_id}/attendees", response_model=list[AttendeeRead])
 async def list_event_attendees(
-    event_id: IdPath, _: RequireViewAccess, session: SessionDep
+    event_id: IdPath, _: BrowseReadRateLimit, session: SessionDep
 ) -> list[AttendeeRead]:
     """Alumni who attended an event (view-access read). 404 if the event is
     unknown so callers can distinguish "no attendees" from "no such event".

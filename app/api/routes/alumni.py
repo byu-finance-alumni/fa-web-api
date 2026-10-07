@@ -974,15 +974,16 @@ async def _normalise_stored_headshot(
         and the caller re-checks ``size > _HEADSHOT_MAX_BYTES`` from the probe
         BEFORE calling this — so at most ~20 MiB of compressed bytes are read;
       * the DECODED buffer, which is the real cost, is capped by
-        ``images._MAX_PIXELS`` (50 Mpx) at ~150 MB, and that check runs off the
-        header while the pixels are still unread.
+        ``images._MAX_PIXELS`` (25 Mpx) at ~75 MB, and that check runs off the
+        header while the pixels are still unread (a JPEG is decoded through
+        ``draft()`` at a reduced scale, so a real phone photo costs far less).
 
-    ~180 MB peak for one object against the function's 2 GB, shared across
+    ~105 MB peak for one object against the function's 2 GB, shared across
     concurrent invocations. One at a time is comfortable. ⚠️ ONE — this is
     deliberately NOT called from ``/alumni/headshots/bulk/confirm``, which
     verifies up to 100 objects with ``_HEADSHOT_BULK_CONCURRENCY`` (8) in
-    flight: 8 x 180 MB is most of the instance, and the batch shares it with
-    every co-tenant request. Bulk normalisation belongs to a background sweep.
+    flight: 8 x ~105 MB is a large slice of the instance, and the batch shares
+    it with every co-tenant request. Bulk normalisation belongs to a background sweep.
 
     ON FAILURE THE OBJECT IS DELETED
     --------------------------------

@@ -45,6 +45,11 @@ from PIL import Image, ImageOps
 
 from app.core.errors import InvalidRequestError
 
+try:  # littleCMS ships in Pillow's wheels, but a source build can omit it.
+    from PIL import ImageCms
+except ImportError:  # pragma: no cover - exercised only on a stripped Pillow
+    ImageCms = None  # type: ignore[assignment]
+
 # Matches HeadshotCropper.tsx (MAX_OUTPUT = 1024, quality 0.9) so a cropped
 # photo re-encoded here is a near-identical second generation rather than a
 # visible drop. Also matches compress-headshots.py, which performs the same
@@ -68,15 +73,36 @@ _JPEG_QUALITY = 90
 # the header, so `.size` is known while the pixels are still on disk — and the
 # warning is promoted to an error as a second line of defence.
 #
-# 50 Mpx is chosen to sit just above a 48 MP phone camera, so a real photo from
-# a modern handset is accepted and anything above it is refused.
-_MAX_PIXELS = 50_000_000
+# TWO CEILINGS, because the header size and the decoded size are not the same
+# thing for a JPEG (#597):
+#
+#   * `_MAX_HEADER_PIXELS` (50 Mpx) is what a file may CLAIM. It sits just above
+#     a 48 MP phone camera, so a full-resolution photo from a modern handset is
+#     still accepted. Pillow's own open-time bomb check is pinned to it.
+#   * `_MAX_PIXELS` (25 Mpx, ~75 MB as RGB) is what we will actually ALLOCATE.
+#     A JPEG is decoded through `draft()`, which has libjpeg scale by 1/2, 1/4
+#     or 1/8 DURING decode — a 48 MP photo bound for a 1024px avatar decodes at
+#     ~3 Mpx and never touches this limit. PNG and WebP have no reduced-size
+#     decode, so for them the header size IS the decoded size, and anything
+#     over 25 Mpx is refused.
+#
+# Halving the real allocation matters because the function's 2 GB is shared
+# with co-tenant requests; see the alumni headshot-normalise docstring.
+_MAX_HEADER_PIXELS = 50_000_000
+_MAX_PIXELS = 25_000_000
 
-Image.MAX_IMAGE_PIXELS = _MAX_PIXELS
+Image.MAX_IMAGE_PIXELS = _MAX_HEADER_PIXELS
 warnings.simplefilter("error", Image.DecompressionBombWarning)
 
+# The ONLY decoders hostile bytes may reach. Without `formats=` Pillow tries
+# every plugin it ships (TIFF, PSD, ICO, EPS, FITS, ...), each one a parser we
+# never meant to expose. This matches `_BAD_IMAGE` and the survey route's
+# magic-byte gate. (A phone JPEG carrying a multi-picture extension still opens
+# through the JPEG plugin — Pillow reports it as "MPO" — and is accepted.)
+_ALLOWED_FORMATS = ("JPEG", "PNG", "WEBP")
+
 _BAD_IMAGE = "That file could not be read as a JPEG, PNG or WebP image."
-_TOO_LARGE = "That image is too large. Please use a photo under 50 megapixels."
+_TOO_LARGE = "That image is too large. Please use a photo under 25 megapixels."
 
 
 def normalise_headshot(data: bytes) -> bytes:
@@ -89,7 +115,7 @@ def normalise_headshot(data: bytes) -> bytes:
     and must not destroy something it merely failed to parse.)
     """
     try:
-        image = Image.open(io.BytesIO(data))
+        image = Image.open(io.BytesIO(data), formats=_ALLOWED_FORMATS)
     except Image.DecompressionBombWarning as exc:  # promoted to an error above
         raise InvalidRequestError(_TOO_LARGE) from exc
     except Exception as exc:
@@ -102,8 +128,24 @@ def normalise_headshot(data: bytes) -> bytes:
     # `.size` comes from the header alone, so this runs while the pixels are
     # still unread — the whole point of checking here rather than after load().
     width, height = image.size
+    if width * height > _MAX_HEADER_PIXELS:
+        raise InvalidRequestError(_TOO_LARGE)
+
+    try:
+        # Ask libjpeg to decode at the smallest 1/2^n scale that still covers
+        # the output size. The request is square so it holds whichever way
+        # `exif_transpose` later turns the picture. A no-op for PNG/WebP.
+        image.draft(None, (_MAX_EDGE, _MAX_EDGE))
+    except Exception as exc:
+        raise InvalidRequestError(_BAD_IMAGE) from exc
+
+    # Re-checked AFTER draft(): this is the buffer that will really be allocated.
+    width, height = image.size
     if width * height > _MAX_PIXELS:
         raise InvalidRequestError(_TOO_LARGE)
+
+    # Read before exif_transpose, which builds a new image object.
+    icc = image.info.get("icc_profile")
 
     try:
         # ⚠️ ORIENTATION MUST COME FIRST, AND MUST NOT BE SKIPPED.
@@ -118,6 +160,9 @@ def normalise_headshot(data: bytes) -> bytes:
         # `exif_transpose` bakes the rotation into the pixels and clears the tag,
         # which is exactly what we want before discarding the rest of the EXIF.
         image = ImageOps.exif_transpose(image)
+
+        if icc:
+            image = _to_srgb(image, icc)
 
         if image.mode in ("RGBA", "LA", "P"):
             # JPEG has no alpha. A plain convert("RGB") makes transparent pixels
@@ -139,18 +184,12 @@ def normalise_headshot(data: bytes) -> bytes:
             image.thumbnail((_MAX_EDGE, _MAX_EDGE), Image.LANCZOS)
 
         buffer = io.BytesIO()
-        # The colour profile is carried across deliberately. It is not personal
-        # data, it costs a few KB, and dropping it visibly shifts colours on
-        # wide-gamut phone photos — a regression real people would notice, in a
-        # change whose point is to be invisible to them.
-        icc = image.info.get("icc_profile")
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=_JPEG_QUALITY,
-            optimize=True,
-            **({"icc_profile": icc} if icc else {}),
-        )
+        # NO icc_profile= here, deliberately (#597). The uploader's profile is
+        # an attacker-chosen blob that would otherwise be stored and served to
+        # every browser that renders the avatar. The colours it described were
+        # already baked into the pixels by `_to_srgb` above, and an untagged
+        # JPEG is displayed as sRGB, so the output looks the same without it.
+        image.save(buffer, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
     except InvalidRequestError:
         raise
     except Image.DecompressionBombWarning as exc:
@@ -162,3 +201,33 @@ def normalise_headshot(data: bytes) -> bytes:
         raise InvalidRequestError(_BAD_IMAGE) from exc
 
     return buffer.getvalue()
+
+
+def _to_srgb(image: Image.Image, icc: bytes) -> Image.Image:
+    """Convert *image* from its embedded ICC profile into plain sRGB pixels.
+
+    WHY NOT JUST DROP THE PROFILE: a modern phone photo is very often Display
+    P3. Its pixel values only mean the right colours when read through that
+    profile; treated as sRGB (which is what an untagged JPEG is) they come out
+    visibly washed out — skin tones especially. Converting first means dropping
+    the profile afterwards changes nothing a viewer can see.
+
+    BEST EFFORT, NEVER A REJECTION: a missing littleCMS, a malformed profile or
+    one that does not match the image's mode (an RGB profile on a greyscale
+    PNG) all fall back to the unconverted pixels — the pre-#597 look minus the
+    tag, at worst a mild colour shift. Refusing a real photo over its colour
+    metadata would be the worse outcome for someone with one shot at a link.
+    """
+    if ImageCms is None or image.mode not in ("RGB", "RGBA", "CMYK"):
+        return image
+    try:
+        source = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        converted = ImageCms.profileToProfile(
+            image,
+            source,
+            ImageCms.createProfile("sRGB"),
+            outputMode="RGBA" if image.mode == "RGBA" else "RGB",
+        )
+    except Exception:
+        return image
+    return converted if converted is not None else image

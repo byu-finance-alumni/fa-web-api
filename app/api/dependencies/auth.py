@@ -198,10 +198,11 @@ async def _enforce_maintenance_mode(
         that is accepted, because the frontend relies on it to decide where to
         send them (the ``(app)`` layout reads it, finds they are not an engineer,
         and redirects to the maintenance page).
-      * ``POST /auth/password/complete`` — clears the caller's own temp-password
-        flag and nothing else (deprecated by ``POST /auth/password/change``,
-        #592, which is on the exempt resolver too but calls this gate and
-        ``_enforce_single_session`` itself, because it sets a real password).
+      * ``POST /auth/password/complete`` (deprecated) and its replacement
+        ``POST /auth/password/change`` (#592) are on the exempt resolver too,
+        but each calls this gate and ``_enforce_single_session`` ITSELF: one
+        sets a real password and the other clears the temp-password flag, and a
+        revoked session must be able to do neither.
 
     Everything that reads or writes application data goes through this gate.
 

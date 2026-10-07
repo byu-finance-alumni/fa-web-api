@@ -1058,15 +1058,17 @@ async def update_alumni(
     payload: AlumniUpdateFull,
     actor_user_id: int | None = None,
     *,
-    can_change_identity: bool = True,
+    can_change_identity: bool = False,
 ) -> Alumni:
     """Apply a partial edit to an existing alumnus.
 
     ``can_change_identity`` is the caller's ``alumni.archive`` capability
     (#593). When False, a write that would CHANGE any of ``IDENTITY_FIELDS`` is
     refused with a 403 before anything is written; re-sending the stored value is
-    allowed. It defaults to True for the trusted non-HTTP callers (importers,
-    survey apply), which are gated by their own capabilities."""
+    allowed, and is then not written at all (so a re-sent ``"abc12"`` cannot
+    re-case a stored ``"ABC12"`` net ID — the headshot object key). It defaults
+    to False — fail closed — so every caller must pass the capability it
+    actually checked (the PATCH route and the bulk-update importer both do)."""
     # Archived records 404 on edit, symmetric with GET /alumni/{id} — an archived
     # record is "removed from the directory", so it must be restored (via
     # POST /alumni/{id}/restore) before it can be edited, not silently mutated.
@@ -1120,6 +1122,10 @@ async def update_alumni(
                 + ", ".join(blocked)
                 + " requires permission to archive alumni."
             )
+        # Unchanged after normalisation: nothing to write. Without this a
+        # re-sent value that differs only in case/format would still be set.
+        for field in IDENTITY_FIELDS:
+            changes.pop(field, None)
     if "spouse_alumni_id" in changes:
         await _validate_spouse_link(
             session, changes["spouse_alumni_id"], self_id=alumni_id

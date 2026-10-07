@@ -386,3 +386,118 @@ def test_survey_non_responders_404_writes_no_audit(run, monkeypatch):
     resp = run(session, "full_access", "GET", "/survey/schedules/2020/non-responders")
     assert resp.status_code == 404
     assert session.audits == []
+
+
+# --- archived: opportunity links (appsec follow-up) ---------------------------
+
+
+class _LinkSession:
+    """Answers ``_project``'s alumni then employment queries."""
+
+    def __init__(self, alumni, employment):
+        self._queue = [alumni, employment]
+
+    async def execute(self, _stmt):
+        return _Result(self._queue.pop(0) if self._queue else [])
+
+
+@pytest.mark.parametrize("redact", [True, False])
+def test_link_projection_blanks_archived_submitters_only_when_asked(monkeypatch, redact):
+    import asyncio
+
+    from app.services import opportunity_links as links_service
+
+    seen: list[dict] = []
+
+    def _to_read(link, **kw):
+        seen.append({"alumni_id": link.alumni_id, **kw})
+        return kw
+
+    monkeypatch.setattr(links_service, "_to_read", _to_read)
+    alumni = [
+        SimpleNamespace(alumni_id=1, first_name="Gone", preferred_first_name=None,
+                        last_name="Away", archived=True),
+        SimpleNamespace(alumni_id=2, first_name="Still", preferred_first_name=None,
+                        last_name="Here", archived=False),
+    ]
+    employment = [
+        SimpleNamespace(alumni_id=1, current_employer="SecretCo"),
+        SimpleNamespace(alumni_id=2, current_employer="OpenCo"),
+    ]
+    links = [
+        SimpleNamespace(alumni_id=1, reviewed_by_user_id=None),
+        SimpleNamespace(alumni_id=2, reviewed_by_user_id=None),
+    ]
+    asyncio.run(
+        links_service._project(_LinkSession(alumni, employment), links, redact_archived=redact)
+    )
+    by_id = {row["alumni_id"]: row for row in seen}
+    # The active submitter is always named.
+    assert by_id[2]["submitted_by"] == "Still Here"
+    assert by_id[2]["employer"] == "OpenCo"
+    if redact:
+        assert by_id[1]["submitted_by"] is None
+        assert by_id[1]["employer"] is None
+    else:
+        assert by_id[1]["submitted_by"] == "Gone Away"
+        assert by_id[1]["employer"] == "SecretCo"
+
+
+@pytest.mark.parametrize(("role", "redact"), [("view_only", True), ("student", True),
+                                              ("full_access", False), ("engineer", False)])
+def test_link_reads_redact_archived_below_full_access(run, monkeypatch, role, redact):
+    from app.api.routes import opportunity_links as links_routes
+    from app.schemas.opportunity_link import OpportunityLinkPage
+
+    seen: dict = {}
+
+    async def _list(_session, _filters, **kw):
+        seen["list"] = kw["redact_archived"]
+        return OpportunityLinkPage(items=[], total=0, limit=50, offset=0)
+
+    async def _get(_session, _link_id, **kw):
+        seen["get"] = kw["redact_archived"]
+        from app.core.errors import NotFoundError
+
+        raise NotFoundError("gone")
+
+    async def _count(_session, _filters):
+        return 0
+
+    async def _csv(_session, _filters, **kw):
+        seen["export"] = kw["redact_archived"]
+        return "x\n"
+
+    monkeypatch.setattr(links_routes.service, "list_links", _list)
+    monkeypatch.setattr(links_routes.service, "get_link", _get)
+    monkeypatch.setattr(links_routes.service, "count_links", _count)
+    monkeypatch.setattr(links_routes.service, "export_csv", _csv)
+
+    assert run(_Session(), role, "GET", "/opportunity-links").status_code == 200
+    run(_Session(), role, "GET", "/opportunity-links/1")
+    assert run(_Session(), role, "GET", "/opportunity-links/export").status_code == 200
+    assert seen == {"list": redact, "get": redact, "export": redact}
+
+
+# --- archived: task list + dashboard follow-ups -------------------------------
+
+
+@pytest.mark.parametrize(("role", "hidden"), [("student", True), ("view_only", True),
+                                              ("full_access", False), ("super_admin", False)])
+def test_task_list_archived_rule(run, role, hidden):
+    session = _Session(scalar=0)
+    app.dependency_overrides[auth_deps.get_permission_config] = lambda: _activity_config(role)
+    resp = run(session, role, "GET", "/tasks")
+    assert resp.status_code == 200, resp.text
+    count_sql, rows_sql = session.sql()[0], session.sql()[1]
+    assert (_ARCHIVED_PREDICATE in count_sql) is hidden
+    assert (_ARCHIVED_PREDICATE in rows_sql) is hidden
+
+
+@pytest.mark.parametrize(("role", "hidden"), [("student", True), ("full_access", False)])
+def test_dashboard_follow_ups_archived_rule(run, role, hidden):
+    session = _Session()
+    app.dependency_overrides[auth_deps.get_permission_config] = lambda: _activity_config(role)
+    resp = run(session, role, "GET", "/dashboard/follow-ups")
+    assert resp.status_code == 200, resp.text
+    assert (_ARCHIVED_PREDICATE in session.sql()[0]) is hidden

@@ -226,12 +226,38 @@ def test_rejects_unknown_fields_and_ignores_no_user_id(calls):
     assert calls["set"] == []
 
 
-def test_is_rate_limited_per_user(calls):
+def test_typos_and_no_pending_change_do_not_spend_the_budget(calls):
+    """A 422 on the strength rules or a 409 is refused before the limiter."""
+    for _ in range(6):
+        assert _post(_Session(_db_user()), _ctx(), {"new_password": "short"}).status_code == 422
+        resp = _post(
+            _Session(_db_user(False)), _ctx(must_change=False), {"new_password": "long-enough-1"}
+        )
+        assert resp.status_code == 409
+    resp = _post(_Session(_db_user()), _ctx(), {"new_password": "a-brand-new-one"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_temp_password_guesses_are_rate_limited(calls):
+    """The reuse check is a "is this the current password?" oracle, so each
+    guess spends the budget: the sixth in ten minutes is a 429."""
+    calls["reuse"] = True
     for _ in range(5):
-        _post(_Session(_db_user()), _ctx(), {"new_password": "short"})
+        resp = _post(_Session(_db_user()), _ctx(), {"new_password": "guess-guess"})
+        assert resp.status_code == 422
     resp = _post(_Session(_db_user()), _ctx(), {"new_password": "a-brand-new-one"})
     assert resp.status_code == 429
     assert calls["set"] == []
+
+
+def test_an_unrunnable_reuse_check_is_logged_at_error(calls, caplog):
+    calls["reuse"] = None
+    with caplog.at_level("ERROR"):
+        resp = _post(_Session(_db_user()), _ctx(), {"new_password": "a-brand-new-one"})
+    assert resp.status_code == 200
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("reuse check could not run" in r.getMessage() for r in errors)
+    assert "a-brand-new-one" not in caplog.text
 
 
 def test_old_complete_route_still_works(calls):
@@ -253,6 +279,49 @@ def test_old_complete_route_still_works(calls):
         app.dependency_overrides.pop(get_current_db_user_allow_must_change, None)
     assert resp.status_code == 200
     assert user.must_change_password is False
+
+
+def _complete(session, ctx):
+    async def _s():
+        yield session
+
+    app.dependency_overrides[get_session] = _s
+    app.dependency_overrides[get_current_db_user_allow_must_change] = lambda: ctx
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            return client.post("/auth/password/complete")
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_current_db_user_allow_must_change, None)
+
+
+def test_old_complete_route_refuses_a_superseded_or_revoked_session(calls):
+    """Appsec review: the deprecated route must not let a revoked session clear
+    the flag while it survives the rollout."""
+    user = _db_user()
+    session = _Session(user)
+    resp = _complete(
+        session, _ctx(session_id="stolen", active_session_id="revoked:2026-10-07")
+    )
+    assert resp.json()["error"]["code"] == "session_superseded"
+    assert user.must_change_password is True
+    assert session.commits == 0
+
+
+def test_old_complete_route_refuses_during_maintenance(monkeypatch):
+    from app.api.dependencies import auth as auth_deps
+
+    async def _on(_session):
+        return SimpleNamespace(enabled=True, message=None)
+
+    monkeypatch.setattr(
+        auth_routes, "_enforce_maintenance_mode", auth_deps._enforce_maintenance_mode
+    )
+    monkeypatch.setattr(maintenance, "read_status", _on)
+    user = _db_user()
+    resp = _complete(_Session(user), _ctx())
+    assert resp.status_code == 503
+    assert user.must_change_password is True
 
 
 # --- the reuse check itself ---------------------------------------------------

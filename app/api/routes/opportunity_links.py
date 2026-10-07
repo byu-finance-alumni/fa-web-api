@@ -232,7 +232,14 @@ async def list_opportunity_links(
         submitted_from=submitted_from,
         submitted_to=submitted_to,
     )
-    return await service.list_links(session, filters, limit=limit, offset=offset)
+    # Archived submitters are named only to full_access and up (#591).
+    return await service.list_links(
+        session,
+        filters,
+        limit=limit,
+        offset=offset,
+        redact_archived=not user.sees_archived,
+    )
 
 
 @router.get("/export", response_model=None)
@@ -309,7 +316,12 @@ async def export_opportunity_links(
                 }
             },
         )
-    csv_text = await service.export_csv(session, filters, actor_user_id=user.user_id)
+    csv_text = await service.export_csv(
+        session,
+        filters,
+        actor_user_id=user.user_id,
+        redact_archived=not user.sees_archived,
+    )
     # The filename carries only a generated date — never a filter value. Free
     # text in a Content-Disposition header is header injection, and `company`/`q`
     # are caller-supplied strings. Same rule as the event-attendee export.
@@ -397,7 +409,9 @@ async def get_opportunity_link(
     """One link. 404 if it does not exist; 403 if it is unmoderated and the
     caller may not moderate — the same boundary the list draws, enforced here too
     so a direct id fetch is not a way around the status gate."""
-    link = await service.get_link(session, link_id)
+    link = await service.get_link(
+        session, link_id, redact_archived=not user.sees_archived
+    )
     if link.status != "approved" and not _may_moderate(user, config):
         raise AuthorizationError()
     return link

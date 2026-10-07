@@ -200,17 +200,17 @@ RECORD_LOGIN_LIMITER = rate_limiter(
     actor_guard=get_current_db_user_allow_must_change,
 )
 # The forced password change (#592) sets a real Supabase password server-side,
-# so it is braked like the other credential-minting calls. Same exempt resolver
-# as login recording: the caller is by definition still flagged
-# must_change_password. A person gets it right in one or two tries; five in ten
-# minutes leaves room for typos and the "too short" retry without letting a
-# stolen temp-password session spin on it.
-CHANGE_PASSWORD_LIMITER = rate_limiter(
-    "auth:change_password",
-    limit=5,
-    window_seconds=600,
-    actor_guard=get_current_db_user_allow_must_change,
-)
+# so it is braked like the other credential-minting calls: 5 per user per 10
+# minutes. Unlike the dependency-style limiters above it is checked INSIDE the
+# route, AFTER the cheap refusals (no change pending -> 409, too short / the
+# email -> 422), so a typo doesn't burn the budget. It is checked BEFORE the
+# temp-password reuse check, though: that check answers "is this the current
+# password?", which is exactly the guess a brake exists to ration.
+def check_change_password_budget(user_id: int) -> None:
+    """Spend one ``auth:change_password`` hit for *user_id*; 429 when over."""
+    _check("auth:change_password", user_id, limit=5, window_seconds=600)
+
+
 # Turning maintenance mode ON is the most destructive single call in the app: it
 # invalidates every non-engineer session at once and closes the site. A generous
 # budget (an incident may legitimately involve a few flips) that still brakes a
@@ -250,7 +250,6 @@ CreateUserRateLimit = Annotated[UserContext, Depends(CREATE_USER_LIMITER)]
 AssignRoleRateLimit = Annotated[UserContext, Depends(ASSIGN_ROLE_LIMITER)]
 DeleteUserRateLimit = Annotated[UserContext, Depends(DELETE_USER_LIMITER)]
 RecordLoginRateLimit = Annotated[UserContext, Depends(RECORD_LOGIN_LIMITER)]
-ChangePasswordRateLimit = Annotated[UserContext, Depends(CHANGE_PASSWORD_LIMITER)]
 EnableMaintenanceRateLimit = Annotated[
     UserContext, Depends(ENABLE_MAINTENANCE_LIMITER)
 ]

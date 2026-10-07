@@ -81,6 +81,7 @@ from app.schemas.alumni import (
     minimize_alumni_read,
 )
 from app.schemas.alumni_export import (
+    SEARCH_TEXT_MAX_LENGTH,
     AlumniExportFilters,
     AlumniExportRequest,
     ExportColumnCatalog,
@@ -158,6 +159,7 @@ async def list_alumni(
     q: Annotated[
         str | None,
         Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
             description=(
                 "Free-text search over names, external ids, designations, "
                 "current employer / title / city / state / country / industry "
@@ -170,23 +172,38 @@ async def list_alumni(
     ] = None,
     net_id: Annotated[
         str | None,
-        Query(description="Net ID — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Net ID — case-insensitive partial match.",
+        ),
     ] = None,
     first_name: Annotated[
         str | None,
-        Query(description="First name — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="First name — case-insensitive partial match.",
+        ),
     ] = None,
     last_name: Annotated[
         str | None,
-        Query(description="Last name — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Last name — case-insensitive partial match.",
+        ),
     ] = None,
     preferred_name: Annotated[
         str | None,
-        Query(description="Preferred first name — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Preferred first name — case-insensitive partial match.",
+        ),
     ] = None,
     email: Annotated[
         str | None,
-        Query(description="Email (personal or work) — case-insensitive partial match."),
+        Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
+            description="Email (personal or work) — case-insensitive partial match.",
+        ),
     ] = None,
     graduation_year: int | None = None,
     grad_year_min: int | None = None,
@@ -463,6 +480,7 @@ async def list_alumni(
     near: Annotated[
         str | None,
         Query(
+            max_length=SEARCH_TEXT_MAX_LENGTH,
             description=(
                 "Natural-language location search (#358): a place phrase such as "
                 "'near Los Angeles, CA', 'within 50 miles of Provo', or a region "

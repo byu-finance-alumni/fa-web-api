@@ -11,8 +11,18 @@ restricted to the chosen columns.
 from __future__ import annotations
 
 import datetime
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# Ceiling on every free-text search/filter string (#597), shared with the
+# ``GET /alumni`` query params so the list and the export refuse the same input.
+# 200 matches the other free-text search params (opportunity links). No real
+# name, email or place phrase comes near it; what it stops is a multi-KB string
+# being fed to the fuzzy/trigram search and the geocoder on every request.
+# Over-long input is a 422 through the app's normal validation envelope.
+SEARCH_TEXT_MAX_LENGTH = 200
+SearchText = Annotated[str | None, Field(max_length=SEARCH_TEXT_MAX_LENGTH)]
 
 
 class ExportColumn(BaseModel):
@@ -39,16 +49,16 @@ class AlumniExportFilters(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    q: str | None = None
+    q: SearchText = None
     # Name/identifier facets — kept in parity with GET /alumni so a future list-UI
     # facet on these exports the same population (they flow straight into
     # build_alumni_query via _filters_dict). The export route is full_access-only,
     # so the email/net_id enumeration concern that gates these on GET doesn't apply.
-    net_id: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
-    preferred_name: str | None = None
-    email: str | None = None
+    net_id: SearchText = None
+    first_name: SearchText = None
+    last_name: SearchText = None
+    preferred_name: SearchText = None
+    email: SearchText = None
     graduation_year: int | None = None
     grad_year_min: int | None = None
     grad_year_max: int | None = None
@@ -91,7 +101,7 @@ class AlumniExportFilters(BaseModel):
     # back to an unfiltered search and shows a "couldn't pinpoint" note; an
     # export has no such affordance, and quietly handing over a nationwide file
     # when the operator asked for one metro is a disclosure).
-    near: str | None = None
+    near: SearchText = None
     radius: float | None = Field(default=None, ge=1, le=3000)
     tag: list[str] | None = None
     status_label: list[str] | None = None

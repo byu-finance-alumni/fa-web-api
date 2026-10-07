@@ -17,4 +17,7 @@ regexes = [
   # scrubber replaces an opaque survey token with {id} before it can reach a
   # mailbox. Not a credential, and it decodes to {"alg":"HS256"} and filler.
   '''eyJhbGciOiJIUzI1NiJ9\.abcdefghijklmnopqrstuvwxyz0123456789''',
+  # tests/test_password_change_592.py: the dummy "temporary password" used to
+  # prove POST /auth/password/change refuses reusing it. Not a credential.
+  '''TempPass-1234''',
 ]

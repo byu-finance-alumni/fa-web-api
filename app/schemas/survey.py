@@ -179,6 +179,12 @@ class GraduationYearCount(BaseModel):
     # than after it quietly under-delivers. Excludes suppressed alumni — see
     # `SurveyRecipientBreakdown`.
     unreachable: int = 0
+    # Submissions from this year WAITING FOR REVIEW (#856) — shown in the year
+    # picker as "2020 (14)". Counted by `survey_email.pending_review_counts_by_year`
+    # over exactly the rows `survey_responses.list_pending` returns, so it always
+    # equals the Submissions tab's badge for the same year. It counts
+    # SUBMISSIONS, like the badge, not distinct alumni.
+    pending_review: int = 0
 
 
 class SurveySendSample(BaseModel):
@@ -445,6 +451,23 @@ class SurveyScheduleItem(BaseModel):
     # state ("paused 3 days ago" is what tells staff a stopped campaign has been
     # forgotten about).
     paused_at: datetime.datetime | None = None
+    # WHAT GOES OUT NEXT (#562): the stage (0=initial, 1/2=reminders), the date
+    # of the daily cron run expected to send it, and roughly how many people it
+    # will reach. Computed only for a RUNNABLE campaign (scheduled/active) — a
+    # paused, cancelled or completed one has no next send, and all three are
+    # None. Also None when every stage has been delivered to everyone owed it.
+    #
+    # The stage comes from `survey_email.select_stage_targets`, the same rule
+    # the cron sends by, so an unfinished earlier stage is reported ahead of a
+    # later one. The date is anchored to `start_date` (which a resume shifts),
+    # never to "today + 7". The count is approximate: replies before then shrink
+    # it, and the daily send cap can spread it over several days.
+    #
+    # Filled only by the list read (`GET /survey/schedules`); the write
+    # endpoints that echo one schedule back leave all three None.
+    next_stage: int | None = None
+    next_send_date: datetime.date | None = None
+    next_send_count: int | None = None
     # Delivered counts per stage from survey_send_log (0=initial, 1/2=reminders).
     sent_initial: int = 0
     sent_reminder_1: int = 0

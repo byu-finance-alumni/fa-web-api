@@ -797,8 +797,11 @@ async def list_survey_schedules(
     Also backs the engineer Surveys console (which needs who started each
     campaign and when) — the console reads this rather than a second endpoint,
     since it wants exactly this list. The engineer holds every capability, so
-    the full-access gate already admits them."""
-    return await survey_schedule.list_schedules(session)
+    the full-access gate already admits them.
+
+    Carries each running campaign's next send (#562) — the only schedule read
+    that does."""
+    return await survey_schedule.list_schedules(session, with_next_send=True)
 
 
 @router.post("/schedules", response_model=SurveyScheduleItem)

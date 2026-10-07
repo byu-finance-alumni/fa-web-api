@@ -25,8 +25,10 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.survey_email_event import (
@@ -36,6 +38,7 @@ from app.models.survey_email_event import (
     SurveyEmailEvent,
 )
 from app.models.survey_schedule import SurveySendLog
+from app.repositories.alumni import build_alumni_query
 from app.schemas.survey import SurveyBouncedAlum
 
 log = logging.getLogger(__name__)
@@ -113,6 +116,8 @@ async def _match(
     ``alumni_id`` / ``graduation_year`` tags the sender puts on every email. A
     tag match is only accepted if that alum still exists -- the event row has a
     foreign key, and a tag for a deleted alum must not fail the insert."""
+    tags = _tags(data)
+    tag_alumni_id = _as_int(tags.get("alumni_id"), 1, 2**63 - 1)
     if email_id:
         row = (
             await session.execute(
@@ -122,10 +127,19 @@ async def _match(
             )
         ).first()
         if row is not None:
+            # The send-log id was paired with its recipient BY POSITION in
+            # Resend's batch response. The tag rode on the email itself. If the
+            # two disagree, one of them is wrong and we cannot tell which --
+            # naming nobody beats pinning a bounce on the wrong alum.
+            if tag_alumni_id is not None and tag_alumni_id != int(row[0]):
+                log.warning(
+                    "resend webhook: send-log alum and alumni_id tag disagree; "
+                    "bounce left unattributed"
+                )
+                return None, None
             return int(row[0]), int(row[1])
 
-    tags = _tags(data)
-    alumni_id = _as_int(tags.get("alumni_id"), 1, 2**63 - 1)
+    alumni_id = tag_alumni_id
     year = _as_int(tags.get("graduation_year"), *_GRAD_YEAR_RANGE)
     if alumni_id is None:
         return None, None
@@ -139,6 +153,20 @@ async def _match(
     return alumni_id, year
 
 
+async def _insert_event(session: AsyncSession, values: dict[str, Any]):
+    """INSERT ... ON CONFLICT (svix_id) DO NOTHING, committed. Returns the new
+    row's id tuple, or None when this svix_id was already stored."""
+    stmt = (
+        pg_insert(SurveyEmailEvent)
+        .values(**values)
+        .on_conflict_do_nothing(index_elements=["svix_id"])
+        .returning(SurveyEmailEvent.survey_email_event_id)
+    )
+    inserted = (await session.execute(stmt)).first()
+    await session.commit()
+    return inserted
+
+
 async def record_webhook_event(
     session: AsyncSession, *, svix_id: str, payload: Any
 ) -> str:
@@ -150,7 +178,9 @@ async def record_webhook_event(
 
     Idempotent on ``svix_id`` via ``ON CONFLICT DO NOTHING``, so two concurrent
     deliveries of the same event cannot both insert."""
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not svix_id or len(svix_id) > _MAX_ID_LEN:
+        # The route refuses an over-long svix-id; never truncate the
+        # idempotency key here (two truncated ids could collide).
         return "ignored"
     event_type = payload.get("type")
     if event_type not in STORED_EVENT_TYPES:
@@ -174,7 +204,7 @@ async def record_webhook_event(
     occurred_at = _parse_when(payload.get("created_at"), data.get("created_at"))
 
     values: dict[str, Any] = {
-        "svix_id": svix_id[:_MAX_ID_LEN],
+        "svix_id": svix_id,
         "resend_email_id": email_id,
         "alumni_id": alumni_id,
         "graduation_year": graduation_year,
@@ -185,14 +215,20 @@ async def record_webhook_event(
     if occurred_at is not None:
         values["occurred_at"] = occurred_at
 
-    stmt = (
-        pg_insert(SurveyEmailEvent)
-        .values(**values)
-        .on_conflict_do_nothing(index_elements=["svix_id"])
-        .returning(SurveyEmailEvent.survey_email_event_id)
-    )
-    inserted = (await session.execute(stmt)).first()
-    await session.commit()
+    try:
+        inserted = await _insert_event(session, values)
+    except IntegrityError:
+        # The tag-matched alum was deleted between the existence check and this
+        # insert (the FK refuses it). Keep the event, unattributed. svix_id
+        # idempotency is untouched: the failed insert stored nothing, and the
+        # retry is the same ON CONFLICT DO NOTHING.
+        await session.rollback()
+        if values.get("alumni_id") is None:
+            raise
+        values["alumni_id"] = None
+        values["graduation_year"] = None
+        alumni_id = None
+        inserted = await _insert_event(session, values)
     outcome = "stored" if inserted is not None else "duplicate"
     # Ids and types only -- never an address, never the body.
     log.info(
@@ -221,19 +257,33 @@ async def list_bounced(
     so it reads like a worklist. Each row carries the address that bounced (from
     the send log) and whether it is still on the profile, so staff can see at a
     glance whether someone has already fixed it."""
+    # The same population rule as `/unreachable` (`survey_email._survey_cohort_query`):
+    # live alumni only -- not archived, flagged as alumni, not deceased, not Do
+    # Not Contact. An archived or suppressed person is not someone staff should
+    # be sent to chase an address for. The cohort's WHERE is applied to the
+    # joined Alumni directly (as `repositories.alumni` does for its row query),
+    # so its correlated EXISTS binds to this query's alumni row.
+    cohort = build_alumni_query(
+        deceased=False, suppress_labels=SUPPRESSED_CONTACT_STATUS_LABELS
+    )
+    stmt = (
+        select(SurveyEmailEvent, SurveySendLog.sent_to, Alumni)
+        .join(Alumni, Alumni.alumni_id == SurveyEmailEvent.alumni_id)
+        .outerjoin(
+            SurveySendLog,
+            SurveySendLog.resend_email_id == SurveyEmailEvent.resend_email_id,
+        )
+        .where(
+            SurveyEmailEvent.graduation_year == graduation_year,
+            SurveyEmailEvent.event_type == EVENT_BOUNCED,
+            SurveyEmailEvent.bounce_type == BOUNCE_PERMANENT,
+        )
+    )
+    if cohort.whereclause is not None:
+        stmt = stmt.where(cohort.whereclause)
     rows = (
         await session.execute(
-            select(SurveyEmailEvent, SurveySendLog.sent_to)
-            .outerjoin(
-                SurveySendLog,
-                SurveySendLog.resend_email_id == SurveyEmailEvent.resend_email_id,
-            )
-            .where(
-                SurveyEmailEvent.graduation_year == graduation_year,
-                SurveyEmailEvent.event_type == EVENT_BOUNCED,
-                SurveyEmailEvent.bounce_type == BOUNCE_PERMANENT,
-                SurveyEmailEvent.alumni_id.is_not(None),
-            )
+            stmt
             .order_by(
                 SurveyEmailEvent.occurred_at.desc(),
                 SurveyEmailEvent.survey_email_event_id.desc(),
@@ -241,21 +291,15 @@ async def list_bounced(
         )
     ).all()
     latest: dict[int, tuple[SurveyEmailEvent, str | None]] = {}
-    for event, sent_to in rows:
+    alumni: dict[int, Alumni] = {}
+    for event, sent_to, alum in rows:
         if event.alumni_id not in latest:
             latest[event.alumni_id] = (event, sent_to)
+            alumni[event.alumni_id] = alum
     if not latest:
         return []
 
     ids = list(latest)
-    alumni = {
-        a.alumni_id: a
-        for a in (
-            await session.execute(select(Alumni).where(Alumni.alumni_id.in_(ids)))
-        )
-        .scalars()
-        .all()
-    }
     contacts = {
         c.alumni_id: c
         for c in (

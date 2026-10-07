@@ -47,6 +47,9 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 #: and HMAC.
 MAX_BODY_BYTES = 64 * 1024
 
+#: Matches ``survey_email_events.svix_id varchar(100)``.
+MAX_SVIX_ID_LEN = 100
+
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
@@ -97,6 +100,10 @@ async def resend_webhook(request: Request, session: SessionDep) -> JSONResponse:
         return _error(413, "payload_too_large", "Request body is too large.")
 
     svix_id = request.headers.get("svix-id")
+    # The id is the idempotency key and is stored as-is; one too long to store
+    # would have to be truncated, and two truncated ids could then collide.
+    if svix_id is not None and len(svix_id) > MAX_SVIX_ID_LEN:
+        return _error(400, "invalid_svix_id", "svix-id header is too long.")
     if not verify_resend_webhook(
         svix_id=svix_id,
         svix_timestamp=request.headers.get("svix-timestamp"),
@@ -107,7 +114,8 @@ async def resend_webhook(request: Request, session: SessionDep) -> JSONResponse:
 
     try:
         payload = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        # RecursionError: a pathologically nested body must be a clean 400.
         return _error(400, "invalid_payload", "Webhook body is not valid JSON.")
 
     outcome = await survey_bounces.record_webhook_event(

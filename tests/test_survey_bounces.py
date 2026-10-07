@@ -26,6 +26,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.sql.dml import Insert, Update
@@ -44,6 +45,7 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.survey_email_event import SurveyEmailEvent
 from app.models.survey_schedule import SurveySendLog
+from app.models.tags import AlumniStatusLabel, StatusLabel
 from app.schemas.auth import UserContext
 from app.services import survey_bounces, survey_email
 from app.services.survey_message import SurveyMessage
@@ -290,6 +292,25 @@ def test_a_signed_non_json_body_is_a_400(webhook_client):
     assert webhook_client.calls == []
 
 
+def test_a_deeply_nested_signed_body_is_a_clean_400(webhook_client):
+    half = webhook_routes.MAX_BODY_BYTES // 2
+    body = b"[" * half + b"]" * half
+    r = webhook_client.post("/webhooks/resend", content=body, headers=_sign(body))
+    assert r.status_code == 400
+    assert webhook_client.calls == []
+
+
+def test_an_over_long_svix_id_is_refused_not_truncated(webhook_client):
+    body = json.dumps(_BOUNCE).encode()
+    r = webhook_client.post(
+        "/webhooks/resend",
+        content=body,
+        headers=_sign(body, svix_id="m" * (webhook_routes.MAX_SVIX_ID_LEN + 1)),
+    )
+    assert r.status_code == 400
+    assert webhook_client.calls == []
+
+
 def test_a_valid_delivery_is_handed_on_with_its_svix_id(webhook_client):
     body = json.dumps(_BOUNCE).encode()
     r = webhook_client.post(
@@ -322,17 +343,22 @@ class _EventSession:
     """Enough of a session for ``record_webhook_event``: a send log keyed by
     message id, a set of existing alumni, and a real svix_id unique store."""
 
-    def __init__(self, *, send_log=None, alumni=()):
+    def __init__(self, *, send_log=None, alumni=(), deleted_before_insert=()):
         self.send_log = dict(send_log or {})  # email_id -> (alumni_id, year)
         self.alumni = set(alumni)
+        # Alumni that pass the existence check but are gone by the INSERT.
+        self.deleted_before_insert = set(deleted_before_insert)
         self.events: dict[str, dict] = {}
         self.commits = 0
+        self.rollbacks = 0
 
     async def execute(self, stmt):
         params = dict(stmt.compile().params)
         table = getattr(getattr(stmt, "table", None), "name", None)
         if isinstance(stmt, Insert) and table == "survey_email_events":
             sid = params["svix_id"]
+            if params.get("alumni_id") in self.deleted_before_insert:
+                raise IntegrityError("INSERT", {}, Exception("fk violation"))
             if sid in self.events:
                 return _Result(None)
             self.events[sid] = params
@@ -349,6 +375,9 @@ class _EventSession:
     async def commit(self):
         self.commits += 1
 
+    async def rollback(self):
+        self.rollbacks += 1
+
 
 def _record(session, payload, svix_id="msg_1"):
     return asyncio.run(
@@ -357,10 +386,12 @@ def _record(session, payload, svix_id="msg_1"):
 
 
 def test_a_bounce_is_matched_through_the_send_log_message_id():
+    payload = json.loads(json.dumps(_BOUNCE))
+    del payload["data"]["tags"]  # matched by message id alone
     session = _EventSession(send_log={"re_123": (42, 2019)}, alumni={5})
-    assert _record(session, _BOUNCE) == "stored"
+    assert _record(session, payload) == "stored"
     row = session.events["msg_1"]
-    # The send log wins over the tags (which say alum 5 / 2020).
+    # The year comes from the send log too, not from anywhere else.
     assert (row["alumni_id"], row["graduation_year"]) == (42, 2019)
     assert row["event_type"] == "email.bounced"
     assert row["bounce_type"] == "permanent"
@@ -393,6 +424,39 @@ def test_a_tag_naming_a_deleted_alum_is_stored_unmatched_not_failed():
     session = _EventSession(alumni=set())
     assert _record(session, _BOUNCE) == "stored"
     assert session.events["msg_1"]["alumni_id"] is None
+
+
+def test_a_send_log_match_contradicted_by_the_tag_is_left_unattributed():
+    # The id was paired with alum 42 by position; the signed tag says alum 5.
+    session = _EventSession(send_log={"re_123": (42, 2019)}, alumni={5, 42})
+    assert _record(session, _BOUNCE) == "stored"
+    row = session.events["msg_1"]
+    assert row["alumni_id"] is None and row["graduation_year"] is None
+
+
+def test_a_send_log_match_with_an_agreeing_tag_is_kept():
+    payload = json.loads(json.dumps(_BOUNCE))
+    payload["data"]["tags"]["alumni_id"] = "42"
+    session = _EventSession(send_log={"re_123": (42, 2019)})
+    _record(session, payload)
+    assert session.events["msg_1"]["alumni_id"] == 42
+
+
+def test_an_alum_deleted_between_check_and_insert_is_stored_unattributed():
+    session = _EventSession(alumni={5}, deleted_before_insert={5})
+    assert _record(session, _BOUNCE, "msg_race") == "stored"
+    assert session.rollbacks == 1
+    row = session.events["msg_race"]
+    assert row["alumni_id"] is None
+    # Idempotency survives the retry path.
+    assert _record(session, _BOUNCE, "msg_race") == "duplicate"
+    assert len(session.events) == 1
+
+
+def test_an_over_long_svix_id_is_never_truncated_into_storage():
+    session = _EventSession(alumni={5})
+    assert _record(session, _BOUNCE, "m" * 101) == "ignored"
+    assert session.events == {}
 
 
 def test_a_redelivery_with_the_same_svix_id_is_a_no_op():
@@ -462,6 +526,8 @@ def db():
                 AlumniContactInfo.__table__,
                 SurveySendLog.__table__,
                 SurveyEmailEvent.__table__,
+                AlumniStatusLabel.__table__,
+                StatusLabel.__table__,
             ],
         )
         conn.commit()
@@ -480,16 +546,32 @@ class _AsyncWrap:
 _seq = iter(range(1, 10_000))
 
 
-def _alum(conn, alumni_id, first, *, personal=None, work=None):
+def _alum(conn, alumni_id, first, *, personal=None, work=None, archived=False,
+         deceased=False, is_alumni=True, label=None):
     conn.execute(
         Alumni.__table__.insert().values(
             alumni_id=alumni_id,
             first_name=first,
             last_name="Test",
             graduation_year=_YEAR,
-            is_alumni=True,
+            is_alumni=is_alumni,
+            archived=archived,
+            deceased=deceased,
         )
     )
+    if label:
+        conn.execute(
+            StatusLabel.__table__.insert().values(
+                status_label_id=alumni_id, status_label_name=label
+            )
+        )
+        conn.execute(
+            AlumniStatusLabel.__table__.insert().values(
+                alumni_status_label_id=alumni_id,
+                alumni_id=alumni_id,
+                status_label_id=alumni_id,
+            )
+        )
     conn.execute(
         AlumniContactInfo.__table__.insert().values(
             contact_info_id=alumni_id,
@@ -552,6 +634,19 @@ def test_only_permanent_bounces_are_listed(db):
     assert items[0].bounced_address == "hard@x.org"
     assert items[0].bounce_subtype == "General"
     assert items[0].name == "Hard Test"
+
+
+def test_the_list_uses_the_same_population_as_unreachable(db):
+    """Archived, non-alumni (friends), deceased and Do Not Contact people are
+    never put on a worklist to chase -- same rule as `/unreachable`."""
+    _alum(db, 1, "Live", personal="l@x.org")
+    _alum(db, 2, "Archived", personal="a@x.org", archived=True)
+    _alum(db, 3, "Friend", personal="f@x.org", is_alumni=False)
+    _alum(db, 4, "Deceased", personal="d@x.org", deceased=True)
+    _alum(db, 5, "Dnc", personal="n@x.org", label="Do Not Contact")
+    for i in range(1, 6):
+        _event(db, i, f"re_{i}")
+    assert [i.alumni_id for i in _list(db)] == [1]
 
 
 def test_complaints_other_years_and_unmatched_events_are_not_listed(db):

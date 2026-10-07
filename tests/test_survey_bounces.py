@@ -614,9 +614,13 @@ def _event(conn, alumni_id, email_id, *, bounce_type="permanent", when=None,
     )
 
 
-def _list(conn, year=_YEAR):
+def _page(conn, year=_YEAR, **kw):
     conn.commit()
-    return asyncio.run(survey_bounces.list_bounced(_AsyncWrap(conn), year))
+    return asyncio.run(survey_bounces.list_bounced(_AsyncWrap(conn), year, **kw))
+
+
+def _list(conn, year=_YEAR):
+    return _page(conn, year).items
 
 
 def test_only_permanent_bounces_are_listed(db):
@@ -737,37 +741,57 @@ def test_unauthenticated_callers_get_401():
     assert r.status_code == 401
 
 
+def test_the_list_is_capped_and_reports_the_uncapped_total(db):
+    for i in range(1, 6):
+        _alum(db, i, f"N{i}", personal=f"n{i}@x.org")
+        _event(db, i, f"re_{i}")
+    page = _page(db, limit=2)
+    assert page.total == 5 and page.limit == 2
+    assert [i.alumni_id for i in page.items] == [1, 2]  # name order, first two
+    full = _page(db)
+    assert full.total == 5 and len(full.items) == 5
+    assert full.limit == survey_bounces.BOUNCED_PAGE_DEFAULT
+
+
 class _AuditSession:
-    def __init__(self):
+    def __init__(self, *, commit_raises=False):
         self.added = []
+        self._commit_raises = commit_raises
 
     def add(self, obj):
         self.added.append(obj)
 
     async def commit(self):
-        pass
+        if self._commit_raises:
+            raise RuntimeError("audit_logs is unavailable")
 
     async def rollback(self):
         pass
 
 
-def test_the_read_is_audited_without_naming_anyone(monkeypatch):
-    from app.schemas.survey import SurveyBouncedAlum
+def _bounced_get(monkeypatch, session, path, seen_limits=None):
+    from app.schemas.survey import SurveyBouncedAlum, SurveyBouncedPage
 
-    async def fake_list(session, year):
-        return [
-            SurveyBouncedAlum(
-                alumni_id=3,
-                name="Zelda Quux",
-                bounced_address="zq@x.org",
-                bounce_subtype="General",
-                bounced_at=datetime.datetime(2026, 10, 1, tzinfo=datetime.UTC),
-                address_still_on_file=True,
-            )
-        ]
+    async def fake_list(session, year, *, limit):
+        if seen_limits is not None:
+            seen_limits.append(limit)
+        return SurveyBouncedPage(
+            graduation_year=year,
+            total=1,
+            limit=limit,
+            items=[
+                SurveyBouncedAlum(
+                    alumni_id=3,
+                    name="Zelda Quux",
+                    bounced_address="zq@x.org",
+                    bounce_subtype="General",
+                    bounced_at=datetime.datetime(2026, 10, 1, tzinfo=datetime.UTC),
+                    address_still_on_file=True,
+                )
+            ],
+        )
 
     monkeypatch.setattr(survey_bounces, "list_bounced", fake_list)
-    session = _AuditSession()
 
     async def _override():
         yield session
@@ -777,17 +801,52 @@ def test_the_read_is_audited_without_naming_anyone(monkeypatch):
         RoleName.FULL_ACCESS.value
     )
     try:
-        r = TestClient(app).get(f"/survey/campaigns/{_YEAR}/bounced")
+        return TestClient(app).get(path)
     finally:
         app.dependency_overrides.clear()
+
+
+def test_the_read_is_audited_without_naming_anyone(monkeypatch):
+    session = _AuditSession()
+    r = _bounced_get(monkeypatch, session, f"/survey/campaigns/{_YEAR}/bounced")
     assert r.status_code == 200
-    assert r.json()[0]["bounced_address"] == "zq@x.org"
+    assert r.json()["items"][0]["bounced_address"] == "zq@x.org"
+    assert r.json()["total"] == 1
     rows = [a for a in session.added if isinstance(a, AuditLog)]
     assert len(rows) == 1
     assert rows[0].action_type == "read_survey_bounced"
     assert rows[0].entity_id == _YEAR
     assert "Zelda" not in (rows[0].new_value or "")
     assert "zq@x.org" not in (rows[0].new_value or "")
+
+
+def test_limit_defaults_to_200_and_is_bounded(monkeypatch):
+    seen: list[int] = []
+    base = f"/survey/campaigns/{_YEAR}/bounced"
+    assert _bounced_get(monkeypatch, _AuditSession(), base, seen).status_code == 200
+    assert _bounced_get(
+        monkeypatch, _AuditSession(), base + "?limit=1000", seen
+    ).status_code == 200
+    assert seen == [200, 1000]
+    for bad in ("0", "1001", "-1"):
+        r = _bounced_get(monkeypatch, _AuditSession(), f"{base}?limit={bad}", seen)
+        assert r.status_code == 422
+    assert seen == [200, 1000]
+
+
+def test_a_failed_audit_write_still_returns_the_list_and_logs_a_warning(
+    monkeypatch, caplog
+):
+    session = _AuditSession(commit_raises=True)
+    with caplog.at_level("WARNING", logger="app.api.routes.survey"):
+        r = _bounced_get(monkeypatch, session, f"/survey/campaigns/{_YEAR}/bounced")
+    assert r.status_code == 200
+    warnings = [m for m in caplog.records if "read-audit write failed" in m.getMessage()]
+    assert len(warnings) == 1
+    text = warnings[0].getMessage()
+    assert "read_survey_bounced" in text
+    assert "Zelda" not in text and "zq@x.org" not in text
+    assert "graduation_year=" not in text  # the scope is not logged either
 
 
 # ============================================================ send path =====

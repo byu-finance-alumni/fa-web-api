@@ -1106,6 +1106,33 @@ async def get_respondent(
 # --------------------------------------------------------- graduation years --
 
 
+def awaiting_review_where() -> tuple:
+    """WHERE clauses for "a submission waiting for review" (#856).
+
+    THE one definition, shared by the review queue
+    (``survey_responses.list_pending``) and the year picker's per-year count
+    (:func:`pending_review_counts_by_year`). Two spellings of this filter is how
+    the picker would end up saying "2020 (3)" over a queue of two.
+
+    Callers must also inner-join ``Alumni``: the queue skips a response whose
+    alum row is gone, so the count does too."""
+    return (SurveyResponse.status == STATUS_PENDING,)
+
+
+async def pending_review_counts_by_year(session: AsyncSession) -> dict[int, int]:
+    """How many submissions each graduation year has waiting for review — one
+    grouped query for every year, so the picker stays a fixed number of round
+    trips. Counts the same rows ``survey_responses.list_pending`` lists."""
+    stmt = (
+        select(SurveyResponse.graduation_year, func.count().label("n"))
+        .join(Alumni, Alumni.alumni_id == SurveyResponse.alumni_id)
+        .where(*awaiting_review_where(), SurveyResponse.graduation_year.is_not(None))
+        .group_by(SurveyResponse.graduation_year)
+    )
+    return {int(year): int(n) for year, n in (await session.execute(stmt)).all()}
+
+
+
 async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCount]:
     """Every graduation year present among eligible alumni (is_alumni, not
     archived), with a count — newest first. Drives the console's year picker so
@@ -1154,12 +1181,17 @@ async def list_graduation_years(session: AsyncSession) -> list[GraduationYearCou
     # picker stays a fixed number of round trips.
     unreachable_by_year = await unreachable_counts_by_year(session)
 
+    # Submissions waiting for review per year (#856), for the picker's
+    # "2020 (14)". Same rows as the review queue, so it matches the tab badge.
+    pending_by_year = await pending_review_counts_by_year(session)
+
     return [
         GraduationYearCount(
             graduation_year=year,
             total_alumni=count,
             responded=responded_by_year.get(year, 0),
             unreachable=unreachable_by_year.get(year, 0),
+            pending_review=pending_by_year.get(year, 0),
         )
         for year, count in rows
     ]

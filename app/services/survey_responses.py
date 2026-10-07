@@ -93,6 +93,7 @@ from app.services.survey_email import (
     STATUS_CONFIRMED,
     STATUS_PENDING,
     _resurvey_cutoff,
+    awaiting_review_where,
     response_not_superseded,
     sent_cycle_and_stage,
     verify_survey_token,
@@ -1547,7 +1548,9 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
             await session.execute(
                 select(SurveyResponse)
                 .where(
-                    SurveyResponse.status == "pending",
+                    # Shared with the year picker's pending count (#856) so the
+                    # two can never disagree.
+                    *awaiting_review_where(),
                     SurveyResponse.graduation_year == graduation_year,
                 )
                 .order_by(SurveyResponse.submitted_at.desc())

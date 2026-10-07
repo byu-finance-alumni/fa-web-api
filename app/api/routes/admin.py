@@ -184,6 +184,10 @@ def _validate_optional_name(value: object) -> str | None:
 # obvious non-addresses; the value is stored lowercased and the throttle/auth
 # layers never trust it as a verified identity.
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Checked BEFORE the regex (#597): the field's own ``max_length`` only runs after
+# this ``mode="before"`` validator, so without an explicit check here a
+# megabyte-long string would be fed to the regex first.
+_EMAIL_MAX = 255
 
 
 class CreateUserRequest(BaseModel):
@@ -197,7 +201,7 @@ class CreateUserRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    email: str = Field(min_length=3, max_length=255)
+    email: str = Field(min_length=3, max_length=_EMAIL_MAX)
     first_name: str | None = None
     last_name: str | None = None
     # Typed as the plain ``RoleName`` enum so an unknown role produces a clean
@@ -212,6 +216,8 @@ class CreateUserRequest(BaseModel):
         if not isinstance(value, str):
             raise ValueError("Must be a string.")
         value = value.strip().lower()
+        if len(value) > _EMAIL_MAX:
+            raise ValueError(f"Must be at most {_EMAIL_MAX} characters.")
         if not _EMAIL_RE.match(value):
             raise ValueError("Must be a valid email address.")
         return value

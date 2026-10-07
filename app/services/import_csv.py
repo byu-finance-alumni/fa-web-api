@@ -77,6 +77,24 @@ log = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 MiB
 MAX_IMPORT_ROWS = 2000
 
+
+def unreadable_csv_message(line: int) -> str:
+    """The file-level error for a CSV the ``csv`` module refuses mid-parse.
+
+    WHY (#597): ``csv.reader`` raises ``csv.Error`` on a cell over its 128 KB
+    field limit — most often an unclosed quote mark that swallows the rest of
+    the file into one cell. Uncaught, that was a 500 on every importer. It is
+    reported through each importer's existing file-level error list instead,
+    the same path as "the file is empty". The limit itself is kept: no real
+    cell needs 128 KB, and raising it would only let one cell eat more memory.
+    """
+    return (
+        f"The file could not be read near line {line:,}: a cell is too long or "
+        "malformed (cells are limited to 128 KB). This is usually a stray "
+        "quote mark (\") that is never closed. Fix it, re-save as CSV and "
+        "re-upload."
+    )
+
 # --- Column mapping ----------------------------------------------------------
 #
 # Each Alumni-sheet header maps to a (section, field) target in the
@@ -688,6 +706,8 @@ def _parse_and_map(
         header_row = next(reader)
     except StopIteration:
         return [], ["The file is empty."], []
+    except csv.Error:
+        return [], [unreadable_csv_message(reader.line_num)], []
 
     # Retired header spellings are folded to their current names here, so every
     # downstream step (validation, duplicate detection, _map_row) sees one
@@ -717,16 +737,19 @@ def _parse_and_map(
     rows: list[dict] = []
     # csv row index: header consumed above is spreadsheet row 1, so data rows
     # start at spreadsheet row 2.
-    for offset, raw_row in enumerate(reader, start=2):
-        # Skip fully-blank lines (Excel often pads with empty trailing rows).
-        if not any(cell.strip() for cell in raw_row):
-            continue
-        if max_rows is not None and len(rows) >= max_rows:
-            return [], [
-                f"File exceeds the {max_rows:,}-row import limit. Split into "
-                "smaller batches."
-            ], ignored
-        rows.append(_map_row(offset, headers, raw_row, mapping, friend))
+    try:
+        for offset, raw_row in enumerate(reader, start=2):
+            # Skip fully-blank lines (Excel often pads with empty trailing rows).
+            if not any(cell.strip() for cell in raw_row):
+                continue
+            if max_rows is not None and len(rows) >= max_rows:
+                return [], [
+                    f"File exceeds the {max_rows:,}-row import limit. Split into "
+                    "smaller batches."
+                ], ignored
+            rows.append(_map_row(offset, headers, raw_row, mapping, friend))
+    except csv.Error:
+        return [], [unreadable_csv_message(reader.line_num)], ignored
     return rows, header_errors, ignored
 
 
@@ -2031,6 +2054,8 @@ async def commit_update(
     session: AsyncSession,
     rows: list[dict],
     actor_user_id: int | None = None,
+    *,
+    can_change_identity: bool = False,
 ) -> dict:
     """Re-evaluate *rows* and apply every matched, changed row in ONE transaction.
 
@@ -2118,8 +2143,15 @@ async def commit_update(
                     # through update_alumni — and a later restore feature has to
                     # be able to tell them apart before it reverts anything.
                     with audit_source_scope(AUDIT_SOURCE_IMPORT):
+                        # The caller's ``alumni.archive`` (#593): a bulk
+                        # update must not be a back door to the identity
+                        # fields the edit form refuses to change.
                         await alumni_service.update_alumni(
-                            session, alumni_id, model, actor_user_id=actor_user_id
+                            session,
+                            alumni_id,
+                            model,
+                            actor_user_id=actor_user_id,
+                            can_change_identity=can_change_identity,
                         )
                 finally:
                     session.commit = real_commit  # type: ignore[method-assign]

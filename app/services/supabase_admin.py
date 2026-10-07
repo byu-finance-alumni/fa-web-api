@@ -12,12 +12,18 @@ here. This module performs no authorization itself.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import uuid
 
 import httpx
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import ServiceError
+
+logger = logging.getLogger(__name__)
 
 # Keep outbound calls snappy; this is a synchronous admin action behind a button.
 _TIMEOUT_SECONDS = 10.0
@@ -165,3 +171,49 @@ async def delete_auth_user(auth_user_id: uuid.UUID) -> None:
     if not response.is_success:
         # Deliberately opaque: do not leak the Supabase status/body to the client.
         raise ServiceError("The authentication service rejected the user deletion.")
+
+
+async def password_matches_current(
+    session: AsyncSession, auth_user_id: uuid.UUID, candidate: str
+) -> bool | None:
+    """Does *candidate* equal the auth user's CURRENT password? (#592)
+
+    Used by the forced password change to refuse "changing" to the very temp
+    password an admin issued — the Admin API sets whatever it is given and,
+    unlike the self-service ``PUT /user`` endpoint, has no "same password" check.
+
+    Answered in the database, not over HTTP: Supabase stores the bcrypt hash in
+    ``auth.users.encrypted_password`` and ships ``pgcrypto`` in the ``extensions``
+    schema, so ``crypt(candidate, hash) = hash`` is the standard comparison. A
+    password-grant sign-in would answer the same question, but it mints a real
+    session and counts against Supabase's per-IP auth limit for everyone behind
+    this API.
+
+    Returns True / False, or None when the check cannot run (no row or no hash,
+    no ``pgcrypto``, no read grant on ``auth.users``). None is "unknown", and the
+    caller proceeds: the reuse check is a best-effort extra, the strength rules
+    are not. The candidate is a BIND PARAMETER and the failure path logs the
+    exception TYPE only — a SQLAlchemy error message embeds its parameters, and
+    this one is a password.
+
+    Leaves the session rolled back on failure, so call it BEFORE loading any ORM
+    rows the caller still needs (a rollback expires them).
+    """
+    try:
+        result = await session.scalar(
+            text(
+                "SELECT encrypted_password = extensions.crypt(:candidate, "
+                "encrypted_password) FROM auth.users WHERE id = :auth_user_id "
+                "AND coalesce(encrypted_password, '') <> ''"
+            ),
+            {"candidate": candidate, "auth_user_id": auth_user_id},
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort; never log the params
+        logger.warning(
+            "Password reuse check unavailable (%s); continuing without it.",
+            type(exc).__name__,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        return None
+    return None if result is None else bool(result)

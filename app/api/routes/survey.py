@@ -11,6 +11,7 @@ legacy `surveys` table — see `models.crm.Survey`.
 
 import contextlib
 import datetime
+import logging
 from typing import Annotated, Literal
 
 from fastapi import (
@@ -46,7 +47,9 @@ from app.core.rate_limit import (
     SURVEY_PHOTO_LIMITER,
     SURVEY_RESPOND_READ_LIMITER,
     SURVEY_SUBMIT_LIMITER,
+    EngineerBrowseReadRateLimit,
     ExportReadRateLimit,
+    SurveysBrowseReadRateLimit,
 )
 from app.models.audit import AuditLog
 from app.schemas.opportunity_link import (
@@ -57,6 +60,7 @@ from app.schemas.survey import (
     GraduationYearCount,
     SurveyAlumniState,
     SurveyApplyResult,
+    SurveyBouncedPage,
     SurveyHeldOutPage,
     SurveyMessageRead,
     SurveyMessageUpdate,
@@ -86,6 +90,7 @@ from app.schemas.survey import (
 )
 from app.services import (
     opportunity_links,
+    survey_bounces,
     survey_email,
     survey_message,
     survey_reset,
@@ -102,6 +107,8 @@ _GRAD_YEAR_MAX = 2100
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 router = APIRouter(prefix="/survey", tags=["survey"])
+
+log = logging.getLogger(__name__)
 
 
 async def _log_survey_read(
@@ -140,6 +147,11 @@ async def _log_survey_read(
     mirrors this AuditLog into ``engineer_action_log`` and drops the audit_logs
     row. That is the intended destination — engineer actions stay out of the
     record-change trail but land in the append-only log the engineer cannot purge.
+
+    #591 extended it to the console's ``surveys.manage`` lists (pending
+    responses, recipients, unreachable, non-responders, responders). Those are
+    read by full_access / super_admin staff too, whose rows stay in
+    ``audit_logs`` like any other disclosure.
     """
     if actor_user_id is None:
         return
@@ -154,7 +166,18 @@ async def _log_survey_read(
             )
         )
         await session.commit()
-    except Exception:  # noqa: BLE001 - audit is best-effort
+    except Exception as exc:  # noqa: BLE001 - audit is best-effort
+        # Not silent: a disclosure that leaves no trace must at least leave a
+        # log line. Action, entity and actor id only -- never the scope or any
+        # of the people the read returned.
+        log.warning(
+            "survey read-audit write failed: action=%s entity=%s:%s actor=%s (%s)",
+            action,
+            entity_type,
+            entity_id,
+            actor_user_id,
+            type(exc).__name__,
+        )
         with contextlib.suppress(Exception):
             await session.rollback()
 
@@ -198,10 +221,18 @@ async def survey_contact(session: SessionDep) -> SurveySupportContact | None:
     response_model=SurveyRespondInfo,
     dependencies=[Depends(SURVEY_RESPOND_READ_LIMITER)],
 )
-async def survey_respond_info(token: str, session: SessionDep) -> SurveyRespondInfo:
+async def survey_respond_info(
+    token: str, session: SessionDep, response: Response
+) -> SurveyRespondInfo:
     """PUBLIC (token-gated, no login): the alum's current on-file info for the
     confirm page. The signed token is the credential — an invalid or expired one
-    404s with the same message either way."""
+    404s with the same message either way.
+
+    ``Cache-Control: no-store`` (#597): the body is the alum's on-file PII, and
+    the URL carries the bearer token, so no browser, proxy or shared cache may
+    keep a copy. Set here explicitly rather than relying only on the app-wide
+    default in ``app.main`` — this is the one PUBLIC route that returns PII."""
+    response.headers["Cache-Control"] = "no-store"
     info = await survey_email.get_respondent(session, token)
     if info is None:
         raise NotFoundError(survey_email.LINK_DEAD_MESSAGE)
@@ -420,11 +451,22 @@ async def survey_submit_photo(
 )
 async def survey_pending_responses(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> list[SurveyResponseItem]:
-    """Admin review queue: pending responses for a grad year, each with a diff."""
-    return await survey_responses.list_pending(session, grad_year)
+    """Admin review queue: pending responses for a grad year, each with a diff.
+    Audit-logged (``read_survey_responses``, #591) — the diffs carry what each
+    alum submitted."""
+    items = await survey_responses.list_pending(session, grad_year)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_responses",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}; rows={len(items)}",
+    )
+    return items
 
 
 @router.post("/responses/{response_id}/apply", response_model=SurveyApplyResult)
@@ -656,7 +698,7 @@ async def send_survey_campaign(
 )
 async def survey_recipient_breakdown(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> SurveyRecipientBreakdown:
     """Who this year's survey would reach, and who it would not (#392).
@@ -671,9 +713,19 @@ async def survey_recipient_breakdown(
     before a send and the figure explaining it afterwards cannot disagree.
 
     Read-only, sends nothing, takes no send lock — safe to poll while the daily
-    cron is mid-run. Gated like the rest of the console.
+    cron is mid-run. Gated like the rest of the console. Audit-logged
+    (``read_survey_recipients``, #591).
     """
-    return await survey_email.recipient_breakdown(session, grad_year)
+    breakdown = await survey_email.recipient_breakdown(session, grad_year)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_recipients",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}",
+    )
+    return breakdown
 
 
 @router.get(
@@ -682,7 +734,7 @@ async def survey_recipient_breakdown(
 )
 async def list_survey_unreachable(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> list[SurveyUnreachableAlum]:
     """The alumni this year's survey CANNOT email, by name (#392).
@@ -702,9 +754,58 @@ async def list_survey_unreachable(
     to chase for an address.
 
     Read-only and gated like the rest of the console (it returns alumni contact
-    details).
+    details). Audit-logged (``read_survey_unreachable``, #591).
     """
-    return await survey_email.list_unreachable(session, grad_year)
+    items = await survey_email.list_unreachable(session, grad_year)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_unreachable",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}; rows={len(items)}",
+    )
+    return items
+
+
+@router.get(
+    "/campaigns/{grad_year}/bounced",
+    response_model=SurveyBouncedPage,
+)
+async def list_survey_bounced(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: RequireSurveysManage,
+    session: SessionDep,
+    limit: Annotated[
+        int, Query(ge=1, le=survey_bounces.BOUNCED_PAGE_MAX)
+    ] = survey_bounces.BOUNCED_PAGE_DEFAULT,
+) -> SurveyBouncedPage:
+    """The alumni whose survey email for this year PERMANENTLY bounced (#858).
+
+    Fed by Resend's ``email.bounced`` webhook (``POST /webhooks/resend``). The
+    companion to ``/unreachable``: that one lists people with no usable address
+    on file; this one lists people whose address LOOKED usable and was refused
+    by the receiving server, so staff can correct it on the profile.
+
+    Permanent ("hard") bounces only -- a temporary one is stored but not listed
+    (owner decision). Read-only: listing someone changes nothing about them.
+    Emails sent before message ids were recorded cannot be matched, so a year
+    surveyed only before this shipped lists nobody.
+
+    Gated like ``/unreachable`` (``surveys.manage``) and AUDITED like the other
+    survey name lists (#422): the row records who asked for which year, never
+    who was returned.
+    """
+    page = await survey_bounces.list_bounced(session, grad_year, limit=limit)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_bounced",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}; limit={limit}",
+    )
+    return page
 
 
 @router.get(
@@ -713,7 +814,7 @@ async def list_survey_unreachable(
 )
 async def list_survey_held_out(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireEngineer,
+    user: EngineerBrowseReadRateLimit,
     session: SessionDep,
     reason: Annotated[
         Literal["suppressed", "already_responded", "unreachable"] | None, Query()
@@ -787,8 +888,11 @@ async def list_survey_schedules(
     Also backs the engineer Surveys console (which needs who started each
     campaign and when) — the console reads this rather than a second endpoint,
     since it wants exactly this list. The engineer holds every capability, so
-    the full-access gate already admits them."""
-    return await survey_schedule.list_schedules(session)
+    the full-access gate already admits them.
+
+    Carries each running campaign's next send (#562) — the only schedule read
+    that does."""
+    return await survey_schedule.list_schedules(session, with_next_send=True)
 
 
 @router.post("/schedules", response_model=SurveyScheduleItem)
@@ -883,7 +987,7 @@ async def create_survey_schedules_bulk(
 )
 async def list_survey_non_responders(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> list[SurveyNonResponder]:
     """Who needs MANUAL follow-up for this year's current campaign (#359).
@@ -896,10 +1000,19 @@ async def list_survey_non_responders(
     Read-only, and gated like the rest of the console (full access) because it
     returns alumni contact details. Empty list = nobody left to chase; 404 = the
     year has no campaign at all. Cycle-scoped: a previous campaign's
-    non-responders are not in here."""
+    non-responders are not in here. Audit-logged
+    (``read_survey_non_responders``, #591)."""
     items = await survey_schedule.list_non_responders(session, grad_year)
     if items is None:
         raise NotFoundError("No schedule exists for that graduation year.")
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_non_responders",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}; rows={len(items)}",
+    )
     return items
 
 
@@ -976,7 +1089,7 @@ async def export_survey_no_reply(
 )
 async def list_survey_responders(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: RequireSurveysManage,
+    user: SurveysBrowseReadRateLimit,
     session: SessionDep,
 ) -> SurveyResponders:
     """Who is behind this year's `replied` and `confirmed` counts (#836).
@@ -988,10 +1101,19 @@ async def list_survey_responders(
 
     Gated like `GET /schedules` (the counts it expands) and the non-responders
     call sheet. Returns only an id and a display name per alum. 404 = the year
-    has no campaign at all; two empty lists = nobody has answered yet."""
+    has no campaign at all; two empty lists = nobody has answered yet.
+    Audit-logged (``read_survey_responders``, #591)."""
     result = await survey_schedule.list_responders(session, grad_year)
     if result is None:
         raise NotFoundError("No schedule exists for that graduation year.")
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_responders",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}",
+    )
     return result
 
 

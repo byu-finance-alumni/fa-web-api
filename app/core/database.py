@@ -49,11 +49,19 @@ if settings.async_database_url:
     # fresh connection). The fix is to NOT pool across invocations: open a fresh
     # connection per checkout and dispose it at request end (NullPool).
     _is_serverless = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+    # Keep bound parameters OUT of DB exception messages (#595). Without this a
+    # failed statement's error string embeds the row values it was sent — names,
+    # BYU IDs, emails — and that string lands in logs via the unhandled-error
+    # handler and the import loops. With it, SQLAlchemy prints
+    # "[SQL parameters hidden due to hide_parameters=True]" instead. Applied to
+    # EVERY engine branch below; tests/test_database_engine.py asserts that.
+    _hide_parameters = True
 
     if _is_transaction_pooler:
         engine = create_async_engine(
             _url,
             echo=_echo,
+            hide_parameters=_hide_parameters,
             poolclass=NullPool,
             connect_args={"statement_cache_size": 0},
         )
@@ -69,6 +77,7 @@ if settings.async_database_url:
         engine = create_async_engine(
             _url,
             echo=_echo,
+            hide_parameters=_hide_parameters,
             poolclass=NullPool,
             connect_args={"statement_cache_size": 0},
         )
@@ -90,6 +99,7 @@ if settings.async_database_url:
         engine = create_async_engine(
             _url,
             echo=_echo,
+            hide_parameters=_hide_parameters,
             pool_pre_ping=True,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,

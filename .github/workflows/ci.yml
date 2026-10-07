@@ -65,6 +65,11 @@ jobs:
   test:
     name: Test (pytest)
     runs-on: ubuntu-latest
+    # ENVIRONMENT fails closed to "production" when unset (#597); the suite
+    # expects development behaviour, so set it explicitly. (tests/conftest.py
+    # also defaults it, but CI should not rely on that alone.)
+    env:
+      ENVIRONMENT: development
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

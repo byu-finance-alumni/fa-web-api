@@ -949,8 +949,13 @@ def _to_item(
     all_time_sent: dict[int, int] | None = None,
     progress: dict[int, tuple[int, int, int, int, int, int]] | None = None,
     fill_medians: dict[int, float] | None = None,
+    next_sends: dict[int, tuple[int | None, datetime.date | None, int | None]]
+    | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
+    next_stage, next_send_date, next_send_count = (next_sends or {}).get(
+        year, (None, None, None)
+    )
     created_by_id = getattr(sched, "created_by_user_id", None)
     (
         recipients,
@@ -970,6 +975,9 @@ def _to_item(
         created_at=getattr(sched, "created_at", None),
         created_by=creators.get(created_by_id) if created_by_id else None,
         paused_at=getattr(sched, "paused_at", None),
+        next_stage=next_stage,
+        next_send_date=next_send_date,
+        next_send_count=next_send_count,
         sent_initial=counts.get((year, STAGE_INITIAL), 0),
         sent_reminder_1=counts.get((year, STAGE_REMINDER_1), 0),
         sent_reminder_2=counts.get((year, STAGE_REMINDER_2), 0),
@@ -987,12 +995,114 @@ def _to_item(
     )
 
 
+# ------------------------------------------------------------ next send ------
+#
+# "Which email goes out next, and when?" (#562) — answered for the console from
+# the same rules the cron sends by, so the two cannot disagree.
+
+# The daily survey cron (`vercel.json`: "0 18 * * *"). Vercel Hobby fires a cron
+# at any minute inside its hour, so only the DATE of the next run is promised.
+_CRON_HOUR_UTC = 18
+
+
+def _next_cron_date(
+    now: datetime.datetime, last_run_at: datetime.datetime | None
+) -> datetime.date:
+    """The date of the next daily cron run that has not happened yet.
+
+    Before 18:00 UTC that is today; from 19:00 it is tomorrow. Inside the 18:00
+    hour the cron may or may not have fired — a ``last_run_at`` stamped since
+    18:00 today says it has."""
+    today = now.date()
+    tomorrow = today + datetime.timedelta(days=1)
+    if now.hour < _CRON_HOUR_UTC:
+        return today
+    if now.hour > _CRON_HOUR_UTC:
+        return tomorrow
+    cron_window_opened = now.replace(
+        hour=_CRON_HOUR_UTC, minute=0, second=0, microsecond=0
+    )
+    if last_run_at is not None:
+        if last_run_at.tzinfo is None:
+            last_run_at = last_run_at.replace(tzinfo=datetime.UTC)
+        if last_run_at >= cron_window_opened:
+            return tomorrow
+    return today
+
+
+async def _next_send(
+    session: AsyncSession, sched: SurveySchedule
+) -> tuple[int | None, datetime.date | None, int | None]:
+    """``(stage, date, approx count)`` of a campaign's next email, or all None.
+
+    Only a RUNNABLE campaign has one: paused, cancelled and completed campaigns
+    are skipped by the cron, and saying they have a next send is worse than
+    saying nothing.
+
+    The stage is :func:`survey_email.select_stage_targets` asked with NO
+    calendar ceiling — the lowest stage that still has anyone owed it. The cron
+    sends exactly that stage on its first run on or after the stage's window
+    opens (``start_date + 7 * stage``), so the date is the later of that and
+    the next cron run. Reading the stage from the calendar instead (today's
+    window, or ``last stage + 1``) is wrong for any stage that could not drain
+    inside its own week — the cron finishes it before moving on.
+
+    The recipients are the cron's own (`_load_recipients` + the shared-address
+    dedupe), so the count is who the cron would email if it ran now: replies
+    before then shrink it, and the daily cap may spread it over several days.
+
+    Costs the recipient load plus at most three indexed send-log reads, and is
+    only ever run for runnable campaigns — of which there are a handful at once.
+    """
+    if sched.status not in _RUNNABLE_STATUSES:
+        return None, None, None
+    year = sched.graduation_year
+    recipients = await survey_email._load_recipients(session, year)
+    eligible, _dupes = survey_email.dedupe_by_email(recipients)
+    stage, targets = await survey_email.select_stage_targets(
+        session,
+        graduation_year=year,
+        recipients=eligible,
+        max_stage=STAGE_REMINDER_2,
+        cycle_seq=getattr(sched, "cycle_seq", survey_email.FIRST_CYCLE),
+    )
+    if stage is None or not targets:
+        # Every stage delivered to everyone owed it: the next cron run marks
+        # the campaign completed and sends nothing.
+        return None, None, None
+    window_opens = sched.start_date + datetime.timedelta(
+        days=stage * _STAGE_WINDOW_DAYS
+    )
+    run_date = _next_cron_date(_now(), sched.last_run_at)
+    return stage, max(run_date, window_opens), len(targets)
+
+
+async def _next_sends(
+    session: AsyncSession, schedules: list[SurveySchedule]
+) -> dict[int, tuple[int | None, datetime.date | None, int | None]]:
+    """:func:`_next_send` for each RUNNABLE schedule, keyed by year. Rows that
+    cannot send are not queried at all."""
+    out: dict[int, tuple[int | None, datetime.date | None, int | None]] = {}
+    for sched in schedules:
+        if sched.status in _RUNNABLE_STATUSES:
+            out[sched.graduation_year] = await _next_send(session, sched)
+    return out
+
+
 # ----------------------------------------------------------- management --------
 
 
-async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
+async def list_schedules(
+    session: AsyncSession, *, with_next_send: bool = False
+) -> list[SurveyScheduleItem]:
     """Every schedule (newest cohort first) with its per-stage delivered counts
-    and its manual-follow-up count."""
+    and its manual-follow-up count.
+
+    ``with_next_send`` also fills the ``next_*`` fields (#562). It is the one
+    read that is NOT a fixed number of queries — it loads each RUNNABLE
+    campaign's recipients — so only the console's list read asks for it. The
+    write endpoints that echo a schedule back leave those fields None; the
+    console re-reads this list after every write anyway."""
     schedules = list(
         (
             await session.execute(
@@ -1008,9 +1118,17 @@ async def list_schedules(session: AsyncSession) -> list[SurveyScheduleItem]:
     progress = await _progress_counts(session)
     fill_medians = await _median_fill_times(session)
     creators = await _creator_names(session, schedules)
+    next_sends = await _next_sends(session, schedules) if with_next_send else None
     return [
         _to_item(
-            s, counts, creators, non_responders, all_time, progress, fill_medians
+            s,
+            counts,
+            creators,
+            non_responders,
+            all_time,
+            progress,
+            fill_medians,
+            next_sends,
         )
         for s in schedules
     ]

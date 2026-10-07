@@ -10,7 +10,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, extract, func, or_, select, text
+from sqlalchemy import and_, extract, func, or_, select, text, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -931,6 +931,12 @@ async def activity_feed(
     # and is reflected in both the count and the page (shared ``conditions``).
     if mine:
         conditions.append(Interaction.user_id == actor.user_id)
+    # Archived alumni's interactions are full_access-and-up only (#591), as on
+    # the alumni list. ``reports.advanced`` is assignable, so a lower role
+    # granted this feed must not read activity on records removed from the
+    # directory through it.
+    if not actor.sees_archived:
+        conditions.append(Alumni.archived.is_(False))
 
     total = await session.scalar(
         select(func.count())
@@ -1132,6 +1138,8 @@ async def upcoming_follow_ups_list(
             .where(
                 FollowUpTask.completed.is_(False),
                 FollowUpTask.due_date >= today,
+                # Archived alumni: full_access-and-up only (#591).
+                true() if actor.sees_archived else Alumni.archived.is_(False),
             )
             .order_by(FollowUpTask.due_date.asc(), FollowUpTask.follow_up_task_id)
             .limit(200)

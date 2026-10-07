@@ -93,6 +93,14 @@ class UserContext(BaseModel):
         return RoleName.VIEW_ONLY.value in self.roles
 
     @property
+    def sees_archived(self) -> bool:
+        """full_access and up (engineer / super_admin / full_access): the tier
+        that may still read ARCHIVED records — on the alumni list, a profile,
+        and every list that names alumni (notes, event rosters, the activity
+        feed, donors; #591). Below it, an archived record reads as absent."""
+        return self.is_full_access or self.is_super_admin or self.is_engineer
+
+    @property
     def can_edit_alumni(self) -> bool:
         """True for any role permitted to edit an existing alumnus and their
         nested records: engineer, super_admin, full_access, or student. Mirrors

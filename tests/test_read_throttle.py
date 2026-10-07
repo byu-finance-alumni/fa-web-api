@@ -478,6 +478,81 @@ def test_geography_lists_keep_their_reports_advanced_gate(client):
     assert client.get("/geography/cities").status_code == 403
 
 
+# --- the donations / event-attendee / survey-console lists (#590) -------------
+#
+# Each keeps its own gate but spends the SAME browse budget as the alumni reads.
+
+_OTHER_STAFF_LISTS = [
+    "/donations/donors",
+    "/donations/summary",
+    "/donations/alumni/1",
+    "/events/1/attendees",
+    "/survey/campaigns/2020/responses",
+    "/survey/campaigns/2020/recipients",
+    "/survey/campaigns/2020/unreachable",
+    "/survey/schedules/2020/non-responders",
+    "/survey/schedules/2020/responders",
+]
+
+
+@pytest.mark.parametrize("path", _OTHER_STAFF_LISTS)
+def test_other_staff_lists_spend_the_browse_budget(client, alerts, path):
+    _as("full_access")
+    _spend_browse(client, _BROWSE_PER_MINUTE)
+    assert client.get(path).status_code == 429
+
+
+def test_engineer_held_out_list_is_braked_and_stays_engineer_only(client, alerts):
+    _as("full_access")
+    assert client.get("/survey/campaigns/2020/held-out").status_code == 403
+    _as("engineer", user_id=2)
+    _spend_browse(client, _BROWSE_PER_MINUTE)
+    assert client.get("/survey/campaigns/2020/held-out").status_code == 429
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/donations/donors", "/survey/campaigns/2020/unreachable"],
+)
+def test_other_staff_lists_keep_their_own_gate(client, path):
+    # view_only holds neither donations.view nor surveys.manage: still 403, not
+    # widened to plain view access by the limiter.
+    _as("view_only")
+    assert client.get(path).status_code == 403
+
+
+# Cheap DB-free requests that pass each limiter and then 422 on validation.
+@pytest.mark.parametrize(
+    "kind,path,template",
+    [
+        ("donations", "/donations/donors?limit=0", "/donations/donors"),
+        ("events", "/events/0/attendees", "/events/{event_id}/attendees"),
+        (
+            "survey",
+            "/survey/schedules/1/non-responders",
+            "/survey/schedules/{grad_year}/non-responders",
+        ),
+    ],
+)
+def test_other_staff_list_exhausted_returns_429_and_alerts(
+    client, alerts, kind, path, template
+):
+    _as("full_access", user_id=11)
+    seen = [client.get(path).status_code for _ in range(_BROWSE_PER_MINUTE + 1)]
+    assert seen[:_BROWSE_PER_MINUTE] == [422] * _BROWSE_PER_MINUTE
+    assert seen[-1] == 429
+    # One budget: the alumni list is now refused too.
+    assert client.get(_LIST).status_code == 429
+
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert["purpose"] == failure_alert.SECURITY
+    rows = dict(alert["rows"])
+    assert rows["User id"] == "11"
+    assert rows["Bucket"] == "read:browse"
+    assert rows["Route"] == template
+
+
 # --- a failed alert delivery is retried on the next 429 -----------------------
 
 

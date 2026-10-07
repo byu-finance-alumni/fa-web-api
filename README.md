@@ -28,6 +28,13 @@ uvicorn app.main:app --reload
 - API root: http://127.0.0.1:8000/
 - Swagger docs: http://127.0.0.1:8000/docs
 
+> ⚠️ **`ENVIRONMENT` fails closed to `production` when unset** (#597). Local
+> runs need `ENVIRONMENT=development` (it is in `.env.example`) or `/docs`,
+> `/openapi.json` and the `localhost:3000` CORS origin are all switched off.
+> The same applies to the **dev Vercel API project** — it must set
+> `ENVIRONMENT=development`, or dev's `/openapi.json` disappears and the app's
+> `npm run gen:api-types` can no longer fetch it.
+
 ## Endpoints
 
 The surface is far too large to mirror by hand here and a hand-kept list goes

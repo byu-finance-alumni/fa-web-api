@@ -9,10 +9,24 @@ the app works whether values are set manually or by the integration.
 """
 
 import datetime
+import logging
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# Hosts that only ever mean "the machine the browser is running on". A deployed
+# production API must never trust one as a CORS origin (#597): any local page or
+# process on a staff member's laptop could then make credentialed calls.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _is_loopback_origin(origin: str) -> bool:
+    host = (urlsplit(origin).hostname or "").lower()
+    return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
 
 
 class Settings(BaseSettings):
@@ -24,7 +38,14 @@ class Settings(BaseSettings):
     )
 
     # Application
-    environment: str = "development"
+    # FAIL CLOSED (#597): an unset ENVIRONMENT means "production", so a deploy
+    # that forgets the variable hides /docs + /openapi.json, forces SQL echo off
+    # and drops localhost CORS origins, rather than silently exposing all of it.
+    # Anything that WANTS development behaviour must say so explicitly: the local
+    # `.env` (see .env.example), tests/conftest.py, the CI test job, and the DEV
+    # Vercel API project (ENVIRONMENT=development — without it dev's
+    # /openapi.json disappears and the app's `npm run gen:api-types` breaks).
+    environment: str = "production"
     debug: bool = False
     # SQL statement echo is OFF by default — it floods the terminal. Turn it on
     # only when actively debugging a query (SQL_ECHO=true), independent of DEBUG.
@@ -224,6 +245,13 @@ class Settings(BaseSettings):
     # the endpoint rejects every request (401), so it's never open by default.
     cron_secret: str | None = Field(default=None)  # CRON_SECRET
 
+    # Signing secret for Resend's delivery webhook (POST /webhooks/resend,
+    # fa-web-app #858) -- the `whsec_...` value Resend shows when the endpoint is
+    # registered. Resend signs every delivery with it (Svix scheme). Unset (None)
+    # -> the route answers 503 and processes NOTHING, so it is never open by
+    # default.
+    resend_webhook_secret: str | None = Field(default=None)  # RESEND_WEBHOOK_SECRET
+
     # CORS — comma-separated list of allowed frontend origins.
     cors_origins: str = Field(
         default=(
@@ -237,8 +265,23 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
-        """Parse the comma-separated CORS origins into a clean list."""
-        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        """Parse the comma-separated CORS origins into a clean list.
+
+        In production, localhost / loopback origins are DROPPED (#597) — whether
+        they came from the built-in default (CORS_ORIGINS unset) or were pasted
+        into the env var. Dropping with a warning, rather than refusing to start,
+        is deliberate: a stray localhost entry must never be able to take prod
+        down, and the real frontend origins keep working either way.
+        """
+        origins = [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        if self.environment != "production":
+            return origins
+        dropped = [o for o in origins if _is_loopback_origin(o)]
+        if dropped:
+            logger.warning(
+                "Ignoring localhost CORS origin(s) in production: %s", ", ".join(dropped)
+            )
+        return [o for o in origins if not _is_loopback_origin(o)]
 
     @property
     def async_database_url(self) -> str | None:

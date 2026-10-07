@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.audit import AuditLog
 from app.models.event import Event, EventAttendance
 from app.repositories.net_id import match_net_ids, normalize_net_id
+from app.services.import_csv import unreadable_csv_message
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +91,8 @@ def parse_and_map(
         header_row = next(reader)
     except StopIteration:
         return [], ["The file is empty."]
+    except csv.Error:  # a cell over the 128 KB field limit (#597)
+        return [], [unreadable_csv_message(reader.line_num)]
 
     headers = [h.strip() for h in header_row]
     header_errors = _validate_headers(headers)
@@ -98,15 +101,18 @@ def parse_and_map(
 
     index = {h: i for i, h in enumerate(headers)}
     rows: list[dict] = []
-    for offset, raw_row in enumerate(reader, start=2):
-        if not any(cell.strip() for cell in raw_row):
-            continue
-        if max_rows is not None and len(rows) >= max_rows:
-            return [], [
-                f"File exceeds the {max_rows:,}-row import limit. Split into "
-                "smaller batches."
-            ]
-        rows.append(_map_row(offset, index, raw_row))
+    try:
+        for offset, raw_row in enumerate(reader, start=2):
+            if not any(cell.strip() for cell in raw_row):
+                continue
+            if max_rows is not None and len(rows) >= max_rows:
+                return [], [
+                    f"File exceeds the {max_rows:,}-row import limit. Split into "
+                    "smaller batches."
+                ]
+            rows.append(_map_row(offset, index, raw_row))
+    except csv.Error:
+        return [], [unreadable_csv_message(reader.line_num)]
     return rows, header_errors
 
 

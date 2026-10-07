@@ -455,8 +455,13 @@ def _filters_dict(filters: AlumniExportFilters) -> dict:
     :func:`build_export_query` resolves it into ``photo_filter``.
     """
     out = filters.model_dump(
-        exclude_unset=True, exclude={"sort", "near", "radius", "missing_photo"}
+        exclude_unset=True,
+        exclude={"sort", "near", "radius", "missing_photo", "kind", "is_alumni"},
     )
+    # The friends/alumni split is ALWAYS passed, resolved from ``kind`` /
+    # ``is_alumni`` (#594): leaving it to ``exclude_unset`` is what let an
+    # explicit ``is_alumni: null`` drop the predicate and widen the export.
+    out["is_alumni"] = filters.effective_is_alumni
     if out.get("needs_survey"):
         out["survey_due_before"] = datetime.datetime.now(datetime.UTC) - SURVEY_CADENCE
     if out.get("designations") is not None:

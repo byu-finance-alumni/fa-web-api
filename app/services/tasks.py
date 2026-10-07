@@ -84,6 +84,7 @@ async def list_all_tasks(
     q: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    include_archived: bool = True,
 ) -> AdminTaskPage:
     """Return a page of follow-up tasks across all alumni.
 
@@ -100,11 +101,16 @@ async def list_all_tasks(
     ``assigned_to_user_id`` (numeric string) or the literal ``"unassigned"`` for
     tasks with no assignee. ``q`` is a case-insensitive substring match over the
     task title OR the owning alumnus's first/last name.
+
+    ``include_archived=False`` (callers below full_access, #591) leaves out
+    tasks on ARCHIVED alumni, as the alumni list does — in the count and the page.
     """
     if sort not in ALLOWED_SORTS:
         sort = DEFAULT_SORT
 
     conditions = []
+    if not include_archived:
+        conditions.append(Alumni.archived.is_(False))
     if completed is not None:
         conditions.append(FollowUpTask.completed.is_(completed))
 

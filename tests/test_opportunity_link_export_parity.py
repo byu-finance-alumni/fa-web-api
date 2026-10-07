@@ -375,7 +375,7 @@ def test_the_csv_carries_the_declared_columns_and_one_row_per_link(monkeypatch):
     )
     session = _ExportSession([link])
 
-    async def _project(_session, links):
+    async def _project(_session, links, *, redact_archived=False):
         from app.services.opportunity_links import _to_read
 
         return [
@@ -407,7 +407,7 @@ def test_the_export_is_audited_with_the_filters_that_produced_it(monkeypatch):
 
     session = _ExportSession([])
 
-    async def _project(_session, links):
+    async def _project(_session, links, *, redact_archived=False):
         return []
 
     monkeypatch.setattr(service, "_project", _project)

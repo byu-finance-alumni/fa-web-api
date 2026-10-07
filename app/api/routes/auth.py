@@ -15,13 +15,17 @@ from app.api.dependencies.auth import (
     CurrentUser,
     PermissionConfig,
     _clear_login_attempts,
+    _enforce_maintenance_mode,
+    _enforce_single_session,
 )
 from app.core.capabilities import effective_capabilities
 from app.core.database import get_session
+from app.core.errors import ConflictError, InvalidRequestError
 from app.core.rate_limit import (
     LOGIN_PRECHECK_LIMITER,
     LOGIN_RECORD_LIMITER,
     RecordLoginRateLimit,
+    check_change_password_budget,
 )
 from app.core.security import MaintenanceModeError
 from app.models.audit import AuditLog
@@ -36,6 +40,7 @@ from app.services import (
     login_block,
     login_lockout,
     maintenance,
+    supabase_admin,
 )
 
 logger = logging.getLogger(__name__)
@@ -319,6 +324,19 @@ async def password_complete(
 ) -> PasswordCompleteResponse:
     """Clear the force-password-change flag for the AUTHENTICATED caller.
 
+    DEPRECATED (#592) — superseded by ``POST /auth/password/change``, which
+    sets the password itself and only then clears the flag. This route clears
+    the flag on the caller's word alone, so a user can keep the admin-issued
+    temp password and still get through the gate. It is kept ONLY so app builds
+    deployed before the switch keep working while both sides roll out.
+    TODO(#592 follow-up, added 2026-10-07): delete this route once the app
+    calling ``/auth/password/change`` is live in prod.
+
+    Until then it carries the same session + maintenance gates as the new route
+    (appsec review 2026-10-07): it is on the force-change-exempt resolver, so
+    without them a superseded or engineer-REVOKED session could still clear the
+    flag.
+
     EXEMPT from the force-password-change gate (it depends on the exempt
     resolver): this is the very endpoint a flagged user calls to clear the flag,
     so it must remain reachable while ``must_change_password`` is true.
@@ -332,9 +350,122 @@ async def password_complete(
     Idempotent: a caller whose flag is already false simply gets a 200 and no
     audit row is written.
     """
+    _enforce_single_session(user)
+    await _enforce_maintenance_mode(session, user)
     db_user = await session.scalar(
         select(User).where(User.user_id == user.user_id)
     )
+    if db_user is not None and db_user.must_change_password:
+        db_user.must_change_password = False
+        session.add(
+            AuditLog(
+                user_id=user.user_id,
+                action_type="password_changed",
+                entity_type="user",
+                entity_id=user.user_id,
+                field_name="must_change_password",
+                old_value="true",
+                new_value="false",
+            )
+        )
+        await session.commit()
+    return PasswordCompleteResponse()
+
+
+# The app enforces the same rules client-side (SetPasswordForm.tsx); these are
+# the server's copy, so a direct API call can't skip them. 72 is bcrypt's input
+# limit, which Supabase enforces in BYTES — checking bytes here turns what would
+# be an opaque upstream rejection (502) into a clear 422.
+_PASSWORD_MIN_CHARS = 8
+_PASSWORD_MAX_BYTES = 72
+
+
+class PasswordChangeRequest(BaseModel):
+    """Body for ``POST /auth/password/change``: the new password only. There is
+    no user id — the route acts on the token's own account."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Loose shape bound only (keeps an absurd body out); the real strength
+    # rules run in the handler so they come back with readable messages.
+    new_password: str = Field(max_length=1024)
+
+
+@router.post("/password/change", response_model=PasswordCompleteResponse)
+async def password_change(
+    payload: PasswordChangeRequest,
+    user: CurrentDBUserAllowMustChange,
+    session: SessionDep,
+) -> PasswordCompleteResponse:
+    """Finish a FORCED password change server-side (#592).
+
+    Replaces the old two-step flow (the browser set the password through its own
+    Supabase session, then told ``/auth/password/complete`` it had) in which the
+    API cleared ``must_change_password`` without any evidence the password had
+    changed. Here the API sets the password itself through the Supabase Admin
+    API and clears the flag only after that succeeded — so a cleared flag always
+    means the temp password is gone.
+
+    Rules, in order:
+
+      * Only while the caller's ``must_change_password`` flag is set; otherwise
+        409. This is not a general "change my password" endpoint — without the
+        flag it would turn a stolen access token into a permanent password
+        without ever knowing the old one.
+      * The token must be the account's ACTIVE session (#147): a superseded or
+        engineer-revoked session is refused (``session_superseded``) even though
+        this route uses the force-change-exempt resolver. Maintenance mode
+        refuses it too (503), like any other write.
+      * Same strength rules as the app's form: at least 8 characters, at most 72
+        bytes, not the account's email address (case-insensitive). 422.
+      * Not the current (temporary) password, when that can be checked
+        (``supabase_admin.password_matches_current``). 422.
+
+    A Supabase failure is a 502 and the flag stays set, so the user can retry.
+    Rate limited per user (``auth:change_password``, 5/10 min), counted only
+    once the request has passed the flag and strength checks — a 409 or a
+    "too short" 422 does not spend the budget; a temp-password guess does. Audited as
+    ``password_changed``, like the route it replaces; the password itself is
+    never logged or stored here.
+    """
+    _enforce_single_session(user)
+    await _enforce_maintenance_mode(session, user)
+    if not user.must_change_password:
+        raise ConflictError("No password change is pending for this account.")
+    password = payload.new_password
+    if len(password) < _PASSWORD_MIN_CHARS:
+        raise InvalidRequestError(
+            f"Password must be at least {_PASSWORD_MIN_CHARS} characters."
+        )
+    if len(password.encode("utf-8")) > _PASSWORD_MAX_BYTES:
+        raise InvalidRequestError(
+            f"Password must be {_PASSWORD_MAX_BYTES} characters or fewer."
+        )
+    if user.email and password.strip().lower() == user.email.strip().lower():
+        raise InvalidRequestError(
+            "Your password can't be the same as your email address."
+        )
+    check_change_password_budget(user.user_id)
+    # Before any ORM load: on failure the helper rolls the session back.
+    matches = await supabase_admin.password_matches_current(
+        session, user.auth_user_id, password
+    )
+    if matches is None:
+        # Fail open, but LOUDLY: a reuse check that silently never runs is how
+        # a temp password survives a "change" unnoticed. Never the password.
+        logger.error(
+            "Temp-password reuse check could not run for user_id=%s; "
+            "allowing the change without it.",
+            user.user_id,
+        )
+    if matches:
+        raise InvalidRequestError(
+            "Choose a new password — it can't be the temporary one you were given."
+        )
+
+    await supabase_admin.set_user_password(user.auth_user_id, password)
+
+    db_user = await session.scalar(select(User).where(User.user_id == user.user_id))
     if db_user is not None and db_user.must_change_password:
         db_user.must_change_password = False
         session.add(

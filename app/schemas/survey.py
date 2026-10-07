@@ -179,6 +179,12 @@ class GraduationYearCount(BaseModel):
     # than after it quietly under-delivers. Excludes suppressed alumni — see
     # `SurveyRecipientBreakdown`.
     unreachable: int = 0
+    # Submissions from this year WAITING FOR REVIEW (#856) — shown in the year
+    # picker as "2020 (14)". Counted by `survey_email.pending_review_counts_by_year`
+    # over exactly the rows `survey_responses.list_pending` returns, so it always
+    # equals the Submissions tab's badge for the same year. It counts
+    # SUBMISSIONS, like the badge, not distinct alumni.
+    pending_review: int = 0
 
 
 class SurveySendSample(BaseModel):
@@ -255,6 +261,42 @@ class SurveyUnreachableAlum(BaseModel):
     # when the reason is "no_email".
     personal_email: str | None = None
     work_email: str | None = None
+
+
+class SurveyBouncedAlum(BaseModel):
+    """One alumnus whose survey email PERMANENTLY bounced (fa-web-app #858).
+
+    From Resend's ``email.bounced`` webhook. Permanent ("hard") bounces only --
+    a temporary one is stored but never listed. Listing someone here changes
+    nothing about them; staff fix the address on the profile by hand.
+
+    One row per alumnus: their most recent permanent bounce for the year.
+    """
+
+    alumni_id: int
+    name: str
+    # The address the bounced email was sent to. None when the message id never
+    # reached the send log (the bounce was matched by its alumni tag instead).
+    bounced_address: str | None = None
+    # Resend's bounce subtype as sent, e.g. "General", "NoEmail", "Suppressed".
+    bounce_subtype: str | None = None
+    bounced_at: datetime.datetime
+    # Whether that address is still one of the two on the profile. False means
+    # someone has already changed it since the bounce. None when unknown.
+    address_still_on_file: bool | None = None
+
+
+class SurveyBouncedPage(BaseModel):
+    """The bounced list, capped, plus the size of the whole set (#858).
+
+    `total` counts every alumnus with a permanent bounce for the year, BEFORE
+    `limit`, so the console can say "showing the first N of M" rather than pass
+    a prefix off as the whole list."""
+
+    graduation_year: int
+    total: int
+    limit: int
+    items: list[SurveyBouncedAlum]
 
 
 class SurveyHeldOutAlum(BaseModel):
@@ -445,6 +487,23 @@ class SurveyScheduleItem(BaseModel):
     # state ("paused 3 days ago" is what tells staff a stopped campaign has been
     # forgotten about).
     paused_at: datetime.datetime | None = None
+    # WHAT GOES OUT NEXT (#562): the stage (0=initial, 1/2=reminders), the date
+    # of the daily cron run expected to send it, and roughly how many people it
+    # will reach. Computed only for a RUNNABLE campaign (scheduled/active) — a
+    # paused, cancelled or completed one has no next send, and all three are
+    # None. Also None when every stage has been delivered to everyone owed it.
+    #
+    # The stage comes from `survey_email.select_stage_targets`, the same rule
+    # the cron sends by, so an unfinished earlier stage is reported ahead of a
+    # later one. The date is anchored to `start_date` (which a resume shifts),
+    # never to "today + 7". The count is approximate: replies before then shrink
+    # it, and the daily send cap can spread it over several days.
+    #
+    # Filled only by the list read (`GET /survey/schedules`); the write
+    # endpoints that echo one schedule back leave all three None.
+    next_stage: int | None = None
+    next_send_date: datetime.date | None = None
+    next_send_count: int | None = None
     # Delivered counts per stage from survey_send_log (0=initial, 1/2=reminders).
     sent_initial: int = 0
     sent_reminder_1: int = 0

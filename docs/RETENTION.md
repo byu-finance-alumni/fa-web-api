@@ -42,6 +42,18 @@ shape for a right-to-be-forgotten request against an audited system. It is left 
 tracked follow-up rather than shipped speculatively, since the destructive path needs an
 explicit institutional policy and careful review before it exists.
 
+## Survey send log and email bounce events
+
+`survey_send_log` keeps one row per survey email sent. Since #858 each row also
+holds the address the email went to (`sent_to`) and Resend's message id
+(`resend_email_id`), and `survey_email_events` holds the bounce/complaint events
+Resend reports for those emails (event type, bounce type/subtype, when, the alum
+it was matched to — no address, no raw payload). Both are **retained with the
+send log**: nothing prunes them, an archived alum's rows stay, and deleting an
+alum removes their send-log rows (`ON DELETE CASCADE`) while their events are kept
+unattributed (`alumni_id` set NULL). A PII scrub (above) must null
+`survey_send_log.sent_to` as well.
+
 ## Staff/user accounts
 
 Staff accounts already support permanent deletion (`super_admin`/`engineer`, two-step

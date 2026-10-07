@@ -31,7 +31,9 @@ def _clean_email(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("Must be a string.")
     value = value.strip().lower()
-    if not _EMAIL_RE.match(value) or len(value) > 255:
+    # Length FIRST (#597): never hand an unbounded string to the regex. The
+    # field's own max_length runs only after this mode="before" validator.
+    if len(value) > 255 or not _EMAIL_RE.match(value):
         raise ValueError("Must be a valid email address.")
     return value
 

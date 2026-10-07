@@ -81,9 +81,21 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
 
-def _full_name(first: str | None, last: str | None, email: str | None) -> str | None:
+def _full_name(first: str | None, last: str | None) -> str | None:
+    """"First Last", or None. Never falls back to an email address: staff emails
+    must not leak onto a profile (interactions, tasks, attachments, the audit
+    list) — see :func:`_staff_name` for the user-facing fallback."""
     name = " ".join(p for p in (first, last) if p).strip()
-    return name or email
+    return name or None
+
+
+# Shown for a staff account that has no first/last name on file, in place of the
+# email address the profile used to fall back to.
+STAFF_NAME_FALLBACK = "Staff member"
+
+
+def _staff_name(user: User) -> str:
+    return _full_name(user.first_name, user.last_name) or STAFF_NAME_FALLBACK
 
 
 async def _pay_it_forward_summary(
@@ -134,7 +146,7 @@ async def _actor_name(session: AsyncSession, user_id: int | None) -> str | None:
     if user_id is None:
         return None
     user = await session.get(User, user_id)
-    return _full_name(user.first_name, user.last_name, user.email) if user else None
+    return _staff_name(user) if user else None
 
 
 def _require_interaction_ownership(
@@ -360,7 +372,6 @@ async def get_profile(
             spouse_alumni_name = _full_name(
                 spouse.preferred_first_name or spouse.first_name,
                 spouse.last_name,
-                None,
             )
 
     # Resolve the display name of the user who last manually updated this profile
@@ -545,7 +556,7 @@ async def get_profile(
         for u in (
             await session.scalars(select(User).where(User.user_id.in_(user_ids)))
         ).all():
-            names[u.user_id] = _full_name(u.first_name, u.last_name, u.email)
+            names[u.user_id] = _staff_name(u)
             first_names[u.user_id] = u.first_name or None
 
     pay_it_forward = await _pay_it_forward_summary(
@@ -642,14 +653,19 @@ async def get_profile(
         ],
         audit=[
             AuditEntryRead.model_validate(a).model_copy(
-                # Prefer the snapshotted actor name/email (survives the actor's
+                # Prefer the snapshotted actor NAME (survives the actor's
                 # deletion); fall back to a live name lookup for legacy rows
-                # written before the snapshot trigger existed.
+                # written before the snapshot trigger existed. Never the
+                # snapshotted email: a nameless actor reads "Staff member".
                 update={
                     "performed_by": (
                         a.actor_name
-                        or a.actor_email
                         or (names.get(a.user_id) if a.user_id else None)
+                        or (
+                            STAFF_NAME_FALLBACK
+                            if a.user_id or a.actor_email
+                            else None
+                        )
                     )
                 }
             )

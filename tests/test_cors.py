@@ -41,3 +41,57 @@ def test_disallowed_origin_is_not_reflected():
     # Request still succeeds, but the browser-enforced CORS header must not
     # echo the disallowed origin.
     assert response.headers.get("access-control-allow-origin") != DISALLOWED_ORIGIN
+
+
+# --- Production never trusts a localhost origin (#597) ------------------------
+# The built-in default carries http://localhost:3000 for local development. If
+# CORS_ORIGINS were ever unset in prod that default would apply as-is, so in
+# production the loopback origins are dropped (with a warning) — never a refusal
+# to start, which could take prod down over a stray entry.
+
+PROD_FRONTENDS = [
+    "https://finance.alumni.byu.edu",
+    "https://finance-alumni-database.vercel.app",
+    "https://dev-fa-web-app.vercel.app",
+]
+
+
+def _settings(**overrides):
+    from app.core.config import Settings
+
+    return Settings(_env_file=None, **overrides)
+
+
+def test_production_default_drops_localhost(monkeypatch, caplog):
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    monkeypatch.delenv("CORS_ORIGIN", raising=False)
+    with caplog.at_level("WARNING", logger="app.core.config"):
+        origins = _settings(environment="production").cors_origins_list
+    assert origins == PROD_FRONTENDS
+    assert "localhost" in caplog.text
+
+
+def test_production_drops_every_loopback_spelling_from_explicit_env(monkeypatch):
+    monkeypatch.setenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000, http://127.0.0.1:3000,http://[::1]:3000,"
+        "http://app.localhost:3000,https://finance.alumni.byu.edu",
+    )
+    origins = _settings(environment="production").cors_origins_list
+    assert origins == ["https://finance.alumni.byu.edu"]
+
+
+def test_production_without_localhost_logs_nothing(monkeypatch, caplog):
+    monkeypatch.setenv("CORS_ORIGINS", ",".join(PROD_FRONTENDS))
+    with caplog.at_level("WARNING", logger="app.core.config"):
+        origins = _settings(environment="production").cors_origins_list
+    assert origins == PROD_FRONTENDS
+    assert caplog.text == ""
+
+
+def test_development_keeps_localhost(monkeypatch):
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    monkeypatch.delenv("CORS_ORIGIN", raising=False)
+    origins = _settings(environment="development").cors_origins_list
+    assert ALLOWED_ORIGIN in origins
+

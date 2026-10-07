@@ -229,3 +229,90 @@ def test_the_rejection_message_never_echoes_the_uploaded_bytes():
         assert "Traceback" not in str(exc)
     else:
         pytest.fail("expected a rejection")
+
+
+# ---------------------------------------------- #597 decode hardening -------
+
+
+@pytest.mark.parametrize("fmt", ["GIF", "TIFF", "BMP"])
+def test_formats_pillow_can_read_but_we_do_not_accept_are_refused(fmt):
+    """`formats=` keeps hostile bytes away from every other Pillow plugin."""
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (1, 2, 3)).save(buf, format=fmt)
+    with pytest.raises(InvalidRequestError):
+        normalise_headshot(buf.getvalue())
+
+
+def test_a_png_over_the_decode_ceiling_is_refused():
+    """PNG has no reduced-size decode, so 26 Mpx would really be allocated."""
+    buf = io.BytesIO()
+    Image.new("L", (5200, 5000), 255).save(buf, format="PNG")
+    with pytest.raises(InvalidRequestError, match="too large"):
+        normalise_headshot(buf.getvalue())
+
+
+def test_a_jpeg_over_the_decode_ceiling_is_decoded_small_via_draft(monkeypatch):
+    """A 30 Mpx JPEG is fine: draft() decodes it at 1/4 scale, not at 30 Mpx."""
+    decoded_sizes = []
+    real_thumbnail = Image.Image.thumbnail
+
+    def spy(self, *args, **kwargs):
+        decoded_sizes.append(self.size)
+        return real_thumbnail(self, *args, **kwargs)
+
+    src = _jpeg(size=(6000, 5000))
+    monkeypatch.setattr(Image.Image, "thumbnail", spy)
+    out = normalise_headshot(src)
+    monkeypatch.undo()
+
+    assert max(Image.open(io.BytesIO(out)).size) == 1024
+    # 1/4 scale: the largest power-of-two reduction still covering 1024px.
+    assert decoded_sizes == [(1500, 1250)]
+
+
+def _srgb_icc() -> bytes:
+    from PIL import ImageCms
+
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def test_the_uploaded_colour_profile_is_not_copied_through():
+    src = _jpeg(colour=(200, 40, 40), icc_profile=_srgb_icc())
+    assert Image.open(io.BytesIO(src)).info.get("icc_profile"), "fixture has no profile"
+
+    out = normalise_headshot(src)
+
+    image = Image.open(io.BytesIO(out))
+    assert "icc_profile" not in image.info
+    # sRGB -> sRGB is an identity transform: the colour must survive.
+    r, g, b = image.convert("RGB").getpixel((10, 10))
+    assert abs(r - 200) < 8 and abs(g - 40) < 8 and abs(b - 40) < 8
+
+
+def test_a_profile_is_converted_to_srgb_before_it_is_dropped(monkeypatch):
+    """The pixels are re-expressed in sRGB, so dropping the tag keeps colours."""
+    from app.services import images
+
+    calls = []
+    real = images.ImageCms.profileToProfile
+
+    def spy(im, src, dst, **kw):
+        calls.append(kw.get("outputMode"))
+        return real(im, src, dst, **kw)
+
+    monkeypatch.setattr(images.ImageCms, "profileToProfile", spy)
+    normalise_headshot(_jpeg(icc_profile=_srgb_icc()))
+    assert calls == ["RGB"]
+
+
+def test_a_malformed_profile_does_not_reject_a_real_photo():
+    out = normalise_headshot(_jpeg(icc_profile=b"definitely not an icc profile"))
+    assert "icc_profile" not in Image.open(io.BytesIO(out)).info
+
+
+def test_without_littlecms_the_profile_is_simply_dropped(monkeypatch):
+    from app.services import images
+
+    monkeypatch.setattr(images, "ImageCms", None)
+    out = normalise_headshot(_jpeg(icc_profile=_srgb_icc()))
+    assert "icc_profile" not in Image.open(io.BytesIO(out)).info

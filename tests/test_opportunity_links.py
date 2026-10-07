@@ -964,7 +964,7 @@ def test_a_moderator_may_read_the_pending_queue(monkeypatch, client):
 def test_a_direct_id_fetch_is_not_a_way_round_the_status_gate(monkeypatch, client):
     from app.schemas.opportunity_link import OpportunityLinkRead
 
-    async def _get(session, link_id):
+    async def _get(session, link_id, *, redact_archived=False):
         return OpportunityLinkRead(
             opportunity_link_id=link_id,
             alumni_id=1,

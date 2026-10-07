@@ -24,7 +24,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("", response_model=AdminTaskPage)
 async def list_tasks(
-    _: RequireReportsAdvanced,
+    user: RequireReportsAdvanced,
     session: SessionDep,
     completed: Annotated[
         bool | None,
@@ -97,4 +97,7 @@ async def list_tasks(
         q=q,
         limit=limit,
         offset=offset,
+        # Archived alumni's tasks are full_access-and-up only (#591);
+        # ``reports.advanced`` is assignable to lower roles.
+        include_archived=user.sees_archived,
     )

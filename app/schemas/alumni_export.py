@@ -11,8 +11,18 @@ restricted to the chosen columns.
 from __future__ import annotations
 
 import datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# Ceiling on every free-text search/filter string (#597), shared with the
+# ``GET /alumni`` query params so the list and the export refuse the same input.
+# 200 matches the other free-text search params (opportunity links). No real
+# name, email or place phrase comes near it; what it stops is a multi-KB string
+# being fed to the fuzzy/trigram search and the geocoder on every request.
+# Over-long input is a 422 through the app's normal validation envelope.
+SEARCH_TEXT_MAX_LENGTH = 200
+SearchText = Annotated[str | None, Field(max_length=SEARCH_TEXT_MAX_LENGTH)]
 
 
 class ExportColumn(BaseModel):
@@ -39,16 +49,18 @@ class AlumniExportFilters(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    q: str | None = None
+    q: SearchText = None
     # Name/identifier facets — kept in parity with GET /alumni so a future list-UI
     # facet on these exports the same population (they flow straight into
-    # build_alumni_query via _filters_dict). The export route is full_access-only,
-    # so the email/net_id enumeration concern that gates these on GET doesn't apply.
-    net_id: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
-    preferred_name: str | None = None
-    email: str | None = None
+    # build_alumni_query via _filters_dict). ``alumni.export`` is assignable, so the
+    # route applies the SAME tier gates as GET /alumni: ``email`` and
+    # ``include_archived`` need full_access and up, the hidden-field filters need
+    # edit rights (#594).
+    net_id: SearchText = None
+    first_name: SearchText = None
+    last_name: SearchText = None
+    preferred_name: SearchText = None
+    email: SearchText = None
     graduation_year: int | None = None
     grad_year_min: int | None = None
     grad_year_max: int | None = None
@@ -91,7 +103,7 @@ class AlumniExportFilters(BaseModel):
     # back to an unfiltered search and shows a "couldn't pinpoint" note; an
     # export has no such affordance, and quietly handing over a nationwide file
     # when the operator asked for one metro is a disclosure).
-    near: str | None = None
+    near: SearchText = None
     radius: float | None = Field(default=None, ge=1, le=3000)
     tag: list[str] | None = None
     status_label: list[str] | None = None
@@ -137,12 +149,42 @@ class AlumniExportFilters(BaseModel):
     missing_linkedin: bool = False
     missing_photo: bool = False
     duplicate: bool = False
-    # Friends/alumni split (#218). Unset -> the query builder's default
-    # (alumni only), so an export mirrors the default Alumni list view. Send
-    # ``true`` for alumni only, ``false`` for friends only, or ``null`` for both.
+    # Friends/alumni split (#218, #594). ``kind`` mirrors GET /alumni's own
+    # ``kind`` param: 'alumni' (default) | 'friend' | 'all'. The older
+    # ``is_alumni`` field is still accepted for compatibility (``true`` ->
+    # alumni, ``false`` -> friend), but an explicit ``null`` on EITHER field now
+    # means the default ("alumni") — it used to mean "alumni AND friends", so a
+    # caller sending ``is_alumni: null`` silently widened an alumni export to
+    # friends of the program (``exclude_unset`` counts an explicit null as set).
+    # The only way to ask for both is now the explicit ``kind: "all"``.
+    # ``effective_is_alumni`` is the one resolved value the query builder sees.
+    kind: Literal["alumni", "friend", "all"] | None = None
     is_alumni: bool | None = None
     include_archived: bool = False
     sort: str = "name"
+
+    @model_validator(mode="after")
+    def _kind_and_is_alumni_agree(self) -> AlumniExportFilters:
+        # Both sent and disagreeing is ambiguous; refuse it (422) rather than
+        # guess which one the caller meant and maybe export the wider set.
+        if (
+            self.kind is not None
+            and self.is_alumni is not None
+            and self.kind != ("alumni" if self.is_alumni else "friend")
+        ):
+            raise ValueError("'kind' and 'is_alumni' disagree; send only 'kind'.")
+        return self
+
+    @property
+    def effective_is_alumni(self) -> bool | None:
+        """The tri-state filter for ``build_alumni_query``: True (alumni only),
+        False (friends only) or None (both — ONLY for an explicit
+        ``kind="all"``). Unset or null resolves to alumni-only."""
+        if self.kind is not None:
+            return {"alumni": True, "friend": False, "all": None}[self.kind]
+        if self.is_alumni is not None:
+            return self.is_alumni
+        return True
 
 
 class AlumniExportRequest(BaseModel):

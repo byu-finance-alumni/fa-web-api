@@ -49,10 +49,12 @@ from app.api.dependencies.auth import (
     require_alumni_edit,
     require_alumni_export,
     require_alumni_photos,
+    require_donations_view,
     require_engineer,
     require_interactions_create,
     require_reports_advanced,
     require_super_admin,
+    require_surveys_manage,
     require_view_only,
 )
 from app.core.config import get_settings
@@ -197,6 +199,18 @@ RECORD_LOGIN_LIMITER = rate_limiter(
     window_seconds=600,
     actor_guard=get_current_db_user_allow_must_change,
 )
+# The forced password change (#592) sets a real Supabase password server-side,
+# so it is braked like the other credential-minting calls: 5 per user per 10
+# minutes. Unlike the dependency-style limiters above it is checked INSIDE the
+# route, AFTER the cheap refusals (no change pending -> 409, too short / the
+# email -> 422), so a typo doesn't burn the budget. It is checked BEFORE the
+# temp-password reuse check, though: that check answers "is this the current
+# password?", which is exactly the guess a brake exists to ration.
+def check_change_password_budget(user_id: int) -> None:
+    """Spend one ``auth:change_password`` hit for *user_id*; 429 when over."""
+    _check("auth:change_password", user_id, limit=5, window_seconds=600)
+
+
 # Turning maintenance mode ON is the most destructive single call in the app: it
 # invalidates every non-engineer session at once and closes the site. A generous
 # budget (an incident may legitimately involve a few flips) that still brakes a
@@ -613,6 +627,16 @@ SURVEY_CONTACT_LIMITER = client_ip_rate_limiter(
     "survey:contact", limit=300, window_seconds=_SURVEY_WINDOW
 )
 
+# Resend's delivery webhook (#858). Unauthenticated by nature -- the Svix
+# signature is the credential, checked in the route -- so it is IP-only. Resend
+# delivers from a small pool of addresses and a single survey batch can produce
+# a burst of bounce events, so the ceiling is loose: it bounds a flood of
+# unsigned junk, not real traffic. A 429 here is harmless to a real event --
+# Svix retries with backoff.
+RESEND_WEBHOOK_LIMITER = client_ip_rate_limiter(
+    "webhook:resend", limit=1200, window_seconds=_SURVEY_WINDOW
+)
+
 LOGIN_PRECHECK_LIMITER = client_ip_rate_limiter(
     "auth:login_precheck", limit=LOGIN_PRECHECK_LIMIT, window_seconds=_LOGIN_WINDOW
 )
@@ -1002,6 +1026,23 @@ BROWSE_READ_LIMITER = read_rate_limiter("read:browse", windows=_BROWSE_WINDOWS)
 GEO_BROWSE_READ_LIMITER = read_rate_limiter(
     "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_reports_advanced
 )
+# The other staff lists of named alumni (#590): the donations lists, an event's
+# attendee list (view access — the plain BROWSE_READ_LIMITER) and the survey
+# console's per-year lists. Each resolves through its route's OWN guard, so the
+# gate is unchanged, but all spend the SAME browse budget: walking the donor list
+# or a year's non-responders is the same kind of read as paging the directory,
+# and one budget means a stolen token cannot get N budgets by switching lists.
+DONATIONS_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_donations_view
+)
+SURVEYS_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_surveys_manage
+)
+# The engineer-only held-out list: same budget, engineer gate kept. Engineers
+# are not exempt from any limiter here (see above).
+ENGINEER_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_engineer
+)
 EXPORT_READ_LIMITER = read_rate_limiter(
     "read:export",
     windows=_EXPORT_WINDOWS,
@@ -1018,7 +1059,24 @@ VIEW_EXPORT_READ_LIMITER = read_rate_limiter(
     global_count=True,
 )
 
+# Per-record version history (#45) is an editor-tier read (``alumni.edit``), so
+# it resolves through that guard — and spends the SAME browse budget, because
+# paging one record's history after another is the same kind of walk.
+HISTORY_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_alumni_edit
+)
+
 BrowseReadRateLimit = Annotated[UserContext, Depends(BROWSE_READ_LIMITER)]
+HistoryReadRateLimit = Annotated[UserContext, Depends(HISTORY_READ_LIMITER)]
 GeoBrowseReadRateLimit = Annotated[UserContext, Depends(GEO_BROWSE_READ_LIMITER)]
+DonationsBrowseReadRateLimit = Annotated[
+    UserContext, Depends(DONATIONS_BROWSE_READ_LIMITER)
+]
+SurveysBrowseReadRateLimit = Annotated[
+    UserContext, Depends(SURVEYS_BROWSE_READ_LIMITER)
+]
+EngineerBrowseReadRateLimit = Annotated[
+    UserContext, Depends(ENGINEER_BROWSE_READ_LIMITER)
+]
 ExportReadRateLimit = Annotated[UserContext, Depends(EXPORT_READ_LIMITER)]
 ViewExportReadRateLimit = Annotated[UserContext, Depends(VIEW_EXPORT_READ_LIMITER)]

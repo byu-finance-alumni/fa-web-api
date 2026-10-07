@@ -38,13 +38,17 @@ async def list_notes(
 ) -> list[NoteRead]:
     """List the notes on one entity, newest first (any view-access role). 404 if
     the parent entity doesn't exist. The disclosure is audit-logged. A view_only
-    caller sees note authors by first name only; editors see full names."""
+    caller sees note authors by first name only; editors see full names.
+
+    Notes on an ARCHIVED alumnus (or one of their interactions) 404 below
+    full_access, like the profile itself (#591)."""
     return await service.list_notes(
         session,
         entity_type,
         entity_id,
         actor_user_id=user.user_id,
         full_author_name=user.can_edit_alumni,
+        include_archived=user.sees_archived,
     )
 
 

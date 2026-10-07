@@ -156,6 +156,7 @@ async def list_notes(
     actor_user_id: int | None = None,
     *,
     full_author_name: bool = True,
+    include_archived: bool = True,
 ) -> list[NoteRead]:
     """Return the notes attached to one entity, newest first.
 
@@ -171,8 +172,19 @@ async def list_notes(
     view_only. The caller (route) decides this from the authenticated role.
 
     404s if the parent entity does not exist (so a bad id is distinguishable
-    from an entity that simply has no notes yet)."""
+    from an entity that simply has no notes yet).
+
+    ``include_archived=False`` (callers below full_access, #591) also 404s when
+    the notes belong to an ARCHIVED alumnus — directly, or through one of their
+    interactions — matching the profile read, which already 404s that record for
+    them. Event notes name no single alumnus and are unaffected."""
     _, audit_type, audit_id = await _resolve_target(session, entity_type, entity_id)
+    if not include_archived and audit_type == "alumni":
+        from app.models.alumni import Alumni
+
+        owner = await session.get(Alumni, audit_id)
+        if owner is None or owner.archived:
+            raise NotFoundError(f"{entity_type.value.capitalize()} {entity_id} not found.")
     column = {
         NoteEntityType.ALUMNI: Note.alumni_id,
         NoteEntityType.INTERACTION: Note.interaction_id,

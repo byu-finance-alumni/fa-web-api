@@ -35,8 +35,10 @@ class AlumniHistoryChange(BaseModel):
     label: str | None = None
     old: str | None = None
     new: str | None = None
-    # True when the caller's role may not see this change's values (they are
-    # nulled, exactly as the profile would null the field for that role).
+    # True when a value was withheld for the caller's role: either both values
+    # (nulled exactly as the profile would null them), or — for a student — the
+    # text of a deleted note/interaction, or the OLD text of an edited one (the
+    # new text is still returned).
     redacted: bool = False
 
 

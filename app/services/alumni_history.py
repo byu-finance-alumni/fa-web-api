@@ -27,6 +27,7 @@ import base64
 import binascii
 import contextlib
 import datetime
+import logging
 import re
 
 from sqlalchemy import String, and_, cast, func, literal_column, or_, select
@@ -41,6 +42,8 @@ from app.schemas.alumni_history import (
     AlumniHistoryPage,
 )
 from app.services.alumni_export import CATALOG
+
+log = logging.getLogger(__name__)
 
 # Field-level capture (change_set_id + section old/new) shipped 2026-08-18;
 # nothing before it can be reconstructed, so the UI says where history begins.
@@ -126,6 +129,14 @@ _SUMMARY_ACTIONS = frozenset({"apply_survey_response"})
 
 _SOURCES = frozenset({"manual", "import", "survey"})
 
+# Free text that is no longer on the profile: a deleted note / interaction's
+# snapshot, and the SUPERSEDED (old) value of an edited one. Below full_access
+# (i.e. student) that text is withheld — the profile only ever shows a student
+# the CURRENT text, and the trail must not become a way to read what an editor
+# removed or rewrote. full_access and up see it (the FERPA reviewer tier).
+_DELETED_TEXT_ACTIONS = frozenset({"delete_note", "delete_interaction"})
+_SUPERSEDED_TEXT_ACTIONS = frozenset({"update_note", "update_interaction"})
+
 # ``<section>.<column>`` / bare core column → export-catalog label. The export
 # catalog's ``source`` names are exactly the audit section prefixes, so one
 # table serves both and the history reads with the same names as the export.
@@ -198,6 +209,7 @@ async def get_history(
     alumni_id: int,
     *,
     can_edit: bool,
+    full_access: bool = False,
     limit: int = DEFAULT_LIMIT,
     before: str | None = None,
     actor_user_id: int | None = None,
@@ -213,6 +225,10 @@ async def get_history(
         that caller a minimized aggregate WITHOUT its audit trail, so this read
         returns the shape (who / when / which field) with every value nulled
         and ``redacted`` set, rather than more than the profile would show.
+      * ``full_access`` (full_access / super_admin / engineer) additionally sees
+        removed and superseded note / interaction text. Anyone below gets the
+        delete with its text withheld, and an edit's OLD text withheld (the new
+        text is what the profile shows them anyway).
 
     The read itself is audit-logged (``view_history``), best-effort, like
     ``view_profile``.
@@ -258,7 +274,14 @@ async def get_history(
             rows_by_key[key].append(row)
 
     items = [
-        _build_group(h.gkey, h.at, rows_by_key.get(h.gkey, []), can_edit=can_edit) for h in heads
+        _build_group(
+            h.gkey,
+            h.at,
+            rows_by_key.get(h.gkey, []),
+            can_edit=can_edit,
+            full_access=full_access,
+        )
+        for h in heads
     ]
     next_before = encode_cursor(heads[-1].at, heads[-1].head_id) if has_more and heads else None
 
@@ -277,15 +300,40 @@ async def get_history(
                 )
             )
             await session.commit()
-        except Exception:  # noqa: BLE001 - audit is best-effort
+        except Exception as exc:  # noqa: BLE001 - audit is best-effort
+            # Type only — never the message, which can carry row values.
+            log.warning(
+                "view_history audit write failed (%s); history read still served",
+                type(exc).__name__,
+            )
             with contextlib.suppress(Exception):
                 await session.rollback()
 
     return AlumniHistoryPage(items=items, next_before=next_before, history_starts=HISTORY_STARTS)
 
 
+def _visible_values(
+    r: AuditLog, *, can_edit: bool, full_access: bool
+) -> tuple[str | None, str | None, bool]:
+    """(old, new, redacted) for one row as this caller may see it."""
+    old, new = r.old_value, r.new_value
+    if not can_edit:
+        return None, None, old is not None or new is not None
+    if not full_access:
+        if r.action_type in _DELETED_TEXT_ACTIONS:
+            return None, None, old is not None or new is not None
+        if r.action_type in _SUPERSEDED_TEXT_ACTIONS:
+            return None, new, old is not None
+    return old, new, False
+
+
 def _build_group(
-    key: str, at: datetime.datetime, rows: list[AuditLog], *, can_edit: bool
+    key: str,
+    at: datetime.datetime,
+    rows: list[AuditLog],
+    *,
+    can_edit: bool,
+    full_access: bool = False,
 ) -> AlumniHistoryGroup:
     actor_name = next((r.actor_name for r in rows if r.actor_name), None)
     source = next((r.source for r in rows if r.source in _SOURCES), None)
@@ -293,18 +341,20 @@ def _build_group(
         source = "survey"
 
     shown = [r for r in rows if r.action_type not in _SUMMARY_ACTIONS] or rows
-    changes = [
-        AlumniHistoryChange(
-            audit_id=r.audit_log_id,
-            action=r.action_type,
-            field=r.field_name,
-            label=field_label(r.field_name),
-            old=r.old_value if can_edit else None,
-            new=r.new_value if can_edit else None,
-            redacted=not can_edit and (r.old_value is not None or r.new_value is not None),
+    changes = []
+    for r in shown:
+        old, new, redacted = _visible_values(r, can_edit=can_edit, full_access=full_access)
+        changes.append(
+            AlumniHistoryChange(
+                audit_id=r.audit_log_id,
+                action=r.action_type,
+                field=r.field_name,
+                label=field_label(r.field_name),
+                old=old,
+                new=new,
+                redacted=redacted,
+            )
         )
-        for r in shown
-    ]
     first = rows[0] if rows else None
     return AlumniHistoryGroup(
         group_id=key,

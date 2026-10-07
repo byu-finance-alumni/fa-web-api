@@ -7,6 +7,7 @@ no Postgres and no aiosqlite. The alumnus lookup is canned on the shim.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import pathlib
 import re
@@ -25,6 +26,7 @@ from app.core.database import get_session
 from app.main import app
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
+from app.models.user import User
 from app.schemas.alumni import VIEW_ONLY_HIDDEN_FIELDS
 from app.schemas.auth import UserContext
 from app.services import alumni_history
@@ -394,3 +396,184 @@ def test_every_alumni_audit_action_is_classified():
         f"{sorted(unclassified)}"
     )
     assert not (alumni_history.HISTORY_ACTIONS & alumni_history.NON_HISTORY_ACTIONS)
+
+
+# --- removed / superseded free text: full_access and up only ------------------
+
+
+def _text_rows(db):
+    _row(db, action="delete_note", old="secret deleted note", cs=None)
+    _row(
+        db,
+        action="delete_interaction",
+        field="interaction",
+        old="type='Call'; notes='secret call notes'",
+        cs=None,
+        at=T0 + datetime.timedelta(minutes=1),
+    )
+    _row(
+        db,
+        action="update_note",
+        old="secret old note",
+        new="current note",
+        cs=None,
+        at=T0 + datetime.timedelta(minutes=2),
+    )
+    _row(
+        db,
+        action="update_interaction",
+        field="interaction_notes",
+        old="secret old call",
+        new="current call",
+        cs="ui",
+        at=T0 + datetime.timedelta(minutes=3),
+    )
+
+
+def _by_action(body):
+    return {ch["action"]: ch for g in body["items"] for ch in g["changes"]}
+
+
+def test_student_cannot_read_removed_or_superseded_text(client_for, db):
+    _text_rows(db)
+    c, _ = client_for("student")
+    res = c.get("/alumni/1/history")
+    assert "secret" not in res.text
+    ch = _by_action(res.json())
+    for action in ("delete_note", "delete_interaction"):
+        assert (ch[action]["old"], ch[action]["new"], ch[action]["redacted"]) == (
+            None,
+            None,
+            True,
+        )
+    for action, current in (
+        ("update_note", "current note"),
+        ("update_interaction", "current call"),
+    ):
+        assert (ch[action]["old"], ch[action]["new"], ch[action]["redacted"]) == (
+            None,
+            current,
+            True,
+        )
+
+
+@pytest.mark.parametrize("role", ["full_access", "super_admin", "engineer"])
+def test_full_access_and_up_read_removed_and_superseded_text(client_for, db, role):
+    _text_rows(db)
+    c, _ = client_for(role)
+    ch = _by_action(c.get("/alumni/1/history").json())
+    assert ch["delete_note"]["old"] == "secret deleted note"
+    assert "secret call notes" in ch["delete_interaction"]["old"]
+    assert ch["update_note"]["old"] == "secret old note"
+    assert ch["update_interaction"]["old"] == "secret old call"
+    assert not any(v["redacted"] for v in ch.values())
+
+
+def test_student_still_sees_ordinary_field_values(client_for, db):
+    _row(db, field="contact.email", old="a@x.com", new="b@x.com", cs="c1")
+    c, _ = client_for("student")
+    ch = c.get("/alumni/1/history").json()["items"][0]["changes"][0]
+    assert (ch["old"], ch["new"], ch["redacted"]) == ("a@x.com", "b@x.com", False)
+
+
+# --- the read's own audit row failing is logged, not swallowed ---------------
+
+
+def test_audit_write_failure_is_logged_without_values(client_for, db, caplog):
+    _row(db, field="first_name", old="SecretOld", new="SecretNew", cs="c1")
+    c, shim = client_for("student")
+
+    async def _boom():
+        raise RuntimeError("SecretOld leaked in message")
+
+    shim.commit = _boom
+    with caplog.at_level("WARNING", logger="app.services.alumni_history"):
+        res = c.get("/alumni/1/history")
+    assert res.status_code == 200
+    msgs = [r.getMessage() for r in caplog.records if r.name == "app.services.alumni_history"]
+    assert len(msgs) == 1 and "view_history" in msgs[0]
+    assert "Secret" not in msgs[0]
+
+
+# --- profile audit list: names only, never staff emails ----------------------
+
+
+class _ProfileShim:
+    """get_profile over canned rows: AuditLog rows for the audit query, User rows
+    for the name lookup, nothing for everything else."""
+
+    def __init__(self, alumnus, audit_rows, users):
+        self._alumnus, self._audit, self._users = alumnus, audit_rows, users
+
+    async def get(self, model, pk):
+        return self._alumnus if model is Alumni and pk == self._alumnus.alumni_id else None
+
+    async def scalar(self, stmt):
+        return 0
+
+    async def scalars(self, stmt):
+        entity = stmt.column_descriptions[0].get("entity")
+        rows = self._audit if entity is AuditLog else self._users if entity is User else []
+        return SimpleNamespace(all=lambda: list(rows))
+
+    async def execute(self, stmt):
+        return SimpleNamespace(all=lambda: [], scalars=lambda: SimpleNamespace(all=list))
+
+    def add(self, obj):
+        pass
+
+    async def commit(self):
+        pass
+
+
+def test_profile_audit_list_never_falls_back_to_email():
+    from app.services import profile as profile_service
+
+    now = datetime.datetime(2026, 9, 1, tzinfo=datetime.UTC)
+    alumnus = Alumni(
+        alumni_id=1,
+        first_name="Jane",
+        last_name="Doe",
+        archived=False,
+        deceased=False,
+        is_alumni=True,
+        created_at=now,
+        updated_at=now,
+    )
+    audit = [
+        # Snapshot has an email but no name (a nameless account).
+        AuditLog(
+            audit_log_id=1,
+            user_id=None,
+            action_type="update",
+            entity_type="alumni",
+            entity_id=1,
+            actor_name=None,
+            actor_email="nameless@byu.edu",
+            created_at=now,
+        ),
+        # Legacy row: no snapshot, live user has no name either.
+        AuditLog(
+            audit_log_id=2,
+            user_id=9,
+            action_type="update",
+            entity_type="alumni",
+            entity_id=1,
+            created_at=now,
+        ),
+        AuditLog(
+            audit_log_id=3,
+            user_id=None,
+            action_type="update",
+            entity_type="alumni",
+            entity_id=1,
+            actor_name="Sam Editor",
+            actor_email="sam@byu.edu",
+            created_at=now,
+        ),
+    ]
+    users = [User(user_id=9, email="legacy@byu.edu", first_name=None, last_name=None)]
+    profile = asyncio.run(profile_service.get_profile(_ProfileShim(alumnus, audit, users), 1))
+    performed = [a.performed_by for a in profile.audit]
+    assert performed == ["Staff member", "Staff member", "Sam Editor"]
+    assert "@" not in profile.model_dump_json()

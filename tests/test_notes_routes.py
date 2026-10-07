@@ -255,7 +255,9 @@ def test_create_event_note_audits_against_event(client):
 
 def test_list_notes_happy_path_view_only_sees_first_name(client):
     rows = [_note(note_id=7, body="Newest"), _note(note_id=6, body="Older")]
-    session = _FakeSession(alumni=SimpleNamespace(alumni_id=1), user=_actor(), rows=rows)
+    session = _FakeSession(
+        alumni=SimpleNamespace(alumni_id=1, archived=False), user=_actor(), rows=rows
+    )
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
     app.dependency_overrides[get_session] = _with_session(session)
 
@@ -359,3 +361,64 @@ def test_delete_note_snapshots_body(client):
     assert [a.action_type for a in session.audits] == ["delete_note"]
     # Body snapshotted into the audit row before the hard delete (FERPA).
     assert session.audits[0].old_value == "Sensitive note text"
+
+
+# --- #591: notes on an ARCHIVED alumnus are hidden below full_access -----------
+
+
+@pytest.mark.parametrize("role", ["view_only", "student"])
+def test_list_notes_on_archived_alumnus_404s_below_full_access(client, role):
+    session = _FakeSession(
+        alumni=SimpleNamespace(alumni_id=1, archived=True),
+        user=_actor(),
+        rows=[_note(note_id=7, body="Secret")],
+    )
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/notes", params={"entity_type": "alumni", "entity_id": 1})
+    assert response.status_code == 404
+    assert "Secret" not in response.text
+    # Nothing was disclosed, so nothing is audited.
+    assert session.audits == []
+
+
+@pytest.mark.parametrize("role", ["full_access", "super_admin", "engineer"])
+def test_list_notes_on_archived_alumnus_still_visible_to_full_access(client, role):
+    session = _FakeSession(
+        alumni=SimpleNamespace(alumni_id=1, archived=True),
+        user=_actor(),
+        rows=[_note(note_id=7, body="Kept")],
+    )
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx(role)
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/notes", params={"entity_type": "alumni", "entity_id": 1})
+    assert response.status_code == 200
+    assert [n["body"] for n in response.json()] == ["Kept"]
+
+
+def test_list_interaction_notes_of_archived_alumnus_404s_for_view_only(client):
+    """The interaction route to the same notes is closed too, not just the
+    alumni one."""
+    from app.models.crm import Interaction
+
+    class _WithInteraction(_FakeSession):
+        async def get(self, model, pk):
+            if model is Interaction:
+                return SimpleNamespace(interaction_id=pk, alumni_id=1)
+            return await super().get(model, pk)
+
+    session = _WithInteraction(
+        alumni=SimpleNamespace(alumni_id=1, archived=True),
+        user=_actor(),
+        rows=[_note(note_id=7, alumni_id=None, interaction_id=3, body="Secret")],
+    )
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get(
+        "/notes", params={"entity_type": "interaction", "entity_id": 3}
+    )
+    assert response.status_code == 404
+    assert "Secret" not in response.text

@@ -199,7 +199,9 @@ async def _enforce_maintenance_mode(
         send them (the ``(app)`` layout reads it, finds they are not an engineer,
         and redirects to the maintenance page).
       * ``POST /auth/password/complete`` — clears the caller's own temp-password
-        flag and nothing else.
+        flag and nothing else (deprecated by ``POST /auth/password/change``,
+        #592, which is on the exempt resolver too but calls this gate and
+        ``_enforce_single_session`` itself, because it sets a real password).
 
     Everything that reads or writes application data goes through this gate.
 

@@ -50,6 +50,7 @@ from app.models.donation import Donation
 from app.schemas.auth import UserContext
 from app.schemas.donation import DonationCreate, DonationUpdate
 from app.schemas.imports import DonationImportPreview, DonationImportResult
+from app.services import alumni as alumni_service
 from app.services import import_donations
 
 router = APIRouter(prefix="/donations", tags=["donations"])
@@ -98,12 +99,20 @@ async def list_donors(
     OFFSET are pushed into PostgreSQL; only the page's per-year breakdown is then
     aggregated (``WHERE alumni_id IN (<page ids>)``), so the endpoint is bounded
     regardless of donor count. Amount-viewers see the biggest givers first;
-    others get a stable name sort (the lifetime ranking is amount-gated too)."""
-    show = _can_view_amounts(user, config)
+    others get a stable name sort (the lifetime ranking is amount-gated too).
 
-    total = await session.scalar(
-        select(func.count(func.distinct(Donation.alumni_id)))
-    )
+    ARCHIVED donors are listed only for full_access and up (#591), as on the
+    alumni list; ``donations.view`` is assignable, so a lower role granted it
+    gets the active donors only. The read is audit-logged (``view_donors``)."""
+    show = _can_view_amounts(user, config)
+    active_only = not user.sees_archived
+
+    count_stmt = select(func.count(func.distinct(Donation.alumni_id)))
+    if active_only:
+        count_stmt = count_stmt.join(Alumni, Alumni.alumni_id == Donation.alumni_id).where(
+            Alumni.archived.is_(False)
+        )
+    total = await session.scalar(count_stmt)
 
     lifetime_total = func.coalesce(func.sum(Donation.amount), 0).label("lifetime_total")
     page_stmt = (
@@ -119,6 +128,8 @@ async def list_donors(
         .join(Donation, Donation.alumni_id == Alumni.alumni_id)
         .group_by(Alumni.alumni_id)
     )
+    if active_only:
+        page_stmt = page_stmt.where(Alumni.archived.is_(False))
     # Push the sort into SQL. Amount-viewers rank by lifetime giving (tie-broken by
     # name); non-viewers get a name-only sort so the giving ranking isn't leaked.
     if show:
@@ -169,6 +180,13 @@ async def list_donors(
             }
         )
 
+    await alumni_service.log_read(
+        session,
+        actor_user_id=user.user_id,
+        action="view_donors",
+        entity_type="donation",
+        detail=f"rows={len(donors)}; limit={limit}; offset={offset}",
+    )
     return {
         "items": donors,
         "total": int(total or 0),
@@ -233,10 +251,11 @@ async def list_alumni_donations(
     session: SessionDep,
 ) -> dict:
     """A single donor's donation history (full_access+). 404 if the alumnus is
-    unknown. Each entry's ``amount`` and ``notes`` are gated to amount-viewers."""
+    unknown — or archived, below full_access (#591). Each entry's ``amount`` and
+    ``notes`` are gated to amount-viewers. Audit-logged (``view_donations``)."""
     show = _can_view_amounts(user, config)
     alumni = await session.get(Alumni, alumni_id)
-    if alumni is None:
+    if alumni is None or (not user.sees_archived and alumni.archived):
         raise NotFoundError(f"Alumni {alumni_id} not found.")
 
     rows = (
@@ -252,7 +271,8 @@ async def list_alumni_donations(
     ).scalars().all()
 
     lifetime = sum((d.amount for d in rows), Decimal(0))
-    return {
+    # Built BEFORE the audit commit, which would expire the loaded rows.
+    result = {
         "alumni_id": alumni_id,
         "name": _alumni_name(
             alumni.first_name, alumni.preferred_first_name, alumni.last_name, alumni_id
@@ -270,6 +290,14 @@ async def list_alumni_donations(
             for d in rows
         ],
     }
+    await alumni_service.log_read(
+        session,
+        actor_user_id=user.user_id,
+        action="view_donations",
+        entity_id=alumni_id,
+        detail=f"rows={len(rows)}",
+    )
+    return result
 
 
 def _serialize_donation(d: Donation) -> dict:

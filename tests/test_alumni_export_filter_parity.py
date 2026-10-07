@@ -321,7 +321,7 @@ def test_all_new_filters_together_parity(client, captured, session):
         spoke_before="2026-12-31",
         missing_phone=True,
         industry=["Consulting"],
-        is_alumni=None,
+        kind="all",
         include_archived=True,
     )
 
@@ -387,11 +387,11 @@ def test_every_list_filter_param_exists_on_the_export_body():
     """The regression net for #366: any filter added to ``GET /alumni`` must get
     a matching ``AlumniExportFilters`` field, or exports of that view silently
     widen again."""
-    # Not filters: auth/session deps, paging, and ``kind`` (the list's tri-state
-    # friends/alumni param, carried on the body as ``is_alumni``).
-    not_filters = {"user", "session", "limit", "offset", "kind"}
+    # Not filters: auth/session deps and paging. ``kind`` (the list's tri-state
+    # friends/alumni param) now exists on the body under the same name (#594).
+    not_filters = {"user", "session", "limit", "offset"}
     params = {
         name for name in inspect.signature(list_alumni).parameters if name not in not_filters
     }
-    fields = set(AlumniExportFilters.model_fields) | {"is_alumni"}
+    fields = set(AlumniExportFilters.model_fields)
     assert params - fields == set()

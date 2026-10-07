@@ -140,6 +140,11 @@ async def _log_survey_read(
     mirrors this AuditLog into ``engineer_action_log`` and drops the audit_logs
     row. That is the intended destination — engineer actions stay out of the
     record-change trail but land in the append-only log the engineer cannot purge.
+
+    #591 extended it to the console's ``surveys.manage`` lists (pending
+    responses, recipients, unreachable, non-responders, responders). Those are
+    read by full_access / super_admin staff too, whose rows stay in
+    ``audit_logs`` like any other disclosure.
     """
     if actor_user_id is None:
         return
@@ -423,8 +428,19 @@ async def survey_pending_responses(
     user: RequireSurveysManage,
     session: SessionDep,
 ) -> list[SurveyResponseItem]:
-    """Admin review queue: pending responses for a grad year, each with a diff."""
-    return await survey_responses.list_pending(session, grad_year)
+    """Admin review queue: pending responses for a grad year, each with a diff.
+    Audit-logged (``read_survey_responses``, #591) — the diffs carry what each
+    alum submitted."""
+    items = await survey_responses.list_pending(session, grad_year)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_responses",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}; rows={len(items)}",
+    )
+    return items
 
 
 @router.post("/responses/{response_id}/apply", response_model=SurveyApplyResult)
@@ -671,9 +687,19 @@ async def survey_recipient_breakdown(
     before a send and the figure explaining it afterwards cannot disagree.
 
     Read-only, sends nothing, takes no send lock — safe to poll while the daily
-    cron is mid-run. Gated like the rest of the console.
+    cron is mid-run. Gated like the rest of the console. Audit-logged
+    (``read_survey_recipients``, #591).
     """
-    return await survey_email.recipient_breakdown(session, grad_year)
+    breakdown = await survey_email.recipient_breakdown(session, grad_year)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_recipients",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}",
+    )
+    return breakdown
 
 
 @router.get(
@@ -702,9 +728,18 @@ async def list_survey_unreachable(
     to chase for an address.
 
     Read-only and gated like the rest of the console (it returns alumni contact
-    details).
+    details). Audit-logged (``read_survey_unreachable``, #591).
     """
-    return await survey_email.list_unreachable(session, grad_year)
+    items = await survey_email.list_unreachable(session, grad_year)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_unreachable",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}; rows={len(items)}",
+    )
+    return items
 
 
 @router.get(
@@ -896,10 +931,19 @@ async def list_survey_non_responders(
     Read-only, and gated like the rest of the console (full access) because it
     returns alumni contact details. Empty list = nobody left to chase; 404 = the
     year has no campaign at all. Cycle-scoped: a previous campaign's
-    non-responders are not in here."""
+    non-responders are not in here. Audit-logged
+    (``read_survey_non_responders``, #591)."""
     items = await survey_schedule.list_non_responders(session, grad_year)
     if items is None:
         raise NotFoundError("No schedule exists for that graduation year.")
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_non_responders",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}; rows={len(items)}",
+    )
     return items
 
 
@@ -988,10 +1032,19 @@ async def list_survey_responders(
 
     Gated like `GET /schedules` (the counts it expands) and the non-responders
     call sheet. Returns only an id and a display name per alum. 404 = the year
-    has no campaign at all; two empty lists = nobody has answered yet."""
+    has no campaign at all; two empty lists = nobody has answered yet.
+    Audit-logged (``read_survey_responders``, #591)."""
     result = await survey_schedule.list_responders(session, grad_year)
     if result is None:
         raise NotFoundError("No schedule exists for that graduation year.")
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_responders",
+        entity_type="survey_campaign",
+        entity_id=grad_year,
+        scope=f"graduation_year={grad_year}",
+    )
     return result
 
 

@@ -138,14 +138,17 @@ def test_student_can_edit_and_read_but_not_create_or_admin():
     assert asyncio.run(auth_deps.require_alumni_edit(ctx, CONFIG)) is ctx
     # Logging an interaction is open to every role (#379).
     assert asyncio.run(auth_deps.require_interactions_create(ctx, CONFIG)) is ctx
-    # Create / archive / import / export / photos, event + notes + survey
-    # management, donation reads, the advanced reports, user admin and vocab
-    # admin are all still closed to a student.
+    # Export and the read-only survey progress view are open to students since
+    # #605 (Jake, 2026-10-13).
+    assert asyncio.run(auth_deps.require_alumni_export(ctx, CONFIG)) is ctx
+    assert asyncio.run(auth_deps.require_surveys_progress(ctx, CONFIG)) is ctx
+    # Create / archive / import / photos, event + notes + survey management,
+    # donation reads, the advanced reports, user admin and vocab admin are all
+    # still closed to a student.
     for guard in (
         auth_deps.require_alumni_create,
         auth_deps.require_alumni_archive,
         auth_deps.require_alumni_import,
-        auth_deps.require_alumni_export,
         auth_deps.require_alumni_photos,
         auth_deps.require_events_manage,
         auth_deps.require_notes_manage,

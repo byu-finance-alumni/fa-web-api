@@ -163,11 +163,13 @@ def test_export_forbidden_for_view_only(client):
     assert response.status_code == 403
 
 
-def test_export_forbidden_for_student(client):
-    # student can edit alumni but bulk export is full_access and up.
+def test_export_allowed_for_student(client):
+    # #605 (Jake, 2026-10-13): every student may export. `!= 403`, not 200 —
+    # there is no database behind this client, so the guard is what is tested.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
-    response = client.post("/alumni/export", json={"columns": ["first_name"]})
-    assert response.status_code == 403
+    with TestClient(app, raise_server_exceptions=False) as lenient:
+        response = lenient.post("/alumni/export", json={"columns": ["first_name"]})
+    assert response.status_code != 403
 
 
 def test_export_columns_requires_auth(client):

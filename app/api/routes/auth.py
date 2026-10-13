@@ -453,6 +453,9 @@ async def password_change(
     if matches is None:
         # Fail open, but LOUDLY: a reuse check that silently never runs is how
         # a temp password survives a "change" unnoticed. Never the password.
+        # Semgrep's credential-disclosure rule keys on the word "password" in
+        # the message; only the user id is logged.
+        # nosemgrep
         logger.error(
             "Temp-password reuse check could not run for user_id=%s; "
             "allowing the change without it.",

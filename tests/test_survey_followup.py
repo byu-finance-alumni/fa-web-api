@@ -87,6 +87,10 @@ def _ddl(conn):
             " first_name VARCHAR(100),"
             " preferred_first_name VARCHAR(100),"
             " last_name VARCHAR(100),"
+            # The Progress exports' profile columns (#605).
+            " net_id VARCHAR(50),"
+            " linkedin_url VARCHAR(500),"
+            " updated_at TIMESTAMP,"
             " archived BOOLEAN NOT NULL DEFAULT 0)"
         )
     )
@@ -100,7 +104,28 @@ def _ddl(conn):
             # to, which may be the work email (#392).
             " work_email VARCHAR(255),"
             # The "No reply yet" export (#836) carries the phone number.
-            " phone VARCHAR(50))"
+            " phone VARCHAR(50),"
+            # The "Replied" export (#605) carries the mailing address.
+            " address_line_1 VARCHAR(255),"
+            " address_line_2 VARCHAR(255),"
+            " city VARCHAR(100),"
+            " state VARCHAR(100),"
+            " zip VARCHAR(20),"
+            " country VARCHAR(100))"
+        )
+    )
+    # The Progress exports' employer columns (#605), outer-joined.
+    conn.execute(
+        text(
+            "CREATE TABLE current_employment ("
+            " current_employment_id INTEGER PRIMARY KEY,"
+            " alumni_id INTEGER NOT NULL UNIQUE,"
+            " current_employer VARCHAR(255),"
+            " current_title VARCHAR(255),"
+            " current_industry VARCHAR(255),"
+            " current_city VARCHAR(100),"
+            " current_state VARCHAR(100),"
+            " current_country VARCHAR(100))"
         )
     )
 

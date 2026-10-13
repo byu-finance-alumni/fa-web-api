@@ -55,6 +55,7 @@ from app.api.dependencies.auth import (
     require_reports_advanced,
     require_super_admin,
     require_surveys_manage,
+    require_surveys_progress,
     require_view_only,
 )
 from app.core.config import get_settings
@@ -769,6 +770,7 @@ EXPORT_AUDIT_ACTIONS: frozenset[str] = frozenset(
         "export_profile",  # GET /alumni/{id}/export
         "export_event_attendees",
         "export_survey_no_reply",  # both no-reply CSVs
+        "export_survey_replied",  # both replied CSVs (#605)
         "export_opportunity_links",
     }
 )
@@ -1038,6 +1040,11 @@ DONATIONS_BROWSE_READ_LIMITER = read_rate_limiter(
 SURVEYS_BROWSE_READ_LIMITER = read_rate_limiter(
     "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_surveys_manage
 )
+# The Progress tab's "who replied" hover (#605) is gated on the read-only
+# progress view, not the console — same browse budget.
+SURVEYS_PROGRESS_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_surveys_progress
+)
 # The engineer-only held-out list: same budget, engineer gate kept. Engineers
 # are not exempt from any limiter here (see above).
 ENGINEER_BROWSE_READ_LIMITER = read_rate_limiter(
@@ -1074,6 +1081,9 @@ DonationsBrowseReadRateLimit = Annotated[
 ]
 SurveysBrowseReadRateLimit = Annotated[
     UserContext, Depends(SURVEYS_BROWSE_READ_LIMITER)
+]
+SurveysProgressBrowseReadRateLimit = Annotated[
+    UserContext, Depends(SURVEYS_PROGRESS_BROWSE_READ_LIMITER)
 ]
 EngineerBrowseReadRateLimit = Annotated[
     UserContext, Depends(ENGINEER_BROWSE_READ_LIMITER)

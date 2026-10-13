@@ -22,7 +22,13 @@ from pydantic import BaseModel, ConfigDict, field_validator
 #: this is a budget cap as much as a sanity one.
 MAX_RECIPIENTS = 10
 
-_EMAIL_RE = re.compile(r"^[^@\s,;<>\"]+@[^@\s,;<>\"]+\.[^@\s,;<>\"]+$")
+# The domain is dot-separated labels that cannot themselves contain a dot, so
+# there is exactly one way to split it and matching stays linear (CodeQL
+# py/polynomial-redos flagged the old `[^...]+\.[^...]+`, whose classes both
+# admitted `.`). Still requires at least one dot in the domain.
+_EMAIL_RE = re.compile(
+    r"^[^@\s,;<>\"]+@[^@\s,;<>\".]+(?:\.[^@\s,;<>\".]+)+$"
+)
 _MAX_EMAIL_LEN = 254
 
 

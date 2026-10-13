@@ -78,6 +78,7 @@ from app.core.errors import ConflictError, ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
+from app.models.employment import CurrentEmployment
 from app.models.survey_response import SurveyResponse
 from app.models.survey_retirement import SurveyCampaignRetirement
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
@@ -744,27 +745,35 @@ async def list_responders(
     )
 
 
-# ------------------------------------------------------ no-reply export ------
+# ------------------------------------------- no-reply / replied exports ------
 #
 # "No reply yet" in the Progress tab (#836) is `recipients - replied`: emailed in
-# the year's current cycle and without a qualifying reply. The export below is
-# that column's people, built on the same current-cycle rows and the same reply
-# predicate as both counts, minus archived alumni (Jake, #836): the file leaves
-# them out exactly as the follow-up call sheet does, while the column still
-# counts them — so the file can have FEWER rows than the column shows, by the
-# number of archived alumni in it, and never more. It is deliberately NOT
-# `_cycle_non_responders` (the follow-up set): that one also requires all
-# three emails, so mid-campaign it is a strict subset.
+# the year's current cycle and without a qualifying reply. "Replied" is the
+# `replied` column itself. The two exports below are those columns' people,
+# built on the same current-cycle rows and the same reply predicate as the
+# counts — one is the complement of the other over the same send rows — minus
+# archived alumni (Jake, #836): the files leave them out exactly as the
+# follow-up call sheet does, while the columns still count them — so a file can
+# have FEWER rows than its column shows, by the number of archived alumni in
+# it, and never more. "No reply yet" is deliberately NOT `_cycle_non_responders`
+# (the follow-up set): that one also requires all three emails, so mid-campaign
+# it is a strict subset.
+#
+# Both files are built by ONE function (:func:`_export_cycle_csv`) so the
+# shared columns, the archived rule, the formula guard and the audit row cannot
+# drift between them; they differ only in which side of the reply predicate
+# they read and in the replied file's extra mailing-address columns.
 
 
-def _cycle_no_reply():
+def _cycle_send_summary(reply_clause):
     """``(graduation_year, alumni_id, emails_sent, last_sent_at)`` for each alum
-    emailed in their year's CURRENT campaign who has not replied.
+    emailed in their year's CURRENT campaign whose send rows satisfy
+    ``reply_clause`` — one side or the other of the shared reply predicate.
 
-    ``~_qualifying_reply(_REPLIED_STATUSES)`` is the complement of the ``replied``
-    count's predicate over the same rows, so this set's size per year is
-    ``recipients - replied``. A ``rejected``-only alum is IN it: a discarded
-    submission is not a reply, exactly as the sender and the count treat it."""
+    Grouped by ``(year, alumni_id)``, so each alum appears once per year: the
+    same distinct set ``count(distinct case(reply, id))`` counts in
+    :func:`_cycle_progress`, with the send details a caller working the list
+    wants alongside it."""
     return _current_cycle_sends(
         select(
             SurveySendLog.graduation_year,
@@ -774,10 +783,49 @@ def _cycle_no_reply():
             func.count(func.distinct(SurveySendLog.stage)).label("emails_sent"),
             func.max(SurveySendLog.sent_at).label("last_sent_at"),
         )
-        .where(~_qualifying_reply(_REPLIED_STATUSES))
+        .where(reply_clause)
         .group_by(SurveySendLog.graduation_year, SurveySendLog.alumni_id)
     )
 
+
+def _cycle_no_reply():
+    """The "No reply yet" people: emailed this cycle, no qualifying reply.
+
+    ``~_qualifying_reply(_REPLIED_STATUSES)`` is the complement of the ``replied``
+    count's predicate over the same rows, so this set's size per year is
+    ``recipients - replied``. A ``rejected``-only alum is IN it: a discarded
+    submission is not a reply, exactly as the sender and the count treat it."""
+    return _cycle_send_summary(~_qualifying_reply(_REPLIED_STATUSES))
+
+
+def _cycle_replied():
+    """The "Replied" people: emailed this cycle, with a qualifying reply.
+
+    Exactly the set :func:`_cycle_responders` returns for
+    ``_REPLIED_STATUSES`` — the names behind the ``replied`` count and its
+    hover — read with the SAME current-cycle rows (:func:`_current_cycle_sends`)
+    and the SAME predicate (:func:`_qualifying_reply`), plus the per-person send
+    details. So its size per year is the ``replied`` count, before archived
+    alumni are dropped."""
+    return _cycle_send_summary(_qualifying_reply(_REPLIED_STATUSES))
+
+
+# The profile details both survey exports append after their cycle columns —
+# who the alum is and where they work, so the file can be worked (or cleaned up)
+# without opening every profile. Work location is the EMPLOYER's
+# (`current_employment.current_*`, #287), not the mailing address.
+_PROFILE_EXPORT_COLUMNS = (
+    "NetID",
+    "Employer",
+    "Title",
+    "Industry",
+    "Work City",
+    "Work State",
+    "Work Country",
+    "LinkedIn",
+    "Last Updated",
+    "Profile Link",
+)
 
 NO_REPLY_EXPORT_COLUMNS = (
     "Name",
@@ -786,53 +834,111 @@ NO_REPLY_EXPORT_COLUMNS = (
     "Phone",
     "Emails sent this cycle",
     "Last email sent",
+    *_PROFILE_EXPORT_COLUMNS,
 )
 
+# The replied file is the no-reply file's columns plus the mailing address
+# (`alumni_contact_info`): a reply is the moment the record is most current, and
+# that is the list a mailing gets built from.
+_MAILING_EXPORT_COLUMNS = (
+    "Mailing Address 1",
+    "Mailing Address 2",
+    "Mailing City",
+    "Mailing State",
+    "Mailing Zip",
+    "Mailing Country",
+)
 
-async def export_no_reply_csv(
+REPLIED_EXPORT_COLUMNS = (*NO_REPLY_EXPORT_COLUMNS, *_MAILING_EXPORT_COLUMNS)
+
+
+def _profile_link_base() -> str | None:
+    """The frontend origin a "Profile Link" cell hangs off, or None when
+    ``SURVEY_APP_BASE_URL`` is unset (the cell is then left empty rather than
+    holding a relative path a spreadsheet cannot open). Same setting and same
+    normalisation as the staff digest's Links-tab button."""
+    base = (survey_email.get_settings().survey_app_base_url or "").strip()
+    return base.rstrip("/") or None
+
+
+def _as_date(value: object) -> datetime.date | None:
+    """A timestamp cell rendered as its date — the files carry days, not times."""
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    return value if isinstance(value, datetime.date) else None
+
+
+async def _export_cycle_csv(
     session: AsyncSession,
     graduation_year: int | None,
     *,
+    population,
+    with_mailing: bool,
+    action_type: str,
     actor_user_id: int | None,
+    can_edit: bool,
 ) -> str | None:
-    """The "No reply yet" column as a CSV (#836) — one year, or every year.
+    """The shared body of the survey Progress exports (#836, #605).
 
-    Returns ``None`` when a single year was asked for and it has no schedule
-    (the route 404s). ``graduation_year=None`` is the all-years export and never
-    ``None`` — no campaigns at all is just a header row.
+    ``can_edit`` is the caller's ``can_edit_alumni``. A non-editor gets the NetID
+    and mailing-address cells BLANKED (columns kept, so the header never moves):
+    those are fields their reads null, and the main export strips them for the
+    same callers (``alumni_export.visible_columns``). No default role holds
+    ``alumni.export`` without ``alumni.edit`` today; this keeps the file honest
+    if the permission editor ever grants one.
 
-    Archived alumni are LEFT OUT, the same way and with the same filter as the
-    follow-up call sheet (:func:`list_non_responders`) — Jake's call (#836): an
-    archived record is not someone to chase. The "No reply yet" count and the
-    hover lists still include them, so the row count is that column minus its
-    archived alumni. Every free-text cell goes through
-    the shared formula-injection guard. The email shown is the one the survey
-    would have used (personal, else work — same display rule as the call sheet).
+    ``population`` is a :func:`_cycle_send_summary` select — which side of the
+    reply predicate the file reads. Everything else is identical for both files:
+    the 404 rule, the archived exclusion, the column order, the formula guard and
+    the audit row. ``with_mailing`` appends the mailing-address columns (the
+    replied file only).
 
-    Audit-logged as ``export_survey_no_reply`` with the row count and the year
-    — what left the system and under which selection, never the rows."""
+    ``current_employment`` and ``alumni_contact_info`` are both OUTER-joined and
+    both are one-row-per-alum (unique ``alumni_id`` indexes), so neither can fan
+    a person out into several rows nor drop someone who has no job or no contact
+    row on file."""
     if graduation_year is not None:
         if await _load_schedule_row(session, graduation_year) is None:
             return None
-    no_reply = _cycle_no_reply()
-    if graduation_year is not None:
-        no_reply = no_reply.where(SurveySendLog.graduation_year == graduation_year)
-    sub = no_reply.subquery()
-    stmt = (
-        select(
-            Alumni.alumni_id,
-            Alumni.preferred_first_name,
-            Alumni.first_name,
-            Alumni.last_name,
-            sub.c.graduation_year,
-            AlumniContactInfo.personal_email,
-            AlumniContactInfo.work_email,
-            AlumniContactInfo.phone,
-            sub.c.emails_sent,
-            sub.c.last_sent_at,
+        population = population.where(
+            SurveySendLog.graduation_year == graduation_year
         )
+    sub = population.subquery()
+    columns = [
+        Alumni.alumni_id,
+        Alumni.preferred_first_name,
+        Alumni.first_name,
+        Alumni.last_name,
+        sub.c.graduation_year,
+        AlumniContactInfo.personal_email,
+        AlumniContactInfo.work_email,
+        AlumniContactInfo.phone,
+        sub.c.emails_sent,
+        sub.c.last_sent_at,
+        Alumni.net_id,
+        CurrentEmployment.current_employer,
+        CurrentEmployment.current_title,
+        CurrentEmployment.current_industry,
+        CurrentEmployment.current_city,
+        CurrentEmployment.current_state,
+        CurrentEmployment.current_country,
+        Alumni.linkedin_url,
+        Alumni.updated_at,
+    ]
+    if with_mailing:
+        columns += [
+            AlumniContactInfo.address_line_1,
+            AlumniContactInfo.address_line_2,
+            AlumniContactInfo.city,
+            AlumniContactInfo.state,
+            AlumniContactInfo.zip,
+            AlumniContactInfo.country,
+        ]
+    stmt = (
+        select(*columns)
         .join(sub, sub.c.alumni_id == Alumni.alumni_id)
         .outerjoin(AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id)
+        .outerjoin(CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id)
         # Same archived exclusion as `list_non_responders`.
         .where(Alumni.archived.is_(False))
         # Newest cohort first, like the Progress table; then by name.
@@ -844,42 +950,74 @@ async def export_no_reply_csv(
         )
     )
     rows = (await session.execute(stmt)).all()
+    link_base = _profile_link_base()
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(list(NO_REPLY_EXPORT_COLUMNS))
-    for (
-        alumni_id,
-        preferred,
-        first,
-        last,
-        year,
-        personal,
-        work,
-        phone,
-        emails_sent,
-        last_sent_at,
-    ) in rows:
-        writer.writerow(
-            [
-                _csv_cell(_display_name(alumni_id, preferred, first, last), "str"),
-                _csv_cell(year, "int"),
-                _csv_cell(email_reach.preferred_display_email(personal, work), "str"),
-                _csv_cell(phone, "str"),
-                _csv_cell(emails_sent, "int"),
-                _csv_cell(
-                    last_sent_at.date() if last_sent_at is not None else None, "date"
-                ),
+    writer.writerow(
+        list(REPLIED_EXPORT_COLUMNS if with_mailing else NO_REPLY_EXPORT_COLUMNS)
+    )
+    for row in rows:
+        (
+            alumni_id,
+            preferred,
+            first,
+            last,
+            year,
+            personal,
+            work,
+            phone,
+            emails_sent,
+            last_sent_at,
+            net_id,
+            employer,
+            title,
+            industry,
+            work_city,
+            work_state,
+            work_country,
+            linkedin,
+            updated_at,
+        ) = row[:19]
+        cells = [
+            _csv_cell(_display_name(alumni_id, preferred, first, last), "str"),
+            _csv_cell(year, "int"),
+            _csv_cell(email_reach.preferred_display_email(personal, work), "str"),
+            _csv_cell(phone, "str"),
+            _csv_cell(emails_sent, "int"),
+            _csv_cell(_as_date(last_sent_at), "date"),
+            _csv_cell(net_id if can_edit else None, "str"),
+            _csv_cell(employer, "str"),
+            _csv_cell(title, "str"),
+            _csv_cell(industry, "str"),
+            _csv_cell(work_city, "str"),
+            _csv_cell(work_state, "str"),
+            _csv_cell(work_country, "str"),
+            _csv_cell(linkedin, "str"),
+            _csv_cell(_as_date(updated_at), "date"),
+            # Built from the configured origin and the integer id only — never
+            # from a stored value — but still sent through the guard so every
+            # cell in the file takes the same path.
+            _csv_cell(
+                f"{link_base}/alumni/{alumni_id}" if link_base else None, "str"
+            ),
+        ]
+        if with_mailing:
+            cells += [
+                _csv_cell(value if can_edit else None, "str")
+                for value in row[19:25]
             ]
-        )
+        writer.writerow(cells)
 
     if actor_user_id is None:
-        log.warning("No-reply export audit skipped: no actor (rows=%s)", len(rows))
+        log.warning(
+            "%s audit skipped: no actor (rows=%s)", action_type, len(rows)
+        )
     else:
         session.add(
             AuditLog(
                 user_id=actor_user_id,
-                action_type="export_survey_no_reply",
+                action_type=action_type,
                 entity_type="survey_campaign",
                 entity_id=graduation_year,
                 new_value=(
@@ -890,6 +1028,73 @@ async def export_no_reply_csv(
         )
         await session.commit()
     return buffer.getvalue()
+
+
+async def export_no_reply_csv(
+    session: AsyncSession,
+    graduation_year: int | None,
+    *,
+    actor_user_id: int | None,
+    can_edit: bool,
+) -> str | None:
+    """The "No reply yet" column as a CSV (#836) — one year, or every year.
+
+    Returns ``None`` when a single year was asked for and it has no schedule
+    (the route 404s). ``graduation_year=None`` is the all-years export and never
+    ``None`` — no campaigns at all is just a header row.
+
+    Archived alumni are LEFT OUT, the same way and with the same filter as the
+    follow-up call sheet (:func:`list_non_responders`) — Jake's call (#836): an
+    archived record is not someone to chase. The "No reply yet" count and the
+    hover lists still include them, so the row count is that column minus its
+    archived alumni. Every cell goes through the shared formula-injection guard.
+    The email shown is the one the survey would have used (personal, else work —
+    same display rule as the call sheet). Columns:
+    :data:`NO_REPLY_EXPORT_COLUMNS`.
+
+    Audit-logged as ``export_survey_no_reply`` with the row count and the year
+    — what left the system and under which selection, never the rows."""
+    return await _export_cycle_csv(
+        session,
+        graduation_year,
+        population=_cycle_no_reply(),
+        with_mailing=False,
+        action_type="export_survey_no_reply",
+        actor_user_id=actor_user_id,
+        can_edit=can_edit,
+    )
+
+
+async def export_replied_csv(
+    session: AsyncSession,
+    graduation_year: int | None,
+    *,
+    actor_user_id: int | None,
+    can_edit: bool,
+) -> str | None:
+    """The "Replied" column as a CSV (#605) — one year, or every year.
+
+    The people behind the Progress table's ``replied`` count and its hover
+    (:func:`list_responders`): emailed in the year's current cycle with a
+    pending, applied or confirmed reply inside the re-survey window that a reset
+    has not superseded. A ``rejected``-only alum is NOT in it — a discarded
+    submission is not a reply, and that alum is in the no-reply file instead.
+
+    Archived alumni are left out exactly as in :func:`export_no_reply_csv`, so
+    the row count is the ``replied`` column minus its archived alumni. (The
+    hover list keeps them, because its count does; a file of people to contact
+    or mail does not.) Columns: :data:`REPLIED_EXPORT_COLUMNS` — the no-reply
+    columns plus the mailing address. ``None`` for a single year with no
+    schedule. Audit-logged as ``export_survey_replied``."""
+    return await _export_cycle_csv(
+        session,
+        graduation_year,
+        population=_cycle_replied(),
+        with_mailing=True,
+        action_type="export_survey_replied",
+        actor_user_id=actor_user_id,
+        can_edit=can_edit,
+    )
 
 
 async def _creator_names(
@@ -924,6 +1129,22 @@ async def _creator_names(
     return names
 
 
+async def _last_sent_at(session: AsyncSession) -> dict[int, datetime.datetime]:
+    """When each graduation year's most recent survey email went out, any cycle.
+
+    What the console's "Last auto-send" shows. It used to show the schedule's
+    ``last_run_at``, but the daily cron stamps that on EVERY run — including the
+    runs where nothing was owed and nothing was sent — so the console said
+    "today" on a day no email left. ``last_run_at`` keeps that job (it paces
+    :func:`_next_cron_date`); this is the record of an email actually sent."""
+    stmt = select(SurveySendLog.graduation_year, func.max(SurveySendLog.sent_at)).group_by(
+        SurveySendLog.graduation_year
+    )
+    return {
+        year: at for year, at in (await session.execute(stmt)).all() if at is not None
+    }
+
+
 async def _all_time_send_counts(session: AsyncSession) -> dict[int, int]:
     """Emails ever sent for each graduation year, ACROSS EVERY CYCLE (#398).
 
@@ -951,6 +1172,7 @@ def _to_item(
     fill_medians: dict[int, float] | None = None,
     next_sends: dict[int, tuple[int | None, datetime.date | None, int | None]]
     | None = None,
+    last_sent: dict[int, datetime.datetime] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     next_stage, next_send_date, next_send_count = (next_sends or {}).get(
@@ -972,6 +1194,7 @@ def _to_item(
         status=sched.status,
         cycle_seq=getattr(sched, "cycle_seq", 1),
         last_run_at=sched.last_run_at,
+        last_sent_at=(last_sent or {}).get(year),
         created_at=getattr(sched, "created_at", None),
         created_by=creators.get(created_by_id) if created_by_id else None,
         paused_at=getattr(sched, "paused_at", None),
@@ -1117,6 +1340,7 @@ async def list_schedules(
     all_time = await _all_time_send_counts(session)
     progress = await _progress_counts(session)
     fill_medians = await _median_fill_times(session)
+    last_sent = await _last_sent_at(session)
     creators = await _creator_names(session, schedules)
     next_sends = await _next_sends(session, schedules) if with_next_send else None
     return [
@@ -1129,6 +1353,7 @@ async def list_schedules(
             progress,
             fill_medians,
             next_sends,
+            last_sent,
         )
         for s in schedules
     ]
@@ -1152,9 +1377,17 @@ async def get_schedule(
     all_time = await _all_time_send_counts(session)
     progress = await _progress_counts(session)
     fill_medians = await _median_fill_times(session)
+    last_sent = await _last_sent_at(session)
     creators = await _creator_names(session, [sched])
     return _to_item(
-        sched, counts, creators, non_responders, all_time, progress, fill_medians
+        sched,
+        counts,
+        creators,
+        non_responders,
+        all_time,
+        progress,
+        fill_medians,
+        last_sent=last_sent,
     )
 
 

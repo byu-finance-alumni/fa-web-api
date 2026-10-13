@@ -58,10 +58,14 @@ def test_default_grants_reproduce_historical_guards():
         Capability.VIEW,
         Capability.INTERACTIONS_CREATE,
     }
+    # #605 (Jake, 2026-10-13): students also watch survey progress (read-only)
+    # and may export.
     assert caps("student") == {
         Capability.VIEW,
         Capability.ALUMNI_EDIT,
         Capability.INTERACTIONS_CREATE,
+        Capability.SURVEYS_PROGRESS,
+        Capability.ALUMNI_EXPORT,
     }
     # The twelve ALUMNI_FULL_REPLACEMENTS (#379) — which include the events.create
     # / events.import pair split out earlier (#378) — are seeded to exactly the
@@ -71,6 +75,9 @@ def test_default_grants_reproduce_historical_guards():
         Capability.ALUMNI_EDIT,
         Capability.INTERACTIONS_CREATE,
         *ALUMNI_FULL_REPLACEMENTS,
+        # surveys.progress (#605): the read-only Progress view, seeded to every
+        # role that holds surveys.manage.
+        Capability.SURVEYS_PROGRESS,
     }
     assert caps("super_admin") == {
         Capability.VIEW,
@@ -88,6 +95,7 @@ def test_default_grants_reproduce_historical_guards():
         # keeps surveys.manage (approve / reject / add / edit) but cannot delete.
         Capability.LINKS_DELETE,
         Capability.PROFILE_COMPLETENESS,
+        Capability.SURVEYS_PROGRESS,
     }
 
 
@@ -110,6 +118,8 @@ def test_union_across_multiple_roles():
         Capability.VIEW,
         Capability.ALUMNI_EDIT,
         Capability.INTERACTIONS_CREATE,
+        Capability.SURVEYS_PROGRESS,
+        Capability.ALUMNI_EXPORT,
     }
 
 

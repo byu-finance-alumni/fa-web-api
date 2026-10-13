@@ -61,6 +61,9 @@ HISTORY_ACTIONS: frozenset[str] = frozenset(
         "update",
         "archive",
         "restore",
+        # "Info confirmed" (#605): no field changed, but the record was checked
+        # and its "Last updated" moved — the history is where that shows who.
+        "confirm_current",
         "archive_current_role",
         "apply_survey_response",
         # Headshot.

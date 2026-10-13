@@ -2819,6 +2819,24 @@ async def update_alumni(
     )
 
 
+@router.post("/{alumni_id}/confirm-current", response_model=AlumniWriteResult)
+async def confirm_alumni_current(
+    alumni_id: IdPath, user: RequireAlumniEdit, session: SessionDep
+) -> AlumniWriteResult:
+    """"Info confirmed" (#605): mark the profile as checked today, changing no
+    data.
+
+    Bumps the record's "Last updated" to now and attributes it to the caller
+    (the same provenance a real edit stamps), and stamps the current role's
+    `last_verified_at` when there is one. Gated like `PATCH /alumni/{id}`
+    (`alumni.edit`). 404 for an unknown or archived record. Audit-logged as
+    `confirm_current`. Returns the same `AlumniWriteResult` as the edit, with
+    an empty `duplicate_warnings`."""
+    return await service.confirm_current(
+        session, alumni_id, actor_user_id=user.user_id
+    )
+
+
 @router.delete("/{alumni_id}", response_model=AlumniRead)
 async def archive_alumni(
     alumni_id: IdPath, user: RequireAlumniArchive, session: SessionDep

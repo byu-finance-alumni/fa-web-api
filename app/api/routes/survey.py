@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies.auth import (
     RequireEngineer,
     RequireSurveysManage,
+    RequireSurveysProgress,
 )
 from app.api.routes.alumni import (
     _HEADSHOT_MAX_BYTES,
@@ -50,6 +51,7 @@ from app.core.rate_limit import (
     EngineerBrowseReadRateLimit,
     ExportReadRateLimit,
     SurveysBrowseReadRateLimit,
+    SurveysProgressBrowseReadRateLimit,
 )
 from app.models.audit import AuditLog
 from app.schemas.opportunity_link import (
@@ -881,14 +883,20 @@ async def list_survey_held_out(
 
 @router.get("/schedules", response_model=list[SurveyScheduleItem])
 async def list_survey_schedules(
-    user: RequireSurveysManage, session: SessionDep
+    user: RequireSurveysProgress, session: SessionDep
 ) -> list[SurveyScheduleItem]:
     """All auto-send schedules (newest cohort first) + per-stage sent counts.
+
+    Gated on the read-only progress view (`surveys.progress`, #605) — or
+    `surveys.manage`, which includes it — because this is the list the
+    Progress tab is drawn from. It carries counts and campaign state only, no
+    alumni; the one person it names is the staff member who started each
+    campaign (`created_by`, a display name).
 
     Also backs the engineer Surveys console (which needs who started each
     campaign and when) — the console reads this rather than a second endpoint,
     since it wants exactly this list. The engineer holds every capability, so
-    the full-access gate already admits them.
+    the gate already admits them.
 
     Carries each running campaign's next send (#562) — the only schedule read
     that does."""
@@ -1016,11 +1024,12 @@ async def list_survey_non_responders(
     return items
 
 
-def _no_reply_csv_response(csv_text: str, scope: str) -> Response:
-    # The filename carries only the year (a validated int) or "all" and a
-    # generated date — never caller free text, which in a Content-Disposition
-    # header would be header injection. Same rule as the other exports.
-    filename = f"survey_no_reply_{scope}_{datetime.date.today().isoformat()}.csv"
+def _survey_csv_response(csv_text: str, kind: str, scope: str) -> Response:
+    # The filename carries only a fixed kind, the year (a validated int) or
+    # "all", and a generated date — never caller free text, which in a
+    # Content-Disposition header would be header injection. Same rule as the
+    # other exports.
+    filename = f"survey_{kind}_{scope}_{datetime.date.today().isoformat()}.csv"
     return Response(
         content=csv_text,
         media_type="text/csv",
@@ -1028,9 +1037,10 @@ def _no_reply_csv_response(csv_text: str, scope: str) -> Response:
     )
 
 
-# The literal `no-reply` segment cannot be taken for a graduation year: no GET
-# under `/schedules/{grad_year}` has the two-segment `.../export` shape. Keep it
-# that way — FastAPI matches in declaration order and would 422 on the int.
+# The literal `no-reply` / `replied` segments cannot be taken for a graduation
+# year: no GET under `/schedules/{grad_year}` has the two-segment `.../export`
+# shape. Keep it that way — FastAPI matches in declaration order and would 422
+# on the int. The static all-years route of each pair is declared FIRST.
 @router.get("/schedules/no-reply/export", response_model=None)
 async def export_survey_no_reply_all(
     user: ExportReadRateLimit, session: SessionDep
@@ -1042,11 +1052,12 @@ async def export_survey_no_reply_all(
     yet" total minus archived alumni, which the file leaves out. Same gate,
     same columns, same audit trail."""
     csv_text = await survey_schedule.export_no_reply_csv(
-        session, None, actor_user_id=user.user_id
+        session, None, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
     )
     if csv_text is None:  # unreachable: only a single missing year yields None
         raise NotFoundError("No schedule exists for that graduation year.")
-    return _no_reply_csv_response(csv_text, "all")
+    return _survey_csv_response(csv_text, "no_reply", "all")
 
 
 @router.get("/schedules/{grad_year}/no-reply/export", response_model=None)
@@ -1069,18 +1080,74 @@ async def export_survey_no_reply(
     manual follow-up call sheet, which also requires all three emails and so is
     a subset of this until the campaign ends.
 
-    Columns: name, graduation year, email, phone, emails sent this cycle, last
-    email sent (date). Formula-injection-safe. Gated by `RequireAlumniExport`,
-    not the surveys guard: bulk contact details leave the system here, and every
-    file of alumni data does so under that one capability (as the event attendee
-    export does). Audit-logged as `export_survey_no_reply`. 404 = no campaign for the
-    year. Returns `text/csv` as `survey_no_reply_<year>_<YYYY-MM-DD>.csv`."""
+    Columns: Name, Graduation year, Email, Phone, Emails sent this cycle, Last
+    email sent (date), NetID, Employer, Title, Industry, Work City, Work State,
+    Work Country (the employer's location), LinkedIn, Last Updated (date the
+    record last changed), Profile Link (the app's profile URL; empty when the
+    frontend URL is not configured). Formula-injection-safe. Gated by
+    `RequireAlumniExport`, not the surveys guard: bulk contact details leave the
+    system here, and every file of alumni data does so under that one capability
+    (as the event attendee export does). Audit-logged as
+    `export_survey_no_reply`. 404 = no campaign for the year. Returns `text/csv`
+    as `survey_no_reply_<year>_<YYYY-MM-DD>.csv`."""
     csv_text = await survey_schedule.export_no_reply_csv(
-        session, grad_year, actor_user_id=user.user_id
+        session, grad_year, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
     )
     if csv_text is None:
         raise NotFoundError("No schedule exists for that graduation year.")
-    return _no_reply_csv_response(csv_text, str(grad_year))
+    return _survey_csv_response(csv_text, "no_reply", str(grad_year))
+
+
+@router.get("/schedules/replied/export", response_model=None)
+async def export_survey_replied_all(
+    user: ExportReadRateLimit, session: SessionDep
+) -> Response:
+    """Every year's "Replied" people as one CSV (#605).
+
+    The all-years twin of `GET /schedules/{grad_year}/replied/export`. Its row
+    count is the summed `replied` column minus archived alumni, which the file
+    leaves out. Same gate, same columns, same audit trail."""
+    csv_text = await survey_schedule.export_replied_csv(
+        session, None, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
+    )
+    if csv_text is None:  # unreachable: only a single missing year yields None
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return _survey_csv_response(csv_text, "replied", "all")
+
+
+@router.get("/schedules/{grad_year}/replied/export", response_model=None)
+async def export_survey_replied(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: ExportReadRateLimit,
+    session: SessionDep,
+) -> Response:
+    """This year's "Replied" people as a CSV download (#605).
+
+    The Progress table's `replied` column — the same people the
+    `GET /schedules/{grad_year}/responders` "replied" hover lists: emailed in
+    the year's current cycle with a pending, applied or confirmed reply inside
+    the re-survey window that a reset has not superseded. A `rejected`-only alum
+    is NOT in it (they are in the no-reply file). Archived alumni are left out,
+    as in the no-reply file, so the row count is the column minus its archived
+    alumni.
+
+    Columns: every no-reply column (Name, Graduation year, Email, Phone, Emails
+    sent this cycle, Last email sent, NetID, Employer, Title, Industry, Work
+    City, Work State, Work Country, LinkedIn, Last Updated, Profile Link), then
+    Mailing Address 1, Mailing Address 2, Mailing City, Mailing State, Mailing
+    Zip, Mailing Country. Formula-injection-safe. Gated by `RequireAlumniExport`
+    (via the shared export rate limit) for the same reason as the no-reply file.
+    Audit-logged as `export_survey_replied`. 404 = no campaign for the year.
+    Returns `text/csv` as `survey_replied_<year>_<YYYY-MM-DD>.csv`."""
+    csv_text = await survey_schedule.export_replied_csv(
+        session, grad_year, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
+    )
+    if csv_text is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return _survey_csv_response(csv_text, "replied", str(grad_year))
 
 
 @router.get(
@@ -1089,7 +1156,7 @@ async def export_survey_no_reply(
 )
 async def list_survey_responders(
     grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
-    user: SurveysBrowseReadRateLimit,
+    user: SurveysProgressBrowseReadRateLimit,
     session: SessionDep,
 ) -> SurveyResponders:
     """Who is behind this year's `replied` and `confirmed` counts (#836).
@@ -1099,8 +1166,10 @@ async def list_survey_responders(
     cycle, re-survey window, not superseded by a reset, distinct alumni — so
     each list is exactly as long as the number it hangs off.
 
-    Gated like `GET /schedules` (the counts it expands) and the non-responders
-    call sheet. Returns only an id and a display name per alum. 404 = the year
+    Gated like `GET /schedules` (the counts it expands): the read-only
+    `surveys.progress` view, or `surveys.manage` (#605). Returns only an id, a
+    display name and a fill time per alum — no contact details, which is why it
+    can sit on the read-only gate while the non-responders call sheet cannot. 404 = the year
     has no campaign at all; two empty lists = nobody has answered yet.
     Audit-logged (``read_survey_responders``, #591)."""
     result = await survey_schedule.list_responders(session, grad_year)

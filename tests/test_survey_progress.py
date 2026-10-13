@@ -202,6 +202,7 @@ def test_counts_reach_the_schedule_item(
                 ]
             ),
             _Res(rows=[]),  # median fill time per cycle
+            _Res(rows=[]),  # last real send per year
         ]
     )
     item = asyncio.run(survey_schedule.list_schedules(session))[0]
@@ -228,6 +229,7 @@ def test_a_rejected_submission_never_lands_in_replied():
             _Res(rows=[]),
             _Res(rows=[(year, 10, 1, 1, 0, 5, 0)]),
             _Res(rows=[]),  # median fill time per cycle
+            _Res(rows=[]),  # last real send per year
         ]
     )
     item = asyncio.run(survey_schedule.list_schedules(session))[0]
@@ -316,6 +318,7 @@ def test_median_reaches_the_schedule_item():
             _Res(rows=[]),  # all-time sent counts
             _Res(rows=[(year, 30, 9, 1, 0, 0, 8)]),  # progress counts
             _Res(rows=[(year, 72.0)]),  # median fill time per cycle
+            _Res(rows=[]),  # last real send per year
         ]
     )
     item = asyncio.run(survey_schedule.list_schedules(session))[0]
@@ -334,6 +337,7 @@ def test_a_year_with_no_usable_fill_time_reports_none():
             _Res(rows=[]),
             _Res(rows=[(year, 10, 3, 3, 0, 0, 0)]),
             _Res(rows=[]),  # no median for this year
+            _Res(rows=[]),  # last real send per year
         ]
     )
     item = asyncio.run(survey_schedule.list_schedules(session))[0]

@@ -209,6 +209,9 @@ async def password_matches_current(
             {"candidate": candidate, "auth_user_id": auth_user_id},
         )
     except Exception as exc:  # noqa: BLE001 - best-effort; never log the params
+        # Only the exception's class name is logged (see above); semgrep's
+        # credential-disclosure rule keys on the word "password" in the message.
+        # nosemgrep
         logger.warning(
             "Password reuse check unavailable (%s); continuing without it.",
             type(exc).__name__,

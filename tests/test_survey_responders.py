@@ -316,9 +316,30 @@ class _AuditingSession:
         pass
 
 
-def _export(db, year=_YEAR, actor=1):
+@pytest.fixture
+def no_app_url(monkeypatch):
+    """``SURVEY_APP_BASE_URL`` unset, whatever the environment says."""
+    monkeypatch.setattr(ss, "_profile_link_base", lambda: None)
+
+
+@pytest.fixture
+def app_url(monkeypatch):
+    """A configured frontend origin, with the trailing slash the setting is
+    allowed to carry — the link must not come out with ``//alumni``."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        ss.survey_email,
+        "get_settings",
+        lambda: SimpleNamespace(survey_app_base_url=" https://app.example/ "),
+    )
+
+
+def _export(db, year=_YEAR, actor=1, can_edit=True):
     session = _AuditingSession(db)
-    out = asyncio.run(ss.export_no_reply_csv(session, year, actor_user_id=actor))
+    out = asyncio.run(
+        ss.export_no_reply_csv(session, year, actor_user_id=actor, can_edit=can_edit)
+    )
     return out, session
 
 
@@ -364,13 +385,16 @@ def test_export_includes_someone_whose_reply_a_reset_superseded(db):
     assert len(body) == _silent(_item(db))
 
 
-def test_export_columns_carry_contact_and_cycle_details(db):
+def test_export_columns_carry_contact_and_cycle_details(db, no_app_url):
     db.schedule()
     db.alum(1, last_name="Diaz", email="diaz@example.com")
     db.conn.execute(
         text("UPDATE alumni_contact_info SET phone = '801-555-0100' WHERE alumni_id = 1")
     )
     db.sent(1, (0, 1))
+    # Only the cycle columns are filled here; the profile columns (#605) are
+    # empty for an alum with nothing else on file — including the profile link
+    # when the frontend URL is not configured.
     assert _rows(_export(db)[0])[1] == [
         "A1 Diaz",
         str(_YEAR),
@@ -378,6 +402,7 @@ def test_export_columns_carry_contact_and_cycle_details(db):
         "801-555-0100",
         "2",
         _NOW.date().isoformat(),
+        *[""] * len(ss._PROFILE_EXPORT_COLUMNS),
     ]
 
 
@@ -509,3 +534,376 @@ def test_export_all_years_route_downloads_a_csv(db):
 def test_export_route_404s_for_a_year_with_no_campaign(db):
     resp = _get(_export_path(1999), _AuditingSession(db), _ctx("full_access"))
     assert resp.status_code == 404
+
+
+# ------------------------------------- export profile columns (#605) ----------
+
+
+def _profile(db, alumni_id, **employment):
+    """Fill in an alum's profile columns and (optionally) a current role."""
+    db.conn.execute(
+        text(
+            "UPDATE alumni SET net_id = :n, linkedin_url = :l, updated_at = :u"
+            " WHERE alumni_id = :a"
+        ),
+        {
+            "a": alumni_id,
+            "n": f"net{alumni_id}",
+            "l": f"https://linkedin.example/in/a{alumni_id}",
+            "u": datetime.datetime(2026, 9, 15, 23, 30),
+        },
+    )
+    if employment:
+        db.conn.execute(
+            text(
+                "INSERT INTO current_employment (current_employment_id, alumni_id,"
+                " current_employer, current_title, current_industry, current_city,"
+                " current_state, current_country) VALUES (:a, :a, :e, :t, :i, :c,"
+                " :s, :k)"
+            ),
+            {
+                "a": alumni_id,
+                "e": employment.get("employer"),
+                "t": employment.get("title"),
+                "i": employment.get("industry"),
+                "c": employment.get("city"),
+                "s": employment.get("state"),
+                "k": employment.get("country"),
+            },
+        )
+
+
+def test_no_reply_header_keeps_the_old_columns_first_then_the_profile_ones():
+    assert ss.NO_REPLY_EXPORT_COLUMNS == (
+        "Name",
+        "Graduation year",
+        "Email",
+        "Phone",
+        "Emails sent this cycle",
+        "Last email sent",
+        "NetID",
+        "Employer",
+        "Title",
+        "Industry",
+        "Work City",
+        "Work State",
+        "Work Country",
+        "LinkedIn",
+        "Last Updated",
+        "Profile Link",
+    )
+
+
+def test_no_reply_row_carries_the_profile_columns_and_link(db, app_url):
+    db.schedule()
+    db.alum(1, last_name="Diaz", email="diaz@example.com")
+    _profile(
+        db,
+        1,
+        employer="Acme Capital",
+        title="Analyst",
+        industry="Investment Banking",
+        city="New York",
+        state="New York",
+        country="United States",
+    )
+    db.sent(1, (0,))
+    header, row = _rows(_export(db)[0])
+    assert dict(zip(header, row, strict=True)) == {
+        "Name": "A1 Diaz",
+        "Graduation year": str(_YEAR),
+        "Email": "diaz@example.com",
+        "Phone": "",
+        "Emails sent this cycle": "1",
+        "Last email sent": _NOW.date().isoformat(),
+        "NetID": "net1",
+        "Employer": "Acme Capital",
+        "Title": "Analyst",
+        "Industry": "Investment Banking",
+        "Work City": "New York",
+        "Work State": "New York",
+        "Work Country": "United States",
+        "LinkedIn": "https://linkedin.example/in/a1",
+        "Last Updated": "2026-09-15",
+        # Trimmed origin + the integer id, no double slash.
+        "Profile Link": "https://app.example/alumni/1",
+    }
+
+
+def test_an_alum_with_no_job_on_file_is_still_one_row(db, app_url):
+    # The employment join is OUTER: no current role must not drop the person.
+    db.schedule()
+    db.alum(1, last_name="Diaz")
+    db.alum(2, last_name="Evans")
+    _profile(db, 2, employer="Acme")
+    db.sent(1, (0,))
+    db.sent(2, (0,))
+    body = _rows(_export(db)[0])[1:]
+    assert [r[0] for r in body] == ["A1 Diaz", "A2 Evans"]
+    assert body[0][7] == "" and body[1][7] == "Acme"
+
+
+def test_the_profile_columns_go_through_the_formula_guard(db, app_url):
+    db.schedule()
+    db.alum(1, last_name="Evil")
+    db.conn.execute(
+        text(
+            "UPDATE alumni SET net_id = '=1+1', linkedin_url = '@SUM(A1)'"
+            " WHERE alumni_id = 1"
+        )
+    )
+    db.conn.execute(
+        text(
+            "INSERT INTO current_employment (current_employment_id, alumni_id,"
+            " current_employer, current_title, current_industry, current_city)"
+            " VALUES (1, 1, '=HYPERLINK(\"http://x\")', '+cmd', '-2', '=c')"
+        )
+    )
+    db.sent(1, (0,))
+    header, row = _rows(_export(db)[0])
+    cells = dict(zip(header, row, strict=True))
+    for column in ("NetID", "Employer", "Title", "Industry", "Work City", "LinkedIn"):
+        assert cells[column].startswith("\t"), column
+
+
+# ------------------------------------------------- "Replied" export (#605) ----
+#
+# The file's population is the `replied` count's — the very people the hover
+# (`list_responders`) names — minus archived alumni. Compared against BOTH the
+# count and the hover list over the same rows, never a hand-picked expectation.
+
+
+def _export_replied(db, year=_YEAR, actor=1, can_edit=True):
+    session = _AuditingSession(db)
+    out = asyncio.run(
+        ss.export_replied_csv(session, year, actor_user_id=actor, can_edit=can_edit)
+    )
+    return out, session
+
+
+def test_replied_header_is_the_no_reply_columns_plus_the_mailing_address():
+    assert ss.REPLIED_EXPORT_COLUMNS == (
+        *ss.NO_REPLY_EXPORT_COLUMNS,
+        "Mailing Address 1",
+        "Mailing Address 2",
+        "Mailing City",
+        "Mailing State",
+        "Mailing Zip",
+        "Mailing Country",
+    )
+
+
+def test_replied_export_is_exactly_the_replied_count_and_hover(db):
+    _world(db)
+    header, *body = _rows(_export_replied(db)[0])
+    assert header == list(ss.REPLIED_EXPORT_COLUMNS)
+    hover = [r.name for r in _responders(db).replied]
+    # Same people, same (name) order as the hover, as long as the count.
+    assert [r[0] for r in body] == hover == ["A2 Adams", "A3 Moss", "A1 Young"]
+    assert len(body) == _item(db).replied == 3
+
+
+def test_replied_and_no_reply_partition_the_recipients(db):
+    # The two files are the two sides of ONE predicate over the same rows:
+    # nobody in both, nobody in neither (Baker's rejected-only reply puts her in
+    # no-reply; Cole's out-of-window reply likewise).
+    _world(db)
+    replied = {r[0] for r in _rows(_export_replied(db)[0])[1:]}
+    silent = {r[0] for r in _rows(_export(db)[0])[1:]}
+    assert not replied & silent
+    assert len(replied | silent) == _item(db).recipients == 7
+    assert "A4 Baker" in silent and "A4 Baker" not in replied
+
+
+def test_replied_export_drops_a_reply_a_reset_superseded(db):
+    _world(db)
+    db.conn.execute(
+        text("UPDATE survey_send_log SET reset_seq = 1 WHERE alumni_id = 2")
+    )
+    _reset(db, 2, at=_NOW + datetime.timedelta(minutes=5))
+    body = _rows(_export_replied(db)[0])[1:]
+    assert "A2 Adams" not in [r[0] for r in body]
+    assert len(body) == _item(db).replied == len(_responders(db).replied)
+
+
+def test_replied_export_leaves_out_archived_alumni_the_count_keeps(db):
+    _world(db)
+    _archive(db, 1)  # Young replied
+    item = _item(db)
+    body = _rows(_export_replied(db)[0])[1:]
+    assert "A1 Young" not in [r[0] for r in body]
+    # The column (and the hover) still count her; the file is that minus one.
+    assert item.replied == len(_responders(db).replied) == 3
+    assert len(body) == item.replied - 1
+
+
+def test_replied_export_all_years_matches_the_summed_column(db):
+    _world(db)
+    db.schedule(year=2001)
+    db.alum(20, last_name="Hale")
+    db.alum(21, last_name="Iver")
+    db.sent(20, (0,), year=2001)
+    db.sent(21, (0,), year=2001)
+    db.replied(20, "applied")
+    db.replied(21, "confirmed")
+    _archive(db, 21)
+    items = asyncio.run(ss.list_schedules(db.session))
+    total = sum(i.replied for i in items)
+    assert total == 5
+    body = _rows(_export_replied(db, year=None)[0])[1:]
+    assert len(body) == total - 1  # Iver is archived
+    # Newest cohort first, like the table.
+    assert body[0][:2] == ["A20 Hale", "2001"]
+
+
+def test_replied_export_carries_the_mailing_address(db, no_app_url):
+    db.schedule()
+    db.alum(1, last_name="Diaz", email="diaz@example.com")
+    db.conn.execute(
+        text(
+            "UPDATE alumni_contact_info SET address_line_1 = '1 Main St',"
+            " address_line_2 = '=Apt 2', city = 'Provo', state = 'Utah',"
+            " zip = '84604', country = 'United States' WHERE alumni_id = 1"
+        )
+    )
+    db.sent(1, (0,))
+    db.replied(1, "confirmed")
+    header, row = _rows(_export_replied(db)[0])
+    cells = dict(zip(header, row, strict=True))
+    assert cells["Mailing Address 1"] == "1 Main St"
+    # The mailing cells take the same formula guard as every other cell.
+    assert cells["Mailing Address 2"] == "\t=Apt 2"
+    assert cells["Mailing City"] == "Provo"
+    assert cells["Mailing State"] == "Utah"
+    assert cells["Mailing Zip"] == "84604"
+    assert cells["Mailing Country"] == "United States"
+    assert cells["Profile Link"] == ""
+
+
+def test_non_editor_export_blanks_net_id_and_mailing_address(db, no_app_url):
+    """A caller who holds alumni.export without alumni.edit (not a default
+    grant, but the permission editor allows it) must not get the fields their
+    reads null -- same rule as the main export's visible_columns."""
+    db.schedule()
+    db.alum(1, last_name="Diaz", email="diaz@example.com")
+    db.conn.execute(text("UPDATE alumni SET net_id = 'net1' WHERE alumni_id = 1"))
+    db.conn.execute(
+        text(
+            "UPDATE alumni_contact_info SET address_line_1 = '1 Main St',"
+            " city = 'Provo', zip = '84604' WHERE alumni_id = 1"
+        )
+    )
+    db.sent(1, (0,))
+    db.replied(1, "confirmed")
+    header, row = _rows(_export_replied(db, can_edit=False)[0])
+    cells = dict(zip(header, row, strict=True))
+    assert cells["NetID"] == ""
+    for column in header:
+        if column.startswith("Mailing"):
+            assert cells[column] == "", column
+    assert cells["Name"]  # the rest of the row is still there
+    editor = dict(zip(*_rows(_export_replied(db)[0]), strict=True))
+    assert editor["NetID"] == "net1"
+    assert editor["Mailing Address 1"] == "1 Main St"
+
+
+def test_replied_export_is_audited_without_the_rows(db):
+    _world(db)
+    _, session = _export_replied(db, actor=42)
+    (entry,) = session.added
+    assert entry.action_type == "export_survey_replied"
+    assert entry.user_id == 42
+    assert entry.entity_type == "survey_campaign"
+    assert entry.entity_id == _YEAR
+    assert entry.new_value == f"rows=3; graduation_year={_YEAR}"
+
+
+def test_replied_export_all_years_audits_as_all(db):
+    _world(db)
+    _, session = _export_replied(db, year=None, actor=42)
+    (entry,) = session.added
+    assert entry.entity_id is None
+    assert entry.new_value == "rows=3; graduation_year=all"
+
+
+def test_replied_export_is_none_for_a_year_with_no_campaign(db):
+    assert _export_replied(db, year=1999)[0] is None
+
+
+# ------------------------------------------ export + progress gates (#605) ----
+
+
+@pytest.fixture
+def fresh_limits():
+    from app.core import rate_limit
+
+    rate_limit.reset()
+    yield
+    rate_limit.reset()
+
+
+_EXPORT_PATHS = [
+    f"/survey/schedules/{_YEAR}/no-reply/export",
+    "/survey/schedules/no-reply/export",
+    f"/survey/schedules/{_YEAR}/replied/export",
+    "/survey/schedules/replied/export",
+]
+
+
+@pytest.mark.parametrize("path", _EXPORT_PATHS)
+def test_survey_exports_require_auth(db, path):
+    assert _get(path, db.session).status_code == 401
+
+
+@pytest.mark.parametrize("path", _EXPORT_PATHS)
+def test_survey_exports_forbidden_for_view_only(db, path, fresh_limits):
+    assert _get(path, _AuditingSession(db), _ctx("view_only")).status_code == 403
+
+
+@pytest.mark.parametrize("path", _EXPORT_PATHS)
+def test_students_may_download_the_survey_exports(db, path, fresh_limits):
+    # Jake, 2026-10-13: every student may export.
+    _world(db)
+    resp = _get(path, _AuditingSession(db), _ctx("student"))
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+
+
+def test_replied_export_route_downloads_a_csv(db, fresh_limits):
+    _world(db)
+    resp = _get(
+        f"/survey/schedules/{_YEAR}/replied/export",
+        _AuditingSession(db),
+        _ctx("full_access"),
+    )
+    assert resp.status_code == 200
+    disposition = resp.headers["content-disposition"]
+    assert disposition.startswith(f'attachment; filename="survey_replied_{_YEAR}_')
+    assert len(_rows(resp.text)) == 1 + 3
+
+
+def test_replied_export_all_years_route_is_not_taken_for_a_year(db, fresh_limits):
+    # Declared before the parametrised route, so `replied` is never parsed as
+    # a graduation year (which would 422).
+    _world(db)
+    resp = _get(
+        "/survey/schedules/replied/export", _AuditingSession(db), _ctx("full_access")
+    )
+    assert resp.status_code == 200
+    assert 'filename="survey_replied_all_' in resp.headers["content-disposition"]
+
+
+def test_replied_export_route_404s_for_a_year_with_no_campaign(db, fresh_limits):
+    resp = _get(
+        "/survey/schedules/1999/replied/export",
+        _AuditingSession(db),
+        _ctx("full_access"),
+    )
+    assert resp.status_code == 404
+
+
+def test_students_can_see_who_replied(db, fresh_limits):
+    _world(db)
+    resp = _get(_path(), db.session, _ctx("student"))
+    assert resp.status_code == 200
+    assert len(resp.json()["replied"]) == 3

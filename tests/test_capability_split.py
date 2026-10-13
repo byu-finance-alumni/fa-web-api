@@ -37,6 +37,7 @@ from app.core.capabilities import (
     CAPABILITIES_BY_CODE,
     DEFAULT_GRANTS,
     POST_SPLIT_CAPABILITIES,
+    POST_SPLIT_ROLE_WIDENINGS,
     Capability,
     effective_capabilities,
     expand_legacy_grants,
@@ -144,7 +145,10 @@ _PROBES: list[tuple[str, str, str, dict]] = [
     (Capability.NOTES_MANAGE, "delete", "/notes/1", {}),
     (Capability.SURVEYS_MANAGE, "get", "/survey/campaigns/2020/responses", {}),
     (Capability.SURVEYS_MANAGE, "post", "/survey/responses/1/apply", {}),
-    (Capability.SURVEYS_MANAGE, "get", "/survey/schedules", {}),
+    # `GET /survey/schedules` moved to the read-only `surveys.progress` view
+    # (#605), which `surveys.manage` also satisfies, so it can no longer prove
+    # this capability on its own; creating a schedule can.
+    (Capability.SURVEYS_MANAGE, "post", "/survey/schedules", {"json": {}}),
     (Capability.SURVEYS_MANAGE, "post", "/survey/campaigns/2020/send", {}),
     (Capability.DONATIONS_VIEW, "get", "/donations/donors", {}),
     (Capability.DONATIONS_VIEW, "get", "/donations/summary", {}),
@@ -321,7 +325,8 @@ def test_no_role_gained_or_lost_access():
             expected |= ALUMNI_FULL_REPLACEMENTS
         expected.add(Capability.INTERACTIONS_CREATE)
         actual = effective_capabilities(DEFAULT_GRANTS, [role])
-        assert actual - POST_SPLIT_CAPABILITIES == expected, role
+        widened = POST_SPLIT_ROLE_WIDENINGS.get(role, frozenset())
+        assert actual - POST_SPLIT_CAPABILITIES - widened == expected, role
 
 
 def test_the_post_split_register_cannot_hide_a_widening():
@@ -346,6 +351,29 @@ def test_the_post_split_register_cannot_hide_a_widening():
         assert CAPABILITIES_BY_CODE[code].assignable is True, code
 
 
+def test_the_role_widening_register_is_narrow_and_real():
+    """The per-role register is the second escape hatch, so it gets its own
+    lock: every entry is a real, assignable, PRE-EXISTING code (a brand-new one
+    belongs in ``POST_SPLIT_CAPABILITIES``), keyed by a real role, never the
+    admin tier or the engineer meta-capability, and actually granted — an
+    entry the defaults do not grant would silently excuse nothing."""
+    pre_split_codes = {code for caps in _PRE_SPLIT_GRANTS.values() for code in caps}
+    known = pre_split_codes | ALUMNI_FULL_REPLACEMENTS
+    for role, codes in POST_SPLIT_ROLE_WIDENINGS.items():
+        assert role in _PRE_SPLIT_GRANTS, role
+        for code in codes:
+            assert code in known, code
+            assert code not in POST_SPLIT_CAPABILITIES, code
+            assert code not in {
+                Capability.USER_ADMIN,
+                Capability.DONATIONS_MANAGE,
+                Capability.ENGINEER,
+                Capability.LEGACY_ALUMNI_FULL,
+            }, code
+            assert CAPABILITIES_BY_CODE[code].assignable is True, code
+            assert code in DEFAULT_GRANTS[role], (role, code)
+
+
 def test_the_split_is_a_partition_not_a_reshuffle():
     # Sanity on the translation itself: the replacements are all real, currently
     # registered, assignable capabilities — not a set that quietly includes the
@@ -365,7 +393,10 @@ def test_the_retired_capability_is_no_longer_grantable():
 
 
 def test_lower_roles_did_not_widen():
-    student = effective_capabilities(DEFAULT_GRANTS, ["student"])
+    # Minus the widenings the owner declared since (#605: students may export).
+    student = effective_capabilities(DEFAULT_GRANTS, ["student"]) - set(
+        POST_SPLIT_ROLE_WIDENINGS.get("student", frozenset())
+    )
     view_only = effective_capabilities(DEFAULT_GRANTS, ["view_only"])
     # Neither picked up anything from the dissolved capability.
     assert not student & ALUMNI_FULL_REPLACEMENTS

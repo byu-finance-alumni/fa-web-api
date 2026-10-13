@@ -607,11 +607,15 @@ def test_export_forbidden_for_view_only(client):
     assert resp.json()["error"]["code"] == "forbidden"
 
 
-def test_export_forbidden_for_student(client):
-    # student can edit but not full_access; export is full_access-gated.
+def test_export_reaches_past_the_guard_for_student(client):
+    # Export is `alumni.export`-gated; students hold it since #605 (Jake,
+    # 2026-10-13), view_only still does not (above). `!= 403`: there is no
+    # database behind this client, so the handler fails past the guard — which
+    # is the point being proved.
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
-    resp = client.get("/alumni/1/export")
-    assert resp.status_code == 403
+    with TestClient(app, raise_server_exceptions=False) as lenient:
+        resp = lenient.get("/alumni/1/export")
+    assert resp.status_code != 403
 
 
 # --- #112b: AuditEntryRead / AttachmentRead hide internal user PKs ------------

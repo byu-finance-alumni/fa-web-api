@@ -63,6 +63,7 @@ class Capability:
     EVENTS_MANAGE = "events.manage"
     NOTES_MANAGE = "notes.manage"
     SURVEYS_MANAGE = "surveys.manage"
+    SURVEYS_PROGRESS = "surveys.progress"
     DONATIONS_VIEW = "donations.view"
     USER_ADMIN = "user_admin"
     DONATIONS_MANAGE = "donations.manage"
@@ -255,6 +256,25 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "cancelling EVERY cohort at once stays engineer-only."
         ),
     ),
+    # The survey Progress tab as a READ (#605): per-year counts and who replied,
+    # so a role can watch a campaign without being able to run one. Carved off
+    # the read side of "Manage surveys" rather than replacing it — holding
+    # "Manage surveys" still lets you see progress (the console cannot work
+    # without it), so the guard accepts either; this toggle exists to hand the
+    # view to a role that must NOT manage. Seeded to every role that held
+    # `surveys.manage` plus student.
+    CapabilitySpec(
+        code=Capability.SURVEYS_PROGRESS,
+        label="View survey progress",
+        description=(
+            "See the survey Progress tab: each graduation year's campaign, how "
+            "many alumni were emailed and replied, and who replied. Read-only — "
+            "it does not allow sending, pausing, cancelling, or reviewing "
+            "responses, which stay with \"Manage surveys\" (and anyone with "
+            "\"Manage surveys\" can already see progress). Downloading the "
+            "Progress lists also needs \"Export alumni data\"."
+        ),
+    ),
     CapabilitySpec(
         code=Capability.DONATIONS_VIEW,
         label="View donations",
@@ -405,8 +425,29 @@ POST_SPLIT_CAPABILITIES: frozenset[str] = frozenset(
         # #441 follow-up: deleting an opportunity link, carved out of
         # `surveys.manage` and given to super_admin + engineer only.
         Capability.LINKS_DELETE,
+        # #605: the read-only survey Progress view, granted to every role that
+        # held `surveys.manage` (super_admin, full_access) plus student.
+        Capability.SURVEYS_PROGRESS,
     }
 )
+
+
+# Deliberate widenings of a capability that ALREADY EXISTED at #379 to a role
+# that did not hold it then — keyed by role. The other half of the register
+# above, and it exists for the same reason: the preservation test subtracts
+# these per role, so it keeps asserting "the split moved nobody" while each later
+# owner decision is written down here, with its reason, instead of being edited
+# into the frozen pre-#379 fixture.
+#
+# Per ROLE, not global, on purpose: a global entry for an old code would excuse
+# that code on every role and hide exactly the widening the test exists to catch.
+# Add an entry only for a widening the owner asked for, and say who and when.
+POST_SPLIT_ROLE_WIDENINGS: dict[str, frozenset[str]] = {
+    # #605 (Jake, 2026-10-13): all students may export — the survey Progress
+    # downloads and every other export, since "can this role take alumni data
+    # out of the system" stays the one `alumni.export` switch.
+    RoleName.STUDENT.value: frozenset({Capability.ALUMNI_EXPORT}),
+}
 
 
 # --- Default grants (seed + empty-table fallback) -----------------------------
@@ -446,6 +487,8 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             # preservation test.
             Capability.LINKS_DELETE,
             Capability.PROFILE_COMPLETENESS,
+            # #605: read-only survey progress, alongside `surveys.manage`.
+            Capability.SURVEYS_PROGRESS,
         }
     ),
     RoleName.FULL_ACCESS.value: frozenset(
@@ -454,6 +497,8 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             Capability.ALUMNI_EDIT,
             Capability.INTERACTIONS_CREATE,
             *ALUMNI_FULL_REPLACEMENTS,
+            # #605: read-only survey progress, alongside `surveys.manage`.
+            Capability.SURVEYS_PROGRESS,
         }
     ),
     RoleName.STUDENT.value: frozenset(
@@ -461,6 +506,13 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             Capability.VIEW,
             Capability.ALUMNI_EDIT,
             Capability.INTERACTIONS_CREATE,
+            # #605: students watch the survey Progress tab (read-only — no
+            # send / pause / cancel / review) and may download its lists...
+            Capability.SURVEYS_PROGRESS,
+            # ...and every other export (Jake, 2026-10-13). Declared in
+            # POST_SPLIT_ROLE_WIDENINGS so the #379 preservation test still
+            # holds.
+            *POST_SPLIT_ROLE_WIDENINGS[RoleName.STUDENT.value],
         }
     ),
     RoleName.VIEW_ONLY.value: frozenset(

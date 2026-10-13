@@ -321,6 +321,27 @@ def require_capability(
     return _guard
 
 
+def require_any_capability(
+    *capabilities: str,
+) -> Callable[[UserContext, dict[str, frozenset[str]]], Awaitable[UserContext]]:
+    """Like :func:`require_capability`, but ANY one of ``capabilities`` admits.
+
+    For a read whose capability is strictly contained in a broader one — the
+    holder of the broader capability must keep the read even if the narrow
+    toggle is off for their role, or the broader one stops working. Same live
+    config, same engineer override, same 403."""
+
+    async def _guard(
+        user: CurrentDBUser, config: PermissionConfig
+    ) -> UserContext:
+        held = effective_capabilities(config, user.roles)
+        if not any(capability in held for capability in capabilities):
+            raise AuthorizationError()
+        return user
+
+    return _guard
+
+
 # The historical guards, now expressed as capability checks. The capability →
 # default-role mapping in ``app/core/capabilities.DEFAULT_GRANTS`` reproduces the
 # old hardcoded allow-lists exactly, so behaviour is unchanged until an engineer
@@ -356,6 +377,21 @@ require_alumni_photos = require_capability(Capability.ALUMNI_PHOTOS)
 require_events_manage = require_capability(Capability.EVENTS_MANAGE)
 require_notes_manage = require_capability(Capability.NOTES_MANAGE)
 require_surveys_manage = require_capability(Capability.SURVEYS_MANAGE)
+# The survey Progress tab as a read (#605): the schedule list that feeds it and
+# the "who replied" hover. `surveys.manage` ALSO admits, deliberately:
+#   * managing a campaign includes watching it — the console reads the same
+#     schedule list, so a role with "Manage surveys" but not this toggle would
+#     have a console that cannot load;
+#   * it defuses the deploy-ordering trap (see `expand_legacy_grants`): on a real
+#     database `surveys.progress` exists only once its seed migration has run,
+#     and without the fallback every survey manager would 403 on the Progress
+#     tab in the gap between the API deploy and the migrate job.
+# So this toggle WIDENS (hands the view to a role that must not manage, e.g.
+# student); revoking it from a manager does not hide progress from them. Every
+# mutating / campaign / approval route stays on `require_surveys_manage`.
+require_surveys_progress = require_any_capability(
+    Capability.SURVEYS_PROGRESS, Capability.SURVEYS_MANAGE
+)
 # Deleting an opportunity link (#441 follow-up). Carved OUT of surveys.manage
 # rather than added alongside it: surveys.manage still covers approve / reject /
 # add / edit, and this guard is the single rule for deletion — both the one-at-a-
@@ -400,6 +436,7 @@ RequireEventsImport = Annotated[UserContext, Depends(require_events_import)]
 RequireEventsManage = Annotated[UserContext, Depends(require_events_manage)]
 RequireNotesManage = Annotated[UserContext, Depends(require_notes_manage)]
 RequireSurveysManage = Annotated[UserContext, Depends(require_surveys_manage)]
+RequireSurveysProgress = Annotated[UserContext, Depends(require_surveys_progress)]
 RequireLinksDelete = Annotated[UserContext, Depends(require_links_delete)]
 RequireReportsAdvanced = Annotated[UserContext, Depends(require_reports_advanced)]
 RequireAlumniEdit = Annotated[UserContext, Depends(require_alumni_edit)]

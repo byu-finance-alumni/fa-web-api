@@ -577,3 +577,31 @@ def test_a_campaign_deleted_before_it_sent_anything_still_retires_its_cycle(worl
     assert result.emails_retired == 0
     assert [r.cycle_seq for r in world.retirements()] == [1]
     assert world.create_campaign().cycle_seq == 2
+
+
+def test_last_sent_at_is_the_last_email_not_the_last_cron_run(world):
+    """The console's "Last auto-send" said "today" on a day nothing went out:
+    the cron stamps `last_run_at` on every run, sends or not. `last_sent_at` is
+    read from the send log, so a quiet cron run cannot move it."""
+    world.cohort()
+    world.schedule()
+    world.sent(_ANN, (0,))
+    sent_at = world.send_rows()[0].sent_at
+    # A later cron run that owed nobody anything.
+    later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=3)
+    world.conn.execute(
+        SurveySchedule.__table__.update().values(last_run_at=later)
+    )
+    world.conn.commit()
+
+    item = asyncio.run(survey_schedule.get_schedule(world.session, _YEAR))
+    assert item.last_sent_at is not None
+    assert item.last_sent_at.replace(tzinfo=None) == sent_at.replace(tzinfo=None)
+    assert item.last_run_at.replace(tzinfo=None) == later.replace(tzinfo=None)
+
+
+def test_last_sent_at_is_none_before_any_email(world):
+    world.cohort()
+    world.schedule()
+    item = asyncio.run(survey_schedule.get_schedule(world.session, _YEAR))
+    assert item.last_sent_at is None

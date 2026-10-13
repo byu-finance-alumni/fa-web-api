@@ -474,7 +474,13 @@ class SurveyScheduleItem(BaseModel):
     # Which campaign this year is on (#357). 1 until someone starts a second
     # cycle. The per-stage counts below are scoped to THIS cycle, not all time.
     cycle_seq: int = 1
+    # When the daily cron last RAN for this year — stamped even on a run that
+    # sent nothing, so it is NOT "the last email". The console shows
+    # ``last_sent_at`` for that.
     last_run_at: datetime.datetime | None = None
+    # When this year's most recent survey email actually went out (any cycle,
+    # automatic or "send now"); None if none ever has.
+    last_sent_at: datetime.datetime | None = None
     created_at: datetime.datetime | None = None
     # Who started this campaign, as a display name (falling back to their email).
     # The internal ``created_by_user_id`` PK is never disclosed — only the

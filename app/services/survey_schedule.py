@@ -1129,6 +1129,22 @@ async def _creator_names(
     return names
 
 
+async def _last_sent_at(session: AsyncSession) -> dict[int, datetime.datetime]:
+    """When each graduation year's most recent survey email went out, any cycle.
+
+    What the console's "Last auto-send" shows. It used to show the schedule's
+    ``last_run_at``, but the daily cron stamps that on EVERY run — including the
+    runs where nothing was owed and nothing was sent — so the console said
+    "today" on a day no email left. ``last_run_at`` keeps that job (it paces
+    :func:`_next_cron_date`); this is the record of an email actually sent."""
+    stmt = select(SurveySendLog.graduation_year, func.max(SurveySendLog.sent_at)).group_by(
+        SurveySendLog.graduation_year
+    )
+    return {
+        year: at for year, at in (await session.execute(stmt)).all() if at is not None
+    }
+
+
 async def _all_time_send_counts(session: AsyncSession) -> dict[int, int]:
     """Emails ever sent for each graduation year, ACROSS EVERY CYCLE (#398).
 
@@ -1156,6 +1172,7 @@ def _to_item(
     fill_medians: dict[int, float] | None = None,
     next_sends: dict[int, tuple[int | None, datetime.date | None, int | None]]
     | None = None,
+    last_sent: dict[int, datetime.datetime] | None = None,
 ) -> SurveyScheduleItem:
     year = sched.graduation_year
     next_stage, next_send_date, next_send_count = (next_sends or {}).get(
@@ -1177,6 +1194,7 @@ def _to_item(
         status=sched.status,
         cycle_seq=getattr(sched, "cycle_seq", 1),
         last_run_at=sched.last_run_at,
+        last_sent_at=(last_sent or {}).get(year),
         created_at=getattr(sched, "created_at", None),
         created_by=creators.get(created_by_id) if created_by_id else None,
         paused_at=getattr(sched, "paused_at", None),
@@ -1322,6 +1340,7 @@ async def list_schedules(
     all_time = await _all_time_send_counts(session)
     progress = await _progress_counts(session)
     fill_medians = await _median_fill_times(session)
+    last_sent = await _last_sent_at(session)
     creators = await _creator_names(session, schedules)
     next_sends = await _next_sends(session, schedules) if with_next_send else None
     return [
@@ -1334,6 +1353,7 @@ async def list_schedules(
             progress,
             fill_medians,
             next_sends,
+            last_sent,
         )
         for s in schedules
     ]
@@ -1357,9 +1377,17 @@ async def get_schedule(
     all_time = await _all_time_send_counts(session)
     progress = await _progress_counts(session)
     fill_medians = await _median_fill_times(session)
+    last_sent = await _last_sent_at(session)
     creators = await _creator_names(session, [sched])
     return _to_item(
-        sched, counts, creators, non_responders, all_time, progress, fill_medians
+        sched,
+        counts,
+        creators,
+        non_responders,
+        all_time,
+        progress,
+        fill_medians,
+        last_sent=last_sent,
     )
 
 

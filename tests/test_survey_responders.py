@@ -335,9 +335,11 @@ def app_url(monkeypatch):
     )
 
 
-def _export(db, year=_YEAR, actor=1):
+def _export(db, year=_YEAR, actor=1, can_edit=True):
     session = _AuditingSession(db)
-    out = asyncio.run(ss.export_no_reply_csv(session, year, actor_user_id=actor))
+    out = asyncio.run(
+        ss.export_no_reply_csv(session, year, actor_user_id=actor, can_edit=can_edit)
+    )
     return out, session
 
 
@@ -671,9 +673,11 @@ def test_the_profile_columns_go_through_the_formula_guard(db, app_url):
 # count and the hover list over the same rows, never a hand-picked expectation.
 
 
-def _export_replied(db, year=_YEAR, actor=1):
+def _export_replied(db, year=_YEAR, actor=1, can_edit=True):
     session = _AuditingSession(db)
-    out = asyncio.run(ss.export_replied_csv(session, year, actor_user_id=actor))
+    out = asyncio.run(
+        ss.export_replied_csv(session, year, actor_user_id=actor, can_edit=can_edit)
+    )
     return out, session
 
 
@@ -774,6 +778,33 @@ def test_replied_export_carries_the_mailing_address(db, no_app_url):
     assert cells["Mailing Zip"] == "84604"
     assert cells["Mailing Country"] == "United States"
     assert cells["Profile Link"] == ""
+
+
+def test_non_editor_export_blanks_net_id_and_mailing_address(db, no_app_url):
+    """A caller who holds alumni.export without alumni.edit (not a default
+    grant, but the permission editor allows it) must not get the fields their
+    reads null -- same rule as the main export's visible_columns."""
+    db.schedule()
+    db.alum(1, last_name="Diaz", email="diaz@example.com")
+    db.conn.execute(text("UPDATE alumni SET net_id = 'net1' WHERE alumni_id = 1"))
+    db.conn.execute(
+        text(
+            "UPDATE alumni_contact_info SET address_line_1 = '1 Main St',"
+            " city = 'Provo', zip = '84604' WHERE alumni_id = 1"
+        )
+    )
+    db.sent(1, (0,))
+    db.replied(1, "confirmed")
+    header, row = _rows(_export_replied(db, can_edit=False)[0])
+    cells = dict(zip(header, row, strict=True))
+    assert cells["NetID"] == ""
+    for column in header:
+        if column.startswith("Mailing"):
+            assert cells[column] == "", column
+    assert cells["Name"]  # the rest of the row is still there
+    editor = dict(zip(*_rows(_export_replied(db)[0]), strict=True))
+    assert editor["NetID"] == "net1"
+    assert editor["Mailing Address 1"] == "1 Main St"
 
 
 def test_replied_export_is_audited_without_the_rows(db):

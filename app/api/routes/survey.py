@@ -1052,7 +1052,8 @@ async def export_survey_no_reply_all(
     yet" total minus archived alumni, which the file leaves out. Same gate,
     same columns, same audit trail."""
     csv_text = await survey_schedule.export_no_reply_csv(
-        session, None, actor_user_id=user.user_id
+        session, None, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
     )
     if csv_text is None:  # unreachable: only a single missing year yields None
         raise NotFoundError("No schedule exists for that graduation year.")
@@ -1090,7 +1091,8 @@ async def export_survey_no_reply(
     `export_survey_no_reply`. 404 = no campaign for the year. Returns `text/csv`
     as `survey_no_reply_<year>_<YYYY-MM-DD>.csv`."""
     csv_text = await survey_schedule.export_no_reply_csv(
-        session, grad_year, actor_user_id=user.user_id
+        session, grad_year, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
     )
     if csv_text is None:
         raise NotFoundError("No schedule exists for that graduation year.")
@@ -1107,7 +1109,8 @@ async def export_survey_replied_all(
     count is the summed `replied` column minus archived alumni, which the file
     leaves out. Same gate, same columns, same audit trail."""
     csv_text = await survey_schedule.export_replied_csv(
-        session, None, actor_user_id=user.user_id
+        session, None, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
     )
     if csv_text is None:  # unreachable: only a single missing year yields None
         raise NotFoundError("No schedule exists for that graduation year.")
@@ -1139,7 +1142,8 @@ async def export_survey_replied(
     Audit-logged as `export_survey_replied`. 404 = no campaign for the year.
     Returns `text/csv` as `survey_replied_<year>_<YYYY-MM-DD>.csv`."""
     csv_text = await survey_schedule.export_replied_csv(
-        session, grad_year, actor_user_id=user.user_id
+        session, grad_year, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
     )
     if csv_text is None:
         raise NotFoundError("No schedule exists for that graduation year.")

@@ -876,8 +876,16 @@ async def _export_cycle_csv(
     with_mailing: bool,
     action_type: str,
     actor_user_id: int | None,
+    can_edit: bool,
 ) -> str | None:
     """The shared body of the survey Progress exports (#836, #605).
+
+    ``can_edit`` is the caller's ``can_edit_alumni``. A non-editor gets the NetID
+    and mailing-address cells BLANKED (columns kept, so the header never moves):
+    those are fields their reads null, and the main export strips them for the
+    same callers (``alumni_export.visible_columns``). No default role holds
+    ``alumni.export`` without ``alumni.edit`` today; this keeps the file honest
+    if the permission editor ever grants one.
 
     ``population`` is a :func:`_cycle_send_summary` select — which side of the
     reply predicate the file reads. Everything else is identical for both files:
@@ -978,7 +986,7 @@ async def _export_cycle_csv(
             _csv_cell(phone, "str"),
             _csv_cell(emails_sent, "int"),
             _csv_cell(_as_date(last_sent_at), "date"),
-            _csv_cell(net_id, "str"),
+            _csv_cell(net_id if can_edit else None, "str"),
             _csv_cell(employer, "str"),
             _csv_cell(title, "str"),
             _csv_cell(industry, "str"),
@@ -995,7 +1003,10 @@ async def _export_cycle_csv(
             ),
         ]
         if with_mailing:
-            cells += [_csv_cell(value, "str") for value in row[19:25]]
+            cells += [
+                _csv_cell(value if can_edit else None, "str")
+                for value in row[19:25]
+            ]
         writer.writerow(cells)
 
     if actor_user_id is None:
@@ -1024,6 +1035,7 @@ async def export_no_reply_csv(
     graduation_year: int | None,
     *,
     actor_user_id: int | None,
+    can_edit: bool,
 ) -> str | None:
     """The "No reply yet" column as a CSV (#836) — one year, or every year.
 
@@ -1049,6 +1061,7 @@ async def export_no_reply_csv(
         with_mailing=False,
         action_type="export_survey_no_reply",
         actor_user_id=actor_user_id,
+        can_edit=can_edit,
     )
 
 
@@ -1057,6 +1070,7 @@ async def export_replied_csv(
     graduation_year: int | None,
     *,
     actor_user_id: int | None,
+    can_edit: bool,
 ) -> str | None:
     """The "Replied" column as a CSV (#605) — one year, or every year.
 
@@ -1079,6 +1093,7 @@ async def export_replied_csv(
         with_mailing=True,
         action_type="export_survey_replied",
         actor_user_id=actor_user_id,
+        can_edit=can_edit,
     )
 
 

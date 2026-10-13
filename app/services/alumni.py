@@ -1361,3 +1361,62 @@ async def restore_alumni(
         await session.commit()
         await session.refresh(alumnus)
     return alumnus
+
+
+async def confirm_current(
+    session: AsyncSession, alumni_id: int, actor_user_id: int | None = None
+) -> Alumni:
+    """Mark a profile as checked today without changing any of its data (#605).
+
+    The "Info confirmed" button: a staffer has looked at the record (usually
+    with the alum on the phone) and everything on it is still right. Without
+    this, the only way to move "Last updated" was to make a meaningless edit.
+
+    What it touches, and nothing else:
+      * ``alumni.updated_at`` -> now. Set explicitly: ``TimestampMixin.onupdate``
+        only fires on a dirty row, and re-stamping the same editor id below
+        does not dirty it.
+      * ``profile_updated_by_user_id`` -> the actor — the same last-updated
+        provenance (#285) ``update_alumni`` stamps, so the profile reads "Last
+        updated <today> by <name>". The intake-sheet ``profile_updated_by`` text
+        column is left alone, exactly as a normal edit leaves it.
+      * ``current_employment.last_verified_at`` -> now, when the alum has a
+        current role on file (it is a statement about that role). No row, no
+        insert — confirming must never manufacture an empty employment row.
+
+    ``manually_edited_at`` is deliberately NOT stamped: it means a human CHANGED
+    a value (the bulk import warns before reverting one, #420), and nothing was
+    changed here.
+
+    Archived records 404, symmetric with ``update_alumni``. Audited as one
+    ``confirm_current`` row on the alumnus (with its own change set, so the
+    version history shows it as one entry); an engineer's row is rerouted to
+    ``engineer_action_log`` by the audit hook (#199) like every other write.
+    """
+    alumnus = await get_alumni(session, alumni_id, include_archived=False)
+    now = _now()
+    alumnus.updated_at = now
+    if actor_user_id is not None:
+        alumnus.profile_updated_by_user_id = actor_user_id
+    role = await session.scalar(
+        select(CurrentEmployment)
+        .where(CurrentEmployment.alumni_id == alumni_id)
+        .order_by(CurrentEmployment.current_employment_id.desc())
+        .limit(1)
+    )
+    if role is not None:
+        role.last_verified_at = now
+    _audit(
+        session,
+        actor_user_id,
+        "confirm_current",
+        alumni_id,
+        new_value=now.date().isoformat(),
+        change_set_id=new_change_set_id(),
+    )
+    await session.commit()
+    await session.refresh(alumnus)
+    # Same response shape as PATCH /alumni/{id}; a confirmation writes no field,
+    # so there is nothing to warn about.
+    alumnus.duplicate_warnings = []
+    return alumnus

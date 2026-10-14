@@ -1223,9 +1223,20 @@ def _to_item(
 # "Which email goes out next, and when?" (#562) — answered for the console from
 # the same rules the cron sends by, so the two cannot disagree.
 
-# The daily survey cron (`vercel.json`: "0 18 * * *"). Vercel Hobby fires a cron
-# at any minute inside its hour, so only the DATE of the next run is promised.
+# The daily survey cron (`vercel.json`: "0 18 * * 0,2-6"). Vercel Hobby fires a
+# cron at any minute inside its hour, so only the DATE of the next run is promised.
+# It does NOT run on Mondays (#611, Jake 2026-10-14): whatever is due on a Monday
+# goes out on Tuesday instead. Nothing is lost — the cron sends whatever is still
+# owed, and a campaign only completes once every stage has drained.
 _CRON_HOUR_UTC = 18
+_CRON_SKIPPED_WEEKDAY = 0  # date.weekday(): Monday
+
+
+def _skip_cron_rest_day(day: datetime.date) -> datetime.date:
+    """``day``, or the next day the cron actually runs if it lands on Monday."""
+    if day.weekday() == _CRON_SKIPPED_WEEKDAY:
+        return day + datetime.timedelta(days=1)
+    return day
 
 
 def _next_cron_date(
@@ -1235,9 +1246,11 @@ def _next_cron_date(
 
     Before 18:00 UTC that is today; from 19:00 it is tomorrow. Inside the 18:00
     hour the cron may or may not have fired — a ``last_run_at`` stamped since
-    18:00 today says it has."""
+    18:00 today says it has. Mondays are skipped (:data:`_CRON_SKIPPED_WEEKDAY`)."""
     today = now.date()
-    tomorrow = today + datetime.timedelta(days=1)
+    tomorrow = _skip_cron_rest_day(today + datetime.timedelta(days=1))
+    if today.weekday() == _CRON_SKIPPED_WEEKDAY:
+        return tomorrow
     if now.hour < _CRON_HOUR_UTC:
         return today
     if now.hour > _CRON_HOUR_UTC:
@@ -1297,7 +1310,7 @@ async def _next_send(
         days=stage * _STAGE_WINDOW_DAYS
     )
     run_date = _next_cron_date(_now(), sched.last_run_at)
-    return stage, max(run_date, window_opens), len(targets)
+    return stage, _skip_cron_rest_day(max(run_date, window_opens)), len(targets)
 
 
 async def _next_sends(

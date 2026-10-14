@@ -7,7 +7,7 @@
   "crons": [
     {
       "path": "/survey/cron/run",
-      "schedule": "0 18 * * *"
+      "schedule": "0 18 * * 0,2-6"
     },
     {
       "path": "/storage/cron/headshot-sweep",

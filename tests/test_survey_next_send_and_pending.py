@@ -293,6 +293,29 @@ def test_next_cron_date(hour, minute, last_run_hour, expected_offset):
     )
 
 
+@pytest.mark.parametrize(
+    "now_day,hour,expected_day",
+    [
+        (4, 19, 6),  # Sunday evening: Monday is skipped, next run is Tuesday
+        (5, 9, 6),  # Monday morning: no run today
+        (5, 19, 6),  # Monday evening
+        (6, 9, 6),  # Tuesday morning runs as normal
+    ],
+)
+def test_next_cron_date_skips_monday(now_day, hour, expected_day):
+    # #611: the cron does not run on Mondays. _day(5) is a Monday.
+    assert _day(5).weekday() == 0
+    now = _at(_day(now_day), hour)
+    assert survey_schedule._next_cron_date(now, None) == _day(expected_day)
+
+
+def test_a_stage_due_on_monday_is_shown_for_tuesday(world, clock):
+    # A campaign starting on a Monday sends its initial on the Tuesday.
+    world.cohort()
+    clock(0, 9)
+    assert _next(world, _sched(start=_day(5))) == (0, _day(6), 2)
+
+
 # ----------------------------------------------- #562 next send: which stage ---
 
 
@@ -383,7 +406,8 @@ def test_the_date_follows_the_rows_start_date_not_the_calendar(world, clock):
     world.sent(_ANN, [0])
     world.sent(_BEN, [0])
     clock(3)
-    resumed = _START + datetime.timedelta(days=5)
+    # +6, not +5: the reminder must land on a Tuesday, not a skipped Monday (#611).
+    resumed = _START + datetime.timedelta(days=6)
     assert _next(world, _sched(start=resumed)) == (
         1,
         resumed + datetime.timedelta(days=7),

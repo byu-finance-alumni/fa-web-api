@@ -218,7 +218,7 @@ def main() -> int:
         "",
         *tw_lines,
         "",
-        f"## Dependencies ({dep_state}) — full tree, not just prod",
+        f"## Dependencies ({dep_state}) — what ships (uv.lock)",
         "",
         *dep_lines,
         "",

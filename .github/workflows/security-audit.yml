@@ -100,9 +100,18 @@ jobs:
         continue-on-error: true
         run: python -m scripts.security_scan --json tripwires.json
 
-      - name: API - dependency audit (full tree)
+      # ⚠️ AUDIT uv.lock, NOT THIS RUNNER. Vercel installs exactly what uv.lock
+      # pins. Auditing the runner's own env (2026-10-19) got it wrong both ways:
+      # it flagged `mcp`, a dependency of semgrep that never ships, and it missed
+      # the pinned pyjwt/cryptography, because `pip install -e .` had pulled
+      # newer releases than the ones live.
+      - name: API - dependency audit (what ships, from uv.lock)
         continue-on-error: true
-        run: pip-audit --format json --output pip-audit.json --progress-spinner off
+        run: |
+          pip install uv
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt -o shipped-requirements.txt
+          pip-audit -r shipped-requirements.txt --require-hashes --disable-pip \
+            --format json --output pip-audit.json --progress-spinner off
 
       - name: API - Semgrep
         continue-on-error: true

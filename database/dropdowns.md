@@ -43,7 +43,7 @@ Options:
 - Credit Risk *(secondary only)*
 - Equity Research
 - Financial Services
-- FP&A
+- FP&A *(secondary only)*
 - Investment Banking
 - Law *(secondary only)*
 - Military
@@ -62,7 +62,8 @@ Options:
 
 ### Primary vs secondary (#282)
 
-Requested by Tanya, 2026-07-16. The four options marked *(secondary only)* are
+Requested by Tanya, 2026-07-16 (FP&A added by Jake, 2026-10-21, fa-web-app
+#875). The five options marked *(secondary only)* are
 **not offered as an alumnus's primary industry** — they aren't dashboard
 industries — but they remain fully valid as a **secondary** industry.
 
@@ -84,8 +85,17 @@ new-entry dropdowns"): the #282 data migration deliberately skips records that
 already had a secondary industry, so some records legitimately keep one of the
 four as their primary and must still save without a 422.
 
-`FP&A` is likewise not a dashboard industry, but Tanya did **not** ask to remove
-it from primary — leave it in primary unless she says otherwise.
+`FP&A` became secondary-only on 2026-10-21 (Jake, fa-web-app #875). It used to
+be the one non-dashboard industry kept in primary; it now gets exactly the same
+treatment as the original four. The existing prod records with FP&A as their
+current primary are moved by hand with
+`database/maintenance/875-fpa-to-corporate-finance.sql` (primary becomes
+`Corporate Finance`, FP&A is kept as the secondary).
+
+On the **public survey** the primary-industry answer only accepts
+`PRIMARY_INDUSTRIES`: a submitted secondary-only value is ignored (not stored,
+not a 422), so a record already holding one keeps it untouched. The survey's
+secondary-industry answer is free text and still takes FP&A.
 
 ### Graduate Student (#294)
 

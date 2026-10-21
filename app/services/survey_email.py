@@ -93,7 +93,12 @@ from app.schemas.survey import (
     SurveyUsage,
 )
 from app.services import mailer, opportunity_link_digest, survey_message
-from app.services.survey_message import ON_FILE_FIELDS, SurveyMessage
+from app.services.survey_message import (
+    ON_FILE_FIELDS,
+    SurveyMessage,
+    copy_to_html,
+    copy_to_text,
+)
 
 log = logging.getLogger(__name__)
 
@@ -826,15 +831,22 @@ def render_survey_email(
     note = message.reminder_note.strip() if stage != STAGE_INITIAL else ""
 
     # Plain-text part.
+    # The staff copy goes through `copy_to_text`, which drops matched
+    # `**bold**` markers (#877) — the plain-text part has no bold to show, and
+    # literal asterisks around a phrase would read as a typo.
     text_lines = [f"Hello {r.first_name},", ""]
     if note:
-        text_lines += [note, ""]
-    text_lines += [message.intro, ""]
+        text_lines += [copy_to_text(note), ""]
+    text_lines += [copy_to_text(message.intro), ""]
     if rows:
         text_lines.append("Here's what we have on file:")
         text_lines += [f"  {label}: {value}" for label, value in rows]
         text_lines.append("")
-    text_lines += [f"Confirm or update your info: {link}", "", message.closing]
+    text_lines += [
+        f"Confirm or update your info: {link}",
+        "",
+        copy_to_text(message.closing),
+    ]
     text = "\n".join(text_lines)
 
     # HTML part (inline styles for email clients).
@@ -861,7 +873,12 @@ def render_survey_email(
     # ESCAPED text and can only introduce paragraph and line breaks. Anything
     # that looks like a tag in what someone typed stays visible text. The
     # reminder note (#560) is under the same rule — see `note_html`.
-    intro_html = escape(message.intro).replace(
+    #
+    # `copy_to_html` is that escape plus the ONE other piece of markup staff copy
+    # may carry: `**bold**` pairs as <strong> (#877), inserted around the
+    # already-escaped text and never spanning a line. The subject is NOT passed
+    # through it — a header has no bold.
+    intro_html = copy_to_html(message.intro).replace(
         "\n\n", "</p><p style=\"margin:0 0 12px;\">"
     )
     # Same escape-then-markup rule as the intro above, and the same markup: the
@@ -871,12 +888,12 @@ def render_survey_email(
     # exactly what it rendered before #560.
     note_html = (
         '<p style="margin:0 0 12px;font-size:15px;">'
-        + escape(note).replace("\n\n", '</p><p style="margin:0 0 12px;">')
+        + copy_to_html(note).replace("\n\n", '</p><p style="margin:0 0 12px;">')
         + "</p>"
         if note
         else ""
     )
-    closing_html = escape(message.closing).replace("\n", "<br>")
+    closing_html = copy_to_html(message.closing).replace("\n", "<br>")
     html = f"""\
 <div style="margin:0;padding:0;background:#f3f4f6;">
   <div style="max-width:600px;margin:0 auto;background:#ffffff;">

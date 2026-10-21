@@ -94,8 +94,8 @@ async def get_vocabulary(
             description=(
                 "'all' (default) returns every active term. 'primary' additionally "
                 "hides the industries that may only be used as a SECONDARY industry "
-                "(Law, Corporate Banking, Sales and Trading, Credit Risk) — pass it "
-                "when rendering the PRIMARY industry dropdown. No effect on other "
+                "(Law, Corporate Banking, Sales and Trading, Credit Risk, FP&A) — "
+                "pass it when rendering the PRIMARY industry dropdown. No effect on other "
                 "categories."
             )
         ),

@@ -425,11 +425,9 @@ _FIELDS: tuple[_Field, ...] = (
     # `validate_industry`; the difference is only that the survey can no longer
     # SET one. "Other" stays in `PRIMARY_INDUSTRIES`, so it is still writable.
     #
-    # KNOWN GAP, needs a frontend change (Jake): the survey's industry control has
-    # an "Other" option that reveals a FREE-TEXT box. Whatever is typed there is
-    # now off-list and therefore ignored, silently. The frontend fix is to make
-    # that option submit the literal "Other" — which IS in `PRIMARY_INDUSTRIES` —
-    # rather than a typed string. Until then an alum choosing Other loses that answer.
+    # "Other" (fa-web-app #874): the survey's industry control submits the
+    # literal "Other" — which IS in `PRIMARY_INDUSTRIES` — with no free-text box,
+    # so choosing Other is a real, saved answer.
     _Field(
         "employment.current_industry",
         "Industry",

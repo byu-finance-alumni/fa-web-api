@@ -45,6 +45,7 @@ sample-survey lists must agree, and a parity test enforces it.
 import logging
 import unicodedata
 from dataclasses import dataclass
+from html import escape
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -149,6 +150,96 @@ SUBJECT_MAX_CHARS = 200
 BODY_MAX_CHARS = 5000
 # The reminder line is a sentence or two, not a second body (#560).
 REMINDER_NOTE_MAX_CHARS = 2000
+
+
+# ------------------------------------------------------------ bold markers --
+#
+# Staff can bold words in the intro, the closing and the reminder line by
+# wrapping them in ``**double asterisks**`` (#877). The SUBJECT never gets this:
+# it is a header, and ``**`` in it is sent as typed.
+#
+# THE RULE, which the frontend's ``src/lib/surveyBold.ts`` mirrors exactly (the
+# editor preview and the sample survey must bold what the real email bolds):
+#
+#   * A pair is the first ``**`` on a LINE and the next ``**`` after it on that
+#     same line. A pair never spans a line break, so it can never span a
+#     paragraph break either, and one stray ``**`` cannot bold the rest of an
+#     email.
+#   * No nesting: whatever sits between the markers is plain text.
+#   * A pair with nothing (or only spaces/tabs) between the markers is not bold;
+#     it stays as typed — "****" left behind by the Bold button with nothing
+#     typed into it is visible rather than silently swallowed.
+#   * An unmatched ``**`` stays as literal text, in both parts of the email.
+#
+# WHY A SCANNER, NOT A REGEX. CodeQL's ``py/polynomial-redos`` reports the
+# PATTERN, not whether it is reachable (2026-08-31: three prod promotions spent
+# learning that a length cap never clears it). A ``\*\*(.+?)\*\*`` pattern is
+# exactly the shape it flags. ``_bold_segments`` below uses only ``str.find``:
+# every search starts where the previous one ended, so each character is looked
+# at a bounded number of times and the whole pass is O(n) whatever is typed.
+#
+# WHY IT IS SAFE. ``copy_to_html`` ESCAPES FIRST and only then inserts
+# ``<strong>`` / ``</strong>`` around the already-escaped text. ``html.escape``
+# never produces or consumes ``*`` or a newline, so escaping cannot create or
+# break a pair, and the only markup this can ever introduce is those two literal
+# tags. Raw HTML in the copy is never accepted — it stays visible text.
+
+_BOLD_MARK = "**"
+_BOLD_BLANK = " \t"
+
+
+def _bold_segments(text: str) -> list[tuple[bool, str]]:
+    """Split ``text`` into ``(is_bold, chunk)`` pieces, markers removed from bold
+    ones. Concatenating the chunks of a non-bold piece gives back exactly what
+    was typed; see the rule above.
+    """
+    out: list[tuple[bool, str]] = []
+    lines = text.split("\n")
+    for n, line in enumerate(lines):
+        i = 0
+        while True:
+            start = line.find(_BOLD_MARK, i)
+            if start == -1:
+                break
+            end = line.find(_BOLD_MARK, start + 2)
+            if end == -1:
+                break
+            inner = line[start + 2 : end]
+            if inner.strip(_BOLD_BLANK) == "":
+                # "****" or "**  **": not bold, kept as typed, and scanning
+                # carries on AFTER the closing marker (so it cannot pair up
+                # with a later one and bold the gap in between).
+                out.append((False, line[i : end + 2]))
+            else:
+                if start > i:
+                    out.append((False, line[i:start]))
+                out.append((True, inner))
+            i = end + 2
+        if i < len(line):
+            out.append((False, line[i:]))
+        if n < len(lines) - 1:
+            out.append((False, "\n"))
+    return out
+
+
+def copy_to_html(text: str) -> str:
+    """Staff copy as HTML: escaped, with ``**pairs**`` as ``<strong>``.
+
+    Escapes FIRST, then scans the escaped text for pairs. Newlines are left as
+    they are; the caller turns them into paragraphs / ``<br>`` afterwards.
+    """
+    return "".join(
+        f"<strong>{chunk}</strong>" if bold else chunk
+        for bold, chunk in _bold_segments(escape(text))
+    )
+
+
+def copy_to_text(text: str) -> str:
+    """Staff copy for the plain-text part: matched ``**`` markers removed.
+
+    An unmatched or empty pair is left exactly as typed, the same as in HTML.
+    """
+    return "".join(chunk for _, chunk in _bold_segments(text))
 
 
 @dataclass(frozen=True)

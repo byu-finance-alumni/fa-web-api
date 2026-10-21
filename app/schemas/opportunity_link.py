@@ -22,8 +22,16 @@ import datetime
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
+from app.core.semesters import semester_of
 from app.models.opportunity_link import (
     CITY_MAX,
     COMPANY_NAME_MAX,
@@ -510,6 +518,24 @@ class OpportunityLinkRead(BaseModel):
     reviewed_by: str | None = None
     reviewed_at: datetime.datetime | None = None
 
+    # The BYU semester the link was SUBMITTED in (#876), derived from
+    # ``submitted_at`` on the Mountain clock by ``app.core.semesters`` — the one
+    # place that calendar lives. Computed rather than stored or passed in, so
+    # every producer of this shape (list, single fetch, writes, the CSV) labels
+    # a link identically and none of them can forget to.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def semester(self) -> str:
+        """The semester as the ``semester`` query parameter spells it:
+        ``Fall-2026``. The Links page groups on this."""
+        return semester_of(self.submitted_at).key
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def semester_label(self) -> str:
+        """The same semester for display and the CSV: ``Fall 2026``."""
+        return semester_of(self.submitted_at).label
+
 
 class OpportunityLinkFilters(BaseModel):
     """THE population selector for the Links list — and for its CSV export.
@@ -555,6 +581,12 @@ class OpportunityLinkFilters(BaseModel):
     #: day rather than only what arrived at midnight.
     submitted_from: datetime.date | None = None
     submitted_to: datetime.date | None = None
+    #: BYU semesters SUBMITTED in (#876), as canonical keys (``Fall-2026``),
+    #: newest first, de-duplicated — already parsed by
+    #: ``app.core.semesters.parse_semesters``. Empty means NO semester
+    #: restriction (no predicate at all), the same as before semesters existed.
+    #: Combines with the date range by AND: a link must satisfy both.
+    semesters: tuple[str, ...] = ()
 
 
 def resolve_status(requested: str | None) -> str:
@@ -575,6 +607,27 @@ class OpportunityLinkPage(BaseModel):
     total: int
     limit: int
     offset: int
+    #: The semester (``Fall-2026``) of the row immediately BEFORE this page, in
+    #: the list's order — ``None`` on the first page or past the end. The page
+    #: groups its rows under semester headings; when its first group carries
+    #: on from the previous page, this is how it knows to say so rather than
+    #: implying the heading starts here (#876).
+    previous_semester: str | None = None
+
+
+class OpportunityLinkSemesterCount(BaseModel):
+    """One semester that has links under the current filters, and how many."""
+
+    semester: str
+    label: str
+    count: int
+
+
+class OpportunityLinkSemesters(BaseModel):
+    """The semesters the Links filter offers as checkboxes (#876): every
+    semester with at least one link under the current filters, newest first."""
+
+    items: list[OpportunityLinkSemesterCount]
 
 
 class OpportunityLinkBulkDeleteRequest(BaseModel):

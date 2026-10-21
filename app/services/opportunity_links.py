@@ -65,10 +65,16 @@ import io
 import logging
 from types import SimpleNamespace
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, and_, extract, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
+from app.core.semesters import (
+    SEMESTER_TZ,
+    parse_semester,
+    semester_for_local,
+    semester_of,
+)
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.employment import CurrentEmployment
@@ -85,6 +91,8 @@ from app.schemas.opportunity_link import (
     OpportunityLinkFilters,
     OpportunityLinkPage,
     OpportunityLinkRead,
+    OpportunityLinkSemesterCount,
+    OpportunityLinkSemesters,
     OpportunityLinkSubmitRequest,
     OpportunityLinkSubmitResult,
     OpportunityLinkUpdate,
@@ -440,6 +448,24 @@ def _filtered(stmt: Select, filters: OpportunityLinkFilters) -> Select:
         stmt = stmt.where(OpportunityLink.submitted_at >= _day_start(filters.submitted_from))
     if filters.submitted_to is not None:
         stmt = stmt.where(OpportunityLink.submitted_at <= _day_end(filters.submitted_to))
+    # SEMESTER SUBMITTED (#876). An OR of half-open ``[start, end)`` ranges on
+    # ``submitted_at``, one per ticked semester, with the bounds computed by
+    # ``app.core.semesters`` on the Mountain clock. Plain range comparisons on
+    # the raw column — no per-row time-zone function — so it stays index-able
+    # and is evaluated in SQL, never by loading rows and filtering in Python.
+    # ANDed with the date range above: both must hold. An empty selection adds
+    # no predicate at all.
+    if filters.semesters:
+        ranges = []
+        for key in filters.semesters:
+            start, end = parse_semester(key).bounds()
+            ranges.append(
+                and_(
+                    OpportunityLink.submitted_at >= start,
+                    OpportunityLink.submitted_at < end,
+                )
+            )
+        stmt = stmt.where(or_(*ranges))
     return stmt
 
 
@@ -507,6 +533,36 @@ def _like_term(value: str) -> str:
     return f"%{escaped}%"
 
 
+async def _previous_semester(
+    session: AsyncSession, filters: OpportunityLinkFilters, offset: int
+) -> str | None:
+    """The semester of the row just before ``offset`` in the list's order.
+
+    One indexed single-row lookup — the same population, the same ordering, one
+    row back — so the page can tell "Fall 2026 starts here" from "Fall 2026
+    carries on from the previous page" (#876). ``None`` on the first page.
+    """
+    if offset <= 0:
+        return None
+    stmt = (
+        _ordered(
+            _filtered(
+                select(OpportunityLink.submitted_at).outerjoin(
+                    CurrentEmployment,
+                    CurrentEmployment.alumni_id == OpportunityLink.alumni_id,
+                ),
+                filters,
+            )
+        )
+        .offset(offset - 1)
+        .limit(1)
+    )
+    moment = await session.scalar(stmt)
+    if not isinstance(moment, datetime.datetime):
+        return None
+    return semester_of(moment).key
+
+
 async def list_links(
     session: AsyncSession,
     filters: OpportunityLinkFilters,
@@ -520,6 +576,12 @@ async def list_links(
     Takes the SAME ``OpportunityLinkFilters`` the CSV export takes and runs the
     SAME :func:`build_population_query` over it. Paging is the only difference
     between what this returns and what the export writes.
+
+    Each item carries its ``semester`` (#876), and the envelope carries
+    ``previous_semester`` so the page's headings stay right across a page
+    boundary. Because the list is ordered by ``submitted_at`` and a semester is
+    a contiguous span of ``submitted_at``, every semester is one unbroken run of
+    rows — grouping is just "start a heading when the semester changes".
     """
     total = await session.scalar(build_population_count(filters)) or 0
     rows = (
@@ -531,11 +593,65 @@ async def list_links(
         .scalars()
         .all()
     )
+    previous = await _previous_semester(session, filters, offset) if rows else None
     return OpportunityLinkPage(
         items=await _project(session, list(rows), redact_archived=redact_archived),
         total=total,
         limit=limit,
         offset=offset,
+        previous_semester=previous,
+    )
+
+
+# --------------------------------------------------------------- semesters ----
+
+
+def build_semester_facet(filters: OpportunityLinkFilters) -> Select:
+    """Link counts per Mountain-local ``(year, month)`` under ``filters``,
+    IGNORING any semester selection (#876).
+
+    The semester selection is dropped on purpose: this is what the checkboxes
+    are built from, and a picker that only offered what is already ticked could
+    never be widened. Every OTHER filter (status, role, company, search, dates)
+    applies, through the same :func:`_filtered`, so the counts beside each box
+    are the counts the list would show.
+
+    Grouped by month rather than by term so the month-to-term rule stays in
+    ``app.core.semesters`` — Postgres does the time-zone conversion and the
+    aggregation, Python only folds at most twelve rows a year into terms.
+    """
+    local = func.timezone(SEMESTER_TZ.key, OpportunityLink.submitted_at)
+    year = extract("year", local).label("local_year")
+    month = extract("month", local).label("local_month")
+    unrestricted = filters.model_copy(update={"semesters": ()})
+    stmt = _filtered(
+        select(year, month, func.count(OpportunityLink.opportunity_link_id)).outerjoin(
+            CurrentEmployment,
+            CurrentEmployment.alumni_id == OpportunityLink.alumni_id,
+        ),
+        unrestricted,
+    )
+    return stmt.group_by(year, month)
+
+
+async def list_semesters(
+    session: AsyncSession, filters: OpportunityLinkFilters
+) -> OpportunityLinkSemesters:
+    """The semesters that actually have links under ``filters``, newest
+    first, with counts. See :func:`build_semester_facet`."""
+    rows = (await session.execute(build_semester_facet(filters))).all()
+    counts: dict = {}
+    for local_year, local_month, n in rows:
+        sem = semester_for_local(int(local_year), int(local_month))
+        counts[sem] = counts.get(sem, 0) + int(n)
+    ordered = sorted(counts, key=lambda s: s.sort_key, reverse=True)
+    return OpportunityLinkSemesters(
+        items=[
+            OpportunityLinkSemesterCount(
+                semester=s.key, label=s.label, count=counts[s]
+            )
+            for s in ordered
+        ]
     )
 
 
@@ -554,6 +670,7 @@ MAX_EXPORT_ROWS = 10_000
 EXPORT_COLUMNS: tuple[str, ...] = (
     "Link ID",
     "Date received",
+    "Semester",
     "Submitted by",
     "Alumni ID",
     "Company",
@@ -607,6 +724,7 @@ def _export_row(link: OpportunityLinkRead) -> list[str]:
     return [
         _cell(link.opportunity_link_id),
         _cell(link.submitted_at),
+        _cell(link.semester_label),
         _cell(link.submitted_by),
         _cell(link.alumni_id),
         _cell(link.company_name),
@@ -702,6 +820,7 @@ def describe_filters(filters: OpportunityLinkFilters) -> str:
             "submitted_to",
             filters.submitted_to.isoformat() if filters.submitted_to else None,
         ),
+        ("semester", ",".join(filters.semesters) if filters.semesters else None),
     )
     return ";".join(f"{k}={v}" for k, v in pairs if v is not None)
 

@@ -60,6 +60,7 @@ from app.core.database import get_session
 from app.core.errors import InvalidRequestError
 from app.core.rate_limit import ViewExportReadRateLimit
 from app.core.security import AuthorizationError
+from app.core.semesters import MAX_SEMESTERS, parse_semesters
 from app.schemas.auth import UserContext
 from app.schemas.opportunity_link import (
     LinkStatus,
@@ -69,6 +70,7 @@ from app.schemas.opportunity_link import (
     OpportunityLinkFilters,
     OpportunityLinkPage,
     OpportunityLinkRead,
+    OpportunityLinkSemesters,
     OpportunityLinkUpdate,
     RoleType,
     resolve_status,
@@ -143,6 +145,19 @@ SubmittedToParam = Annotated[
         )
     ),
 ]
+SemesterParam = Annotated[
+    list[str] | None,
+    Query(
+        alias="semester",
+        description=(
+            "BYU semester SUBMITTED in, repeatable: ?semester=Fall-2026"
+            "&semester=Winter-2027. Winter = Jan-Apr, Spring = May-Jun, "
+            "Summer = Jul-Aug, Fall = Sep-Dec, on America/Denver time. Exact "
+            f"form Term-YYYY; at most {MAX_SEMESTERS}. Omit for no semester "
+            "restriction. ANDed with the submitted_from/submitted_to range."
+        ),
+    ),
+]
 
 
 def _resolve_filters(
@@ -155,6 +170,7 @@ def _resolve_filters(
     q: str | None,
     submitted_from: datetime.date | None,
     submitted_to: datetime.date | None,
+    semester: list[str] | None = None,
 ) -> OpportunityLinkFilters:
     """Turn the query string into THE filter object, enforcing the status gate.
 
@@ -173,6 +189,12 @@ def _resolve_filters(
     A 422 rather than a silent swap when the range is inverted: a report that
     quietly returns nothing looks identical to a report of a quiet week, and the
     person reading it would have no way to tell.
+
+    The ``semester`` values (#876) are parsed STRICTLY here, by
+    ``app.core.semesters.parse_semesters``, before anything touches SQL: a
+    malformed value, an out-of-range year or too many values is a 422, never a
+    silently ignored box — a report that dropped a semester the user ticked
+    would look complete.
     """
     wants = resolve_status(status_filter)
     if wants != "approved" and not _may_moderate(user, config):
@@ -184,6 +206,10 @@ def _resolve_filters(
         and submitted_from > submitted_to
     ):
         raise InvalidRequestError("submitted_from must be on or before submitted_to.")
+    try:
+        semesters = tuple(s.key for s in parse_semesters(semester))
+    except ValueError as exc:
+        raise InvalidRequestError(str(exc)) from exc
     return OpportunityLinkFilters(
         status=wants,
         role_type=role_type,
@@ -191,6 +217,7 @@ def _resolve_filters(
         search=q,
         submitted_from=submitted_from,
         submitted_to=submitted_to,
+        semesters=semesters,
     )
 
 
@@ -205,6 +232,7 @@ async def list_opportunity_links(
     q: SearchParam = None,
     submitted_from: SubmittedFromParam = None,
     submitted_to: SubmittedToParam = None,
+    semester: SemesterParam = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> OpportunityLinkPage:
@@ -231,6 +259,7 @@ async def list_opportunity_links(
         q=q,
         submitted_from=submitted_from,
         submitted_to=submitted_to,
+        semester=semester,
     )
     # Archived submitters are named only to full_access and up (#591).
     return await service.list_links(
@@ -253,6 +282,7 @@ async def export_opportunity_links(
     q: SearchParam = None,
     submitted_from: SubmittedFromParam = None,
     submitted_to: SubmittedToParam = None,
+    semester: SemesterParam = None,
 ) -> Response | JSONResponse:
     """The dated report (#771): the filtered Links list as a CSV download.
 
@@ -300,6 +330,7 @@ async def export_opportunity_links(
         q=q,
         submitted_from=submitted_from,
         submitted_to=submitted_to,
+        semester=semester,
     )
     total = await service.count_links(session, filters)
     if total > service.MAX_EXPORT_ROWS:
@@ -311,7 +342,7 @@ async def export_opportunity_links(
                     "message": (
                         f"This export matches {total:,} links, over the "
                         f"{service.MAX_EXPORT_ROWS:,}-row limit. Narrow the date "
-                        "range and try again."
+                        "range or the semesters and try again."
                     ),
                 }
             },
@@ -331,6 +362,48 @@ async def export_opportunity_links(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/semesters", response_model=OpportunityLinkSemesters)
+async def list_opportunity_link_semesters(
+    user: RequireViewAccess,
+    config: PermissionConfig,
+    session: SessionDep,
+    status_filter: StatusParam = None,
+    role_type: RoleTypeParam = None,
+    company: CompanyParam = None,
+    q: SearchParam = None,
+    submitted_from: SubmittedFromParam = None,
+    submitted_to: SubmittedToParam = None,
+) -> OpportunityLinkSemesters:
+    """The semesters the Links filter offers as checkboxes (#876).
+
+    FROM THE DATA, not a fixed calendar window: every semester that has at least
+    one link under the other current filters, newest first, with its count. A
+    fixed "last N terms" range would offer boxes that can only ever return
+    nothing and would hide an older semester that does have postings; this
+    always offers exactly the terms a report could contain, and the counts tell
+    staff what each tick adds before they export.
+
+    Takes the list's filter parameters MINUS ``semester`` (and paging): the
+    options must not shrink to whatever is already ticked. Resolved by the same
+    :func:`_resolve_filters`, so the status default and the status gate are the
+    list's — a view-only caller sees counts for approved links only, and asking
+    for ``pending``/``rejected`` without ``surveys.manage`` is the same 403.
+
+    ⚠️ DECLARED BEFORE ``/{link_id}``, for the same reason as ``/export``.
+    """
+    filters = _resolve_filters(
+        user,
+        config,
+        status_filter=status_filter,
+        role_type=role_type,
+        company=company,
+        q=q,
+        submitted_from=submitted_from,
+        submitted_to=submitted_to,
+    )
+    return await service.list_semesters(session, filters)
 
 
 @router.post("/cron/digest", include_in_schema=False)

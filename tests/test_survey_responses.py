@@ -7,7 +7,11 @@ import uuid
 
 import pytest
 
-from app.core.dropdowns import INDUSTRIES, SURVEY_EMPLOYMENT_STATUSES
+from app.core.dropdowns import (
+    INDUSTRIES,
+    PRIMARY_INDUSTRIES,
+    SURVEY_EMPLOYMENT_STATUSES,
+)
 from app.core.errors import NotFoundError
 from app.models.audit import AuditLog
 from app.models.survey_response import SurveyResponse
@@ -1123,8 +1127,9 @@ _FRONTEND_EMPLOYMENT_STATUS_OPTIONS = (
     "Unemployed",
 )
 
-# `INDUSTRY_CHOICES` - PRIMARY_INDUSTRY_OPTIONS (the vocabulary minus the four
-# secondary-only industries) minus "Other", which the control handles separately.
+# `INDUSTRY_CHOICES` - PRIMARY_INDUSTRY_OPTIONS (the vocabulary minus the five
+# secondary-only industries; FP&A joined them in #875) minus "Other", which the
+# control handles separately.
 _FRONTEND_INDUSTRY_CHOICES = (
     "Asset Management",
     "Commercial Banking",
@@ -1132,7 +1137,6 @@ _FRONTEND_INDUSTRY_CHOICES = (
     "Corporate Finance",
     "Equity Research",
     "Financial Services",
-    "FP&A",
     "Investment Banking",
     "Military",
     "Private Banking",
@@ -1155,7 +1159,7 @@ def test_industry_and_employment_status_are_constrained_choices():
         "current_industry",
         "choice",
     )
-    assert industry.options == INDUSTRIES
+    assert industry.options == PRIMARY_INDUSTRIES
 
     status = sr._FIELD_BY_KEY["profile.employment_status"]
     assert (status.group, status.column, status.kind) == (
@@ -1181,20 +1185,84 @@ def test_every_industry_the_survey_offers_is_writable(value):
     assert _coerce(sr._FIELD_BY_KEY["employment.current_industry"], value) == value
 
 
-def test_the_backend_accepts_more_industries_than_the_survey_offers():
-    """Deliberate, and the right direction for the asymmetry: the four
-    secondary-only industries and "Other" are legitimate stored values, so an alum
-    re-submitting one already on file must not be refused. The reverse asymmetry -
-    an offered option the server rejects - is what the two tests above forbid."""
+_SECONDARY_ONLY_INDUSTRIES = (
+    "Law",
+    "Corporate Banking",
+    "Sales and Trading",
+    "Credit Risk",
+    "FP&A",
+)
+
+
+def test_other_is_writable_though_the_survey_does_not_list_it():
+    """"Other" is handled by its own control, not `INDUSTRY_CHOICES`, but it is a
+    real primary industry and must still be written."""
     field = sr._FIELD_BY_KEY["employment.current_industry"]
-    for not_offered in (
-        "Law",
-        "Corporate Banking",
-        "Sales and Trading",
-        "Credit Risk",
-        "Other",
-    ):
-        assert _coerce(field, not_offered) == not_offered
+    assert _coerce(field, "Other") == "Other"
+
+
+@pytest.mark.parametrize("value", _SECONDARY_ONLY_INDUSTRIES)
+def test_a_secondary_only_industry_is_refused_as_the_primary(value):
+    """#875: the five secondary-only industries (FP&A among them) can no longer be
+    SET as a primary industry through the public survey, in any casing. Refused
+    is `_IGNORE` - never written, never a 422 - see the next test for why that
+    keeps a legacy record safe."""
+    field = sr._FIELD_BY_KEY["employment.current_industry"]
+    assert value in INDUSTRIES  # still vocabulary...
+    for raw in (value, value.lower(), f"  {value.upper()}  "):
+        assert _coerce(field, raw) is sr._IGNORE, raw  # ...but not a primary
+
+
+def test_fpa_primary_is_ignored_on_apply_and_on_file_values_survive(monkeypatch):
+    """The legacy guarantee. An alum whose job already holds FP&A as primary
+    (the rows #875's hand-run SQL moves, or any it misses) keeps it when the
+    survey re-submits it; an alum on another industry cannot be switched TO
+    FP&A. Meanwhile FP&A is still accepted as the SECONDARY industry."""
+    # Already FP&A on file, re-submitted unchanged: column untouched.
+    alum = types.SimpleNamespace(alumni_id=5, net_id="jdoe5")
+    job = types.SimpleNamespace(
+        alumni_id=5, current_industry="FP&A", current_industry_secondary=None
+    )
+    _apply(
+        _Session(alum),
+        _fake_resp(
+            payload={
+                "employment.current_industry": "FP&A",
+                "employment.current_industry_secondary": "FP&A",
+            }
+        ),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+    assert job.current_industry == "FP&A"  # legacy primary kept
+    assert job.current_industry_secondary == "FP&A"  # secondary accepted
+
+    # A different industry on file: a submitted FP&A primary does not replace it.
+    alum = types.SimpleNamespace(alumni_id=6, net_id="jdoe6")
+    job = types.SimpleNamespace(
+        alumni_id=6,
+        current_industry="Investment Banking",
+        current_industry_secondary=None,
+    )
+    _apply(
+        _Session(alum),
+        _fake_resp(
+            alumni_id=6,
+            payload={
+                "employment.current_industry": "fp&a",
+                "employment.current_industry_secondary": "FP&A",
+            },
+        ),
+        monkeypatch,
+        side_rows=({}, {6: job}, {}),
+    )
+    assert job.current_industry == "Investment Banking"
+    assert job.current_industry_secondary == "FP&A"
+
+
+def test_fpa_is_still_accepted_as_the_secondary_industry():
+    field = sr._FIELD_BY_KEY["employment.current_industry_secondary"]
+    assert _coerce(field, "FP&A") == "FP&A"
 
 
 def test_an_off_list_industry_or_status_is_ignored_not_stored(monkeypatch):

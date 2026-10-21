@@ -54,8 +54,8 @@ from app.core.audit_context import (
     new_change_set_id,
 )
 from app.core.dropdowns import (
-    INDUSTRIES,
     MARITAL_STATUSES,
+    PRIMARY_INDUSTRIES,
     SURVEY_EMPLOYMENT_STATUSES,
     holds_designation,
 )
@@ -397,8 +397,9 @@ _FIELDS: tuple[_Field, ...] = (
     # intake sheet for years — an off-list answer is IGNORED rather than stored or
     # NULLed, and an off-list value already ON FILE still reads back verbatim.
     #
-    # The lists are the canonical ones, imported, never restated: `INDUSTRIES` is
-    # what `validate_industry` enforces on the staff path, and
+    # The lists are the canonical ones, imported, never restated:
+    # `PRIMARY_INDUSTRIES` is `INDUSTRIES` (what `validate_industry` enforces on
+    # the staff path) minus the secondary-only industries, and
     # `SURVEY_EMPLOYMENT_STATUSES` exists in `core/dropdowns.py` specifically for
     # this field (the canonical eight minus "Unknown", which is meaningless as a
     # self-description) and was, until now, imported by nothing.
@@ -411,23 +412,31 @@ _FIELDS: tuple[_Field, ...] = (
     #     strings in the same order, both derived the same way from the canonical
     #     eight. Exact match.
     #   * industry — the survey offers `PRIMARY_INDUSTRY_OPTIONS` minus "Other"
-    #     (19 strings); all 19 are in `INDUSTRIES` exactly. The five it does not
-    #     offer (the four primary-excluded, plus "Other") stay WRITABLE here on
-    #     purpose: they are legitimate stored values, and `choice` re-canonicalises
-    #     casing, so an alum re-submitting one already on file is not refused.
+    #     (18 strings since #875); all of them are in `PRIMARY_INDUSTRIES` exactly.
+    #
+    # PRIMARY-EXCLUDED INDUSTRIES (#875, Jake 2026-10-21). The options here are
+    # `PRIMARY_INDUSTRIES`, NOT the full `INDUSTRIES`: the secondary-only five
+    # (Law, Corporate Banking, Sales and Trading, Credit Risk, FP&A) are refused
+    # as a PRIMARY answer on this public path. Refused means `_IGNORE`, never a
+    # 422 and never a write — so an alum whose job ALREADY holds one of them as
+    # primary keeps that on-file value untouched whether the form re-submits it
+    # or sends nothing (`blankable=False`). That is the same "keep the legacy
+    # value" guarantee the staff path gives by accepting them in
+    # `validate_industry`; the difference is only that the survey can no longer
+    # SET one. "Other" stays in `PRIMARY_INDUSTRIES`, so it is still writable.
     #
     # KNOWN GAP, needs a frontend change (Jake): the survey's industry control has
     # an "Other" option that reveals a FREE-TEXT box. Whatever is typed there is
     # now off-list and therefore ignored, silently. The frontend fix is to make
-    # that option submit the literal "Other" — which IS in `INDUSTRIES` — rather
-    # than a typed string. Until then an alum choosing Other loses that answer.
+    # that option submit the literal "Other" — which IS in `PRIMARY_INDUSTRIES` —
+    # rather than a typed string. Until then an alum choosing Other loses that answer.
     _Field(
         "employment.current_industry",
         "Industry",
         "employment",
         "current_industry",
         "choice",
-        options=INDUSTRIES,
+        options=PRIMARY_INDUSTRIES,
         # Same reason as marital status: an alum whose stored industry is off-list
         # sees a control with no matching option, and if leaving it alone wiped
         # the column the survey would destroy the very legacy value `choice` is

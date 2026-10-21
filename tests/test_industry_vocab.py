@@ -46,9 +46,16 @@ DATABASE_DIR = Path(__file__).resolve().parents[1] / "database"
 MIGRATIONS_DIR = DATABASE_DIR / "migrations"
 DROPDOWNS_MD = DATABASE_DIR / "dropdowns.md"
 
-# The four industries Tanya asked to drop from the PRIMARY dropdown (2026-07-16).
+# The four industries Tanya asked to drop from the PRIMARY dropdown (2026-07-16),
+# plus FP&A (Jake, 2026-10-21, fa-web-app #875).
 # NOTE the stored value is "Sales and Trading", not "Sales & Trading".
-SECONDARY_ONLY = ("Law", "Corporate Banking", "Sales and Trading", "Credit Risk")
+SECONDARY_ONLY = (
+    "Law",
+    "Corporate Banking",
+    "Sales and Trading",
+    "Credit Risk",
+    "FP&A",
+)
 
 # A ('industry', 'Some Value', 12) tuple inside a vocabulary_terms INSERT.
 _TERM_RE = re.compile(r"\(\s*'industry'\s*,\s*'([^']+)'\s*,\s*(\d+)\s*\)")
@@ -270,7 +277,7 @@ def test_secondary_list_is_the_full_vocabulary() -> None:
     assert SECONDARY_INDUSTRIES == INDUSTRIES
 
 
-def test_primary_is_the_full_list_minus_exactly_the_four() -> None:
+def test_primary_is_the_full_list_minus_exactly_the_secondary_only() -> None:
     assert set(INDUSTRIES) - set(PRIMARY_INDUSTRIES) == set(SECONDARY_ONLY)
 
 
@@ -280,10 +287,16 @@ def test_primary_preserves_vocabulary_order() -> None:
     ]
 
 
-def test_fpa_stays_in_primary() -> None:
-    """FP&A is a non-wheel industry like the other four, but Tanya did NOT ask
-    to remove it — do not "helpfully" drop it (#282)."""
-    assert "FP&A" in PRIMARY_INDUSTRIES
+def test_fpa_is_secondary_only() -> None:
+    """#875 (Jake, 2026-10-21): FP&A is no longer a PRIMARY industry. It must
+    stay in the vocabulary and stay a valid SECONDARY industry — do not delete
+    it, and do not "restore" it to primary."""
+    assert "FP&A" not in PRIMARY_INDUSTRIES
+    assert "FP&A" in SECONDARY_INDUSTRIES
+    assert "FP&A" in INDUSTRIES
+    # Staff path: a record that already holds FP&A as its primary still saves.
+    assert validate_industry("FP&A") == "FP&A"
+    assert validate_industry(" fp&a ") == "FP&A"
 
 
 def test_other_stays_in_primary() -> None:
@@ -302,7 +315,7 @@ def test_secondary_only_industries_still_validate(value: str) -> None:
 
 
 def test_filter_primary_industries_is_case_insensitive_and_order_preserving() -> None:
-    values = ["Asset Management", "law", " Credit Risk ", "Other"]
+    values = ["Asset Management", "law", " Credit Risk ", "fp&a", "Other"]
     assert filter_primary_industries(values) == ["Asset Management", "Other"]
 
 
@@ -398,7 +411,7 @@ def test_vocabulary_industry_defaults_to_the_full_list(client) -> None:
     assert resp.json()["values"] == list(SECONDARY_INDUSTRIES)
 
 
-def test_vocabulary_industry_scope_primary_hides_the_four(client) -> None:
+def test_vocabulary_industry_scope_primary_hides_the_secondary_only(client) -> None:
     resp = client.get("/vocabulary/industry", params={"scope": "primary"})
     assert resp.status_code == 200
     values = resp.json()["values"]

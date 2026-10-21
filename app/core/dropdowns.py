@@ -65,10 +65,10 @@ INDUSTRIES: tuple[str, ...] = (
 MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
 
 # --- primary vs secondary industry (#282) ------------------------------------
-# Tanya, 2026-07-16: these four aren't dashboard industries and shouldn't be
-# offered as an alumnus's PRIMARY industry — but they must stay available as a
-# SECONDARY industry, so they are hidden from the primary dropdown rather than
-# deleted from the vocabulary.
+# Tanya, 2026-07-16: these four (five since #875 added FP&A) aren't dashboard
+# industries and shouldn't be offered as an alumnus's PRIMARY industry — but they
+# must stay available as a SECONDARY industry, so they are hidden from the primary
+# dropdown rather than deleted from the vocabulary.
 #
 # This is a DROPDOWN-VISIBILITY split only. :func:`validate_industry` still
 # accepts all of :data:`INDUSTRIES` for either field, matching the established
@@ -76,8 +76,17 @@ MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
 # existing records stays valid, it just disappears from new-entry dropdowns").
 # Records that keep one of these as their primary — the conflict rows the #282
 # data migration deliberately skips — must stay editable, not 422 on save.
+#
+# "FP&A" joined the set on 2026-10-21 (Jake, fa-web-app #875): it is now a
+# secondary-only industry too. Same treatment as the original four — hidden from
+# every primary dropdown, still in the vocabulary, still a valid secondary, and a
+# record that already holds it as its primary keeps it (staff save: accepted by
+# `validate_industry`; survey: not offered, so a submitted FP&A is ignored and the
+# on-file value is left untouched). The existing prod rows are moved by hand with
+# database/maintenance/875-fpa-to-corporate-finance.sql (primary -> Corporate
+# Finance, FP&A kept as secondary).
 _PRIMARY_EXCLUDED_INDUSTRIES = frozenset(
-    {"Law", "Corporate Banking", "Sales and Trading", "Credit Risk"}
+    {"Law", "Corporate Banking", "Sales and Trading", "Credit Risk", "FP&A"}
 )
 _PRIMARY_EXCLUDED_BY_LOWER = frozenset(
     v.lower() for v in _PRIMARY_EXCLUDED_INDUSTRIES
@@ -88,7 +97,7 @@ PRIMARY_INDUSTRIES: tuple[str, ...] = tuple(
     i for i in INDUSTRIES if i not in _PRIMARY_EXCLUDED_INDUSTRIES
 )
 # Options for the SECONDARY industry dropdown (current_industry_secondary) —
-# the full vocabulary, including the four hidden from primary.
+# the full vocabulary, including the five hidden from primary.
 SECONDARY_INDUSTRIES: tuple[str, ...] = INDUSTRIES
 
 

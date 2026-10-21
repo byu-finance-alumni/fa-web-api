@@ -59,6 +59,10 @@ FULL_QUERY = (
     "&q=analyst"
     "&submitted_from=2026-08-01"
     "&submitted_to=2026-08-28"
+    # Semesters (#876): repeated, out of order, so the parity check also covers
+    # their normalisation (both sides must end up with the same tuple).
+    "&semester=Summer-2026"
+    "&semester=Fall-2026"
 )
 
 

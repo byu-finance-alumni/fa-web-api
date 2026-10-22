@@ -56,6 +56,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,6 +113,22 @@ class GuardError(Exception):
     """A request or a response the guard could not use. Message is redacted."""
 
 
+class GuardUnreachable(GuardError):
+    """Supabase's API was down (5xx, 429, network error) on every retry.
+
+    Kept apart from GuardError so the workflow can stay quiet about it: a
+    Supabase outage says nothing about what prod is configured to bill, and on
+    2026-10-22 a one-off Cloudflare 502 sent a "revert it today" Slack alert
+    for nothing. A 401/403 (expired token) is NOT this — that still alerts.
+    """
+
+
+# HTTP statuses worth retrying and, if they never clear, staying quiet about.
+TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
+# Seconds to wait before each retry. Three attempts across ~1.5 minutes.
+RETRY_DELAYS = (15.0, 60.0)
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -158,14 +175,33 @@ class HttpFetcher:
     are removed from URLs.
     """
 
-    def __init__(self, token: str, api_base: str = API_BASE, timeout: float = 30.0):
+    def __init__(
+        self,
+        token: str,
+        api_base: str = API_BASE,
+        timeout: float = 30.0,
+        retry_delays: Iterable[float] = RETRY_DELAYS,
+        sleep: Callable[[float], None] | None = None,
+    ):
         if not token:
             raise GuardError("SUPABASE_ACCESS_TOKEN is empty.")
         self._token = token
         self._api_base = api_base.rstrip("/")
         self._timeout = timeout
+        self._retry_delays = tuple(retry_delays)
+        # Looked up at call time so tests can patch time.sleep.
+        self._sleep = sleep or (lambda seconds: time.sleep(seconds))
 
     def __call__(self, path: str) -> object:
+        """GET with retries; a transient failure that never clears raises GuardUnreachable."""
+        for delay in self._retry_delays:
+            try:
+                return self._get_once(path)
+            except GuardUnreachable:
+                self._sleep(delay)
+        return self._get_once(path)
+
+    def _get_once(self, path: str) -> object:
         url = self._api_base + path
         shown = redact(path, [self._token])
         req = urllib.request.Request(
@@ -189,13 +225,15 @@ class HttpFetcher:
                 snippet = e.read().decode("utf-8", "replace")[:300]
             except Exception:
                 pass
-            raise GuardError(
+            err = GuardUnreachable if e.code in TRANSIENT_STATUSES else GuardError
+            raise err(
                 redact(f"GET {shown} -> HTTP {e.code}: {snippet}".strip(), [self._token])
             ) from None
         except urllib.error.URLError as e:
-            raise GuardError(redact(f"GET {shown} -> {e.reason}", [self._token])) from None
+            raise GuardUnreachable(redact(f"GET {shown} -> {e.reason}", [self._token])) from None
         except OSError as e:
-            raise GuardError(redact(f"GET {shown} -> {e}", [self._token])) from None
+            # Timeouts and connection resets land here.
+            raise GuardUnreachable(redact(f"GET {shown} -> {e}", [self._token])) from None
         try:
             return json.loads(body)
         except json.JSONDecodeError:
@@ -685,6 +723,13 @@ def main(argv: list[str] | None = None, out=None) -> int:
     try:
         snapshot = collect(HttpFetcher(token, args.api_base), ref, org)
         results = run_checks(snapshot)
+    except GuardUnreachable as e:
+        # Exit 3 = "Supabase was down, nothing checked". The workflow turns it
+        # into a warning on a green run — no Slack, no email. Tomorrow's run
+        # checks again.
+        print(f"SKIP guard: {redact(str(e), [token])}", file=out)
+        print("SKIP: Supabase's API was unreachable, so nothing was checked today.", file=out)
+        return 3
     except GuardError as e:
         print(f"FAIL guard: {redact(str(e), [token])}", file=out)
         print("FAIL: the guard could not complete, so NOTHING was verified.", file=out)

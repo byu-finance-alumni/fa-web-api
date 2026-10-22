@@ -18,6 +18,13 @@ import pytest
 
 from scripts import supabase_spend_guard as guard
 
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    """HttpFetcher retries with real delays; never wait in tests."""
+    monkeypatch.setattr(guard.time, "sleep", lambda seconds: None)
+
+
 REF = "njobhhdopwdodvzosrns"
 ORG = "finance-alumni-prod"
 ORG_ID = "org-id-12345"
@@ -588,6 +595,88 @@ def test_non_json_body_is_a_guard_error(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=0: Resp(b"<html>"))
     with pytest.raises(guard.GuardError, match="not JSON"):
         guard.HttpFetcher(TOKEN)("/v1/projects")
+
+
+class _JsonResp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.mark.parametrize("code", [429, 500, 502, 503, 504])
+def test_transient_status_is_retried_then_unreachable(monkeypatch, code):
+    calls = []
+    slept = []
+
+    def fake_urlopen(req, timeout=0):
+        calls.append(req.full_url)
+        raise _fake_http_error(code, "Error 502: Bad gateway")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    fetch = guard.HttpFetcher(TOKEN, retry_delays=(1, 2), sleep=slept.append)
+    with pytest.raises(guard.GuardUnreachable, match=f"HTTP {code}"):
+        fetch("/v1/projects")
+    assert len(calls) == 3
+    assert slept == [1, 2]
+
+
+def test_transient_failure_that_clears_on_retry_returns_the_body(monkeypatch):
+    attempts = iter(
+        [
+            _fake_http_error(502, "bad gateway"),
+            urllib.error.URLError("connection reset"),
+            None,
+        ]
+    )
+
+    def fake_urlopen(req, timeout=0):
+        err = next(attempts)
+        if err:
+            raise err
+        return _JsonResp(json.dumps({"plan": "pro"}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert guard.HttpFetcher(TOKEN)("/v1/projects") == {"plan": "pro"}
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404])
+def test_non_transient_status_is_not_retried_and_still_loud(monkeypatch, code):
+    calls = []
+
+    def fake_urlopen(req, timeout=0):
+        calls.append(1)
+        raise _fake_http_error(code, "nope")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(guard.GuardError) as exc:
+        guard.HttpFetcher(TOKEN)("/v1/projects")
+    assert not isinstance(exc.value, guard.GuardUnreachable)
+    assert len(calls) == 1
+
+
+def test_supabase_outage_exits_3_quietly(monkeypatch, capsys):
+    def fake_urlopen(req, timeout=0):
+        raise _fake_http_error(502, "Error 502: Bad gateway")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("SUPABASE_ACCESS_TOKEN", TOKEN)
+    assert guard.main(["--ref", REF, "--org", ORG]) == 3
+    out = capsys.readouterr().out
+    assert "SKIP: Supabase's API was unreachable" in out
+    assert "FAIL" not in out
+    assert TOKEN not in out
+
+
+def test_expired_token_still_exits_1(monkeypatch, capsys):
+    def fake_urlopen(req, timeout=0):
+        raise _fake_http_error(401, "Unauthorized")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("SUPABASE_ACCESS_TOKEN", TOKEN)
+    assert guard.main(["--ref", REF, "--org", ORG]) == 1
+    assert "could not complete" in capsys.readouterr().out
 
 
 # ----------------------------------------------------------------------------

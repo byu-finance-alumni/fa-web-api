@@ -104,6 +104,13 @@ A failed run emails whoever last edited the workflow (GitHub's default) and
 posts one line to the security Slack channel via `SLACK_SECURITY_WEBHOOK_URL`,
 the same webhook the weekly audit uses. A green run is silent.
 
+A **Supabase outage is also silent.** A 5xx, 429 or network error is retried
+twice (15s, then 60s); if it never clears the script exits 3 and the run stays
+green with a "spend guard skipped" warning — no Slack, no email. Nothing was
+checked that day; the next day's run checks again. Added 2026-10-22 after a
+one-off Cloudflare 502 sent a false "revert it today" alert. An expired or
+revoked token (401/403) is NOT an outage and still goes red.
+
 ## Running it locally
 
 ```

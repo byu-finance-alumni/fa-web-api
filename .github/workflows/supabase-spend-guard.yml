@@ -30,6 +30,10 @@
 # workflow (GitHub's default for scheduled workflows) and, if the
 # SLACK_SECURITY_WEBHOOK_URL secret is set (it is — the weekly security audit
 # uses it), a one-line message goes to that channel. A green run is silent.
+# So is a Supabase outage: the script retries 5xx/429/network errors and, if
+# they never clear, exits 3, which this job turns into a warning on a GREEN
+# run (Jake, 2026-10-22, after a one-off Cloudflare 502 sent a false "revert
+# it today" alert). An expired or revoked token (401/403) still goes red.
 #
 # NOT A VERCEL CRON. Same reason as supabase-keepalive.yml: a Vercel cron only
 # runs on production deployments and every change to one burns builds.
@@ -91,7 +95,12 @@ jobs:
           fi
           python -m scripts.supabase_spend_guard | tee guard.txt
           code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then
+          if [ "$code" -eq 3 ]; then
+            # Supabase's API was down on every retry. Nothing was checked, but
+            # nothing is known to be wrong either; tomorrow's run checks again.
+            echo "::warning title=Supabase spend guard skipped::$(tail -n 1 guard.txt)"
+            exit 0
+          elif [ "$code" -ne 0 ]; then
             summary=$(tail -n 1 guard.txt)
             echo "::error title=Supabase spend guard FAILED::${summary}. Something in the prod Supabase org will bill above the \$25 plan fee. Open the run for the line-by-line arithmetic, then revert it in the dashboard."
           elif grep -q '^WARN ' guard.txt; then

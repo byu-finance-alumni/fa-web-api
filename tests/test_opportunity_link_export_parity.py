@@ -32,7 +32,9 @@ DATABASE_URL, no network.
 from __future__ import annotations
 
 import asyncio
+import csv
 import datetime
+import io
 import uuid
 
 import pytest
@@ -387,7 +389,12 @@ def test_the_csv_carries_the_declared_columns_and_one_row_per_link(monkeypatch):
             for row in links
         ]
 
+    async def _emails(_session, alumni_ids, *, redact_archived=False):
+        assert alumni_ids == {1}
+        return {1: ("dana@acme-capital.example", "dana.w@home.example")}
+
     monkeypatch.setattr(service, "_project", _project)
+    monkeypatch.setattr(service, "_submitter_emails", _emails)
     csv_text = _run(
         service.export_csv(
             session, OpportunityLinkFilters(status="pending"), actor_user_id=7
@@ -398,6 +405,10 @@ def test_the_csv_carries_the_declared_columns_and_one_row_per_link(monkeypatch):
     assert lines[0] == ",".join(service.EXPORT_COLUMNS)
     assert len(lines) == 2
     assert "42" in lines[1] and "Dana Whitcomb" in lines[1]
+    # #625: the submitter's emails ride along so staff can thank them.
+    row = next(csv.reader(io.StringIO(lines[1])))
+    assert row[service.EXPORT_COLUMNS.index("Work email")] == "dana@acme-capital.example"
+    assert row[service.EXPORT_COLUMNS.index("Personal email")] == "dana.w@home.example"
     # "Date received" is the whole point of the report, so it must be in the file
     # and it must say which clock it is on.
     assert "2026-08-28 09:30:00 UTC" in lines[1]
@@ -454,3 +465,100 @@ def test_an_over_cap_export_is_refused_rather_than_truncated(monkeypatch, client
     response = client.get("/opportunity-links/export")
     assert response.status_code == 413
     assert "export" not in seen  # nothing was built, nothing was audited
+
+
+# =============================================================================
+# 5. Submitter emails (#625)
+# =============================================================================
+
+
+def test_the_email_columns_sit_right_after_the_submitter():
+    """Read left to right: who posted it, then how to reach them."""
+    i = service.EXPORT_COLUMNS.index("Submitted by")
+    assert service.EXPORT_COLUMNS[i + 1 : i + 3] == ("Work email", "Personal email")
+
+
+def test_a_submitter_with_no_contact_row_gets_blank_emails(monkeypatch):
+    """Not every alum has a contact row — the cells are empty, not an error."""
+    from app.models.opportunity_link import OpportunityLink
+
+    when = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=datetime.UTC)
+    item = service._to_read(
+        OpportunityLink(
+            opportunity_link_id=1,
+            alumni_id=9,
+            is_own_company=False,
+            company_name="Acme",
+            url="https://acme.example/jobs",
+            role_type="full_time",
+            status="approved",
+            source="survey",
+            submitted_at=when,
+            updated_at=when,
+        ),
+        submitted_by="No Contact",
+        employer=None,
+        reviewed_by=None,
+    )
+
+    async def _project(_session, links, *, redact_archived=False):
+        return [item]
+
+    async def _emails(_session, alumni_ids, *, redact_archived=False):
+        return {}
+
+    monkeypatch.setattr(service, "_project", _project)
+    monkeypatch.setattr(service, "_submitter_emails", _emails)
+    csv_text = _run(
+        service.export_csv(
+            _ExportSession([object()]),
+            OpportunityLinkFilters(status="approved"),
+            actor_user_id=7,
+        )
+    )
+    row = list(csv.reader(io.StringIO(csv_text)))[1]
+    assert row[service.EXPORT_COLUMNS.index("Work email")] == ""
+    assert row[service.EXPORT_COLUMNS.index("Personal email")] == ""
+
+
+def test_the_email_lookup_is_never_issued_for_an_empty_export():
+    class _NoQuery:
+        async def execute(self, stmt):  # pragma: no cover - must not run
+            raise AssertionError("queried with no submitters")
+
+    assert _run(service._submitter_emails(_NoQuery(), set())) == {}
+
+
+def _captured_email_sql(redact_archived: bool) -> str:
+    seen: dict = {}
+
+    class _Capture:
+        async def execute(self, stmt):
+            seen["sql"] = str(
+                stmt.compile(
+                    dialect=postgresql.dialect(),
+                    compile_kwargs={"literal_binds": True},
+                )
+            )
+
+            class _R:
+                def all(self):
+                    return [(5, "w@x.example", "p@x.example")]
+
+            return _R()
+
+    out = _run(
+        service._submitter_emails(_Capture(), {5}, redact_archived=redact_archived)
+    )
+    assert out == {5: ("w@x.example", "p@x.example")}
+    return seen["sql"]
+
+
+def test_archived_submitters_emails_are_blanked_below_full_access():
+    """#591 parity: the name is blanked for an archived submitter, so the emails
+    must be too — otherwise the export reads a record removed from the directory."""
+    assert "archived IS false" in _captured_email_sql(redact_archived=True)
+
+
+def test_full_access_sees_archived_submitters_emails():
+    assert "archived" not in _captured_email_sql(redact_archived=False)

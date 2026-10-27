@@ -304,7 +304,11 @@ def test_the_csv_has_a_semester_column(monkeypatch):
     async def _project(_session, links, *, redact_archived=False):
         return [item]
 
+    async def _emails(_session, alumni_ids, *, redact_archived=False):
+        return {}
+
     monkeypatch.setattr(service, "_project", _project)
+    monkeypatch.setattr(service, "_submitter_emails", _emails)
     csv_text = _run(
         service.export_csv(
             _ExportSession([object()]),

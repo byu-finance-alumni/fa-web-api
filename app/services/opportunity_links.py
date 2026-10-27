@@ -77,6 +77,7 @@ from app.core.semesters import (
 )
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
+from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.opportunity_link import (
     CITY_MAX,
@@ -672,6 +673,8 @@ EXPORT_COLUMNS: tuple[str, ...] = (
     "Date received",
     "Semester",
     "Submitted by",
+    "Work email",
+    "Personal email",
     "Alumni ID",
     "Company",
     "Own company",
@@ -717,15 +720,23 @@ def _cell(value: object) -> str:
     return text
 
 
-def _export_row(link: OpportunityLinkRead) -> list[str]:
+def _export_row(
+    link: OpportunityLinkRead, emails: tuple[str | None, str | None]
+) -> list[str]:
     """One CSV line, built from the SAME ``OpportunityLinkRead`` projection the
     list renders — so a resolved "my company" employer name, and a NULL that
-    shows as a dash on screen, mean the same thing in the file."""
+    shows as a dash on screen, mean the same thing in the file.
+
+    ``emails`` is the submitter's ``(work, personal)`` pair from
+    :func:`_submitter_emails` — export-only, see there."""
+    work_email, personal_email = emails
     return [
         _cell(link.opportunity_link_id),
         _cell(link.submitted_at),
         _cell(link.semester_label),
         _cell(link.submitted_by),
+        _cell(work_email),
+        _cell(personal_email),
         _cell(link.alumni_id),
         _cell(link.company_name),
         _cell(link.is_own_company),
@@ -741,6 +752,40 @@ def _export_row(link: OpportunityLinkRead) -> list[str]:
         _cell(link.reviewed_by),
         _cell(link.reviewed_at),
     ]
+
+
+async def _submitter_emails(
+    session: AsyncSession,
+    alumni_ids: set[int],
+    *,
+    redact_archived: bool = False,
+) -> dict[int, tuple[str | None, str | None]]:
+    """``alumni_id -> (work_email, personal_email)`` for the export's submitters
+    (#625: staff email each alum a thank-you for the posting).
+
+    EXPORT-ONLY, on purpose: the on-screen list and its JSON never carry these,
+    so the hot read does not ship contact details nobody looks at there. One
+    bounded query keyed on the export's ids, never one per row.
+
+    ``redact_archived`` mirrors :func:`_project` (#591): an archived submitter's
+    emails come back blank for callers below full_access, exactly as their name
+    does, so the export is not a way to read a record removed from the directory.
+    """
+    if not alumni_ids:
+        return {}
+    stmt = (
+        select(
+            AlumniContactInfo.alumni_id,
+            AlumniContactInfo.work_email,
+            AlumniContactInfo.personal_email,
+        )
+        .join(Alumni, Alumni.alumni_id == AlumniContactInfo.alumni_id)
+        .where(AlumniContactInfo.alumni_id.in_(alumni_ids))
+    )
+    if redact_archived:
+        stmt = stmt.where(Alumni.archived.is_(False))
+    rows = (await session.execute(stmt)).all()
+    return {alumni_id: (work, personal) for alumni_id, work, personal in rows}
 
 
 async def count_links(
@@ -779,12 +824,17 @@ async def export_csv(
         .all()
     )
     items = await _project(session, list(rows), redact_archived=redact_archived)
+    emails = await _submitter_emails(
+        session,
+        {item.alumni_id for item in items},
+        redact_archived=redact_archived,
+    )
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(list(EXPORT_COLUMNS))
     for item in items:
-        writer.writerow(_export_row(item))
+        writer.writerow(_export_row(item, emails.get(item.alumni_id, (None, None))))
 
     session.add(
         AuditLog(

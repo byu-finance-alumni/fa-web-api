@@ -29,6 +29,7 @@ from app.api.routes import (
     geography,
     health,
     maintenance,
+    nettreks,
     notes,
     opportunity_links,
     storage,
@@ -245,6 +246,7 @@ app.include_router(admin.router)
 app.include_router(engineer.router)
 app.include_router(engineer.admin_router)
 app.include_router(events.router)
+app.include_router(nettreks.router)
 app.include_router(donations.router)
 app.include_router(audit.router)
 app.include_router(geography.router)

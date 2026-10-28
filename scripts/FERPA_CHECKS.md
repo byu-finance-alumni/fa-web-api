@@ -45,7 +45,7 @@ FERPA check: N hard failures, M warnings
 ## Warnings (printed, never fail the build)
 
 4. **Record-of-disclosure logging.** For the alumni-data GET route files
-   (`app/api/routes/alumni.py`, `dashboard.py`, `geography.py`), warns if a file
+   (`app/api/routes/alumni.py`, `dashboard.py`, `geography.py`, `nettreks.py`), warns if a file
    has `@router.get` routes but never references `AuditLog` / an `audit` call —
    a possible missing record of disclosure.
 

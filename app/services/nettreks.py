@@ -34,9 +34,11 @@ Membership is a property of a CITY, not of an alum, so it is decided once per
 
 Population: non-archived alumni only (``archived = false``) and alumni only, not
 friends of the program (``is_alumni = true``) — the main alumni list's defaults
-(``repositories.alumni.build_alumni_query``) — and never the deceased
-(``deceased = false``): these lists are who to ask to host and who to invite to
-the dinner, the same reason the survey sends skip them.
+(``repositories.alumni.build_alumni_query``) — and never anyone suppressed
+from outreach: the deceased flag, or a ``Deceased`` / ``Do Not Contact``
+status label (``SUPPRESSED_CONTACT_STATUS_LABELS``). These lists are who to ask
+to host and who to invite to the dinner, so they follow the survey sends' rule
+(Jake, 2026-10-28: "leave them off").
 """
 
 from __future__ import annotations
@@ -51,12 +53,14 @@ from dataclasses import dataclass
 from sqlalchemy import String, and_, cast, false, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.geo import CityGeo
+from app.repositories.alumni import has_status_label_exists
 from app.schemas.nettreks import (
     NetTrekAreaKey,
     NetTrekAreaSummary,
@@ -290,11 +294,13 @@ _HOST_WILLING = func.coalesce(AlumniProgramEngagement.nettrek_host_willing, fals
 def _population_conditions() -> list:
     """Non-archived alumni, not friends — the main alumni list's defaults
     (``build_alumni_query``: ``include_archived=False``, ``is_alumni=True``) —
-    and not deceased (an invite list; see the module docstring)."""
+    and not suppressed from outreach (deceased flag, or a Deceased / Do Not
+    Contact label; see the module docstring)."""
     return [
         Alumni.archived.is_(False),
         Alumni.is_alumni.is_(True),
         Alumni.deceased.is_(False),
+        not_(has_status_label_exists(SUPPRESSED_CONTACT_STATUS_LABELS)),
     ]
 
 

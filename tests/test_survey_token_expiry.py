@@ -228,7 +228,8 @@ def test_submit_is_rate_limited_per_token(client, monkeypatch):
     from app.schemas.survey import SurveySubmitResult
 
     async def staged(
-        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None
+        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None,
+        comments=None,
     ):
         return SurveySubmitResult(staged=True, change_count=1, survey_response_id=1)
 

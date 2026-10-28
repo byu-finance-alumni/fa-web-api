@@ -31,6 +31,11 @@ An apply is also audited FIELD BY FIELD (#45) — see `apply_response`. The
 before, so the capture lives at the write. Audit `field_name`s use the STAFF
 path's namespace, not the survey key's — see `_AUDIT_SECTION_BY_GROUP`.
 
+THE COMMENT (#890) is the one payload key that is NOT a field. It is stored
+under `COMMENTS_KEY`, skipped by every field loop here, shown to the reviewer
+on its own (`SurveyResponseItem.comments`), and on APPLY saved as a Note on the
+alum's profile — never written to a column, and never saved on reject.
+
 These rows ARE the survey history the profile's Surveys tab shows: it derives
 from them in `profile._derive_survey_history`. Do NOT also insert into the
 legacy `surveys` table (see `models.crm.Survey`) — one fact, one home.
@@ -65,7 +70,12 @@ from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
-from app.models.survey_response import SurveyResponse
+from app.models.note import Note
+from app.models.survey_response import (
+    COMMENTS_KEY,
+    SurveyResponse,
+    payload_field_count,
+)
 from app.schemas.alumni import (
     _NAME_DISALLOWED,
     AlumniBase,
@@ -73,9 +83,11 @@ from app.schemas.alumni import (
     _has_invisible_chars_strict,
 )
 from app.schemas.survey import (
+    SURVEY_COMMENTS_MAX,
     SurveyChange,
     SurveyResponseItem,
     SurveySubmitResult,
+    clean_survey_comment,
 )
 from app.services import headshot_index, hygiene, supabase_storage
 from app.services.alumni import (
@@ -1369,6 +1381,7 @@ async def submit_response(
     has_photo: bool = False,
     confirmed_only: bool = False,
     fill_seconds: int | None = None,
+    comments: str | None = None,
 ) -> SurveySubmitResult:
     """Stage an alum's submission (token-gated, public). Keeps only recognized
     fields; nothing is applied to the record here.
@@ -1386,6 +1399,12 @@ async def submit_response(
     survey through the same signed token, so they share the token check, the
     abuse budget (``SURVEY_SUBMIT_LIMITER``) and the payload caps by construction
     rather than through a second copy that can drift.
+
+    ``comments`` (#890) is the alum's optional free-text comment. It is CONTENT
+    like a field or a photo: a comment on its own still stages a pending row
+    (and upgrades a confirmation), because a reviewer has to read it and the
+    alum must never lose what they wrote for having changed nothing else. It is
+    NOT counted in ``change_count``, which counts fields.
     """
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
@@ -1409,6 +1428,13 @@ async def submit_response(
         for k, v in (fields or {}).items()
         if k in _FIELD_BY_KEY and _coerce(_FIELD_BY_KEY[k], v) is not _IGNORE
     }
+    # The request schema has already cleaned and capped this; cleaning again is
+    # idempotent and keeps a direct caller to the same rules. An over-cap value
+    # that somehow got this far is dropped rather than stored.
+    comment = clean_survey_comment(comments)
+    if comment is not None and len(comment) <= SURVEY_COMMENTS_MAX:
+        payload[COMMENTS_KEY] = comment
+    field_count = payload_field_count(payload)
     if not payload and not has_photo:
         if confirmed_only:
             return await _record_confirmation(session, alum, alumni_id)
@@ -1473,7 +1499,7 @@ async def submit_response(
         upgraded_id = upgrade.survey_response_id
         await session.commit()
         return SurveySubmitResult(
-            staged=True, change_count=len(payload), survey_response_id=upgraded_id
+            staged=True, change_count=field_count, survey_response_id=upgraded_id
         )
 
     response = SurveyResponse(
@@ -1494,7 +1520,7 @@ async def submit_response(
     new_id = response.survey_response_id
     await session.commit()
     return SurveySubmitResult(
-        staged=True, change_count=len(payload), survey_response_id=new_id
+        staged=True, change_count=field_count, survey_response_id=new_id
     )
 
 
@@ -1593,6 +1619,7 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
         for key, raw in (r.payload or {}).items():
             field = _FIELD_BY_KEY.get(key)
             if field is None:
+                # Includes the comment (#890), which is surfaced on its own below.
                 continue
             # A value the apply path will not write is not a change. `submit_response`
             # already drops these, so in practice this only catches rows staged
@@ -1627,9 +1654,37 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
                 submitted_at=r.submitted_at.isoformat(),
                 changes=changes,
                 photo_preview_url=photo_preview_url,
+                comments=_payload_comment(r.payload),
             )
         )
     return items
+
+
+def _payload_comment(payload: dict | None) -> str | None:
+    """The comment stored on a response (#890), or ``None``.
+
+    Missing on every row submitted before the box existed. Re-cleaned on read so
+    a row written by anything other than `submit_response` still reaches the
+    reviewer and the profile as plain, bounded text."""
+    comment = clean_survey_comment((payload or {}).get(COMMENTS_KEY))
+    if comment is None or len(comment) > SURVEY_COMMENTS_MAX:
+        return None
+    return comment
+
+
+def survey_comment_note_body(comment: str, submitted_at: object) -> str:
+    """The profile Note an applied comment becomes (#890).
+
+    Dated by when the ALUM wrote it (the response's ``submitted_at``), not when
+    a reviewer got round to applying it — the note is the alum's words, and the
+    date belongs to them. Falls back to today only for a row with no stamp."""
+    if isinstance(submitted_at, datetime.datetime):
+        day = submitted_at.date()
+    elif isinstance(submitted_at, datetime.date):
+        day = submitted_at
+    else:
+        day = datetime.datetime.now(datetime.UTC).date()
+    return f"Survey comment ({day.isoformat()}): {comment}"
 
 
 async def _get_pending(session: AsyncSession, response_id: int) -> SurveyResponse:
@@ -1882,6 +1937,9 @@ async def apply_response(
         field_changes.append((_audit_field_name(field), old, new))
 
     for key, raw in (resp.payload or {}).items():
+        if key == COMMENTS_KEY:
+            # Not a field (#890) — saved as a Note below, never `dropped`.
+            continue
         field = _FIELD_BY_KEY.get(key)
         if field is None:
             dropped.append(key)
@@ -1995,6 +2053,32 @@ async def apply_response(
             exclude_alumni_id=alum.alumni_id,
         )
 
+    # THE COMMENT BECOMES A NOTE (#890, Jake 2026-10-28) — on apply only, so a
+    # rejected submission's comment never reaches the profile. Attributed to the
+    # REVIEWER, the same way every note records its author (`created_by_user_id`
+    # is whoever put it on the profile, as in `notes.create_note`); the body says
+    # it is the alum's survey comment, so nobody reads it as staff's words.
+    #
+    # Exactly once: `_get_pending` locks the row and refuses anything not
+    # `pending`, so a second apply — a double-click, a retry, a second reviewer —
+    # raises before reaching this line, and the note shares the one commit below
+    # with the status flip, so a failed apply leaves neither.
+    comment = _payload_comment(resp.payload)
+    note_body = (
+        survey_comment_note_body(comment, getattr(resp, "submitted_at", None))
+        if comment is not None
+        else None
+    )
+    if note_body is not None:
+        session.add(
+            Note(
+                alumni_id=alum.alumni_id,
+                body=note_body,
+                created_by_user_id=actor_user_id,
+                updated_by_user_id=actor_user_id,
+            )
+        )
+
     resp.status = "applied"
     resp.reviewed_by_user_id = actor_user_id
     resp.reviewed_at = datetime.datetime.now(datetime.UTC)
@@ -2025,7 +2109,8 @@ async def apply_response(
                 entity_type="alumni",
                 entity_id=alum.alumni_id,
                 new_value=(
-                    f"survey_response={response_id} fields={len(resp.payload or {})} "
+                    f"survey_response={response_id} "
+                    f"fields={payload_field_count(resp.payload)} "
                     f"written={written} dropped={len(dropped)} ignored={len(ignored)}"
                     + (f" duplicate_warnings={len(duplicate_warnings)}" if name_changed else "")
                     # The audit row is the record that outlives the reviewer's
@@ -2036,6 +2121,7 @@ async def apply_response(
                         if had_photo
                         else ""
                     )
+                    + (" comment_note=added" if note_body is not None else "")
                 ),
                 change_set_id=change_set_id,
                 source=audit_source(),
@@ -2057,6 +2143,23 @@ async def apply_response(
                     field_name=field_name,
                     old_value=None if old is None else str(old),
                     new_value=None if new is None else str(new),
+                    change_set_id=change_set_id,
+                    source=audit_source(),
+                )
+            )
+        # #890 — the note write, audited the way `notes.create_note` audits one
+        # (`add_note`, field `note`, the body as the new value) so it shows on
+        # the profile's Audit tab like any other note, and inside this change
+        # set so it reads as part of the approval that produced it.
+        if note_body is not None:
+            session.add(
+                AuditLog(
+                    user_id=actor_user_id,
+                    action_type="add_note",
+                    entity_type="alumni",
+                    entity_id=alum.alumni_id,
+                    field_name="note",
+                    new_value=note_body,
                     change_set_id=change_set_id,
                     source=audit_source(),
                 )

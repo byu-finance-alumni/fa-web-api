@@ -36,7 +36,7 @@ from app.models.engagement import (
 )
 from app.models.event import Event, EventAttendance
 from app.models.survey_reset import SurveyResetLog
-from app.models.survey_response import SurveyResponse
+from app.models.survey_response import COMMENTS_KEY, SurveyResponse, payload_field_count
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.models.user import User
@@ -275,7 +275,8 @@ async def _derive_survey_history(
         # answered it — an older response predating the campaign gets none
         # rather than borrowing a deadline it was never measured against.
         answered_campaign = campaign_start is not None and submitted.date() >= campaign_start
-        field_count = len(r.payload or {})
+        # The comment (#890) is not a field — counted apart, below.
+        field_count = payload_field_count(r.payload)
         if r.status == survey_email.STATUS_CONFIRMED:
             # #755 — a confirmation carries an empty payload BY DEFINITION, so
             # the field count is a true statement that reads as a failed
@@ -285,6 +286,8 @@ async def _derive_survey_history(
             notes = f"{field_count} field{'' if field_count == 1 else 's'} submitted"
         if r.staged_photo_path:
             notes += " + photo"
+        if (r.payload or {}).get(COMMENTS_KEY):
+            notes += " + comment"
         if last_reset_at is not None and _as_utc(last_reset_at) >= _as_utc(submitted):
             # Kept and shown — it IS something they submitted — but named as the
             # earlier cycle so it does not read as a stale duplicate of the

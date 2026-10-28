@@ -3,10 +3,50 @@
 from __future__ import annotations
 
 import datetime
+import unicodedata
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from app.schemas.alumni import DuplicateWarning
+from app.schemas.alumni import _INVISIBLE_CHARS, DuplicateWarning
+
+# Longest "Anything else you'd like to share?" comment (#890), in characters
+# after cleaning. The survey page shows a counter against the same number.
+SURVEY_COMMENTS_MAX = 2000
+
+# The only control characters a multi-line comment legitimately carries.
+_COMMENT_KEEP_CONTROLS = frozenset("\n\t")
+
+
+def clean_survey_comment(value: object) -> str | None:
+    """The alum's free-text comment made safe to store — or ``None`` when blank.
+
+    ⚠️ UNTRUSTED (public, token-gated submit). It is stored and shown as PLAIN
+    TEXT only — React escapes it in the review queue and on the profile's Notes
+    tab, and nothing renders it as HTML or markdown.
+
+    Invisible characters (the shared `_INVISIBLE_CHARS` list: zero-width space,
+    bidi overrides, BOM, ...) and control characters other than newline and tab
+    are REMOVED rather than refused. A bidi override in a note makes the text a
+    reviewer reads differ from what is stored, which is the reason the name
+    rules refuse them; but refusing a whole comment over one pasted zero-width
+    character would throw away what the alum wrote, so here they are dropped and
+    the rest kept. CRLF and bare CR become LF first, so a pasted Windows line
+    ending is not lost as a stripped control character.
+
+    Length is NOT checked here — the request schema refuses an over-cap comment
+    with a 422, and callers outside the request path apply the cap themselves.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(
+        ch
+        for ch in text
+        if ch in _COMMENT_KEEP_CONTROLS
+        or (unicodedata.category(ch) != "Cc" and ch not in _INVISIBLE_CHARS)
+    )
+    text = text.strip()
+    return text or None
 
 
 class SurveySubmitRequest(BaseModel):
@@ -39,6 +79,30 @@ class SurveySubmitRequest(BaseModel):
     # a 500. Best-effort and optional — a missing value leaves the submission
     # working exactly as before.
     fill_seconds: int | None = None
+    # "Anything else you'd like to share?" (#890) — optional free text, placed
+    # last on the survey. NOT a survey field: it is stored under its own payload
+    # key (`models.survey_response.COMMENTS_KEY`), shown to the reviewer, and
+    # saved as a profile Note only when the submission is APPLIED.
+    #
+    # Cleaned by `clean_survey_comment` (blank -> None, so a blank box is simply
+    # absent) and capped at `SURVEY_COMMENTS_MAX` characters — over the cap is a
+    # 422, not a silent truncation, because cutting an alum's words off mid-
+    # sentence would store something they did not write.
+    comments: str | None = None
+
+    @field_validator("comments", mode="before")
+    @classmethod
+    def _clean_comments(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Comments must be text.")
+        cleaned = clean_survey_comment(value)
+        if cleaned is not None and len(cleaned) > SURVEY_COMMENTS_MAX:
+            raise ValueError(
+                f"Comments must be at most {SURVEY_COMMENTS_MAX} characters."
+            )
+        return cleaned
 
 
 class SurveySubmitResult(BaseModel):
@@ -80,6 +144,11 @@ class SurveyResponseItem(BaseModel):
     # Short-lived signed URL of a NEW profile photo the alum submitted with this
     # response, for the reviewer to preview. None when no photo was staged.
     photo_preview_url: str | None = None
+    # The alum's optional free-text comment (#890), verbatim as stored — plain
+    # text, never HTML. None when they left the box blank, and on every row
+    # submitted before the box existed. Applying the response saves it as a Note
+    # on the profile; rejecting it does not.
+    comments: str | None = None
 
 
 class SurveyApplyResult(BaseModel):

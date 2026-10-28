@@ -757,12 +757,13 @@ async def list_responders(
 # have FEWER rows than its column shows, by the number of archived alumni in
 # it, and never more. "No reply yet" is deliberately NOT `_cycle_non_responders`
 # (the follow-up set): that one also requires all three emails, so mid-campaign
-# it is a strict subset.
+# it is a strict subset. That subset is the third file, "Needs follow-up"
+# (#889), which reads `_cycle_non_responders` as-is so it matches its column.
 #
-# Both files are built by ONE function (:func:`_export_cycle_csv`) so the
+# All three files are built by ONE function (:func:`_export_cycle_csv`) so the
 # shared columns, the archived rule, the formula guard and the audit row cannot
-# drift between them; they differ only in which side of the reply predicate
-# they read and in the replied file's extra mailing-address columns.
+# drift between them; they differ only in which population they read and in
+# the replied file's extra mailing-address columns.
 
 
 def _cycle_send_summary(reply_clause):
@@ -808,6 +809,21 @@ def _cycle_replied():
     details. So its size per year is the ``replied`` count, before archived
     alumni are dropped."""
     return _cycle_send_summary(_qualifying_reply(_REPLIED_STATUSES))
+
+
+def _cycle_needs_follow_up():
+    """The "Needs follow-up" people (#889): every email of the current cycle,
+    no reply — :func:`_cycle_non_responders` itself, the SAME select the
+    ``non_responders`` count and the call sheet read, not a re-derivation.
+
+    The only addition is the ``emails_sent`` column the shared CSV body reads.
+    The HAVING already pins it to all three stages, so it is always 3; it is
+    computed rather than hard-coded so the cell cannot claim more than the log
+    holds. So its size per year is the ``non_responders`` count, before
+    archived alumni are dropped."""
+    return _cycle_non_responders().add_columns(
+        func.count(func.distinct(SurveySendLog.stage)).label("emails_sent")
+    )
 
 
 # The profile details both survey exports append after their cycle columns —
@@ -888,7 +904,9 @@ async def _export_cycle_csv(
     if the permission editor ever grants one.
 
     ``population`` is a :func:`_cycle_send_summary` select — which side of the
-    reply predicate the file reads. Everything else is identical for both files:
+    reply predicate the file reads — or :func:`_cycle_needs_follow_up`; any
+    select with ``graduation_year``, ``alumni_id``, ``emails_sent`` and
+    ``last_sent_at`` columns. Everything else is identical for every file:
     the 404 rule, the archived exclusion, the column order, the formula guard and
     the audit row. ``with_mailing`` appends the mailing-address columns (the
     replied file only).
@@ -1092,6 +1110,33 @@ async def export_replied_csv(
         population=_cycle_replied(),
         with_mailing=True,
         action_type="export_survey_replied",
+        actor_user_id=actor_user_id,
+        can_edit=can_edit,
+    )
+
+
+async def export_needs_follow_up_csv(
+    session: AsyncSession,
+    graduation_year: int | None,
+    *,
+    actor_user_id: int | None,
+    can_edit: bool,
+) -> str | None:
+    """The "Needs follow-up" column as a CSV (#889) — one year, or every year.
+
+    The people behind ``SurveyScheduleItem.non_responders``: received all three
+    of the year's current-cycle emails and never replied — the same set, and the
+    same archived exclusion, as the call sheet (:func:`list_non_responders`). So
+    the row count is the column minus its archived alumni. Same columns as the
+    no-reply file (:data:`NO_REPLY_EXPORT_COLUMNS`); "Emails sent this cycle" is
+    always 3 here. ``None`` for a single year with no schedule. Audit-logged as
+    ``export_survey_needs_follow_up``."""
+    return await _export_cycle_csv(
+        session,
+        graduation_year,
+        population=_cycle_needs_follow_up(),
+        with_mailing=False,
+        action_type="export_survey_needs_follow_up",
         actor_user_id=actor_user_id,
         can_edit=can_edit,
     )

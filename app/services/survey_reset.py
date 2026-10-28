@@ -97,7 +97,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.survey_reset import SurveyResetLog
-from app.models.survey_response import SurveyResponse
+from app.models.survey_response import SurveyResponse, payload_field_count
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.schemas.survey import (
     SurveyAlumniResponse,
@@ -282,7 +282,8 @@ async def get_state(session: AsyncSession, alumni_id: int) -> SurveyAlumniState:
             survey_response_id=r.survey_response_id,
             submitted_at=r.submitted_at,
             status=r.status,
-            field_count=len(r.payload or {}),
+            # Fields only — the #890 comment is not one.
+            field_count=payload_field_count(r.payload),
             has_photo=bool(r.staged_photo_path),
             superseded=superseded(r.submitted_at),
             # The exact predicate the send exclusion applies, not an

@@ -13,7 +13,7 @@ correlated EXISTS subqueries. See ``app.core.search_terms`` (parsing) and
 
 import datetime
 
-from sqlalchemy import Select, and_, func, literal_column, or_, select
+from sqlalchemy import Select, and_, case, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import email_reach
@@ -265,6 +265,32 @@ async def get(session: AsyncSession, alumni_id: int) -> Alumni | None:
     return await session.get(Alumni, alumni_id)
 
 
+# The industry the alumni list DISPLAYS, as one SQL expression (#891). When the
+# primary industry is "Other" and a secondary industry is filled in, the table
+# shows the secondary instead (Tanya, 2026-07-11); otherwise it shows the
+# primary. The ``industry`` sort orders by this so the list is alphabetical by
+# what is on screen, not by a hidden "Other" that bunches those rows under O.
+# MUST stay in step with the display rule in fa-web-app
+# ``src/components/alumni/AlumniTable.tsx`` (Industry cell) — change one, change
+# the other. The outer nullif(trim(...)) turns a blank into NULL so blanks sort
+# LAST with the NULLs rather than first. Sort only: the industry FILTERS keep
+# primary and secondary separate (#584) and the dashboard counts use the primary.
+def displayed_industry(primary, secondary):
+    """CASE expression for the displayed industry, given the primary and
+    secondary industry column expressions. Blank results come back as NULL."""
+    shown = case(
+        (
+            and_(
+                func.lower(primary) == "other",
+                func.nullif(func.trim(secondary), "").is_not(None),
+            ),
+            secondary,
+        ),
+        else_=primary,
+    )
+    return func.nullif(func.trim(shown), "")
+
+
 # Sort options exposed by the list UI, mapped to their ORDER BY columns. Kept as
 # a pure module-level function (no IO) so the mapping can be unit-tested by
 # compiling the clause — this is the one place the grad-year direction is decided
@@ -286,7 +312,8 @@ def alumni_order_by(
     Base tokens order by columns on the alumni row: ``name`` | ``grad_desc`` |
     ``grad_asc`` | ``gender`` (A→Z, NULLs last) | ``updated`` (most-recently
     edited first, i.e. ``updated_at`` DESC). The related-data tokens (#357/#495)
-    order by an expression the caller supplies — ``industry`` (current industry),
+    order by an expression the caller supplies — ``industry`` (the DISPLAYED
+    current industry, see ``displayed_industry``),
     ``city``, ``state``, ``employer`` (current employer) — each a correlated
     scalar subquery built in ``list_page`` because those values live on related
     tables, not the alumni row. Related tokens sort ASC with NULLs last, always
@@ -1197,6 +1224,21 @@ async def list_page(
         .limit(1)
         .scalar_subquery()
     )
+    # Sort key for the ``industry`` token (#891): the industry the table SHOWS
+    # (secondary when the primary is "Other"), not the raw primary — see
+    # displayed_industry. One row per alumnus (uq_current_employment_alumni_id),
+    # so this reads the same row as the two projection subqueries above.
+    industry_sort = (
+        select(
+            displayed_industry(
+                CurrentEmployment.current_industry,
+                CurrentEmployment.current_industry_secondary,
+            )
+        )
+        .where(CurrentEmployment.alumni_id == Alumni.alumni_id)
+        .limit(1)
+        .scalar_subquery()
+    )
     # Location for the list's City/State columns: the alumnus's WORK city/state
     # (current_employment.current_city/current_state). The employer's address is
     # the only address this system holds — there is no residence data — and this
@@ -1234,9 +1276,10 @@ async def list_page(
         rows_stmt = rows_stmt.where(base.whereclause)
 
     # Sort options exposed by the list UI (see alumni_order_by). The related-data
-    # sorts (industry / city / state, #357) order by the SAME correlated scalar
+    # sorts (city / state / employer, #357) order by the SAME correlated scalar
     # subqueries the row projection uses, so the ordering matches the displayed
-    # column exactly. Unknown values fall back to name.
+    # column exactly; industry orders by the displayed value (industry_sort,
+    # #891). Unknown values fall back to name.
     #
     # Relevance ranking (#620) is applied ONLY here, in the ORDER BY — never as a
     # predicate — so the population the list shows stays byte-identical to the
@@ -1245,7 +1288,7 @@ async def list_page(
         rows_stmt.order_by(
             *alumni_order_by(
                 sort,
-                industry=current_industry,
+                industry=industry_sort,
                 city=current_city,
                 state=current_state,
                 employer=current_employer,

@@ -830,6 +830,136 @@ def test_replied_export_is_none_for_a_year_with_no_campaign(db):
     assert _export_replied(db, year=1999)[0] is None
 
 
+# ------------------------------------------ "Needs follow-up" export (#889) ----
+#
+# The file's population is the `non_responders` count's — the very people the
+# call sheet (`list_non_responders`) names — minus archived alumni. Compared
+# against BOTH the count and the call sheet over the same rows.
+
+
+def _export_follow_up(db, year=_YEAR, actor=1, can_edit=True):
+    session = _AuditingSession(db)
+    out = asyncio.run(
+        ss.export_needs_follow_up_csv(
+            session, year, actor_user_id=actor, can_edit=can_edit
+        )
+    )
+    return out, session
+
+
+def _follow_up_world(db):
+    """A cycle-2 cohort with every case the column must and must not count."""
+    db.schedule(cycle=2)
+    for i, last in enumerate(
+        ["Young", "Adams", "Moss", "Baker", "Cole", "Diaz", "Evans"], start=1
+    ):
+        db.alum(i, last_name=last)
+    every = (0, 1, 2)
+    db.sent(1, every, cycle=2)  # all three, silent: IN
+    db.sent(2, every, cycle=2)
+    db.replied(2, "applied")  # replied: out
+    db.sent(3, (0, 1), cycle=2)  # still owed a reminder: out (but no-reply)
+    db.sent(4, every, cycle=2)
+    db.replied(4, "rejected")  # a discarded reply is not a reply: IN
+    db.sent(5, every, cycle=2)
+    db.replied(
+        5, "confirmed", when=_NOW - datetime.timedelta(days=400)
+    )  # outside the re-survey window: IN
+    db.sent(6, every, cycle=1)  # only the PREVIOUS campaign: out
+    db.sent(7, every, cycle=2)  # IN
+
+
+def _follow_up_names(body):
+    return [r[0] for r in body]
+
+
+def test_follow_up_export_row_count_matches_needs_follow_up(db):
+    _follow_up_world(db)
+    header, *body = _rows(_export_follow_up(db)[0])
+    assert header == list(ss.NO_REPLY_EXPORT_COLUMNS)
+    assert len(body) == _item(db).non_responders == 4
+
+
+def test_follow_up_export_is_exactly_the_call_sheet(db):
+    _follow_up_world(db)
+    body = _rows(_export_follow_up(db)[0])[1:]
+    sheet = [n.name for n in asyncio.run(ss.list_non_responders(db.session, _YEAR))]
+    assert _follow_up_names(body) == sheet == [
+        "A4 Baker",
+        "A5 Cole",
+        "A7 Evans",
+        "A1 Young",
+    ]
+    # Everyone in it has had all three emails — that is the column's meaning.
+    emails_sent = ss.NO_REPLY_EXPORT_COLUMNS.index("Emails sent this cycle")
+    assert {r[emails_sent] for r in body} == {"3"}
+
+
+def test_follow_up_export_is_a_strict_subset_of_no_reply_mid_campaign(db):
+    _follow_up_world(db)
+    follow_up = set(_follow_up_names(_rows(_export_follow_up(db)[0])[1:]))
+    silent = set(_follow_up_names(_rows(_export(db)[0])[1:]))
+    assert follow_up < silent
+    assert silent - follow_up == {"A3 Moss"}
+
+
+def test_follow_up_export_drops_someone_reset_mid_campaign(db):
+    # A reset with a higher seq than Evans's sends supersedes them: she is owed
+    # the whole campaign again, so not a finished-and-silent case yet.
+    _follow_up_world(db)
+    _reset(db, 7, at=_NOW + datetime.timedelta(minutes=5))
+    body = _rows(_export_follow_up(db)[0])[1:]
+    assert "A7 Evans" not in _follow_up_names(body)
+    assert len(body) == _item(db).non_responders == 3
+
+
+def test_follow_up_export_leaves_out_archived_alumni_the_count_keeps(db):
+    _follow_up_world(db)
+    _archive(db, 1)  # Young: all three emails, silent
+    item = _item(db)
+    body = _rows(_export_follow_up(db)[0])[1:]
+    assert "A1 Young" not in _follow_up_names(body)
+    assert item.non_responders == 4
+    assert len(body) == item.non_responders - 1
+
+
+def test_follow_up_export_all_years_matches_the_summed_column(db):
+    _follow_up_world(db)
+    db.schedule(year=2001)
+    db.alum(20, last_name="Hale")
+    db.alum(21, last_name="Iver")
+    db.sent(20, (0, 1, 2), year=2001)
+    db.sent(21, (0,), year=2001)  # mid-campaign: not yet a follow-up
+    body = _rows(_export_follow_up(db, year=None)[0])[1:]
+    items = asyncio.run(ss.list_schedules(db.session))
+    assert len(body) == sum(i.non_responders for i in items) == 5
+    # Newest cohort first, like the table.
+    assert body[0][:2] == ["A20 Hale", "2001"]
+
+
+def test_follow_up_export_is_audited_without_the_rows(db):
+    _follow_up_world(db)
+    _, session = _export_follow_up(db, actor=42)
+    (entry,) = session.added
+    assert entry.action_type == "export_survey_needs_follow_up"
+    assert entry.user_id == 42
+    assert entry.entity_type == "survey_campaign"
+    assert entry.entity_id == _YEAR
+    assert entry.new_value == f"rows=4; graduation_year={_YEAR}"
+
+
+def test_follow_up_export_all_years_audits_as_all(db):
+    _follow_up_world(db)
+    _, session = _export_follow_up(db, year=None, actor=42)
+    (entry,) = session.added
+    assert entry.entity_id is None
+    assert entry.new_value == "rows=4; graduation_year=all"
+
+
+def test_follow_up_export_is_none_for_a_year_with_no_campaign(db):
+    assert _export_follow_up(db, year=1999)[0] is None
+
+
 # ------------------------------------------ export + progress gates (#605) ----
 
 
@@ -847,6 +977,8 @@ _EXPORT_PATHS = [
     "/survey/schedules/no-reply/export",
     f"/survey/schedules/{_YEAR}/replied/export",
     "/survey/schedules/replied/export",
+    f"/survey/schedules/{_YEAR}/needs-follow-up/export",
+    "/survey/schedules/needs-follow-up/export",
 ]
 
 
@@ -896,6 +1028,44 @@ def test_replied_export_all_years_route_is_not_taken_for_a_year(db, fresh_limits
 def test_replied_export_route_404s_for_a_year_with_no_campaign(db, fresh_limits):
     resp = _get(
         "/survey/schedules/1999/replied/export",
+        _AuditingSession(db),
+        _ctx("full_access"),
+    )
+    assert resp.status_code == 404
+
+
+def test_follow_up_export_route_downloads_a_csv(db, fresh_limits):
+    _follow_up_world(db)
+    resp = _get(
+        f"/survey/schedules/{_YEAR}/needs-follow-up/export",
+        _AuditingSession(db),
+        _ctx("full_access"),
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    disposition = resp.headers["content-disposition"]
+    assert disposition.startswith(
+        f'attachment; filename="survey_needs_follow_up_{_YEAR}_'
+    )
+    assert len(_rows(resp.text)) == 1 + 4
+
+
+def test_follow_up_export_all_years_route_is_not_taken_for_a_year(db, fresh_limits):
+    _follow_up_world(db)
+    resp = _get(
+        "/survey/schedules/needs-follow-up/export",
+        _AuditingSession(db),
+        _ctx("full_access"),
+    )
+    assert resp.status_code == 200
+    assert (
+        'filename="survey_needs_follow_up_all_' in resp.headers["content-disposition"]
+    )
+
+
+def test_follow_up_export_route_404s_for_a_year_with_no_campaign(db, fresh_limits):
+    resp = _get(
+        "/survey/schedules/1999/needs-follow-up/export",
         _AuditingSession(db),
         _ctx("full_access"),
     )

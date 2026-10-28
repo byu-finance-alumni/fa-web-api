@@ -313,7 +313,8 @@ def test_submit_route_is_public(client, monkeypatch):
     from app.schemas.survey import SurveySubmitResult
 
     async def fake_submit(
-        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None
+        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None,
+        comments=None,
     ):
         return SurveySubmitResult(staged=True, change_count=len(fields))
 

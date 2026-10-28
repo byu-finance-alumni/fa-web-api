@@ -198,6 +198,8 @@ def test_single_record_reads_are_braked(client, alerts, method, path):
         "/events/1/attendees/export",
         "/survey/schedules/no-reply/export",
         "/survey/schedules/2020/no-reply/export",
+        "/survey/schedules/needs-follow-up/export",
+        "/survey/schedules/2020/needs-follow-up/export",
     ],
 )
 def test_every_export_route_is_braked(client, alerts, path):
@@ -364,6 +366,7 @@ def test_global_count_under_every_limit_lets_the_export_run(client, alerts, monk
         "/alumni/import/update/export",
         "/events/1/attendees/export",
         "/survey/schedules/no-reply/export",
+        "/survey/schedules/needs-follow-up/export",
         "/opportunity-links/export?status=bogus",
     ],
 )

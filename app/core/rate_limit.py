@@ -771,6 +771,7 @@ EXPORT_AUDIT_ACTIONS: frozenset[str] = frozenset(
         "export_event_attendees",
         "export_survey_no_reply",  # both no-reply CSVs
         "export_survey_replied",  # both replied CSVs (#605)
+        "export_survey_needs_follow_up",  # both needs-follow-up CSVs (#889)
         "export_opportunity_links",
     }
 )

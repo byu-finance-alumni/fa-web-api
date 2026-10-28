@@ -1037,7 +1037,7 @@ def _survey_csv_response(csv_text: str, kind: str, scope: str) -> Response:
     )
 
 
-# The literal `no-reply` / `replied` segments cannot be taken for a graduation
+# The literal `no-reply` / `replied` / `needs-follow-up` segments cannot be taken for a graduation
 # year: no GET under `/schedules/{grad_year}` has the two-segment `.../export`
 # shape. Keep it that way — FastAPI matches in declaration order and would 422
 # on the int. The static all-years route of each pair is declared FIRST.
@@ -1148,6 +1148,55 @@ async def export_survey_replied(
     if csv_text is None:
         raise NotFoundError("No schedule exists for that graduation year.")
     return _survey_csv_response(csv_text, "replied", str(grad_year))
+
+
+@router.get("/schedules/needs-follow-up/export", response_model=None)
+async def export_survey_needs_follow_up_all(
+    user: ExportReadRateLimit, session: SessionDep
+) -> Response:
+    """Every year's "Needs follow-up" people as one CSV (#889).
+
+    The all-years twin of `GET /schedules/{grad_year}/needs-follow-up/export`.
+    Its row count is the summed `non_responders` column minus archived alumni,
+    which the file leaves out. Same gate, same columns, same audit trail."""
+    csv_text = await survey_schedule.export_needs_follow_up_csv(
+        session, None, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
+    )
+    if csv_text is None:  # unreachable: only a single missing year yields None
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return _survey_csv_response(csv_text, "needs_follow_up", "all")
+
+
+@router.get("/schedules/{grad_year}/needs-follow-up/export", response_model=None)
+async def export_survey_needs_follow_up(
+    grad_year: Annotated[int, Path(ge=_GRAD_YEAR_MIN, le=_GRAD_YEAR_MAX)],
+    user: ExportReadRateLimit,
+    session: SessionDep,
+) -> Response:
+    """This year's "Needs follow-up" people as a CSV download (#889).
+
+    The Progress table's "Needs follow-up" column (`non_responders` on
+    `SurveyScheduleItem`): received all three of the year's current-cycle
+    emails and never replied — the same people as the call sheet
+    `GET /schedules/{grad_year}/non-responders`, built from the same select as
+    the count. Archived alumni are left out, as on the call sheet, so the row
+    count is the column minus its archived alumni.
+
+    Columns: the no-reply file's (Name, Graduation year, Email, Phone, Emails
+    sent this cycle, Last email sent, NetID, Employer, Title, Industry, Work
+    City, Work State, Work Country, LinkedIn, Last Updated, Profile Link).
+    Formula-injection-safe. Gated by `RequireAlumniExport` (via the shared
+    export rate limit) for the same reason as the no-reply file. Audit-logged
+    as `export_survey_needs_follow_up`. 404 = no campaign for the year. Returns
+    `text/csv` as `survey_needs_follow_up_<year>_<YYYY-MM-DD>.csv`."""
+    csv_text = await survey_schedule.export_needs_follow_up_csv(
+        session, grad_year, actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
+    )
+    if csv_text is None:
+        raise NotFoundError("No schedule exists for that graduation year.")
+    return _survey_csv_response(csv_text, "needs_follow_up", str(grad_year))
 
 
 @router.get(

@@ -340,6 +340,7 @@ async def survey_submit(
         body.has_photo,
         body.confirmed_only,
         body.fill_seconds,
+        body.comments,
     )
 
 

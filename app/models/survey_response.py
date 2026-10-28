@@ -1,7 +1,9 @@
 """Survey response model (survey_responses table).
 
 An alum's staged "confirm your info" submission, awaiting admin review. `payload`
-holds the submitted values keyed by survey field keys (`table.column`).
+holds the submitted values keyed by survey field keys (`table.column`), plus at
+most ONE non-field key: `COMMENTS_KEY` (#890), the alum's optional free-text
+"anything else?" comment. See `payload_field_count` before counting keys.
 
 Together with `survey_send_log` and `survey_schedule`, these rows are the SOURCE
 OF TRUTH for an alum's survey history — `profile._derive_survey_history` builds
@@ -24,6 +26,23 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+
+# The alum's optional "Anything else you'd like to share?" comment (#890). It
+# rides in `payload` rather than a column (no migration), under a key with no
+# dot, so it can never collide with a `table.column` survey field key. It is
+# NOT a field: nothing writes it to the record column-by-column. On apply it
+# becomes a Note on the profile (`survey_responses.apply_response`); on reject
+# it goes nowhere. Old rows simply have no such key.
+COMMENTS_KEY = "comments"
+
+
+def payload_field_count(payload: dict | None) -> int:
+    """How many survey FIELDS a payload carries — every key except the comment.
+
+    "N fields submitted" on the profile, the engineer survey-state screen and
+    the apply audit row all count fields; a comment counted as one would read
+    as a changed field that the diff then never shows."""
+    return sum(1 for key in (payload or {}) if key != COMMENTS_KEY)
 
 
 class SurveyResponse(Base):

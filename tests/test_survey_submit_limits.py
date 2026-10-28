@@ -48,7 +48,8 @@ def staged(monkeypatch):
     calls = []
 
     async def _submit(
-        session, token, fields, has_photo, confirmed_only=False, fill_seconds=None
+        session, token, fields, has_photo, confirmed_only=False, fill_seconds=None,
+        comments=None,
     ):
         calls.append({"token": token, "fields": fields, "has_photo": has_photo})
         return SurveySubmitResult(staged=True, change_count=len(fields), survey_response_id=7)

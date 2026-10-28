@@ -579,7 +579,8 @@ def test_the_route_passes_the_flag_through_and_returns_the_contract(client, monk
     seen = {}
 
     async def fake_submit(
-        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None
+        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None,
+        comments=None,
     ):
         seen.update(
             token=token,
@@ -621,7 +622,8 @@ def test_the_flag_defaults_to_false_so_existing_clients_are_unchanged(client, mo
     seen = {}
 
     async def fake_submit(
-        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None
+        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None,
+        comments=None,
     ):
         seen["confirmed_only"] = confirmed_only
         return SurveySubmitResult(staged=True, change_count=1)
@@ -644,7 +646,8 @@ def test_the_confirm_is_gated_by_the_same_abuse_budget_as_the_submit(client, mon
     from app.schemas.survey import SurveySubmitResult
 
     async def fake_submit(
-        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None
+        session, token, fields, has_photo=False, confirmed_only=False, fill_seconds=None,
+        comments=None,
     ):
         return SurveySubmitResult(staged=True, change_count=0, confirmed=True)
 

@@ -211,6 +211,7 @@ class _World:
         host=False,
         archived=False,
         is_alumni=True,
+        deceased=False,
         last=None,
         gender="F",
         email=None,
@@ -227,7 +228,7 @@ class _World:
                 linkedin_url=f"https://linkedin.example/in/{alumni_id}",
                 archived=archived,
                 is_alumni=is_alumni,
-                deceased=False,
+                deceased=deceased,
             )
         )
         if city is not None or state is not None or employer is not None:
@@ -300,10 +301,12 @@ def _populate(w: _World):
     w.alum(9, employer="Acme", host=True)  # employment row, blank city/state
     w.alum(10, city="Nowhereville", state="Utah", host=True)  # not in city_geo
     w.alum(11, city="Boise", state="Idaho", host=True)
-    # Excluded from everything: archived and friends.
+    # Excluded from everything: archived, friends and the deceased.
     w.alum(12, city="Dallas", state="Texas", host=True, archived=True)
     w.alum(13, city="Dallas", state="Texas", host=True, is_alumni=False)
     w.alum(14, city="Boise", state="Idaho", host=True, archived=True)
+    w.alum(16, city="Dallas", state="Texas", host=True, deceased=True)
+    w.alum(17, host=True, deceased=True)  # would otherwise land in Other
     # A non-host with no city is on no list at all.
     w.alum(15)
 

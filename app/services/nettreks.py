@@ -34,7 +34,9 @@ Membership is a property of a CITY, not of an alum, so it is decided once per
 
 Population: non-archived alumni only (``archived = false``) and alumni only, not
 friends of the program (``is_alumni = true``) — the main alumni list's defaults
-(``repositories.alumni.build_alumni_query``).
+(``repositories.alumni.build_alumni_query``) — and never the deceased
+(``deceased = false``): these lists are who to ask to host and who to invite to
+the dinner, the same reason the survey sends skip them.
 """
 
 from __future__ import annotations
@@ -287,8 +289,13 @@ _HOST_WILLING = func.coalesce(AlumniProgramEngagement.nettrek_host_willing, fals
 
 def _population_conditions() -> list:
     """Non-archived alumni, not friends — the main alumni list's defaults
-    (``build_alumni_query``: ``include_archived=False``, ``is_alumni=True``)."""
-    return [Alumni.archived.is_(False), Alumni.is_alumni.is_(True)]
+    (``build_alumni_query``: ``include_archived=False``, ``is_alumni=True``) —
+    and not deceased (an invite list; see the module docstring)."""
+    return [
+        Alumni.archived.is_(False),
+        Alumni.is_alumni.is_(True),
+        Alumni.deceased.is_(False),
+    ]
 
 
 def _located_in(keys: list[CityKey]):

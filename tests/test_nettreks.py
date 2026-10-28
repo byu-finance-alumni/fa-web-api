@@ -40,6 +40,7 @@ from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement
 from app.models.geo import CityGeo
+from app.models.tags import AlumniStatusLabel, StatusLabel
 from app.schemas.auth import UserContext
 from app.schemas.nettreks import NetTrekAreaKey as A
 from app.schemas.nettreks import NetTrekReportKind as K
@@ -212,6 +213,7 @@ class _World:
         archived=False,
         is_alumni=True,
         deceased=False,
+        label=None,
         last=None,
         gender="F",
         email=None,
@@ -252,6 +254,23 @@ class _World:
                 phone="555-0100",
             )
         )
+        if label:
+            existing = self.s.query(StatusLabel).filter_by(status_label_name=label).first()
+            if existing is None:
+                # BigInteger PKs don't autoincrement on SQLite; number by hand.
+                existing = StatusLabel(
+                    status_label_id=self.s.query(StatusLabel).count() + 1,
+                    status_label_name=label,
+                )
+                self.s.add(existing)
+                self.s.flush()
+            self.s.add(
+                AlumniStatusLabel(
+                    alumni_status_label_id=alumni_id,
+                    alumni_id=alumni_id,
+                    status_label_id=existing.status_label_id,
+                )
+            )
         if host:
             self.s.add(
                 AlumniProgramEngagement(
@@ -278,6 +297,8 @@ def world():
                 AlumniContactInfo.__table__,
                 AlumniProgramEngagement.__table__,
                 CityGeo.__table__,
+                StatusLabel.__table__,
+                AlumniStatusLabel.__table__,
             ],
         )
     with Session(engine) as session:
@@ -307,6 +328,12 @@ def _populate(w: _World):
     w.alum(14, city="Boise", state="Idaho", host=True, archived=True)
     w.alum(16, city="Dallas", state="Texas", host=True, deceased=True)
     w.alum(17, host=True, deceased=True)  # would otherwise land in Other
+    # Do Not Contact / Deceased LABELS suppress too (Jake, 2026-10-28).
+    w.alum(118, city="Dallas", state="Texas", host=True, label="Do Not Contact")
+    w.alum(119, host=True, label="Do Not Contact")  # would otherwise land in Other
+    w.alum(120, city="Dallas", state="Texas", label="Deceased")
+    # An unrelated label does NOT suppress.
+    w.alum(121, city="Dallas", state="Texas", label="Board Member")
     # A non-host with no city is on no list at all.
     w.alum(15)
 
@@ -322,7 +349,8 @@ def _ids(w, key, kind):
 def test_city_area_hosts_and_area_alumni(world):
     _populate(world)
     assert _ids(world, A.dallas, K.hosts) == {1, 2}
-    assert _ids(world, A.dallas, K.area_alumni) == {1, 2, 3}
+    # 121 carries an unrelated label, which does not suppress.
+    assert _ids(world, A.dallas, K.area_alumni) == {1, 2, 3, 121}
 
 
 def test_a_host_appears_on_both_lists(world):
@@ -376,7 +404,7 @@ def test_summary_counts_match_the_lists(world):
             assert area.area_alumni.title == f"{area.name} Area Alumni"
     by_key = {a.key: a for a in summary.areas}
     assert by_key[A.dallas].hosts.count == 2
-    assert by_key[A.dallas].area_alumni.count == 3
+    assert by_key[A.dallas].area_alumni.count == 4  # incl. 121 (unrelated label)
     assert by_key[A.other].hosts.count == 6
 
 
@@ -427,7 +455,7 @@ def test_csv_header_order_and_cells(world):
         "Graduation Year",
         "Willing to Host a NetTrek",
     ]
-    assert len(rows) == 1 + 4
+    assert len(rows) == 1 + 5  # 1, 2, 3, 121 (unrelated label) and 20
     first = rows[1]  # L001, a host
     assert first[:3] == ["F1", "M", "L001"]
     assert first[6:9] == ["Dallas", "Texas", "p1@dev.example"]
@@ -538,7 +566,7 @@ def test_export_route_downloads_and_audits(world):
     assert resp.headers["content-disposition"].startswith(
         'attachment; filename="dallas_area_alumni_'
     )
-    assert len(_csv_rows(resp.text)) == 1 + 3
+    assert len(_csv_rows(resp.text)) == 1 + 4  # 1, 2, 3 and 121 (unrelated label)
     (entry,) = world.db.added
     assert entry.action_type == "export_nettrek_report"
 

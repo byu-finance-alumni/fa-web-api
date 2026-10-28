@@ -773,6 +773,7 @@ EXPORT_AUDIT_ACTIONS: frozenset[str] = frozenset(
         "export_survey_replied",  # both replied CSVs (#605)
         "export_survey_needs_follow_up",  # both needs-follow-up CSVs (#889)
         "export_opportunity_links",
+        "export_nettrek_report",  # every NetTreks report CSV (#887)
     }
 )
 
@@ -1051,6 +1052,14 @@ SURVEYS_PROGRESS_BROWSE_READ_LIMITER = read_rate_limiter(
 ENGINEER_BROWSE_READ_LIMITER = read_rate_limiter(
     "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_engineer
 )
+# The NetTreks tab's on-screen reports (#887) list named alumni with contact
+# details, so they resolve through the alumni.export guard (the tab is the
+# export tab) but spend the BROWSE budget: paging a report is a page view, and
+# the export budget (20 per 10 minutes, with a security alert on the first
+# refusal) is for files. The CSV itself spends the export budget.
+NETTREKS_BROWSE_READ_LIMITER = read_rate_limiter(
+    "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_alumni_export
+)
 EXPORT_READ_LIMITER = read_rate_limiter(
     "read:export",
     windows=_EXPORT_WINDOWS,
@@ -1088,6 +1097,9 @@ SurveysProgressBrowseReadRateLimit = Annotated[
 ]
 EngineerBrowseReadRateLimit = Annotated[
     UserContext, Depends(ENGINEER_BROWSE_READ_LIMITER)
+]
+NetTreksBrowseReadRateLimit = Annotated[
+    UserContext, Depends(NETTREKS_BROWSE_READ_LIMITER)
 ]
 ExportReadRateLimit = Annotated[UserContext, Depends(EXPORT_READ_LIMITER)]
 ViewExportReadRateLimit = Annotated[UserContext, Depends(VIEW_EXPORT_READ_LIMITER)]

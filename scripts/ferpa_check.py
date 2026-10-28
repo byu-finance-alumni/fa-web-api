@@ -32,6 +32,7 @@ DISCLOSURE_ROUTE_FILES = [
     REPO_ROOT / "app" / "api" / "routes" / "alumni.py",
     REPO_ROOT / "app" / "api" / "routes" / "dashboard.py",
     REPO_ROOT / "app" / "api" / "routes" / "geography.py",
+    REPO_ROOT / "app" / "api" / "routes" / "nettreks.py",
 ]
 
 

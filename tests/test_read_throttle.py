@@ -200,12 +200,23 @@ def test_single_record_reads_are_braked(client, alerts, method, path):
         "/survey/schedules/2020/no-reply/export",
         "/survey/schedules/needs-follow-up/export",
         "/survey/schedules/2020/needs-follow-up/export",
+        "/nettreks/dallas/hosts/export",
+        "/nettreks/other/hosts/export",
     ],
 )
 def test_every_export_route_is_braked(client, alerts, path):
     _as("super_admin")
     for _ in range(_EXPORT_PER_TEN_MIN):
         client.post("/alumni/export", json={"columns": []})
+    assert client.get(path).status_code == 429
+
+
+@pytest.mark.parametrize("path", ["/nettreks", "/nettreks/dallas/area_alumni"])
+def test_nettreks_on_screen_reports_spend_the_browse_budget(client, alerts, path):
+    # The NetTreks tab's on-screen views (#887) are export-gated but are page
+    # views, so they share the directory's browse budget, not the export one.
+    _as("super_admin")
+    _spend_browse(client, _BROWSE_PER_MINUTE)
     assert client.get(path).status_code == 429
 
 
@@ -368,6 +379,7 @@ def test_global_count_under_every_limit_lets_the_export_run(client, alerts, monk
         "/survey/schedules/no-reply/export",
         "/survey/schedules/needs-follow-up/export",
         "/opportunity-links/export?status=bogus",
+        "/nettreks/dallas/area_alumni/export",
     ],
 )
 def test_every_export_route_applies_the_global_count(client, alerts, monkeypatch, path):

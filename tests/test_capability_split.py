@@ -127,6 +127,11 @@ _PROBES: list[tuple[str, str, str, dict]] = [
     # An event's attendee roster is a file of people, so it sits with the other
     # exports rather than with event management (#379).
     (Capability.ALUMNI_EXPORT, "get", "/events/7/attendees/export", {}),
+    # The NetTreks tab (#887): every route — the counts, the on-screen report
+    # and its CSV — is gated by alumni.export.
+    (Capability.ALUMNI_EXPORT, "get", "/nettreks", {}),
+    (Capability.ALUMNI_EXPORT, "get", "/nettreks/dallas/hosts", {}),
+    (Capability.ALUMNI_EXPORT, "get", "/nettreks/wasatch/area_alumni/export", {}),
     (Capability.ALUMNI_PHOTOS, "delete", "/alumni/1/headshot", {}),
     (Capability.ALUMNI_PHOTOS, "post", "/alumni/1/headshot/upload-url", {}),
     (

@@ -14,7 +14,11 @@ from app.core.dropdowns import EMPLOYER_NOT_APPLICABLE_STATUSES, ENGAGEMENT_FLAG
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
-from app.repositories.alumni import alumni_order_by, build_alumni_query
+from app.repositories.alumni import (
+    alumni_order_by,
+    build_alumni_query,
+    displayed_industry,
+)
 
 
 def _sql(stmt) -> str:
@@ -1025,6 +1029,68 @@ def test_industry_sort_orders_by_supplied_expression_nulls_last():
     # Deterministic tiebreaks: last name then the unique PK (stable OFFSET paging).
     assert "last_name ASC" in order_by
     assert order_by.rstrip().endswith("alumni.alumni_id ASC")
+
+
+# --- #891 industry sort follows the DISPLAYED industry -----------------------
+#
+# The list shows the secondary industry when the primary is "Other" (AlumniTable
+# Industry cell), so the ``industry`` sort keys on displayed_industry. The
+# behaviour test runs the real expression on in-memory SQLite (lower / trim /
+# nullif / CASE / NULLS LAST all exist there) — no Postgres needed.
+
+
+def test_displayed_industry_compiles_to_other_secondary_case():
+    expr = displayed_industry(
+        CurrentEmployment.current_industry,
+        CurrentEmployment.current_industry_secondary,
+    )
+    sql = _sql(select(expr))
+    assert "CASE WHEN" in sql
+    assert "lower(current_employment.current_industry)" in sql
+    assert "nullif(trim(current_employment.current_industry_secondary)" in sql
+    assert "THEN current_employment.current_industry_secondary" in sql
+    assert "ELSE current_employment.current_industry END" in sql
+
+
+def test_industry_sort_orders_by_displayed_industry():
+    from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine
+
+    md = MetaData()
+    t = Table(
+        "emp",
+        md,
+        Column("id", Integer, primary_key=True),
+        Column("primary_ind", String),
+        Column("secondary_ind", String),
+    )
+    engine = create_engine("sqlite://")
+    md.create_all(engine)
+    rows = [
+        (1, "Restructuring", None),
+        (2, "Other", "Real Estate"),
+        (3, "Private Equity", None),
+        (4, "Other", None),  # no secondary -> still shown (and sorted) as "Other"
+        (5, "Other", "   "),  # whitespace-only secondary counts as none
+        (6, "", None),  # blank -> last, with the NULLs
+        (7, None, None),
+        (8, "Investment Banking", "Healthcare"),  # secondary ignored: not "Other"
+    ]
+    with engine.begin() as conn:
+        conn.execute(
+            t.insert(),
+            [{"id": i, "primary_ind": p, "secondary_ind": s} for i, p, s in rows],
+        )
+        expr = displayed_industry(t.c.primary_ind, t.c.secondary_ind)
+        ordered = conn.execute(
+            # Just the industry key (the real tiebreakers reference the alumni
+            # table); this table's id stands in as the tiebreak.
+            select(t.c.id).order_by(
+                alumni_order_by("industry", industry=expr)[0], t.c.id
+            )
+        ).scalars().all()
+    # Investment Banking, the two "Other" rows with no usable secondary, Private
+    # Equity, Real Estate (the "Other" row), Restructuring, then blank and NULL.
+    assert ordered == [8, 4, 5, 3, 2, 1, 6, 7]
 
 
 def test_city_and_state_sorts_order_by_supplied_expression():

@@ -28,6 +28,7 @@ _REAL_EXPORT_COUNTS = rate_limit._recent_export_counts
 
 _BROWSE_PER_MINUTE = rate_limit._BROWSE_WINDOWS[0][0]
 _EXPORT_PER_TEN_MIN = rate_limit._EXPORT_WINDOWS[0][0]
+_CONTACT_PER_TEN_MIN = rate_limit._CONTACT_LIST_WINDOWS[0][0]
 
 # Cheap, DB-free browse requests: each passes the limiter, then 422s.
 _LIST = "/alumni?limit=0"
@@ -211,10 +212,10 @@ def test_every_export_route_is_braked(client, alerts, path):
     assert client.get(path).status_code == 429
 
 
-@pytest.mark.parametrize("path", ["/nettreks", "/nettreks/dallas/area_alumni"])
-def test_nettreks_on_screen_reports_spend_the_browse_budget(client, alerts, path):
-    # The NetTreks tab's on-screen views (#887) are export-gated but are page
-    # views, so they share the directory's browse budget, not the export one.
+@pytest.mark.parametrize("path", ["/nettreks", "/outreach/mentors"])
+def test_nettreks_and_outreach_landings_spend_the_browse_budget(client, alerts, path):
+    # The landing pages (#887) are counts only: export-gated, but plain page
+    # views on the directory's browse budget, not the contact-list one.
     _as("super_admin")
     _spend_browse(client, _BROWSE_PER_MINUTE)
     assert client.get(path).status_code == 429
@@ -326,7 +327,7 @@ def test_long_window_catches_a_slow_walk_and_refusals_record_nothing(monkeypatch
 
 
 def _counts(monkeypatch, *values: int):
-    async def _fake(_session, _actor, windows):
+    async def _fake(_session, _actor, windows, _rows=None):
         assert len(windows) == len(values)
         return list(values)
 
@@ -623,3 +624,168 @@ def test_cancelled_alert_releases_the_cooldown_and_reraises(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(_trip())
     assert ("read:browse", 4) not in rate_limit._READ_ALERTED_AT
+
+
+# --- contact-list pages: their own, globally counted budget (BT-1103-2) --------
+
+# Cheap list / report pages: each passes the limiter, then 422s on ``limit=0``.
+_NETTREK_PAGE = "/nettreks/dallas/hosts?limit=0"
+_OUTREACH_PAGE = "/outreach/speakers/utah?limit=0"
+
+
+@pytest.fixture
+def landings(monkeypatch):
+    """The landing pages read the database; answer them 404 without one, so a
+    landing call shows only whether it got past its limiter."""
+    from app.core.errors import NotFoundError
+    from app.services import nettreks, outreach_lists
+
+    async def _none(*_a, **_k):
+        raise NotFoundError("stub")
+
+    monkeypatch.setattr(nettreks, "get_summary", _none)
+    monkeypatch.setattr(outreach_lists, "get_summary", _none)
+
+
+def test_a_person_paging_a_few_lists_is_not_throttled(client, alerts, landings):
+    # Opening several lists and paging a few deep in each: well under budget.
+    _as("full_access")
+    statuses = [client.get("/nettreks").status_code, client.get("/outreach/speakers").status_code]
+    for _ in range(6):
+        statuses.append(client.get(_NETTREK_PAGE).status_code)
+        statuses.append(client.get(_OUTREACH_PAGE).status_code)
+    assert 429 not in statuses
+    assert alerts == []
+
+
+def test_contact_list_limits_are_tighter_than_browse_but_humane():
+    (short, short_s), (hour, hour_s) = rate_limit._CONTACT_LIST_WINDOWS
+    assert (short_s, hour_s) == (600.0, 3600.0)
+    assert 20 <= short <= hour <= 60
+    assert hour < rate_limit._BROWSE_WINDOWS[0][0]
+
+
+def test_contact_list_budget_is_shared_across_both_routers(client, alerts):
+    _as("super_admin", user_id=4)
+    half = _CONTACT_PER_TEN_MIN // 2
+    seen = [client.get(_NETTREK_PAGE).status_code for _ in range(half)]
+    seen += [
+        client.get(_OUTREACH_PAGE).status_code
+        for _ in range(_CONTACT_PER_TEN_MIN - half)
+    ]
+    assert set(seen) == {422}
+    for path in (_NETTREK_PAGE, _OUTREACH_PAGE, "/outreach/mentors/women?limit=0"):
+        resp = client.get(path)
+        assert resp.status_code == 429
+        assert resp.json()["error"]["code"] == "rate_limited"
+        assert resp.json()["error"]["message"] == rate_limit._TOO_MANY_REQUESTS_MESSAGE
+        assert resp.headers.get("Retry-After") == "600"
+
+
+def test_contact_list_pages_no_longer_ride_the_browse_budget(client, alerts, landings):
+    # A spent contact-list budget leaves browsing (and the landings) alone...
+    _as("super_admin")
+    for _ in range(_CONTACT_PER_TEN_MIN):
+        client.get(_NETTREK_PAGE)
+    assert client.get(_NETTREK_PAGE).status_code == 429
+    assert client.get(_LIST).status_code == 422
+    assert client.get("/nettreks").status_code == 404
+    assert client.get("/outreach/speakers").status_code == 404
+
+
+def test_landing_pages_do_not_spend_the_contact_list_budget(client, alerts, landings):
+    _as("super_admin")
+    for _ in range(_CONTACT_PER_TEN_MIN * 2):
+        assert client.get("/nettreks").status_code == 404
+        assert client.get("/outreach/mentors").status_code == 404
+    assert client.get(_NETTREK_PAGE).status_code == 422
+    assert client.get(_OUTREACH_PAGE).status_code == 422
+
+
+def test_contact_list_alert_fires_once_on_crossing(client, alerts):
+    _as("super_admin", user_id=11)
+    for _ in range(_CONTACT_PER_TEN_MIN):
+        client.get(_OUTREACH_PAGE)
+    assert alerts == []  # at the limit, not over it
+    for _ in range(20):
+        assert client.get(_NETTREK_PAGE).status_code == 429
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert["purpose"] == failure_alert.SECURITY
+    rows = dict(alert["rows"])
+    assert rows["Bucket"] == "read:contact_list"
+    assert rows["User id"] == "11"
+    assert rows["Route"] == "/nettreks/{area}/{kind}"
+
+
+def test_contact_list_pages_from_other_instances_refuse_this_one(
+    client, alerts, monkeypatch
+):
+    """Cold instance, but the audit trail shows the hour already spent: 429 +
+    one alert, and the count asked for the contact-list rows, not exports."""
+    asked: list = []
+
+    async def _fake(_session, _actor, windows, rows=rate_limit.EXPORT_AUDIT_ROWS):
+        asked.append(rows)
+        return [0, rate_limit._CONTACT_LIST_WINDOWS[1][0]]
+
+    monkeypatch.setattr(rate_limit, "_recent_export_counts", _fake)
+    _as("super_admin", user_id=3)
+    resp = client.get(_OUTREACH_PAGE)
+    assert resp.status_code == 429
+    assert resp.headers.get("Retry-After") == "3600"
+    assert asked == [rate_limit.CONTACT_LIST_AUDIT_ROWS]
+    assert len(alerts) == 1
+    assert dict(alerts[0]["rows"])["Bucket"] == "read:contact_list"
+
+
+def test_contact_list_global_count_under_limit_lets_the_page_run(
+    client, alerts, monkeypatch
+):
+    _as("super_admin")
+    (short, _), (hour, _) = rate_limit._CONTACT_LIST_WINDOWS
+    _counts(monkeypatch, short - 1, hour - 1)
+    assert client.get(_NETTREK_PAGE).status_code == 422
+    assert alerts == []
+
+
+def test_contact_list_count_is_over_the_view_rows_those_routes_write():
+    session = _CountSession(row=(2, 5))
+    counts = asyncio.run(
+        _REAL_EXPORT_COUNTS(
+            session,
+            _ctx("full_access", user_id=9),
+            rate_limit._CONTACT_LIST_WINDOWS,
+            rate_limit.CONTACT_LIST_AUDIT_ROWS,
+        )
+    )
+    assert counts == [2, 5]
+    sql = _sql(session.stmts[0])
+    assert "audit_logs.user_id =" in sql
+    assert "audit_logs.action_type IN" in sql
+    assert "audit_logs.entity_type IN" in sql
+    # The export count stays on export actions only, with no entity filter.
+    session = _CountSession(row=(0, 0))
+    asyncio.run(
+        _REAL_EXPORT_COUNTS(session, _ctx("full_access"), rate_limit._EXPORT_WINDOWS)
+    )
+    assert "entity_type" not in _sql(session.stmts[0])
+
+
+def test_contact_list_entities_match_what_the_routes_audit():
+    """The global count only works if it counts the rows the two list routes
+    actually write — pin the action and entity types to the route code."""
+    from app.services import outreach_lists
+
+    routes = pathlib.Path(rate_limit.__file__).resolve().parents[1] / "api" / "routes"
+    nettreks_src = (routes / "nettreks.py").read_text()
+    outreach_src = (routes / "outreach.py").read_text()
+    assert 'entity_type="nettrek_report"' in nettreks_src
+    assert "entity_type=svc.OUTREACH_ENTITY" in outreach_src
+    assert rate_limit.CONTACT_LIST_AUDIT_ENTITIES == {
+        "nettrek_report",
+        outreach_lists.OUTREACH_ENTITY,
+    }
+    assert rate_limit.CONTACT_LIST_AUDIT_ROWS.actions == {"view"}
+    for src in (nettreks_src, outreach_src):
+        assert 'action="view"' in src

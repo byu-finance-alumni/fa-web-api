@@ -106,6 +106,17 @@ def new_sentinel() -> str:
     return f"{SESSION_SENTINEL_PREFIX}{uuid.uuid4()}"
 
 
+#: Prefix of the value ``POST /auth/logout`` writes: same guarantee as
+#: :data:`SESSION_SENTINEL_PREFIX`, kept distinct so a row reads as a sign-out
+#: rather than an engineer revoke.
+SIGNED_OUT_SENTINEL_PREFIX = "signed-out:"
+
+
+def new_signed_out_sentinel() -> str:
+    """A fresh, never-matching session-id value for a user's own sign-out."""
+    return f"{SIGNED_OUT_SENTINEL_PREFIX}{uuid.uuid4()}"
+
+
 # --- reads -------------------------------------------------------------------
 
 # One row per LIVE session. Expired rows are excluded (``not_after``): GoTrue

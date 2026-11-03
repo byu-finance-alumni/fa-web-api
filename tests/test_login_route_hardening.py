@@ -11,9 +11,10 @@ Four things are asserted here, in this order:
   1. Both routes now refuse a flood, at the real production budgets.
   2. The refusal is keyed on the CLIENT IP — the trusted rightmost forwarded hop,
      not the spoofable leftmost one — and never on the submitted email.
-  3. Nothing about the lockout or the anti-enumeration contract changed: a
-     registered account still hard-locks, and a registered and an unregistered
-     address are still indistinguishable from the response.
+  3. Nothing about the cooldown or the anti-enumeration contract changed, and
+     (BT-1103-1) anonymous failure reports never hard-lock an account: a
+     registered and an unregistered address are indistinguishable from the
+     response.
   4. The retention purge deletes rows past their window and NOTHING else — in
      particular it cannot unlock a locked account.
 
@@ -189,26 +190,41 @@ def test_spoofed_leftmost_forwarded_hop_does_not_refresh_the_budget(client):
 # --- 3. the lockout and anti-enumeration are unchanged ------------------------
 
 
-def test_lockout_still_trips_through_the_route(client):
-    """The whole feature this route exists for: LOCK_THRESHOLD failures against a
-    REGISTERED address still hard-lock the account. A sticky lock under attack is
-    the intended behaviour, not something the new brakes may soften."""
+def test_anonymous_failures_cool_down_but_never_hard_lock(client):
+    """BT-1103-1: anyone can POST a failure for any email, so 25+ of them against
+    a REGISTERED address must produce the short cooldown and nothing more — the
+    24h hard lock (``users.locked_at``) is never armed from this route."""
     c, session = client
     user = SimpleNamespace(user_id=2, email="alum@byu.edu", locked_at=None, locked_reason=None)
     session.user = user
 
-    for _ in range(login_lockout.LOCK_THRESHOLD - 1):
-        assert _record(c, email="alum@byu.edu").status_code == 200
+    bodies = [_record(c, email="alum@byu.edu").json() for _ in range(25)]
     assert user.locked_at is None
+    assert user.locked_reason is None
+    for n, body in enumerate(bodies, start=1):
+        assert set(body) == {"allowed", "reason", "retry_after_seconds"}
+        if n < login_lockout.COOLDOWN_THRESHOLD:
+            assert body == {"allowed": True, "reason": "ok", "retry_after_seconds": None}
+        else:
+            assert body["reason"] == "cooldown"
+            assert body["allowed"] is False
+            assert 0 < body["retry_after_seconds"] <= login_lockout.COOLDOWN_MINUTES * 60
+    # The precheck reflects the cooldown (and only the cooldown).
+    assert _precheck(c, email="alum@byu.edu").json()["reason"] == "cooldown"
 
-    body = _record(c, email="alum@byu.edu").json()
-    assert user.locked_at is not None
-    assert user.locked_reason == login_lockout.LOCK_REASON_TOO_MANY_FAILED
-    # The lock is armed, but the anonymous caller is told only "cooldown" — the
-    # same thing an address with no account gets (see the test below).
-    assert body["reason"] == "cooldown"
-    assert body["allowed"] is False
-    assert body["retry_after_seconds"] is not None
+
+def test_anonymous_failures_do_not_touch_an_existing_lock(client):
+    c, session = client
+    live = _now() - datetime.timedelta(hours=1)
+    session.user = SimpleNamespace(
+        user_id=2,
+        email="alum@byu.edu",
+        locked_at=live,
+        locked_reason=login_lockout.LOCK_REASON_TOO_MANY_FAILED,
+    )
+    for _ in range(25):
+        assert _record(c, email="alum@byu.edu").status_code == 200
+    assert session.user.locked_at == live
 
 
 def test_cooldown_still_trips_through_the_route(client):
@@ -246,17 +262,17 @@ def _responses_for(user, email, n):
 
 
 def test_registered_and_unregistered_emails_are_indistinguishable():
-    """Anti-enumeration. Driven PAST the lock threshold, a real account, an
-    already-locked account and an address with no account must produce
-    byte-identical responses, failure for failure, and on the precheck after.
-    The real account does get hard-locked along the way — it just isn't said
-    here; the lock is enforced after authentication (403 / account_locked).
+    """Anti-enumeration. Driven well past the cooldown (and the old 20-failure
+    lock threshold), a real account, an already-locked account and an address
+    with no account must produce byte-identical responses, failure for failure,
+    and on the precheck after. An existing lock is enforced after authentication
+    (403 / account_locked), never here.
 
     This used to stop one short of the threshold, because at the threshold the
     real account answered `locked` (no timer) while the unknown one answered
     `cooldown` (with a timer) — an anonymous "this is a real staff account" probe.
     """
-    n = login_lockout.LOCK_THRESHOLD + 2
+    n = 25
     fresh = SimpleNamespace(user_id=2, email="alum@byu.edu", locked_at=None, locked_reason=None)
     registered = _responses_for(fresh, "alum@byu.edu", n)
     rate_limit.reset()
@@ -273,7 +289,7 @@ def test_registered_and_unregistered_emails_are_indistinguishable():
     rate_limit.reset()
     unknown = _responses_for(None, "nobody@example.com", n)
 
-    assert fresh.locked_at is not None  # the sticky lock still trips
+    assert fresh.locked_at is None  # anonymous reports never hard-lock
     assert registered == unknown
     assert already_locked == unknown
     # And no body ever says "locked" or leaks the internal flag.

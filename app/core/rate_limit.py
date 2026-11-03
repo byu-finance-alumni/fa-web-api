@@ -27,8 +27,9 @@ use ``client_ip_rate_limiter(...)`` — client IP only. See the "#423" block.
 The bulk-READ surfaces (alumni list/search, profile, notes, headshot URLs, the
 named-alumni geography lists, and every CSV/export route) use
 ``read_rate_limiter(...)``: per authenticated user, several windows at once,
-and a SECURITY alert the first time a user trips it. The export bucket is also
-counted across instances from the audit trail. See the "read throttle" block.
+and a SECURITY alert the first time a user trips it. The export bucket and the
+contact-list bucket are also counted across instances from the audit trail. See
+the "read throttle" block.
 """
 
 import asyncio
@@ -38,6 +39,7 @@ import json
 import logging
 import time
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
@@ -52,6 +54,7 @@ from app.api.dependencies.auth import (
     require_donations_view,
     require_engineer,
     require_interactions_create,
+    require_notes_write,
     require_reports_advanced,
     require_super_admin,
     require_surveys_manage,
@@ -396,6 +399,36 @@ BulkHeadshotRateLimit = Annotated[
     UserContext, Depends(BULK_HEADSHOT_LIMITER)
 ]
 
+# --- Note writes ------------------------------------------------------------------
+#
+# Create / edit / delete on /notes share one per-user stream with two windows:
+# the usual 30 / minute mutation brake, plus an hourly ceiling so a steady loop
+# just under the per-minute rate still stops. The actor is resolved through the
+# route's own guard (``require_notes_write``).
+NOTE_WRITE_PER_MINUTE = 30
+NOTE_WRITE_PER_HOUR = 300
+
+
+async def _note_write_limiter(
+    actor: Annotated[UserContext, Depends(require_notes_write)],
+) -> UserContext:
+    _check(
+        "notes:write_minute",
+        actor.user_id,
+        limit=NOTE_WRITE_PER_MINUTE,
+        window_seconds=60,
+    )
+    _check(
+        "notes:write_hour",
+        actor.user_id,
+        limit=NOTE_WRITE_PER_HOUR,
+        window_seconds=3600,
+    )
+    return actor
+
+
+NoteWriteRateLimit = Annotated[UserContext, Depends(_note_write_limiter)]
+
 # --- Public, token-gated survey routes (#360) --------------------------------
 #
 # `/survey/respond/{token}` is the one surface here with NO login: the signed
@@ -717,6 +750,26 @@ LOGIN_RECORD_LIMITER = client_ip_rate_limiter(
 _BROWSE_WINDOWS: tuple[tuple[int, float], ...] = ((240, 60.0), (2400, 3600.0))
 _EXPORT_WINDOWS: tuple[tuple[int, float], ...] = ((20, 600.0), (60, 3600.0))
 
+# --- Contact-list pages (BT-1103-2) ---------------------------------------------
+#
+# The on-screen Outreach lists (``GET /outreach/{group}/{key}``) and NetTrek
+# reports (``GET /nettreks/{area}/{kind}``) return the SAME contact columns as
+# their CSV exports, a page at a time. Under the browse budget alone, paging
+# them would deliver a whole list's contact details far faster than the export
+# budget allows, with no alert. So these pages get their OWN bucket, shared by
+# both routers (switching between lists does not buy a fresh budget), counted
+# globally from the ``view`` audit rows those two routes already write — the
+# same mechanism, 429 and SECURITY alert as the export bucket.
+#
+# HOW THE NUMBERS WERE CHOSEN: a page is 50 people (the app's page size) and
+# one navigation is one hit. A person working through lists opens a handful and
+# pages a few deep — a dozen or two pages in a sitting. 30 per ten minutes is one
+# page every 20 s for ten minutes straight; 60 an hour is 3,000 rows of contact
+# details, more than anyone reads on screen (the CSV exists for that). The
+# landing pages (counts only, no contact details) are NOT in this bucket — they
+# stay on the browse budget.
+_CONTACT_LIST_WINDOWS: tuple[tuple[int, float], ...] = ((30, 600.0), (60, 3600.0))
+
 # One alert per (bucket, user) per this many seconds, per instance. Without it a
 # runaway client that ignores 429 would page the channel once per request. An
 # hour matches the longest window: if the same user is still tripping it an hour
@@ -779,11 +832,38 @@ EXPORT_AUDIT_ACTIONS: frozenset[str] = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class CountedAuditRows:
+    """Which of the caller's audit rows a globally counted bucket counts: rows
+    whose ``action_type`` is in ``actions`` and, when set, whose ``entity_type``
+    is in ``entity_types``."""
+
+    actions: frozenset[str]
+    entity_types: frozenset[str] | None = None
+
+
+EXPORT_AUDIT_ROWS = CountedAuditRows(EXPORT_AUDIT_ACTIONS)
+
+# The ``view`` rows the contact-list pages write (one per page served). The
+# entity types are the ones ``app/api/routes/outreach.py`` and
+# ``app/api/routes/nettreks.py`` pass to ``log_read`` — a test pins them.
+CONTACT_LIST_AUDIT_ENTITIES: frozenset[str] = frozenset(
+    {"outreach_list", "nettrek_report"}
+)
+CONTACT_LIST_AUDIT_ROWS = CountedAuditRows(
+    frozenset({"view"}), CONTACT_LIST_AUDIT_ENTITIES
+)
+
+
 async def _recent_export_counts(
-    session: AsyncSession, actor: UserContext, windows: tuple[tuple[int, float], ...]
+    session: AsyncSession,
+    actor: UserContext,
+    windows: tuple[tuple[int, float], ...],
+    rows: CountedAuditRows = EXPORT_AUDIT_ROWS,
 ) -> list[int]:
-    """The caller's completed exports inside each of ``windows``, ACROSS ALL
-    INSTANCES — one COUNT with a FILTER per window, over the longest window.
+    """The caller's completed exports (or other counted ``rows``) inside each of
+    ``windows``, ACROSS ALL INSTANCES — one COUNT with a FILTER per window, over
+    the longest window.
 
     Counted from the audit trail the export routes already write, so it needs no
     new table or migration. An engineer's audit rows are rerouted into
@@ -806,6 +886,13 @@ async def _recent_export_counts(
         table, user_col, time_col = AuditLog, AuditLog.user_id, AuditLog.created_at
     now = datetime.datetime.now(datetime.UTC)
     longest = max(window_seconds for _limit, window_seconds in windows)
+    conditions = [
+        user_col == actor.user_id,
+        table.action_type.in_(sorted(rows.actions)),
+        time_col >= now - datetime.timedelta(seconds=longest),
+    ]
+    if rows.entity_types is not None:
+        conditions.append(table.entity_type.in_(sorted(rows.entity_types)))
     stmt = select(
         *(
             func.count().filter(
@@ -813,17 +900,16 @@ async def _recent_export_counts(
             )
             for _limit, window_seconds in windows
         )
-    ).where(
-        user_col == actor.user_id,
-        table.action_type.in_(sorted(EXPORT_AUDIT_ACTIONS)),
-        time_col >= now - datetime.timedelta(seconds=longest),
-    )
+    ).where(*conditions)
     row = (await session.execute(stmt)).one()
     return [int(n or 0) for n in row]
 
 
 async def _global_export_trip(
-    session: AsyncSession, actor: UserContext, windows: tuple[tuple[int, float], ...]
+    session: AsyncSession,
+    actor: UserContext,
+    windows: tuple[tuple[int, float], ...],
+    rows: CountedAuditRows = EXPORT_AUDIT_ROWS,
 ) -> tuple[int, float] | None:
     """The (limit, window) the caller's completed exports already fill, or None.
 
@@ -832,7 +918,7 @@ async def _global_export_trip(
     refusing here would only change which error the caller sees.
     """
     try:
-        counts = await _recent_export_counts(session, actor, windows)
+        counts = await _recent_export_counts(session, actor, windows, rows)
     except Exception:  # noqa: BLE001 - fail open, see docstring
         log.warning("rate_limit: global export count failed; per-instance only")
         try:
@@ -969,6 +1055,7 @@ def read_rate_limiter(
     windows: tuple[tuple[int, float], ...],
     actor_guard=require_view_only,
     global_count: bool = False,
+    counted_rows: CountedAuditRows = EXPORT_AUDIT_ROWS,
 ):
     """Build a FastAPI dependency throttling a bulk-READ route per user.
 
@@ -981,10 +1068,11 @@ def read_rate_limiter(
     different guards — that is how the opportunity-link export (view access)
     and the alumni exports (``alumni.export``) count against one export limit.
 
-    ``global_count`` (the export bucket only) adds the cross-instance check:
-    after the in-memory windows pass, the caller's completed exports in the
-    audit trail must also be under every window's limit
-    (:func:`_global_export_trip`). Same 429, same alert.
+    ``global_count`` (the export and contact-list buckets) adds the
+    cross-instance check: after the in-memory windows pass, the caller's
+    ``counted_rows`` in the audit trail (completed exports by default) must also
+    be under every window's limit (:func:`_global_export_trip`). Same 429, same
+    alert.
     """
 
     async def _dependency(
@@ -1001,14 +1089,14 @@ def read_rate_limiter(
     if not global_count:
         return _dependency
 
-    # A separate dependency so ONLY the export routes resolve a DB session here
+    # A separate dependency so ONLY the counted routes resolve a DB session here
     # (FastAPI caches it per request, so it is the route's own session).
     async def _global_dependency(
         request: Request,
         actor: Annotated[UserContext, Depends(_dependency)],
         session: Annotated[AsyncSession, Depends(get_session)],
     ) -> UserContext:
-        tripped = await _global_export_trip(session, actor, windows)
+        tripped = await _global_export_trip(session, actor, windows, counted_rows)
         if tripped is not None:
             await _alert_read_throttle(
                 request, bucket, actor.user_id, windows, tripped=tripped
@@ -1053,13 +1141,21 @@ SURVEYS_PROGRESS_BROWSE_READ_LIMITER = read_rate_limiter(
 ENGINEER_BROWSE_READ_LIMITER = read_rate_limiter(
     "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_engineer
 )
-# The NetTreks tab's on-screen reports (#887) list named alumni with contact
-# details, so they resolve through the alumni.export guard (the tab is the
-# export tab) but spend the BROWSE budget: paging a report is a page view, and
-# the export budget (20 per 10 minutes, with a security alert on the first
-# refusal) is for files. The CSV itself spends the export budget.
+# The NetTreks and Outreach LANDING pages (#887) are counts only, so they
+# resolve through the alumni.export guard (the tab is the export tab) and spend
+# the BROWSE budget. The list/report pages themselves carry contact details and
+# spend the contact-list budget below; the CSVs spend the export budget.
 NETTREKS_BROWSE_READ_LIMITER = read_rate_limiter(
     "read:browse", windows=_BROWSE_WINDOWS, actor_guard=require_alumni_export
+)
+# Every Outreach list page and NetTrek report page: one shared, globally counted
+# budget (see _CONTACT_LIST_WINDOWS).
+CONTACT_LIST_READ_LIMITER = read_rate_limiter(
+    "read:contact_list",
+    windows=_CONTACT_LIST_WINDOWS,
+    actor_guard=require_alumni_export,
+    global_count=True,
+    counted_rows=CONTACT_LIST_AUDIT_ROWS,
 )
 EXPORT_READ_LIMITER = read_rate_limiter(
     "read:export",
@@ -1102,5 +1198,6 @@ EngineerBrowseReadRateLimit = Annotated[
 NetTreksBrowseReadRateLimit = Annotated[
     UserContext, Depends(NETTREKS_BROWSE_READ_LIMITER)
 ]
+ContactListReadRateLimit = Annotated[UserContext, Depends(CONTACT_LIST_READ_LIMITER)]
 ExportReadRateLimit = Annotated[UserContext, Depends(EXPORT_READ_LIMITER)]
 ViewExportReadRateLimit = Annotated[UserContext, Depends(VIEW_EXPORT_READ_LIMITER)]

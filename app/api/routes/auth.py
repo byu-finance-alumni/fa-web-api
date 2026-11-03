@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
@@ -59,10 +59,15 @@ _EmailField = Field(min_length=3, max_length=255)
 class LoginContext(BaseModel):
     """Optional client context for a sign-in attempt, forwarded by the frontend
     login action from the incoming request — the client IP (``x-forwarded-for``)
-    and Vercel's IP-geolocation headers. All optional and length-bounded; purely
-    informational (never trusted for authorization), stored on the
-    ``login_events`` row (success) or ``login_failures`` row (failure) for the
-    engineer Logins tabs. ``extra='forbid'`` rejects unknown keys."""
+    and Vercel's IP-geolocation headers. All optional and length-bounded; never
+    trusted for authorization. Stored on the ``login_events`` row (success) or
+    ``login_failures`` row (failure) for the engineer Logins tabs, and
+    ``ip_address`` is also the source key for the #457 automatic block and the
+    #456 abuse alerts. It is caller-supplied, so that block is built to survive a
+    forged value (see app/services/login_block.py, property 1). It cannot be
+    replaced by the request's own forwarded address: these routes are called
+    server-to-server from the frontend, so that address is the frontend's egress
+    for every legitimate sign-in. ``extra='forbid'`` rejects unknown keys."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -312,6 +317,62 @@ async def session_active(
     return SessionActiveResponse(active=is_active)
 
 
+class LogoutResponse(BaseModel):
+    """Result of ``POST /auth/logout``. ``ended`` is true when this call ended
+    the caller's session on the API; false when there was nothing to end (the
+    token carried no session id, or the account's active session is already a
+    different one)."""
+
+    ended: bool
+
+
+@router.post("/logout", response_model=LogoutResponse)
+async def logout(
+    user: CurrentDBUserAllowMustChange, session: SessionDep
+) -> LogoutResponse:
+    """End the caller's session on the API at sign-out.
+
+    The frontend calls this right BEFORE the Supabase sign-out, best-effort.
+    Supabase's sign-out ends the refresh token, but the access token already
+    issued is verified by signature alone and would otherwise keep working here
+    until it expires (~1 hour). This stamps ``users.active_session_id`` with a
+    never-matching sentinel, so ``_enforce_single_session`` rejects that same
+    token (401 ``session_superseded``) on the very next request.
+
+    Only the caller's OWN current session is ended: the stamp is a single
+    conditional UPDATE that applies only while the account's active session is
+    this token's session (or unclaimed, NULL — the fail-open state in which this
+    token would otherwise stay accepted). If a newer sign-in elsewhere has
+    already claimed the account, nothing is written and that device is
+    unaffected. ``active_session_at`` moves to now, so an older surviving
+    session cannot re-claim the account through ``POST /auth/login``; a genuine
+    new sign-in (a newer ``auth.sessions`` row) still can — engineers included,
+    so this can never lock an engineer out.
+
+    Uses the force-password-change-EXEMPT resolver (it does not reject a
+    superseded session or a paused site), so sign-out always works; it reads and
+    writes only the caller's own row, keyed on the token's identity."""
+    if not user.session_id:
+        return LogoutResponse(ended=False)
+    result = await session.execute(
+        update(User)
+        .where(
+            User.user_id == user.user_id,
+            or_(
+                User.active_session_id == user.session_id,
+                User.active_session_id.is_(None),
+            ),
+        )
+        .values(
+            active_session_id=auth_sessions.new_signed_out_sentinel(),
+            active_session_at=datetime.datetime.now(datetime.UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    return LogoutResponse(ended=bool(result.rowcount))
+
+
 class PasswordCompleteResponse(BaseModel):
     """Acknowledgement that the caller's force-change flag was cleared."""
 
@@ -490,16 +551,16 @@ async def password_change(
 #
 # SECURITY: these two endpoints are UNAUTHENTICATED by necessity — they run
 # before the user has a session. They are therefore abusable: anyone who knows a
-# victim's email can spam `/auth/login/record` with `success=false` to drive a
-# registered account into hard lockout (inherent lockout-DoS), or hammer
-# `/auth/login/precheck` for probing. Driving a REAL account into a 24h hard lock
-# is the accepted, intended behaviour of the feature (see the "Lockout
-# denial-of-service" note in app/services/login_lockout.py) and is deliberately
-# NOT what the brakes below try to prevent. They never reveal whether an email is
-# registered OR LOCKED: both routes answer from the per-email counter alone, so
-# the response is the same for an unknown address, a real account, and a
-# hard-locked one — see the anti-enumeration note in that same module. The lock
-# itself is enforced after authentication (403 / `account_locked`).
+# victim's email can spam `/auth/login/record` with `success=false` to put that
+# address into the short cooldown, or hammer `/auth/login/precheck` for probing.
+# Because a report from this route proves nothing about who sent it, it drives
+# the 5-minute cooldown ONLY and never the 24h hard lock (BT-1103-1, see the
+# module docstring of app/services/login_lockout.py). Neither route reveals
+# whether an email is registered OR LOCKED: both answer from the per-email
+# counter alone, so the response is the same for an unknown address, a real
+# account, and a hard-locked one — see the anti-enumeration note in that same
+# module. A (pre-existing) lock is enforced after authentication (403 /
+# `account_locked`).
 #
 # What WAS unbounded (#423), and is now braked here rather than only at the edge:
 #
@@ -558,7 +619,7 @@ async def _purge_expired_login_records(session: AsyncSession) -> None:
     on the FAILURE path of ``POST /auth/login/record`` — see the note at the call
     site for why it lives there and not on a cron.
 
-    THIS MUST NOT WEAKEN THE LOCKOUT. It cannot: the hard lock lives on
+    THIS MUST NOT WEAKEN THE THROTTLE. It cannot: any hard lock lives on
     ``users.locked_at``/``locked_reason``, which this never touches, so a locked
     account stays locked (until its 24h expiry or a super_admin password reset
     — expiry is computed from ``locked_at``, not by deleting anything). What it
@@ -732,7 +793,9 @@ async def login_record(
     """Record a login attempt outcome and return the resulting throttle status.
 
     Unauthenticated. Only FAILURES are accumulated here: a failure may trip the
-    cooldown and (for a registered email) the hard lock. A ``success=true`` from
+    short cooldown and NOTHING longer — it never arms, extends or re-arms the
+    24h hard lock, because anyone can send a failure for any email (BT-1103-1).
+    A ``success=true`` from
     this unauthenticated caller is deliberately IGNORED — it must NOT clear the
     rolling counter, because an attacker could otherwise POST ``{email,
     success:true}`` to wipe a legitimately-set cooldown and brute-force
@@ -740,10 +803,9 @@ async def login_record(
     (``POST /auth/login`` -> ``_clear_login_attempts``), which only a real,
     signed-in user can reach.
 
-    The ``locked`` flag the service returns is intentionally NOT echoed to the
-    client (anti-enumeration), and the ``reason`` is counter-derived: the failure
-    that hard-locks a real account returns the same ``cooldown`` body an unknown
-    address gets on the same failure count.
+    The ``reason`` is counter-derived, so a real account, a hard-locked account
+    and an unknown address get the same body on the same failure count
+    (anti-enumeration).
 
     On a failure, in addition to bumping the rolling counter, a per-attempt
     ``login_failures`` row is logged (attempted email snapshotted + forwarded IP /
@@ -779,8 +841,8 @@ async def login_record(
     #
     #   * it closes the anonymous row-creation primitive this route is (see the
     #     #423 note above) for the one caller already known to be abusing it, and
-    #   * it stops a blocked source driving OTHER people's accounts toward the
-    #     hard lock. The per-email lockout keys on the email, so an attacker's
+    #   * it stops a blocked source driving OTHER people's addresses into the
+    #     cooldown. The per-email counter keys on the email, so an attacker's
     #     reports of "victim@byu.edu failed" would otherwise still count against
     #     the victim. Refusing to record them can only help the victim: the only
     #     failures suppressed are the ones from an address that is already barred

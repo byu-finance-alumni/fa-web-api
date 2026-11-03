@@ -314,11 +314,23 @@ async def list_page(
     )
 
 
+# Characters an audit value must not carry: control characters (newlines
+# included) and ``;``, the field separator of the audit detail line.
+_AUDIT_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f;]+")
+
+
+def _audit_safe(value: str) -> str:
+    return _AUDIT_UNSAFE.sub(" ", value).strip()
+
+
 def audit_detail(ref: ListRef) -> str:
     """``list=<group>:<key>[:<industry>]`` for the audit row — what was read,
-    never the rows."""
+    never the rows. The caller-supplied industry is reduced to one plain
+    ``;``-free line so it cannot add or alter fields of the audit line."""
     base = f"list={ref.group.value}:{ref.key.value}"
-    return f"{base}:{industry_label(ref.industry)}" if ref.industry else base
+    if not ref.industry:
+        return base
+    return f"{base}:{_audit_safe(industry_label(ref.industry))}"
 
 
 # --- CSV --------------------------------------------------------------------------

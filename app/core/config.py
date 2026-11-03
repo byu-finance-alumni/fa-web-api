@@ -24,6 +24,19 @@ logger = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 
 
+# Built-in CORS origins, used only when CORS_ORIGINS is unset. Production gets
+# the production frontends alone; every other environment adds the dev frontend
+# and local development.
+_DEFAULT_CORS_ORIGINS_PRODUCTION = (
+    "https://finance.alumni.byu.edu,https://finance-alumni-database.vercel.app"
+)
+_DEFAULT_CORS_ORIGINS_DEVELOPMENT = (
+    "http://localhost:3000,"
+    f"{_DEFAULT_CORS_ORIGINS_PRODUCTION},"
+    "https://dev-fa-web-app.vercel.app"
+)
+
+
 def _is_loopback_origin(origin: str) -> bool:
     host = (urlsplit(origin).hostname or "").lower()
     return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
@@ -252,14 +265,10 @@ class Settings(BaseSettings):
     # default.
     resend_webhook_secret: str | None = Field(default=None)  # RESEND_WEBHOOK_SECRET
 
-    # CORS — comma-separated list of allowed frontend origins.
-    cors_origins: str = Field(
-        default=(
-            "http://localhost:3000,"
-            "https://finance.alumni.byu.edu,"
-            "https://finance-alumni-database.vercel.app,"
-            "https://dev-fa-web-app.vercel.app"
-        ),
+    # CORS — comma-separated list of allowed frontend origins. Unset -> the
+    # environment's default below (see ``cors_origins_list``).
+    cors_origins: str | None = Field(
+        default=None,
         validation_alias=AliasChoices("CORS_ORIGINS", "CORS_ORIGIN"),
     )
 
@@ -267,13 +276,24 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """Parse the comma-separated CORS origins into a clean list.
 
+        With CORS_ORIGINS unset, production allows only the production
+        frontends; any other environment also allows the dev frontend and
+        localhost.
+
         In production, localhost / loopback origins are DROPPED (#597) — whether
         they came from the built-in default (CORS_ORIGINS unset) or were pasted
         into the env var. Dropping with a warning, rather than refusing to start,
         is deliberate: a stray localhost entry must never be able to take prod
         down, and the real frontend origins keep working either way.
         """
-        origins = [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        raw = self.cors_origins
+        if raw is None:
+            raw = (
+                _DEFAULT_CORS_ORIGINS_PRODUCTION
+                if self.environment == "production"
+                else _DEFAULT_CORS_ORIGINS_DEVELOPMENT
+            )
+        origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
         if self.environment != "production":
             return origins
         dropped = [o for o in origins if _is_loopback_origin(o)]

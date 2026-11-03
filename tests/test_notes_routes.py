@@ -442,3 +442,56 @@ def test_list_notes_rejects_entity_id_past_int64(client):
         "/notes", params={"entity_type": "alumni", "entity_id": str(2**63)}
     )
     assert response.status_code == 422
+
+
+# --- write rate limit ----------------------------------------------------------
+
+
+def test_note_write_limiter_minute_and_hour_windows(monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from app.core import rate_limit
+
+    actor = _ctx("full_access")
+    for _ in range(rate_limit.NOTE_WRITE_PER_MINUTE):
+        asyncio.run(rate_limit._note_write_limiter(actor))
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(rate_limit._note_write_limiter(actor))
+    assert exc.value.status_code == 429
+
+    # The hourly ceiling applies on its own, below the per-minute budget.
+    rate_limit.reset()
+    monkeypatch.setattr(rate_limit, "NOTE_WRITE_PER_HOUR", 3)
+    for _ in range(3):
+        asyncio.run(rate_limit._note_write_limiter(actor))
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(rate_limit._note_write_limiter(actor))
+    assert exc.value.status_code == 429
+    # Per user: another account is unaffected.
+    other = UserContext(
+        user_id=2,
+        auth_user_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+        roles=["full_access"],
+    )
+    asyncio.run(rate_limit._note_write_limiter(other))
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("post", "/notes", {"entity_type": "alumni", "entity_id": 1, "body": "x"}),
+        ("patch", "/notes/7", {"body": "x"}),
+        ("delete", "/notes/7", None),
+    ],
+)
+def test_note_writes_answer_429_past_the_limit(client, monkeypatch, method, path, body):
+    from app.core import rate_limit
+
+    monkeypatch.setattr(rate_limit, "NOTE_WRITE_PER_MINUTE", 0)
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    kwargs = {"json": body} if body is not None else {}
+    response = getattr(client, method)(path, **kwargs)
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "60"

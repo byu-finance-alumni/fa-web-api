@@ -8,8 +8,9 @@ named alumni with contact details, built to be downloaded.
   * ``GET /outreach/{group}`` — one landing page's lists with their counts.
     Counts only, no PII.
   * ``GET /outreach/{group}/{key}`` — one list's rows, paginated. Spends the
-    browse budget and writes a disclosure-audit row. Alumni Mentors' per-
-    industry list takes ``?industry=<industry>``.
+    contact-list budget (shared with the NetTrek reports, counted globally from
+    the audit rows it writes) and writes a disclosure-audit row. Alumni
+    Mentors' per-industry list takes ``?industry=<industry>``.
   * ``GET /outreach/{group}/{key}/export`` — the whole list as CSV. Spends the
     global export budget and is audit-logged as ``export_outreach_list``.
 """
@@ -24,7 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
 from app.core.errors import NotFoundError
-from app.core.rate_limit import ExportReadRateLimit, NetTreksBrowseReadRateLimit
+from app.core.rate_limit import (
+    ContactListReadRateLimit,
+    ExportReadRateLimit,
+    NetTreksBrowseReadRateLimit,
+)
 from app.schemas.outreach import (
     OutreachGroupKey,
     OutreachGroupSummary,
@@ -68,7 +73,7 @@ async def outreach_summary(
 async def outreach_list(
     group: OutreachGroupKey,
     key: OutreachListKey,
-    user: NetTreksBrowseReadRateLimit,
+    user: ContactListReadRateLimit,
     session: SessionDep,
     industry: IndustryParam = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,

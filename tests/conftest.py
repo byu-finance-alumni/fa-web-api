@@ -56,12 +56,13 @@ def _no_global_export_count(monkeypatch):
     """Answer the export throttle's cross-instance COUNT with zero.
 
     The export limiter counts the caller's recent ``export_*`` audit rows (one
-    query per export call). Like the permission-config read above, that query
+    query per export call), and the contact-list limiter its recent list-page
+    ``view`` rows. Like the permission-config read above, that query
     would collide with the canned rows every fake session returns, so it is
     stubbed by default; tests/test_read_throttle.py drives the real one.
     """
 
-    async def _zero(_session, _actor, windows):
+    async def _zero(_session, _actor, windows, _rows=None):
         return [0] * len(windows)
 
     monkeypatch.setattr(rate_limit, "_recent_export_counts", _zero)

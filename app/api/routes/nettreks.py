@@ -39,6 +39,8 @@ router = APIRouter(prefix="/nettreks", tags=["nettreks"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 _NO_SUCH_REPORT = "Other has only a NetTrek Hosts report."
+# Far past any real report; keeps the value inside the database integer range.
+MAX_OFFSET = 1_000_000
 
 
 @router.get("", response_model=NetTrekSummary)
@@ -58,7 +60,7 @@ async def nettreks_report(
     user: NetTreksBrowseReadRateLimit,
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> NetTrekReportPage:
     """One report's people, sorted by last name, paginated. 404 for Other's
     Area Alumni (it has none). Gender is null for a caller who cannot edit

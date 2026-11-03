@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import PermissionConfig, RequireNotesWrite
-from app.api.params import IdPath
+from app.api.params import INT64_MAX, IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
 from app.core.rate_limit import BrowseReadRateLimit
@@ -62,7 +62,12 @@ async def list_notes(
         NoteEntityType,
         Query(description="Which level the notes are attached to."),
     ],
-    entity_id: Annotated[int, Query(gt=0, description="Id of the alumni / interaction / event.")],
+    entity_id: Annotated[
+        int,
+        Query(
+            gt=0, le=INT64_MAX, description="Id of the alumni / interaction / event."
+        ),
+    ],
 ) -> list[NoteRead]:
     """List the notes on one entity, newest first (any view-access role). 404 if
     the parent entity doesn't exist. The disclosure is audit-logged. A view_only

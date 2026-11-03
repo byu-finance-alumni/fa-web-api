@@ -345,3 +345,11 @@ def test_alumni_location_filter_reads_the_work_location():
     assert "current_employment.current_city" in sql
     assert "current_employment.current_state" in sql
     assert "alumni_contact_info" not in sql
+
+
+def test_within_radius_is_clamped_to_the_radius_param_ceiling():
+    m = gs.parse_location_query("within 99999999 miles of Provo, UT")
+    assert m is not None
+    assert m.radius_miles == gs.MAX_RADIUS_MILES == 3000.0
+    m = gs.parse_location_query("within 3000 miles of Provo, UT")
+    assert m.radius_miles == 3000.0

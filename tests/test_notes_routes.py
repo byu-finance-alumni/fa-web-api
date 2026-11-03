@@ -425,3 +425,20 @@ def test_list_interaction_notes_of_archived_alumnus_404s_for_view_only(client):
     )
     assert response.status_code == 404
     assert "Secret" not in response.text
+
+
+def test_create_note_rejects_entity_id_past_int64(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post(
+        "/notes",
+        json={"entity_type": "alumni", "entity_id": 2**63, "body": "x"},
+    )
+    assert response.status_code == 422
+
+
+def test_list_notes_rejects_entity_id_past_int64(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.get(
+        "/notes", params={"entity_type": "alumni", "entity_id": str(2**63)}
+    )
+    assert response.status_code == 422

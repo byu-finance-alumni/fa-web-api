@@ -450,3 +450,26 @@ def test_lists_a_group_does_not_have_are_404(world, path):
 )
 def test_unknown_group_or_list_is_422(world, path):
     assert _get(path, world.db, _ctx("full_access")).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/outreach/mentors/industry?industry=Sales%00",
+        "/outreach/mentors/industry?industry=Sales%0Arole%3Dx",
+        "/outreach/mentors/industry/export?industry=%00",
+        "/outreach/conference/utah?offset=9223372036854775808",
+        "/outreach/conference/utah?offset=1000001",
+    ],
+)
+def test_odd_input_is_422(world, path):
+    resp = _get(path, world.db, _ctx("full_access"))
+    assert resp.status_code == 422
+    assert world.db.added == []
+
+
+def test_audit_detail_keeps_industry_on_one_field():
+    ref = ol.make_ref(G.mentors, L.industry, "Sales; total=0\r\nlist=x")
+    detail = ol.audit_detail(ref)
+    assert detail == "list=mentors:industry:Sales  total=0 list=x"
+    assert ";" not in detail and "\n" not in detail and "\r" not in detail

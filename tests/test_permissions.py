@@ -66,6 +66,8 @@ def test_default_grants_reproduce_historical_guards():
         Capability.INTERACTIONS_CREATE,
         Capability.SURVEYS_PROGRESS,
         Capability.ALUMNI_EXPORT,
+        # Jake, 2026-11-03: add notes on alumni profiles, edit/delete own only.
+        Capability.NOTES_CREATE,
     }
     # The twelve ALUMNI_FULL_REPLACEMENTS (#379) — which include the events.create
     # / events.import pair split out earlier (#378) — are seeded to exactly the
@@ -78,6 +80,8 @@ def test_default_grants_reproduce_historical_guards():
         # surveys.progress (#605): the read-only Progress view, seeded to every
         # role that holds surveys.manage.
         Capability.SURVEYS_PROGRESS,
+        # notes.create (2026-11-03), seeded to every role that holds notes.manage.
+        Capability.NOTES_CREATE,
     }
     assert caps("super_admin") == {
         Capability.VIEW,
@@ -96,6 +100,7 @@ def test_default_grants_reproduce_historical_guards():
         Capability.LINKS_DELETE,
         Capability.PROFILE_COMPLETENESS,
         Capability.SURVEYS_PROGRESS,
+        Capability.NOTES_CREATE,
     }
 
 
@@ -120,6 +125,7 @@ def test_union_across_multiple_roles():
         Capability.INTERACTIONS_CREATE,
         Capability.SURVEYS_PROGRESS,
         Capability.ALUMNI_EXPORT,
+        Capability.NOTES_CREATE,
     }
 
 

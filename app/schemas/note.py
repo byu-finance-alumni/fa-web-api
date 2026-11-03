@@ -4,7 +4,8 @@ A note attaches to exactly one of three entity types — an alumni profile, an
 interaction, or an event — expressed on the wire as ``(entity_type, entity_id)``.
 The service maps that pair to the right FK column on the ``notes`` table.
 
-Write (create/edit) is ``full_access`` and up; read is any view-access role.
+Write: ``notes.manage`` (any note) or ``notes.create`` (add on an alumni
+profile, change only your own); read is any view-access role.
 Author identity and timestamps are system-managed and returned read-only.
 """
 
@@ -69,7 +70,11 @@ class NoteUpdate(BaseModel):
 class NoteRead(BaseModel):
     """A note as returned to clients. ``author`` is the resolved display name of
     the creator (snapshot of the user record at read time, or ``None`` if the
-    user was deleted)."""
+    user was deleted).
+
+    ``can_edit`` is per CALLER: whether the requesting user may edit and delete
+    this note (any note with ``notes.manage``; only their own with
+    ``notes.create``). A display hint only — the server re-checks every write."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -78,5 +83,6 @@ class NoteRead(BaseModel):
     entity_id: int
     body: str
     author: str | None = None
+    can_edit: bool = False
     created_at: datetime.datetime
     updated_at: datetime.datetime

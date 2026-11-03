@@ -18,6 +18,9 @@ decided per request from the LIVE permission config and enforced in the service
 neither and stays read-only. All enforcement is server-side; the UI gate is not
 relied on. Every list / write response carries ``can_edit`` so the UI shows
 edit / delete only where the server would allow it.
+
+Writes are rate limited per user (``NoteWriteRateLimit``: 30 / minute and
+300 / hour across create, edit and delete) and answer 429 past that.
 """
 
 from typing import Annotated
@@ -25,11 +28,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies.auth import PermissionConfig, RequireNotesWrite
-from app.api.params import IdPath
+from app.api.dependencies.auth import PermissionConfig
+from app.api.params import INT64_MAX, IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
-from app.core.rate_limit import BrowseReadRateLimit
+from app.core.rate_limit import BrowseReadRateLimit, NoteWriteRateLimit
 from app.schemas.auth import UserContext
 from app.schemas.note import NoteCreate, NoteEntityType, NoteRead, NoteUpdate
 from app.services import notes as service
@@ -62,7 +65,12 @@ async def list_notes(
         NoteEntityType,
         Query(description="Which level the notes are attached to."),
     ],
-    entity_id: Annotated[int, Query(gt=0, description="Id of the alumni / interaction / event.")],
+    entity_id: Annotated[
+        int,
+        Query(
+            gt=0, le=INT64_MAX, description="Id of the alumni / interaction / event."
+        ),
+    ],
 ) -> list[NoteRead]:
     """List the notes on one entity, newest first (any view-access role). 404 if
     the parent entity doesn't exist. The disclosure is audit-logged. A view_only
@@ -84,7 +92,7 @@ async def list_notes(
 @router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)
 async def create_note(
     payload: NoteCreate,
-    user: RequireNotesWrite,
+    user: NoteWriteRateLimit,
     config: PermissionConfig,
     session: SessionDep,
 ) -> NoteRead:
@@ -102,7 +110,7 @@ async def create_note(
 async def update_note(
     note_id: IdPath,
     payload: NoteUpdate,
-    user: RequireNotesWrite,
+    user: NoteWriteRateLimit,
     config: PermissionConfig,
     session: SessionDep,
 ) -> NoteRead:
@@ -118,7 +126,7 @@ async def update_note(
 @router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(
     note_id: IdPath,
-    user: RequireNotesWrite,
+    user: NoteWriteRateLimit,
     config: PermissionConfig,
     session: SessionDep,
 ) -> None:

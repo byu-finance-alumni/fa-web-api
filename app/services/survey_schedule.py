@@ -886,10 +886,8 @@ def _as_date(value: object) -> datetime.date | None:
     return value if isinstance(value, datetime.date) else None
 
 
-def _do_not_contact_exclusions(enabled: bool) -> list:
+def _do_not_contact_exclusions() -> list:
     """Deceased flag + Deceased / Do Not Contact labels, as in NetTreks."""
-    if not enabled:
-        return []
     return [
         Alumni.deceased.is_(False),
         not_(has_status_label_exists(SUPPRESSED_CONTACT_STATUS_LABELS)),
@@ -905,14 +903,14 @@ async def _export_cycle_csv(
     action_type: str,
     actor_user_id: int | None,
     can_edit: bool,
-    exclude_do_not_contact: bool = False,
 ) -> str | None:
     """The shared body of the survey Progress exports (#836, #605).
 
-    ``exclude_do_not_contact`` also drops deceased alumni and anyone carrying a
-    Deceased / Do Not Contact status label — the same rule as the NetTrek lists.
-    Only the "Needs follow-up" file sets it (Jake, 2026-11-03): it is a call
-    sheet, and nobody on it should be someone we must not contact.
+    EVERY file leaves out archived alumni, deceased alumni and anyone carrying a
+    Deceased / Do Not Contact status label — the same rule as the NetTrek lists
+    (Jake, 2026-11-03). It lives here, not in a per-file flag, so no future
+    export can forget it. Downloads only: the Progress counts, the hover lists
+    and the call sheet (:func:`list_non_responders`) are unchanged.
 
     ``can_edit`` is the caller's ``can_edit_alumni``. A non-editor gets the NetID
     and mailing-address cells BLANKED (columns kept, so the header never moves):
@@ -925,7 +923,7 @@ async def _export_cycle_csv(
     reply predicate the file reads — or :func:`_cycle_needs_follow_up`; any
     select with ``graduation_year``, ``alumni_id``, ``emails_sent`` and
     ``last_sent_at`` columns. Everything else is identical for every file:
-    the 404 rule, the archived exclusion, the column order, the formula guard and
+    the 404 rule, the exclusions above, the column order, the formula guard and
     the audit row. ``with_mailing`` appends the mailing-address columns (the
     replied file only).
 
@@ -977,7 +975,8 @@ async def _export_cycle_csv(
         .outerjoin(CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id)
         # Same archived exclusion as `list_non_responders`.
         .where(Alumni.archived.is_(False))
-        .where(*_do_not_contact_exclusions(exclude_do_not_contact))
+        # Deceased / Do Not Contact: every download, never the counts.
+        .where(*_do_not_contact_exclusions())
         # Newest cohort first, like the Progress table; then by name.
         .order_by(
             sub.c.graduation_year.desc(),
@@ -1082,9 +1081,11 @@ async def export_no_reply_csv(
 
     Archived alumni are LEFT OUT, the same way and with the same filter as the
     follow-up call sheet (:func:`list_non_responders`) — Jake's call (#836): an
-    archived record is not someone to chase. The "No reply yet" count and the
-    hover lists still include them, so the row count is that column minus its
-    archived alumni. Every cell goes through the shared formula-injection guard.
+    archived record is not someone to chase. Deceased alumni and anyone with a
+    Deceased / Do Not Contact status label are left out too (Jake, 2026-11-03).
+    The "No reply yet" count and the hover lists still include them, so the row
+    count is that column minus its archived, deceased and Do Not Contact
+    alumni. Every cell goes through the shared formula-injection guard.
     The email shown is the one the survey would have used (personal, else work —
     same display rule as the call sheet). Columns:
     :data:`NO_REPLY_EXPORT_COLUMNS`.
@@ -1117,9 +1118,10 @@ async def export_replied_csv(
     has not superseded. A ``rejected``-only alum is NOT in it — a discarded
     submission is not a reply, and that alum is in the no-reply file instead.
 
-    Archived alumni are left out exactly as in :func:`export_no_reply_csv`, so
-    the row count is the ``replied`` column minus its archived alumni. (The
-    hover list keeps them, because its count does; a file of people to contact
+    Archived, deceased and Deceased / Do Not Contact-labelled alumni are left
+    out exactly as in :func:`export_no_reply_csv`, so the row count is the
+    ``replied`` column minus its archived, deceased and Do Not Contact alumni.
+    (The hover list keeps them, because its count does; a file of people to contact
     or mail does not.) Columns: :data:`REPLIED_EXPORT_COLUMNS` — the no-reply
     columns plus the mailing address. ``None`` for a single year with no
     schedule. Audit-logged as ``export_survey_replied``."""
@@ -1146,10 +1148,12 @@ async def export_needs_follow_up_csv(
     The people behind ``SurveyScheduleItem.non_responders``: received all three
     of the year's current-cycle emails and never replied — the same set, and the
     same archived exclusion, as the call sheet (:func:`list_non_responders`), and
-    it ALSO leaves off deceased and Deceased / Do Not Contact-labelled alumni
-    (Jake, 2026-11-03). So the row count is the column minus those alumni. Same columns as the
-    no-reply file (:data:`NO_REPLY_EXPORT_COLUMNS`); "Emails sent this cycle" is
-    always 3 here. ``None`` for a single year with no schedule. Audit-logged as
+    — like every Progress file — it ALSO leaves off deceased and Deceased / Do
+    Not Contact-labelled alumni (Jake, 2026-11-03), which the call sheet keeps.
+    So the row count is the column minus its archived, deceased and Do Not
+    Contact alumni. Same columns as the no-reply file
+    (:data:`NO_REPLY_EXPORT_COLUMNS`); "Emails sent this cycle" is always 3 here.
+    ``None`` for a single year with no schedule. Audit-logged as
     ``export_survey_needs_follow_up``."""
     return await _export_cycle_csv(
         session,
@@ -1159,7 +1163,6 @@ async def export_needs_follow_up_csv(
         action_type="export_survey_needs_follow_up",
         actor_user_id=actor_user_id,
         can_edit=can_edit,
-        exclude_do_not_contact=True,
     )
 
 

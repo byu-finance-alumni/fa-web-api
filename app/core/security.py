@@ -65,8 +65,9 @@ class DeactivatedAccountError(AuthorizationError):
 
 class AccountLockedError(AuthorizationError):
     """Raised when a valid token belongs to a HARD-LOCKED account
-    (``users.locked_at`` set after too many failed sign-ins, see
-    app/services/login_lockout.py).
+    (``users.locked_at`` set and less than 24h old, see
+    app/services/login_lockout.py — failed sign-ins no longer arm it, but an
+    existing lock is still enforced).
 
     A subclass of AuthorizationError so it maps to 403 exactly like a
     deactivated account, but with its own machine code (``account_locked``) so

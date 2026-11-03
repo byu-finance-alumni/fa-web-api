@@ -53,8 +53,9 @@ class User(TimestampMixin, Base):
     must_change_password: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
-    # Hard account lock set after too many failed logins (see
-    # app/services/login_lockout.py). While ``locked_at`` is set and younger
+    # Hard account lock. Formerly armed by too many failed logins; since
+    # BT-1103-1 nothing in the app sets it (see app/services/login_lockout.py),
+    # but existing locks are still honoured. While ``locked_at`` is set and younger
     # than ``login_lockout.HARD_LOCK_DURATION`` (24h) every authenticated
     # request from the account is refused (403 / account_locked, engineers
     # exempt — see app/api/dependencies/auth.py); the unauthenticated

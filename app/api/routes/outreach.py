@@ -8,8 +8,9 @@ named alumni with contact details, built to be downloaded.
   * ``GET /outreach/{group}`` — one landing page's lists with their counts.
     Counts only, no PII.
   * ``GET /outreach/{group}/{key}`` — one list's rows, paginated. Spends the
-    browse budget and writes a disclosure-audit row. Alumni Mentors' per-
-    industry list takes ``?industry=<industry>``.
+    contact-list budget (shared with the NetTrek reports, counted globally from
+    the audit rows it writes) and writes a disclosure-audit row. Alumni
+    Mentors' per-industry list takes ``?industry=<industry>``.
   * ``GET /outreach/{group}/{key}/export`` — the whole list as CSV. Spends the
     global export budget and is audit-logged as ``export_outreach_list``.
 """
@@ -24,7 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
 from app.core.errors import NotFoundError
-from app.core.rate_limit import ExportReadRateLimit, NetTreksBrowseReadRateLimit
+from app.core.rate_limit import (
+    ContactListReadRateLimit,
+    ExportReadRateLimit,
+    NetTreksBrowseReadRateLimit,
+)
 from app.schemas.outreach import (
     OutreachGroupKey,
     OutreachGroupSummary,
@@ -37,7 +42,13 @@ from app.services import outreach_lists as svc
 router = APIRouter(prefix="/outreach", tags=["outreach"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
-IndustryParam = Annotated[str | None, Query(max_length=255)]
+# Control characters (NUL, CR/LF, ...) are never part of an industry name;
+# refusing them here returns a 422 instead of failing in the database layer.
+IndustryParam = Annotated[
+    str | None, Query(max_length=255, pattern=r"^[^\x00-\x1f\x7f-\x9f]*$")
+]
+# Far past any real list; keeps the value inside the database integer range.
+MAX_OFFSET = 1_000_000
 
 _NO_SUCH_LIST = "There is no such Outreach list."
 
@@ -68,11 +79,11 @@ async def outreach_summary(
 async def outreach_list(
     group: OutreachGroupKey,
     key: OutreachListKey,
-    user: NetTreksBrowseReadRateLimit,
+    user: ContactListReadRateLimit,
     session: SessionDep,
     industry: IndustryParam = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> OutreachListPage:
     """One list's people, sorted by last name, paginated — the NetTrek report
     rows. 404 for a list the group does not have, an ``industry`` list without

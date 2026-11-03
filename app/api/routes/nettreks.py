@@ -9,7 +9,8 @@ of alumni data rather than with plain view access.
 
   * ``GET /nettreks`` — every report with its count. Counts only, no PII.
   * ``GET /nettreks/{area}/{kind}`` — one report's rows, paginated. Spends the
-    browse budget (a page view) and writes a disclosure-audit row.
+    contact-list budget (shared with the Outreach lists, counted globally from
+    the audit rows it writes) and writes a disclosure-audit row.
   * ``GET /nettreks/{area}/{kind}/export`` — the whole report as CSV. Spends the
     global export budget and is audit-logged as ``export_nettrek_report``.
 """
@@ -24,7 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
 from app.core.errors import NotFoundError
-from app.core.rate_limit import ExportReadRateLimit, NetTreksBrowseReadRateLimit
+from app.core.rate_limit import (
+    ContactListReadRateLimit,
+    ExportReadRateLimit,
+    NetTreksBrowseReadRateLimit,
+)
 from app.schemas.nettreks import (
     NetTrekAreaKey,
     NetTrekReportKind,
@@ -39,6 +44,8 @@ router = APIRouter(prefix="/nettreks", tags=["nettreks"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 _NO_SUCH_REPORT = "Other has only a NetTrek Hosts report."
+# Far past any real report; keeps the value inside the database integer range.
+MAX_OFFSET = 1_000_000
 
 
 @router.get("", response_model=NetTrekSummary)
@@ -55,10 +62,10 @@ async def nettreks_summary(
 async def nettreks_report(
     area: NetTrekAreaKey,
     kind: NetTrekReportKind,
-    user: NetTreksBrowseReadRateLimit,
+    user: ContactListReadRateLimit,
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> NetTrekReportPage:
     """One report's people, sorted by last name, paginated. 404 for Other's
     Area Alumni (it has none). Gender is null for a caller who cannot edit

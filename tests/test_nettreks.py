@@ -604,3 +604,10 @@ def test_other_report_sql_stays_small_with_a_real_sized_key_set():
     assert sql.count("case when") == 1
     assert "in (('" not in sql
     assert "'city 0|tx'" in sql
+
+
+@pytest.mark.parametrize("offset", ["9223372036854775808", "1000001", "-1"])
+def test_report_offset_out_of_range_is_422(world, offset):
+    resp = _get(f"/nettreks/dallas/hosts?offset={offset}", world.db, _ctx("full_access"))
+    assert resp.status_code == 422
+    assert world.db.added == []

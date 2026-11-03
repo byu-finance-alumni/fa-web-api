@@ -16,6 +16,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.api.params import INT64_MAX
+
 # Defence-in-depth cap so a client cannot push unbounded free text into the
 # column or the audit snapshot. Matches the event/interaction notes cap.
 _BODY_MAX = 10000
@@ -44,7 +46,7 @@ class NoteCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     entity_type: NoteEntityType
-    entity_id: int = Field(gt=0)
+    entity_id: int = Field(gt=0, le=INT64_MAX)
     body: str
 
     @field_validator("body")

@@ -70,10 +70,11 @@ import io
 import logging
 from collections.abc import Sequence
 
-from sqlalchemy import case, func, null, select, update
+from sqlalchemy import case, func, not_, null, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import email_reach
+from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS
 from app.core.errors import ConflictError, ServiceError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -84,6 +85,7 @@ from app.models.survey_retirement import SurveyCampaignRetirement
 from app.models.survey_schedule import SurveySchedule, SurveySendLog
 from app.models.survey_send_config import SurveySendConfig
 from app.models.user import User
+from app.repositories.alumni import has_status_label_exists
 from app.schemas.survey import (
     SurveyNewCyclePreview,
     SurveyNonResponder,
@@ -884,6 +886,16 @@ def _as_date(value: object) -> datetime.date | None:
     return value if isinstance(value, datetime.date) else None
 
 
+def _do_not_contact_exclusions(enabled: bool) -> list:
+    """Deceased flag + Deceased / Do Not Contact labels, as in NetTreks."""
+    if not enabled:
+        return []
+    return [
+        Alumni.deceased.is_(False),
+        not_(has_status_label_exists(SUPPRESSED_CONTACT_STATUS_LABELS)),
+    ]
+
+
 async def _export_cycle_csv(
     session: AsyncSession,
     graduation_year: int | None,
@@ -893,8 +905,14 @@ async def _export_cycle_csv(
     action_type: str,
     actor_user_id: int | None,
     can_edit: bool,
+    exclude_do_not_contact: bool = False,
 ) -> str | None:
     """The shared body of the survey Progress exports (#836, #605).
+
+    ``exclude_do_not_contact`` also drops deceased alumni and anyone carrying a
+    Deceased / Do Not Contact status label — the same rule as the NetTrek lists.
+    Only the "Needs follow-up" file sets it (Jake, 2026-11-03): it is a call
+    sheet, and nobody on it should be someone we must not contact.
 
     ``can_edit`` is the caller's ``can_edit_alumni``. A non-editor gets the NetID
     and mailing-address cells BLANKED (columns kept, so the header never moves):
@@ -959,6 +977,7 @@ async def _export_cycle_csv(
         .outerjoin(CurrentEmployment, CurrentEmployment.alumni_id == Alumni.alumni_id)
         # Same archived exclusion as `list_non_responders`.
         .where(Alumni.archived.is_(False))
+        .where(*_do_not_contact_exclusions(exclude_do_not_contact))
         # Newest cohort first, like the Progress table; then by name.
         .order_by(
             sub.c.graduation_year.desc(),
@@ -1126,8 +1145,9 @@ async def export_needs_follow_up_csv(
 
     The people behind ``SurveyScheduleItem.non_responders``: received all three
     of the year's current-cycle emails and never replied — the same set, and the
-    same archived exclusion, as the call sheet (:func:`list_non_responders`). So
-    the row count is the column minus its archived alumni. Same columns as the
+    same archived exclusion, as the call sheet (:func:`list_non_responders`), and
+    it ALSO leaves off deceased and Deceased / Do Not Contact-labelled alumni
+    (Jake, 2026-11-03). So the row count is the column minus those alumni. Same columns as the
     no-reply file (:data:`NO_REPLY_EXPORT_COLUMNS`); "Emails sent this cycle" is
     always 3 here. ``None`` for a single year with no schedule. Audit-logged as
     ``export_survey_needs_follow_up``."""
@@ -1139,6 +1159,7 @@ async def export_needs_follow_up_csv(
         action_type="export_survey_needs_follow_up",
         actor_user_id=actor_user_id,
         can_edit=can_edit,
+        exclude_do_not_contact=True,
     )
 
 

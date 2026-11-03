@@ -923,6 +923,36 @@ def test_follow_up_export_leaves_out_archived_alumni_the_count_keeps(db):
     assert len(body) == item.non_responders - 1
 
 
+def _label(db, alumni_id, name):
+    db.conn.execute(
+        text(
+            "INSERT OR IGNORE INTO status_labels (status_label_id, status_label_name)"
+            " VALUES (:i, :n)"
+        ),
+        {"i": len(name), "n": name},
+    )
+    db.conn.execute(
+        text(
+            "INSERT INTO alumni_status_labels"
+            " (alumni_status_label_id, alumni_id, status_label_id) VALUES (:a, :a, :i)"
+        ),
+        {"a": alumni_id, "i": len(name)},
+    )
+
+
+def test_follow_up_export_leaves_out_deceased_and_do_not_contact(db):
+    # Jake, 2026-11-03: the call-sheet file must never list someone we must not
+    # contact — the same rule as the NetTrek lists.
+    _follow_up_world(db)
+    db.conn.execute(text("UPDATE alumni SET deceased = 1 WHERE alumni_id = 1"))
+    _label(db, 4, "Do Not Contact")
+    _label(db, 5, "deceased")  # matched case-insensitively
+    body = _rows(_export_follow_up(db)[0])[1:]
+    assert _follow_up_names(body) == ["A7 Evans"]
+    # The other Progress files are unchanged: Young is still in "No reply yet".
+    assert "A1 Young" in _follow_up_names(_rows(_export(db)[0])[1:])
+
+
 def test_follow_up_export_all_years_matches_the_summed_column(db):
     _follow_up_world(db)
     db.schedule(year=2001)

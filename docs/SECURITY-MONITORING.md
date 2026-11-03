@@ -14,9 +14,10 @@ SIEM log drain; those are deferred (see [§4](#4-deferred-future-work)).
   login and a prod sign-in land in the same tables.
 - **Controls being monitored:**
   - Pre-login lockout (`app/services/login_lockout.py`): soft **cooldown at 10**
-    failed attempts / 60-min window (any email, 5-min auto-clear); **hard lock at
-    20** (registered users, sticky until a super_admin reset). State in
-    `login_attempts` + `users.locked_at` / `locked_reason`.
+    failed attempts / 60-min window (any email, 5-min auto-clear). The 24h **hard
+    lock** (`users.locked_at` / `locked_reason`) is no longer armed by failed
+    sign-ins (BT-1103-1); existing locks are still enforced until they expire or
+    a super_admin reset clears them. Counter state in `login_attempts`.
   - `login_events`: one row per **successful** sign-in (ip_address, city, region,
     country); 90-day pg_cron retention purge.
   - `audit_logs`: record-change trail with `actor_email`/`actor_name` snapshot.
@@ -74,8 +75,8 @@ emails.
 SELECT user_id, email, locked_at, locked_reason, last_login_at
 FROM users WHERE locked_at IS NOT NULL ORDER BY locked_at DESC;
 ```
-*Anomaly:* any NEW row since the last scan; multiple locks in one window = active
-attack or lockout-DoS. *Escalate:* confirm with the user; super_admin reset clears
+*Anomaly:* any NEW row since the last scan — nothing in the app sets `locked_at`
+any more, so a new lock means someone set it by hand or something unexpected. *Escalate:* confirm with the user; super_admin reset clears
 it; if it looks like a deliberate lockout-DoS, deny the source IP.
 
 **A3. Anomalous successful logins — new country for that user**

@@ -214,8 +214,7 @@ SPRAY_MIN_DISTINCT_EMAILS = 8
 #   a person mistyping their password .......  4
 #   ... and then some ....................... 10, at which point login_lockout's
 #                                              cooldown stops them attempting
-#                                              (COOLDOWN_THRESHOLD), and 20 hard-
-#                                              locks a registered account
+#                                              (COOLDOWN_THRESHOLD) for 5 minutes
 #   66.234.153.26 ........................... 190
 #   159.26.103.94 ........................... 338
 #   134.82.68.139 ........................... 222

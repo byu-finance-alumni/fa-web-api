@@ -47,8 +47,8 @@ jobs:
     name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -71,8 +71,8 @@ jobs:
     env:
       ENVIRONMENT: development
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -94,7 +94,7 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # full history so gitleaks scans every commit, not just the tip
       - name: Install gitleaks
@@ -115,8 +115,8 @@ jobs:
     # ASGI app, so a runtime dependency that's missing from pyproject.toml fails CI
     # here instead of crashing the deployed function ("could not import app/main").
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install only pyproject.toml runtime deps
@@ -135,7 +135,7 @@ jobs:
     # file looks like a scratch artifact. Legit tests live in lowercase tests/,
     # which these uppercase patterns do not match.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Block scratch / throwaway test files
         run: |
           bad=$(git ls-files | grep -E '(^|/)(TEST_[^/]*|SCRATCH[^/]*|DRAFT_[^/]*|[^/]*\.scratch|\.board-seed[^/]*|[^/]*DO_NOT_MERGE[^/]*)$' || true)
@@ -154,8 +154,8 @@ jobs:
     # the wrong field in production, so this fails the build with the mismatched
     # column/file named. Covers alumni, events, and donations CSVs.
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -180,8 +180,8 @@ jobs:
     if: github.base_ref == 'prod' || github.ref_name == 'prod'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install pip-audit
@@ -213,7 +213,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install PostgreSQL client
         # The runner image ships third-party apt sources (Google Chrome, etc.)
         # that we do not use. When one of them serves a bad index -- as
@@ -244,7 +244,7 @@ jobs:
     # it — that gate caused a prod outage and was removed deliberately.
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install PostgreSQL client
         # The runner image ships third-party apt sources (Google Chrome, etc.)
         # that we do not use. When one of them serves a bad index -- as

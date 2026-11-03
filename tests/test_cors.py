@@ -44,10 +44,11 @@ def test_disallowed_origin_is_not_reflected():
 
 
 # --- Production never trusts a localhost origin (#597) ------------------------
-# The built-in default carries http://localhost:3000 for local development. If
-# CORS_ORIGINS were ever unset in prod that default would apply as-is, so in
-# production the loopback origins are dropped (with a warning) — never a refusal
-# to start, which could take prod down over a stray entry.
+# The production built-in default (CORS_ORIGINS unset) holds only the
+# production frontends; other environments add the dev frontend and localhost.
+# An explicit CORS_ORIGINS in production still has its loopback origins dropped
+# (with a warning) — never a refusal to start, which could take prod down over a
+# stray entry.
 
 PROD_FRONTENDS = [
     "https://finance.alumni.byu.edu",
@@ -62,9 +63,21 @@ def _settings(**overrides):
     return Settings(_env_file=None, **overrides)
 
 
-def test_production_default_drops_localhost(monkeypatch, caplog):
+def test_production_default_is_production_frontends_only(monkeypatch, caplog):
+    # CORS_ORIGINS unset in production: neither localhost nor the dev frontend.
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
     monkeypatch.delenv("CORS_ORIGIN", raising=False)
+    with caplog.at_level("WARNING", logger="app.core.config"):
+        origins = _settings(environment="production").cors_origins_list
+    assert origins == [
+        "https://finance.alumni.byu.edu",
+        "https://finance-alumni-database.vercel.app",
+    ]
+    assert caplog.text == ""
+
+
+def test_production_still_drops_an_explicit_localhost(monkeypatch, caplog):
+    monkeypatch.setenv("CORS_ORIGINS", ",".join(["http://localhost:3000", *PROD_FRONTENDS]))
     with caplog.at_level("WARNING", logger="app.core.config"):
         origins = _settings(environment="production").cors_origins_list
     assert origins == PROD_FRONTENDS
@@ -94,4 +107,5 @@ def test_development_keeps_localhost(monkeypatch):
     monkeypatch.delenv("CORS_ORIGIN", raising=False)
     origins = _settings(environment="development").cors_origins_list
     assert ALLOWED_ORIGIN in origins
+    assert "https://dev-fa-web-app.vercel.app" in origins
 

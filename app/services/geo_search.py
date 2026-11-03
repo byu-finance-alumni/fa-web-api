@@ -55,6 +55,10 @@ DEFAULT_RADIUS_MILES = 50.0
 # Area 45, ...) — those are deliberate and are NOT flattened by this — and an
 # explicit "within N miles of <place>" still overrides everything.
 BARE_CITY_RADIUS_MILES = 50.0
+# Largest radius a "within N miles of <place>" phrase may ask for: the same
+# ceiling as the ``radius`` query parameter (``le=3000``). A bigger number is
+# clamped to it rather than refused.
+MAX_RADIUS_MILES = 3000.0
 
 # Mean earth radius in miles (matches app.services.geography._EARTH_MI).
 _EARTH_MI = 3958.8
@@ -258,7 +262,8 @@ def parse_location_query(text: str) -> LocationMatch | None:
 
     m = _WITHIN_RE.match(t)
     if m:
-        return _interpret_place(m.group("place"), radius=float(m.group("num")), strong=True)
+        radius = min(float(m.group("num")), MAX_RADIUS_MILES)
+        return _interpret_place(m.group("place"), radius=radius, strong=True)
 
     m = _STRONG_NEAR_RE.match(t)
     if m:

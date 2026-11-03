@@ -42,7 +42,13 @@ from app.services import outreach_lists as svc
 router = APIRouter(prefix="/outreach", tags=["outreach"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
-IndustryParam = Annotated[str | None, Query(max_length=255)]
+# Control characters (NUL, CR/LF, ...) are never part of an industry name;
+# refusing them here returns a 422 instead of failing in the database layer.
+IndustryParam = Annotated[
+    str | None, Query(max_length=255, pattern=r"^[^\x00-\x1f\x7f-\x9f]*$")
+]
+# Far past any real list; keeps the value inside the database integer range.
+MAX_OFFSET = 1_000_000
 
 _NO_SUCH_LIST = "There is no such Outreach list."
 
@@ -77,7 +83,7 @@ async def outreach_list(
     session: SessionDep,
     industry: IndustryParam = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> OutreachListPage:
     """One list's people, sorted by last name, paginated — the NetTrek report
     rows. 404 for a list the group does not have, an ``industry`` list without

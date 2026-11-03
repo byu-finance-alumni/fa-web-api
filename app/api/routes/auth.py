@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
@@ -315,6 +315,62 @@ async def session_active(
     current_id = user.session_id
     is_active = not (active_id and current_id and active_id != current_id)
     return SessionActiveResponse(active=is_active)
+
+
+class LogoutResponse(BaseModel):
+    """Result of ``POST /auth/logout``. ``ended`` is true when this call ended
+    the caller's session on the API; false when there was nothing to end (the
+    token carried no session id, or the account's active session is already a
+    different one)."""
+
+    ended: bool
+
+
+@router.post("/logout", response_model=LogoutResponse)
+async def logout(
+    user: CurrentDBUserAllowMustChange, session: SessionDep
+) -> LogoutResponse:
+    """End the caller's session on the API at sign-out.
+
+    The frontend calls this right BEFORE the Supabase sign-out, best-effort.
+    Supabase's sign-out ends the refresh token, but the access token already
+    issued is verified by signature alone and would otherwise keep working here
+    until it expires (~1 hour). This stamps ``users.active_session_id`` with a
+    never-matching sentinel, so ``_enforce_single_session`` rejects that same
+    token (401 ``session_superseded``) on the very next request.
+
+    Only the caller's OWN current session is ended: the stamp is a single
+    conditional UPDATE that applies only while the account's active session is
+    this token's session (or unclaimed, NULL — the fail-open state in which this
+    token would otherwise stay accepted). If a newer sign-in elsewhere has
+    already claimed the account, nothing is written and that device is
+    unaffected. ``active_session_at`` moves to now, so an older surviving
+    session cannot re-claim the account through ``POST /auth/login``; a genuine
+    new sign-in (a newer ``auth.sessions`` row) still can — engineers included,
+    so this can never lock an engineer out.
+
+    Uses the force-password-change-EXEMPT resolver (it does not reject a
+    superseded session or a paused site), so sign-out always works; it reads and
+    writes only the caller's own row, keyed on the token's identity."""
+    if not user.session_id:
+        return LogoutResponse(ended=False)
+    result = await session.execute(
+        update(User)
+        .where(
+            User.user_id == user.user_id,
+            or_(
+                User.active_session_id == user.session_id,
+                User.active_session_id.is_(None),
+            ),
+        )
+        .values(
+            active_session_id=auth_sessions.new_signed_out_sentinel(),
+            active_session_at=datetime.datetime.now(datetime.UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    return LogoutResponse(ended=bool(result.rowcount))
 
 
 class PasswordCompleteResponse(BaseModel):

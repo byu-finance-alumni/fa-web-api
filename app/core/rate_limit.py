@@ -54,6 +54,7 @@ from app.api.dependencies.auth import (
     require_donations_view,
     require_engineer,
     require_interactions_create,
+    require_notes_write,
     require_reports_advanced,
     require_super_admin,
     require_surveys_manage,
@@ -397,6 +398,36 @@ HeadshotWriteRateLimit = Annotated[
 BulkHeadshotRateLimit = Annotated[
     UserContext, Depends(BULK_HEADSHOT_LIMITER)
 ]
+
+# --- Note writes ------------------------------------------------------------------
+#
+# Create / edit / delete on /notes share one per-user stream with two windows:
+# the usual 30 / minute mutation brake, plus an hourly ceiling so a steady loop
+# just under the per-minute rate still stops. The actor is resolved through the
+# route's own guard (``require_notes_write``).
+NOTE_WRITE_PER_MINUTE = 30
+NOTE_WRITE_PER_HOUR = 300
+
+
+async def _note_write_limiter(
+    actor: Annotated[UserContext, Depends(require_notes_write)],
+) -> UserContext:
+    _check(
+        "notes:write_minute",
+        actor.user_id,
+        limit=NOTE_WRITE_PER_MINUTE,
+        window_seconds=60,
+    )
+    _check(
+        "notes:write_hour",
+        actor.user_id,
+        limit=NOTE_WRITE_PER_HOUR,
+        window_seconds=3600,
+    )
+    return actor
+
+
+NoteWriteRateLimit = Annotated[UserContext, Depends(_note_write_limiter)]
 
 # --- Public, token-gated survey routes (#360) --------------------------------
 #

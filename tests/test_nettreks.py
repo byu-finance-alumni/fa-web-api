@@ -583,3 +583,24 @@ def test_other_has_no_area_alumni_report(world, path):
 )
 def test_unknown_area_or_kind_is_422(world, path):
     assert _get(path, world.db, _ctx("full_access")).status_code == 422
+
+
+def test_other_report_sql_stays_small_with_a_real_sized_key_set():
+    # Regression (2026-11-03): "Other NetTrek Hosts" never loaded. Other is the
+    # complement of EVERY host catchment — ~1,200 city keys on the real
+    # crosswalk — and the old ``(city, state) IN ((..), ..)`` row comparison made
+    # PostgreSQL copy the 51-branch state-code CASE once per key; the JIT then
+    # spent ~20 s compiling it, per query, twice per page. The location test
+    # must be ONE scalar IN with the CASE written once.
+    from sqlalchemy.dialects import postgresql
+
+    big = [(f"city {i}", "TX") for i in range(1200)]
+    keys = {(a.key, k): big for a in nt.NETTREK_AREAS for k in K}
+    sql = str(
+        nt._report_select(A.other, K.hosts, keys).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+    assert sql.count("case when") == 1
+    assert "in (('" not in sql
+    assert "'city 0|tx'" in sql

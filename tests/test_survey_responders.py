@@ -949,8 +949,80 @@ def test_follow_up_export_leaves_out_deceased_and_do_not_contact(db):
     _label(db, 5, "deceased")  # matched case-insensitively
     body = _rows(_export_follow_up(db)[0])[1:]
     assert _follow_up_names(body) == ["A7 Evans"]
-    # The other Progress files are unchanged: Young is still in "No reply yet".
-    assert "A1 Young" in _follow_up_names(_rows(_export(db)[0])[1:])
+    # Downloads only: the column and the call sheet still name all four.
+    assert _item(db).non_responders == 4
+    sheet = [n.name for n in asyncio.run(ss.list_non_responders(db.session, _YEAR))]
+    assert sheet == ["A4 Baker", "A5 Cole", "A7 Evans", "A1 Young"]
+    # Every Progress file applies the rule: Young is out of "No reply yet" too.
+    assert "A1 Young" not in _follow_up_names(_rows(_export(db)[0])[1:])
+
+
+def _deceased(db, alumni_id):
+    db.conn.execute(
+        text("UPDATE alumni SET deceased = 1 WHERE alumni_id = :a"), {"a": alumni_id}
+    )
+
+
+def test_no_reply_export_leaves_out_deceased_and_do_not_contact(db):
+    # Jake, 2026-11-03: no Progress download lists someone we must not contact.
+    _world(db)
+    _deceased(db, 6)  # Diaz
+    _label(db, 4, "Do Not Contact")  # Baker
+    _label(db, 5, "deceased")  # Cole — matched case-insensitively
+    body = _rows(_export(db)[0])[1:]
+    assert [r[0] for r in body] == ["A7 Evans"]
+    # Downloads only: the "No reply yet" column is unchanged.
+    assert _silent(_item(db)) == 4
+
+
+def test_no_reply_export_all_years_leaves_out_deceased_and_do_not_contact(db):
+    _world(db)
+    db.schedule(year=2001)
+    db.alum(20, last_name="Hale")
+    db.alum(21, last_name="Iver")
+    db.sent(20, (0,), year=2001)
+    db.sent(21, (0,), year=2001)
+    _deceased(db, 20)
+    _label(db, 21, "Do Not Contact")
+    _deceased(db, 6)  # Diaz, in the 2000 cohort
+    body = _rows(_export(db, year=None)[0])[1:]
+    items = asyncio.run(ss.list_schedules(db.session))
+    assert sum(_silent(i) for i in items) == 6
+    assert [r[0] for r in body] == ["A4 Baker", "A5 Cole", "A7 Evans"]
+
+
+def test_replied_export_leaves_out_deceased_and_do_not_contact(db):
+    _world(db)
+    _deceased(db, 1)  # Young
+    _label(db, 2, "Do Not Contact")  # Adams
+    body = _rows(_export_replied(db)[0])[1:]
+    assert [r[0] for r in body] == ["A3 Moss"]
+    # Downloads only: the "Replied" column and its hover list are unchanged.
+    assert _item(db).replied == 3
+    assert [r.name for r in _responders(db).replied] == [
+        "A2 Adams",
+        "A3 Moss",
+        "A1 Young",
+    ]
+
+
+def test_replied_export_all_years_leaves_out_deceased_and_do_not_contact(db):
+    _world(db)
+    db.schedule(year=2001)
+    db.alum(20, last_name="Hale")
+    db.alum(21, last_name="Iver")
+    db.sent(20, (0,), year=2001)
+    db.sent(21, (0,), year=2001)
+    db.replied(20, "applied")
+    db.replied(21, "confirmed")
+    _deceased(db, 20)
+    _label(db, 21, "Deceased")
+    _label(db, 3, "Do Not Contact")  # Moss, in the 2000 cohort
+    items = asyncio.run(ss.list_schedules(db.session))
+    assert sum(i.replied for i in items) == 5
+    body = _rows(_export_replied(db, year=None)[0])[1:]
+    assert [r[0] for r in body] == ["A2 Adams", "A1 Young"]
+    assert len(_responders(db, year=2001).replied) == 2
 
 
 def test_follow_up_export_all_years_matches_the_summed_column(db):

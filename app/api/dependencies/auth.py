@@ -376,6 +376,13 @@ require_alumni_export = require_capability(Capability.ALUMNI_EXPORT)
 require_alumni_photos = require_capability(Capability.ALUMNI_PHOTOS)
 require_events_manage = require_capability(Capability.EVENTS_MANAGE)
 require_notes_manage = require_capability(Capability.NOTES_MANAGE)
+# Reaching a note WRITE route at all (2026-11-03): `notes.create` (add notes,
+# change only your own) or `notes.manage` (change anyone's). The route then
+# decides, from the live config, whether the caller may touch a note somebody
+# else wrote — that half stays `notes.manage`-only.
+require_notes_write = require_any_capability(
+    Capability.NOTES_CREATE, Capability.NOTES_MANAGE
+)
 require_surveys_manage = require_capability(Capability.SURVEYS_MANAGE)
 # The survey Progress tab as a read (#605): the schedule list that feeds it and
 # the "who replied" hover. `surveys.manage` ALSO admits, deliberately:
@@ -435,6 +442,7 @@ RequireEventsCreate = Annotated[UserContext, Depends(require_events_create)]
 RequireEventsImport = Annotated[UserContext, Depends(require_events_import)]
 RequireEventsManage = Annotated[UserContext, Depends(require_events_manage)]
 RequireNotesManage = Annotated[UserContext, Depends(require_notes_manage)]
+RequireNotesWrite = Annotated[UserContext, Depends(require_notes_write)]
 RequireSurveysManage = Annotated[UserContext, Depends(require_surveys_manage)]
 RequireSurveysProgress = Annotated[UserContext, Depends(require_surveys_progress)]
 RequireLinksDelete = Annotated[UserContext, Depends(require_links_delete)]

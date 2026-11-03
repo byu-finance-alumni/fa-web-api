@@ -193,13 +193,30 @@ def test_every_new_capability_is_in_the_editor_registry():
         assert CAPABILITIES_BY_CODE[code].assignable is True
 
 
+# Narrower capabilities added AFTER #379 that a probed route also admits. Every
+# note write route accepts `notes.create` OR `notes.manage` (2026-11-03): a
+# `notes.create`-only holder adds alumni notes and changes only their own, and the
+# ownership half needs a database this suite does not have. So when proving a
+# route still checks `notes.manage`, the narrower code is revoked too — otherwise
+# super_admin's own `notes.create` would let the request past the guard. The
+# narrow rule itself is pinned in tests/test_notes_create_capability.py.
+_ALSO_ADMITTED_BY: dict[str, frozenset[str]] = {
+    Capability.NOTES_MANAGE: frozenset({Capability.NOTES_CREATE}),
+}
+
+
 @pytest.mark.parametrize("cap,method,path,kwargs", _PROBES, ids=_PROBE_IDS)
 def test_route_403s_when_the_role_lacks_the_capability(
     client, cap, method, path, kwargs
 ):
-    # super_admin keeps EVERYTHING except the one capability under test, so a 403
-    # can only have come from that capability's guard.
-    _use_config(super_admin=DEFAULT_GRANTS["super_admin"] - {cap})
+    # super_admin keeps EVERYTHING except the one capability under test (and any
+    # narrower code the same route also admits), so a 403 can only have come from
+    # that capability's guard.
+    _use_config(
+        super_admin=DEFAULT_GRANTS["super_admin"]
+        - {cap}
+        - _ALSO_ADMITTED_BY.get(cap, frozenset())
+    )
     _as("super_admin")
     response = getattr(client, method)(path, **kwargs)
     assert response.status_code == 403

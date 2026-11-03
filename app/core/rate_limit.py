@@ -774,6 +774,7 @@ EXPORT_AUDIT_ACTIONS: frozenset[str] = frozenset(
         "export_survey_needs_follow_up",  # both needs-follow-up CSVs (#889)
         "export_opportunity_links",
         "export_nettrek_report",  # every NetTreks report CSV (#887)
+        "export_outreach_list",  # every Outreach interest-list CSV
     }
 )
 

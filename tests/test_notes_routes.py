@@ -3,7 +3,8 @@
 Two layers, no real database:
 
   * Authorization + validation gating — writes (POST/PATCH/DELETE) must reject
-    view_only AND student before any query runs (write = full_access and up);
+    view_only before any query runs (students may add alumni notes and change
+    their own since 2026-11-03 — tests/test_notes_create_capability.py);
     reads (GET) allow any view-access role. A missing token is 401.
   * Happy paths — create / list / update / delete against a stamping fake
     session, asserting the unified (entity_type, entity_id) projection, author
@@ -157,10 +158,12 @@ def test_create_note_forbidden_for_view_only(client):
     assert response.json()["error"]["code"] == "forbidden"
 
 
-def test_create_note_forbidden_for_student(client):
-    # student may edit existing alumni but is excluded from note writes by spec.
+def test_create_event_note_forbidden_for_student(client):
+    # Since 2026-11-03 students hold `notes.create`: alumni-profile notes only.
+    # Interaction and event notes still need `notes.manage` (see
+    # tests/test_notes_create_capability.py for the full student rule).
     app.dependency_overrides[get_current_db_user] = lambda: _ctx("student")
-    response = client.post("/notes", json={"entity_type": "alumni", "entity_id": 1, "body": "x"})
+    response = client.post("/notes", json={"entity_type": "event", "entity_id": 1, "body": "x"})
     assert response.status_code == 403
 
 

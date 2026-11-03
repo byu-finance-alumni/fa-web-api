@@ -91,7 +91,26 @@ def _ddl(conn):
             " net_id VARCHAR(50),"
             " linkedin_url VARCHAR(500),"
             " updated_at TIMESTAMP,"
-            " archived BOOLEAN NOT NULL DEFAULT 0)"
+            " archived BOOLEAN NOT NULL DEFAULT 0,"
+            # The "Needs follow-up" export leaves the deceased off.
+            " deceased BOOLEAN NOT NULL DEFAULT 0)"
+        )
+    )
+    # ...and anyone labelled Deceased / Do Not Contact.
+    conn.execute(
+        text(
+            "CREATE TABLE status_labels ("
+            " status_label_id INTEGER PRIMARY KEY,"
+            " status_label_name VARCHAR(100) NOT NULL,"
+            " status_label_description TEXT)"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE TABLE alumni_status_labels ("
+            " alumni_status_label_id INTEGER PRIMARY KEY,"
+            " alumni_id INTEGER NOT NULL,"
+            " status_label_id INTEGER NOT NULL)"
         )
     )
     conn.execute(

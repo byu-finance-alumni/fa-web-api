@@ -36,7 +36,7 @@ import math
 import re
 from dataclasses import dataclass, field
 
-from sqlalchemy import ColumnElement, String, case, cast, func, literal, select, tuple_
+from sqlalchemy import ColumnElement, String, case, cast, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.us_states import CODE_BY_NAME, to_code
@@ -413,22 +413,51 @@ def _alumni_state_code_expr() -> ColumnElement[str]:
     )
 
 
+#: Joins a city key's two halves into the ONE string the location predicate
+#: compares (see :func:`alumni_location_filter`). ``city_geo`` city names never
+#: contain it and its state is always exactly two letters, so ``"<city>|<ST>"``
+#: is unambiguous.
+LOCATION_KEY_SEPARATOR = "|"
+
+
+def location_key(city_norm: str, state: str) -> str:
+    """The single-string form of a ``(city_norm, state)`` key."""
+    return f"{city_norm}{LOCATION_KEY_SEPARATOR}{state}"
+
+
+def alumni_location_key_expr() -> ColumnElement[str]:
+    """``lower(trim(current_city)) || '|' || <folded state code>`` — an alum's
+    WORK location as the same single string :func:`location_key` builds."""
+    city_norm = func.lower(
+        func.trim(cast(CurrentEmployment.current_city, String)), type_=String
+    )
+    return city_norm + literal(LOCATION_KEY_SEPARATOR, String) + _alumni_state_code_expr()
+
+
 def alumni_location_filter(keys: list[CityKey]) -> ColumnElement[bool]:
     """A SQLAlchemy predicate selecting ``CurrentEmployment`` rows whose WORK
     location is one of ``keys``.
 
-    Compares ``(lower(trim(current_city)), folded 2-letter state code)`` against
-    the resolved key set with a single ``IN (tuple, ...)`` — the exact mapping
-    between a ``city_geo`` key and how alumni store their location (#287). An
-    empty key set yields a ``false`` predicate (matches nothing), so a location
-    search that resolved to zero cities returns no alumni rather than every
-    alumnus.
+    Compares ``lower(trim(current_city)) || '|' || <folded 2-letter state
+    code>`` against the resolved keys joined the same way, with a single
+    scalar ``IN (...)`` — the exact mapping between a ``city_geo`` key and how
+    alumni store their location (#287). An empty key set yields a ``false``
+    predicate (matches nothing), so a location search that resolved to zero
+    cities returns no alumni rather than every alumnus.
+
+    ⚠️ Why ONE string and not a ``(city, state) IN ((..), (..))`` row
+    comparison: PostgreSQL expands a row ``IN`` into one ``OR`` arm per key,
+    each holding its own copy of the 51-branch state-code ``CASE``. With the
+    NetTreks "Other" report's ~1,200 keys that expression was big enough that
+    the JIT spent ~20 s compiling it per query (twice per page), so the report
+    never loaded (2026-11-03). A scalar ``IN`` becomes one ``= ANY(array)``
+    with the ``CASE`` written once, whatever the number of keys.
     """
     if not keys:
         return literal(False)
-    city_norm = func.lower(func.trim(cast(CurrentEmployment.current_city, String)))
-    state_code = _alumni_state_code_expr()
-    return tuple_(city_norm, state_code).in_([(cn, st) for cn, st in keys])
+    return alumni_location_key_expr().in_(
+        sorted({location_key(cn, st) for cn, st in keys})
+    )
 
 
 async def resolve_near(

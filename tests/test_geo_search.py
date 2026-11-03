@@ -9,6 +9,7 @@ import asyncio
 import time
 
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql.elements import Tuple
 
 from app.services import geo_search as gs
 from app.services.geo_regions import REGION_ALIASES, lookup_region
@@ -294,20 +295,43 @@ def test_alumni_location_filter_empty_is_false():
     assert "false" in sql
 
 
-def test_alumni_location_filter_builds_tuple_in_with_state_fold():
+def test_alumni_location_filter_builds_key_in_with_state_fold():
     expr = gs.alumni_location_filter([("provo", "UT"), ("orem", "UT")])
     sql = str(
         expr.compile(
             dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
         )
     ).lower()
-    # Normalized city + folded state code compared as a tuple membership test.
+    # Normalized city + folded state code, joined into one key, in a scalar
+    # membership test.
     assert "lower" in sql
     assert "trim" in sql
     assert "case" in sql            # full-name -> code fold
     assert "in (" in sql
-    assert "'provo'" in sql
-    assert "'ut'" in sql
+    assert "'orem|ut', 'provo|ut'" in sql
+
+
+def test_alumni_location_filter_writes_the_state_fold_once_however_many_keys():
+    # Regression (NetTreks "Other", 2026-11-03): a ``(city, state) IN ((..),..)``
+    # row comparison made PostgreSQL copy the 51-branch state CASE into one OR
+    # arm PER KEY. Other's ~1,200 keys produced an expression the JIT took ~20 s
+    # to compile, so the report never loaded. The predicate must stay one
+    # scalar IN with the CASE written once, whatever the key count.
+    keys = [(f"city {i}", "UT") for i in range(1500)]
+    expr = gs.alumni_location_filter(keys)
+    assert not isinstance(expr.left, Tuple)  # never a row comparison
+    sql = str(
+        expr.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+    assert sql.count("case when") == 1
+    assert "in (('" not in sql
+    assert "'city 0|ut'" in sql and "'city 1499|ut'" in sql
+
+
+def test_location_key_matches_the_sql_key():
+    assert gs.location_key("salt lake city", "UT") == "salt lake city|UT"
 
 
 def test_alumni_location_filter_reads_the_work_location():

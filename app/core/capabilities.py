@@ -61,6 +61,7 @@ class Capability:
     EVENTS_CREATE = "events.create"
     EVENTS_IMPORT = "events.import"
     EVENTS_MANAGE = "events.manage"
+    NOTES_CREATE = "notes.create"
     NOTES_MANAGE = "notes.manage"
     SURVEYS_MANAGE = "surveys.manage"
     SURVEYS_PROGRESS = "surveys.progress"
@@ -238,13 +239,29 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "for unmatched attendees needs \"Add alumni\"."
         ),
     ),
+    # Adding a note as its own, narrower power (Jake, 2026-11-03): Finance
+    # Society student leaders leave notes on alumni profiles so one club can see
+    # that another already reached out. A holder may add a note on any alumni
+    # profile and edit or delete ONLY the notes they wrote; changing somebody
+    # else's note stays with "Write notes" (`notes.manage`), which also admits
+    # everything this does. Seeded to every role that holds `notes.manage` plus
+    # student.
+    CapabilitySpec(
+        code=Capability.NOTES_CREATE,
+        label="Add notes",
+        description=(
+            "Add a note on any alumnus's profile, and edit or delete notes you "
+            "wrote yourself. Changing or deleting someone else's note, and "
+            "notes on interactions or events, need \"Write notes\"."
+        ),
+    ),
     CapabilitySpec(
         code=Capability.NOTES_MANAGE,
         label="Write notes",
         description=(
-            "Add, edit, and delete the notes attached to an alumnus, an "
-            "interaction, or an event. Reading notes needs only \"View "
-            "records\"."
+            "Add, edit, and delete any note attached to an alumnus, an "
+            "interaction, or an event, including notes other people wrote. "
+            "Reading notes needs only \"View records\"."
         ),
     ),
     CapabilitySpec(
@@ -428,6 +445,10 @@ POST_SPLIT_CAPABILITIES: frozenset[str] = frozenset(
         # #605: the read-only survey Progress view, granted to every role that
         # held `surveys.manage` (super_admin, full_access) plus student.
         Capability.SURVEYS_PROGRESS,
+        # Jake, 2026-11-03: adding profile notes (edit/delete own only), granted
+        # to every role that held `notes.manage` (super_admin, full_access) plus
+        # student.
+        Capability.NOTES_CREATE,
     }
 )
 
@@ -489,6 +510,8 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             Capability.PROFILE_COMPLETENESS,
             # #605: read-only survey progress, alongside `surveys.manage`.
             Capability.SURVEYS_PROGRESS,
+            # 2026-11-03: add notes, alongside `notes.manage`.
+            Capability.NOTES_CREATE,
         }
     ),
     RoleName.FULL_ACCESS.value: frozenset(
@@ -499,6 +522,8 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             *ALUMNI_FULL_REPLACEMENTS,
             # #605: read-only survey progress, alongside `surveys.manage`.
             Capability.SURVEYS_PROGRESS,
+            # 2026-11-03: add notes, alongside `notes.manage`.
+            Capability.NOTES_CREATE,
         }
     ),
     RoleName.STUDENT.value: frozenset(
@@ -513,6 +538,9 @@ DEFAULT_GRANTS: dict[str, frozenset[str]] = {
             # POST_SPLIT_ROLE_WIDENINGS so the #379 preservation test still
             # holds.
             *POST_SPLIT_ROLE_WIDENINGS[RoleName.STUDENT.value],
+            # Jake, 2026-11-03: student leaders add notes on alumni profiles and
+            # may edit or delete only the notes they wrote.
+            Capability.NOTES_CREATE,
         }
     ),
     RoleName.VIEW_ONLY.value: frozenset(

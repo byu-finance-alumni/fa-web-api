@@ -142,6 +142,9 @@ def test_student_can_edit_and_read_but_not_create_or_admin():
     # #605 (Jake, 2026-10-13).
     assert asyncio.run(auth_deps.require_alumni_export(ctx, CONFIG)) is ctx
     assert asyncio.run(auth_deps.require_surveys_progress(ctx, CONFIG)) is ctx
+    # Adding notes (own edit/delete only) is open to students since 2026-11-03;
+    # changing anyone's note (`notes.manage`) is not.
+    assert asyncio.run(auth_deps.require_notes_write(ctx, CONFIG)) is ctx
     # Create / archive / import / photos, event + notes + survey management,
     # donation reads, the advanced reports, user admin and vocab admin are all
     # still closed to a student.

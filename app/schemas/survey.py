@@ -13,6 +13,14 @@ from app.schemas.alumni import _INVISIBLE_CHARS, DuplicateWarning
 # after cleaning. The survey page shows a counter against the same number.
 SURVEY_COMMENTS_MAX = 2000
 
+# Ceiling on the RAW comment, checked BEFORE any per-character cleaning so a
+# multi-megabyte body is refused without walking every character first.
+# Cleaning only ever shrinks the text, so this is deliberately generous (4x the
+# real cap): anything the survey box can produce (its `maxLength` is
+# `SURVEY_COMMENTS_MAX`) plus stray invisible characters stays far beneath it,
+# and the 2000-character cap still applies to the cleaned text afterwards.
+SURVEY_COMMENTS_RAW_MAX = 4 * SURVEY_COMMENTS_MAX
+
 # The only control characters a multi-line comment legitimately carries.
 _COMMENT_KEEP_CONTROLS = frozenset("\n\t")
 
@@ -97,6 +105,12 @@ class SurveySubmitRequest(BaseModel):
             return None
         if not isinstance(value, str):
             raise ValueError("Comments must be text.")
+        # Cheap length check first: refuse a huge raw string before the
+        # per-character clean. Same message as the post-clean cap.
+        if len(value) > SURVEY_COMMENTS_RAW_MAX:
+            raise ValueError(
+                f"Comments must be at most {SURVEY_COMMENTS_MAX} characters."
+            )
         cleaned = clean_survey_comment(value)
         if cleaned is not None and len(cleaned) > SURVEY_COMMENTS_MAX:
             raise ValueError(

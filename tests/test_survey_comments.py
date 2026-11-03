@@ -36,6 +36,7 @@ from app.models.survey_response import (
 )
 from app.schemas.survey import (
     SURVEY_COMMENTS_MAX,
+    SURVEY_COMMENTS_RAW_MAX,
     SurveySubmitRequest,
     clean_survey_comment,
 )
@@ -188,6 +189,47 @@ def test_comment_at_the_cap_is_accepted_and_over_it_is_refused():
         SurveySubmitRequest(fields={}, comments="x" * (SURVEY_COMMENTS_MAX + 1))
 
 
+def _spy_cleaner(monkeypatch):
+    import app.schemas.survey as survey_schema
+
+    calls = []
+    real = survey_schema.clean_survey_comment
+
+    def spy(value):
+        calls.append(len(value))
+        return real(value)
+
+    monkeypatch.setattr(survey_schema, "clean_survey_comment", spy)
+    return calls
+
+
+def test_huge_raw_comment_is_refused_before_cleaning(monkeypatch):
+    calls = _spy_cleaner(monkeypatch)
+    with pytest.raises(ValidationError) as exc:
+        SurveySubmitRequest(fields={}, comments="x" * (1024 * 1024))
+    assert calls == []
+    msg = exc.value.errors()[0]["msg"]
+    assert f"at most {SURVEY_COMMENTS_MAX} characters" in msg
+
+
+def test_raw_cap_boundary(monkeypatch):
+    calls = _spy_cleaner(monkeypatch)
+    # Exactly at the raw cap: cleaned, and accepted once invisible padding drops.
+    padded = "x" * SURVEY_COMMENTS_MAX + "\u200b" * (SURVEY_COMMENTS_RAW_MAX - SURVEY_COMMENTS_MAX)
+    assert len(padded) == SURVEY_COMMENTS_RAW_MAX
+    assert SurveySubmitRequest(fields={}, comments=padded).comments == "x" * SURVEY_COMMENTS_MAX
+    assert calls == [SURVEY_COMMENTS_RAW_MAX]
+    # One past it: refused without cleaning, same message as the 2000 cap.
+    with pytest.raises(ValidationError) as exc:
+        SurveySubmitRequest(fields={}, comments=padded + "\u200b")
+    assert calls == [SURVEY_COMMENTS_RAW_MAX]
+    assert f"at most {SURVEY_COMMENTS_MAX} characters" in exc.value.errors()[0]["msg"]
+
+
+def test_raw_cap_is_never_below_the_cleaned_cap():
+    assert SURVEY_COMMENTS_RAW_MAX >= SURVEY_COMMENTS_MAX
+
+
 def test_comment_must_be_text():
     with pytest.raises(ValidationError):
         SurveySubmitRequest(fields={}, comments=["not", "text"])
@@ -245,6 +287,31 @@ def test_route_refuses_an_over_cap_comment_with_422(client, monkeypatch):
     )
     assert resp.status_code == 422
     assert called == []
+
+
+def test_route_refuses_a_huge_comment_with_422_without_echoing_it(client, monkeypatch):
+    called = []
+
+    async def fake_submit(*_a, **_k):
+        called.append(True)
+
+    monkeypatch.setattr(sr, "submit_response", fake_submit)
+    cleaned = _spy_cleaner(monkeypatch)
+    marker = "SECRETMARKER"
+    resp = client.post(
+        "/survey/respond/sometoken",
+        json={"fields": {}, "comments": marker * (1024 * 1024 // len(marker) + 1)},
+    )
+    assert resp.status_code == 422
+    assert called == []
+    assert cleaned == []
+    assert marker not in resp.text
+    over_cap = client.post(
+        "/survey/respond/sometoken",
+        json={"fields": {}, "comments": "x" * (SURVEY_COMMENTS_MAX + 1)},
+    )
+    # Same error shape as an ordinary over-cap comment.
+    assert resp.json().keys() == over_cap.json().keys()
 
 
 def test_route_without_a_comment_still_works(client, monkeypatch):

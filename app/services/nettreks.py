@@ -291,7 +291,7 @@ def _all_host_keys(keys: dict[ReportId, list[CityKey]]) -> list[CityKey]:
 _HOST_WILLING = func.coalesce(AlumniProgramEngagement.nettrek_host_willing, false())
 
 
-def _population_conditions() -> list:
+def population_conditions() -> list:
     """Non-archived alumni, not friends — the main alumni list's defaults
     (``build_alumni_query``: ``include_archived=False``, ``is_alumni=True``) —
     and not suppressed from outreach (deceased flag, or a Deceased / Do Not
@@ -331,7 +331,7 @@ def report_predicate(
     return located
 
 
-def _from_clause(stmt):
+def report_from_clause(stmt):
     """Alumni with their (one-row-per-alum) job, contact and engagement rows,
     all OUTER-joined so nobody without one of them is dropped."""
     return (
@@ -363,7 +363,7 @@ async def get_summary(session: AsyncSession) -> NetTrekSummary:
         for k in report_keys:
             by_city.setdefault(k, set()).add(report)
 
-    per_alum = _from_clause(
+    per_alum = report_from_clause(
         select(
             func.lower(func.trim(cast(CurrentEmployment.current_city, String))).label(
                 "city_norm"
@@ -371,7 +371,7 @@ async def get_summary(session: AsyncSession) -> NetTrekSummary:
             _alumni_state_code_expr().label("state_code"),
             _HOST_WILLING.label("host"),
         )
-    ).where(*_population_conditions()).subquery()
+    ).where(*population_conditions()).subquery()
     rows = (
         await session.execute(
             select(
@@ -435,7 +435,7 @@ async def get_summary(session: AsyncSession) -> NetTrekSummary:
 
 # --- report rows -------------------------------------------------------------
 
-_ROW_COLUMNS = (
+REPORT_ROW_COLUMNS = (
     Alumni.alumni_id,
     Alumni.first_name,
     Alumni.middle_name,
@@ -455,15 +455,19 @@ _ROW_COLUMNS = (
 )
 
 
+#: Every report's sort: last name, then first name, then id for a total order.
+REPORT_ORDER_BY = (Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
+
+
 def _report_select(key, kind, keys):
     return (
-        _from_clause(select(*_ROW_COLUMNS))
-        .where(*_population_conditions(), report_predicate(key, kind, keys))
-        .order_by(Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
+        report_from_clause(select(*REPORT_ROW_COLUMNS))
+        .where(*population_conditions(), report_predicate(key, kind, keys))
+        .order_by(*REPORT_ORDER_BY)
     )
 
 
-def _to_row(row, *, can_edit: bool) -> NetTrekRow:
+def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
     (
         alumni_id, first, middle, last, employer, industry, industry2, city,
         state, personal, work, phone, linkedin, gender, year, host,
@@ -511,7 +515,7 @@ async def list_report(
         area_name=area_name(key),
         kind=kind,
         title=report_title(key, kind),
-        items=[_to_row(r, can_edit=can_edit) for r in rows],
+        items=[to_report_row(r, can_edit=can_edit) for r in rows],
         total=int(total or 0),
         limit=limit,
         offset=offset,
@@ -555,25 +559,15 @@ def export_filename(
     return f"{key.value}_{middle}_{day}.csv"
 
 
-async def export_report_csv(
-    session: AsyncSession,
-    key: NetTrekAreaKey,
-    kind: NetTrekReportKind,
-    *,
-    actor_user_id: int | None,
-    can_edit: bool,
-) -> str:
-    """The whole report as CSV. Every cell goes through the shared
-    formula-injection guard. Audit-logged as :data:`NETTREK_EXPORT_ACTION` with
-    the report and row count — never the rows."""
-    keys = await resolve_report_keys(session)
-    rows = (await session.execute(_report_select(key, kind, keys))).all()
-
+def report_rows_csv(rows, *, can_edit: bool) -> str:
+    """Raw :data:`REPORT_ROW_COLUMNS` rows as the report CSV —
+    :data:`NETTREK_EXPORT_COLUMNS`, every cell through the shared
+    formula-injection guard. Shared by every Outreach list (``outreach_lists``)."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(list(NETTREK_EXPORT_COLUMNS))
     for raw in rows:
-        r = _to_row(raw, can_edit=can_edit)
+        r = to_report_row(raw, can_edit=can_edit)
         writer.writerow(
             [
                 _csv_cell(r.first_name, "str"),
@@ -594,6 +588,24 @@ async def export_report_csv(
                 "Yes" if r.willing_to_host else "",
             ]
         )
+    return buffer.getvalue()
+
+
+async def export_report_csv(
+    session: AsyncSession,
+    key: NetTrekAreaKey,
+    kind: NetTrekReportKind,
+    *,
+    actor_user_id: int | None,
+    can_edit: bool,
+) -> str:
+    """The whole report as CSV. Every cell goes through the shared
+    formula-injection guard. Audit-logged as :data:`NETTREK_EXPORT_ACTION` with
+    the report and row count — never the rows."""
+    keys = await resolve_report_keys(session)
+    rows = (await session.execute(_report_select(key, kind, keys))).all()
+
+    csv_text = report_rows_csv(rows, can_edit=can_edit)
 
     if actor_user_id is None:
         log.warning("%s audit skipped: no actor (rows=%s)", NETTREK_EXPORT_ACTION, len(rows))
@@ -608,4 +620,4 @@ async def export_report_csv(
             )
         )
         await session.commit()
-    return buffer.getvalue()
+    return csv_text

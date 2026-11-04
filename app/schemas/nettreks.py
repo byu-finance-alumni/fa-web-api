@@ -101,12 +101,28 @@ class NetTrekRow(BaseModel):
     graduation_year: int | None
 
 
+class ReportFilterOptions(BaseModel):
+    """The choices for a list's dropdown filters: only values on the list, and
+    for each column only those still reachable under the OTHER active filters,
+    so no choice leads to an empty table (fa-web-app #918). ``gender`` is
+    ``None`` for a caller who cannot edit alumni: they may not filter or sort
+    on it."""
+
+    industry: list[str]
+    secondary_industry: list[str]
+    company_state: list[str]
+    gender: list[str] | None
+    graduation_year: list[int]
+
+
 class NetTrekReportPage(BaseModel):
     area: NetTrekAreaKey
     area_name: str
     kind: NetTrekReportKind
     title: str
     items: list[NetTrekRow]
+    # The filtered total: everyone the active filters leave on the report.
     total: int
     limit: int
     offset: int
+    filter_options: ReportFilterOptions

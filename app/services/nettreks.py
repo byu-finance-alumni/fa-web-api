@@ -50,7 +50,7 @@ import logging
 import math
 from dataclasses import dataclass
 
-from sqlalchemy import String, and_, cast, false, func, not_, or_, select
+from sqlalchemy import String, and_, cast, false, func, not_, null, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS
@@ -69,6 +69,8 @@ from app.schemas.nettreks import (
     NetTrekReportPage,
     NetTrekRow,
     NetTrekSummary,
+    ReportFilterOptions,
+    ReportSortColumn,
 )
 from app.services.alumni_export import _fmt as _csv_cell
 from app.services.geo_regions import CityKey
@@ -79,7 +81,7 @@ from app.services.geo_search import (
     alumni_location_filter,
     haversine_miles,
 )
-from app.services.report_view import ReportView
+from app.services.report_view import DROPDOWNS, ReportView, dropdown_options
 from app.utils.phone import format_phone
 
 log = logging.getLogger(__name__)
@@ -470,9 +472,45 @@ def report_select(list_predicate, view: ReportView):
     alike."""
     return (
         report_from_clause(select(*REPORT_ROW_COLUMNS))
-        .where(*population_conditions(), list_predicate)
+        .where(*population_conditions(), list_predicate, *view.conditions())
         .order_by(*view.order_by())
     )
+
+
+async def report_filter_options(
+    session: AsyncSession, list_predicate, view: ReportView, *, can_edit: bool
+) -> ReportFilterOptions:
+    """A list's dropdown choices (see ``report_view.dropdown_options``). One
+    query: gender is not even read for a caller who may not use it."""
+    columns = [
+        column if can_edit or name is not ReportSortColumn.gender else null()
+        for name, column in DROPDOWNS.items()
+    ]
+    stmt = (
+        report_from_clause(select(*columns).distinct())
+        .where(*population_conditions(), list_predicate, *view.text_conditions())
+    )
+    rows = (await session.execute(stmt)).all()
+    return dropdown_options(rows, view, can_edit=can_edit)
+
+
+async def report_page(
+    session: AsyncSession,
+    list_predicate,
+    view: ReportView,
+    *,
+    limit: int,
+    offset: int,
+    can_edit: bool,
+) -> tuple[list[NetTrekRow], int, ReportFilterOptions]:
+    """One page of a list: its rows, the filtered total and the dropdowns."""
+    stmt = report_select(list_predicate, view)
+    total = await session.scalar(
+        select(func.count()).select_from(stmt.order_by(None).subquery())
+    )
+    rows = (await session.execute(stmt.limit(limit).offset(offset))).all()
+    options = await report_filter_options(session, list_predicate, view, can_edit=can_edit)
+    return [to_report_row(r, can_edit=can_edit) for r in rows], int(total or 0), options
 
 
 def _report_select(key, kind, keys, view: ReportView | None = None):
@@ -518,20 +556,24 @@ async def list_report(
 ) -> NetTrekReportPage:
     view = (view or ReportView()).for_caller(can_edit=can_edit)
     keys = await resolve_report_keys(session)
-    stmt = _report_select(key, kind, keys, view)
-    total = await session.scalar(
-        select(func.count()).select_from(stmt.order_by(None).subquery())
+    items, total, options = await report_page(
+        session,
+        report_predicate(key, kind, keys),
+        view,
+        limit=limit,
+        offset=offset,
+        can_edit=can_edit,
     )
-    rows = (await session.execute(stmt.limit(limit).offset(offset))).all()
     return NetTrekReportPage(
         area=key,
         area_name=area_name(key),
         kind=kind,
         title=report_title(key, kind),
-        items=[to_report_row(r, can_edit=can_edit) for r in rows],
-        total=int(total or 0),
+        items=items,
+        total=total,
         limit=limit,
         offset=offset,
+        filter_options=options,
     )
 
 

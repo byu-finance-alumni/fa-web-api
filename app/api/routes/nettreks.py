@@ -70,9 +70,10 @@ async def nettreks_report(
     offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> NetTrekReportPage:
     """One report's people, paginated: sorted by last name, or by ``sort`` and
-    ``dir`` with blanks last. 404 for Other's Area Alumni (it has none). Gender
-    is null for a caller who cannot edit alumni, and ``sort=gender`` is ignored
-    for them. Audited as ``view`` on ``nettrek_report`` (who looked at which
+    ``dir`` with blanks last, and narrowed by the ``f_*`` filters. ``total`` and
+    ``filter_options`` follow the filters. 404 for Other's Area Alumni (it has
+    none). Gender is null for a caller who cannot edit alumni, and
+    ``sort=gender`` and ``f_gender`` are ignored for them. Audited as ``view`` on ``nettrek_report`` (who looked at which
     report — never the rows)."""
     if not svc.report_exists(area, kind):
         raise NotFoundError(_NO_SUCH_REPORT)

@@ -295,21 +295,25 @@ async def list_page(
     view: ReportView | None = None,
 ) -> OutreachListPage:
     view = (view or ReportView()).for_caller(can_edit=can_edit)
-    stmt = _list_select(ref, view)
-    total = await session.scalar(
-        select(func.count()).select_from(stmt.order_by(None).subquery())
+    items, total, options = await nettreks.report_page(
+        session,
+        list_predicate(ref),
+        view,
+        limit=limit,
+        offset=offset,
+        can_edit=can_edit,
     )
-    rows = (await session.execute(stmt.limit(limit).offset(offset))).all()
     return OutreachListPage(
         group=ref.group,
         group_title=GROUP_TITLES[ref.group],
         key=ref.key,
         industry=industry_label(ref.industry) if ref.industry else None,
         title=list_title(ref),
-        items=[nettreks.to_report_row(r, can_edit=can_edit) for r in rows],
-        total=int(total or 0),
+        items=items,
+        total=total,
         limit=limit,
         offset=offset,
+        filter_options=options,
     )
 
 

@@ -14,6 +14,8 @@ path exists. There is no such write path today, so nothing imports this yet.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from app.core.errors import InvalidRequestError
 
 # Industries — current_industry, current_industry_secondary, employment_industry.
@@ -487,6 +489,13 @@ def normalize_designation(value: str | None) -> str | None:
 
 # The designation tokens the ``designations`` FILTER accepts (#404) — the same
 # three flag columns ``app.repositories.alumni._DESIGNATION_COLUMNS`` maps.
+# The alumni list's "left a comment" filter (fa-web-app#923): one choice, off by default.
+# ``CommentFilter`` is the type on BOTH ``GET /alumni`` and the export body, so an
+# unknown value is a 422 on each rather than a dropped predicate.
+COMMENT_FILTER_SURVEY = "survey_comment"
+COMMENT_FILTER_ANY_NOTE = "any_note"
+CommentFilter = Literal["survey_comment", "any_note"]
+
 DESIGNATION_TOKENS: tuple[str, ...] = ("CFP", "CFA", "CPA")
 
 

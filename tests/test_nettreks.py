@@ -230,6 +230,7 @@ class _World:
         gender="F",
         email=None,
         employer=None,
+        phone="555-0100",
     ):
         self.s.add(
             Alumni(
@@ -263,7 +264,7 @@ class _World:
                 alumni_id=alumni_id,
                 personal_email=email or f"p{alumni_id}@dev.example",
                 work_email=f"w{alumni_id}@dev.example",
-                phone="555-0100",
+                phone=phone,
             )
         )
         if label:
@@ -490,10 +491,25 @@ def test_csv_header_order_and_cells(world):
     assert first[:3] == ["F1", "M", "L001"]
     assert first[6:9] == ["Dallas", "Texas", "p1@dev.example"]
     assert first[13:] == ["2010"]
+    assert first[10] == "555-0100"  # a number the formatter does not know: as stored
     assert all(len(r) == 14 for r in rows)
     # The formula-injection guard is applied.
     evil = next(r for r in rows[1:] if r[2] == "L020")
     assert evil[3] == "\t=HYPERLINK(1)"
+
+
+def test_csv_formats_the_phone_like_the_table_and_leaves_the_row_stored(world):
+    world.alum(30, city="Dallas", state="Texas", phone="+1 8015551234")
+    text = asyncio.run(
+        nt.export_report_csv(
+            world.db, A.dallas, K.area_alumni, actor_user_id=None, can_edit=True
+        )
+    )
+    assert _csv_rows(text)[1][10] == "(801) 555-1234"
+    page = asyncio.run(
+        nt.list_report(world.db, A.dallas, K.area_alumni, limit=5, offset=0, can_edit=True)
+    )
+    assert page.items[0].phone == "+1 8015551234"
 
 
 def test_csv_is_audited_without_the_rows(world):

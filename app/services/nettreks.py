@@ -79,6 +79,7 @@ from app.services.geo_search import (
     alumni_location_filter,
     haversine_miles,
 )
+from app.utils.phone import format_phone
 
 log = logging.getLogger(__name__)
 
@@ -585,7 +586,8 @@ def report_rows_csv(rows, *, can_edit: bool) -> str:
                 _csv_cell(r.company_state, "str"),
                 _csv_cell(r.permanent_email, "str"),
                 _csv_cell(r.work_email, "str"),
-                _csv_cell(r.phone, "str"),
+                # As the table shows it; the stored value is not touched.
+                _csv_cell(format_phone(r.phone), "str"),
                 _csv_cell(r.linkedin_url, "str"),
                 _csv_cell(r.gender, "str"),
                 _csv_cell(r.graduation_year, "int"),

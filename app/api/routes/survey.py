@@ -59,6 +59,7 @@ from app.schemas.opportunity_link import (
     OpportunityLinkSubmitResult,
 )
 from app.schemas.survey import (
+    SURVEY_SUBMIT_MAX_TOTAL_BYTES,
     GraduationYearCount,
     SurveyAlumniState,
     SurveyApplyResult,
@@ -270,7 +271,7 @@ async def survey_respond_info(
 # browser reports it as a CORS error, which tells the alum nothing. Capping well
 # underneath is what makes our own message the one they actually see.
 _SUBMIT_MAX_FIELD_BYTES = 40 * 1024
-_SUBMIT_MAX_TOTAL_BYTES = 64 * 1024
+_SUBMIT_MAX_TOTAL_BYTES = SURVEY_SUBMIT_MAX_TOTAL_BYTES
 
 
 def _oversized_submission(fields: dict[str, str]) -> JSONResponse | None:
@@ -391,6 +392,9 @@ async def survey_submit_photo(
     photo: Annotated[UploadFile, File()],
 ) -> Response:
     """PUBLIC (token-gated): attach a NEW profile photo to a just-staged response.
+
+    That can be an existing pending row: a repeat submission merges into it and
+    returns its id (#655), and the newest photo replaces the older staged one.
 
     A separate step from the JSON field-submit so the field submit is unaffected.
     The signed token gates it (no login).

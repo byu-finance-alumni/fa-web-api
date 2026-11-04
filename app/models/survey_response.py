@@ -32,7 +32,9 @@ from app.core.database import Base
 # dot, so it can never collide with a `table.column` survey field key. It is
 # NOT a field: nothing writes it to the record column-by-column. On apply it
 # becomes a Note on the profile (`survey_responses.apply_response`); on reject
-# it goes nowhere. Old rows simply have no such key.
+# it goes nowhere. Old rows simply have no such key. A merged submission holds
+# every comment here as one string, oldest first (#655), so there is still one
+# key and one Note.
 COMMENTS_KEY = "comments"
 
 

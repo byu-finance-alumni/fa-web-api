@@ -36,6 +36,11 @@ under `COMMENTS_KEY`, skipped by every field loop here, shown to the reviewer
 on its own (`SurveyResponseItem.comments`), and on APPLY saved as a Note on the
 alum's profile — never written to a column, and never saved on reject.
 
+A SECOND SUBMISSION (#655). The link works for 7 days on purpose, so an alum can
+come back. While their earlier submission is still `pending` the two become ONE
+row, newest answer on top — see `submit_response` and `_merged_payload`. Once it
+has been applied or rejected, the new submission is reviewed by itself.
+
 These rows ARE the survey history the profile's Surveys tab shows: it derives
 from them in `profile._derive_survey_history`. Do NOT also insert into the
 legacy `surveys` table (see `models.crm.Survey`) — one fact, one home.
@@ -84,6 +89,8 @@ from app.schemas.alumni import (
 )
 from app.schemas.survey import (
     SURVEY_COMMENTS_MAX,
+    SURVEY_COMMENTS_SEPARATOR,
+    SURVEY_SUBMIT_MAX_TOTAL_BYTES,
     SurveyChange,
     SurveyResponseItem,
     SurveySubmitResult,
@@ -1230,20 +1237,22 @@ async def _live_reply(
     be "already replied" to the submit path and "never responded" to the sender
     on the same day.
 
-    Used for exactly two questions on the public submit path:
+    Used for exactly three questions on the public submit path:
 
       * *has this alum already replied?* -- the idempotency guard for a repeated
         confirmation (``RESPONDED_STATUSES``);
       * *is there a confirmation to UPGRADE?* -- when real edits arrive after one
-        (``(STATUS_CONFIRMED,)``).
+        (``(STATUS_CONFIRMED,)``);
+      * *is there a pending submission to MERGE into?* -- when an alum submits
+        again before staff have reviewed the last one (``(STATUS_PENDING,)``, #655).
 
-    A reset between the confirmation and the edit makes the confirmation stop
-    counting, so it is deliberately NOT found here and the edit stages a fresh
-    row: the alum was re-asked, and this is a new answer.
+    A reset between the earlier reply and the new one makes the earlier reply stop
+    counting, so it is deliberately NOT found here and the new answer stages a
+    fresh row: the alum was re-asked, and this is a new answer.
 
-    ``limit(1)`` is what makes ``scalar_one_or_none`` safe -- an alum legitimately
-    has several rows in the window (a submission, then another after spotting a
-    typo), and the NEWEST is the one both questions are about.
+    ``limit(1)`` is what makes ``scalar_one_or_none`` safe -- an alum can hold
+    several rows in the window (older duplicates from before #655, a race, an
+    earlier applied reply), and the NEWEST is the one these questions are about.
 
     ``for_update`` LOCKS the row it returns, and the caller that is going to
     MUTATE what it finds must pass it. This is the same reasoning, and the same
@@ -1261,6 +1270,15 @@ async def _live_reply(
     row, which is exactly what two concurrent submissions did before
     confirmations existed, and both answers reach the reviewer. That re-check is
     the point of taking the lock here rather than re-reading the status by hand.
+
+    A MERGE KEEPS THE ROW MATCHABLE, which is the opposite outcome and just as
+    deliberate (#655). The row a blocked request was waiting for is still
+    ``pending``, its ``submitted_at`` only moved forward so it is still in the
+    window and still after any reset, so it passes the re-check and comes back
+    carrying the payload the first request just committed. The second request
+    therefore merges on top of the first rather than over a stale copy. If staff
+    applied or rejected the row while the request waited, it drops out here and
+    the submission stands alone -- the rule for a reviewed row.
 
     The lock only helps a caller that mutates an EXISTING row. A row-level lock
     cannot stop a concurrent INSERT, so two confirmations racing each other can
@@ -1374,6 +1392,143 @@ def _sane_fill_seconds(value: int | None) -> int | None:
     return value
 
 
+def _combined_comment(older: object, newer: str) -> str | None:
+    """The stored comment and *newer* as one value, oldest first -- or ``None``
+    when both do not fit under ``SURVEY_COMMENTS_MAX``.
+
+    Both are kept whole because the cap is not a formality here:
+    :func:`_payload_comment` treats a longer value as unreadable, so storing one
+    would hide BOTH comments from the reviewer and from the profile note. They are
+    never trimmed to fit either; the caller stages a separate row instead.
+
+    A comment already held is not added again. A double-click or a mobile retry
+    posts the same text twice, and that must neither repeat it nor burn the budget.
+    """
+    kept = clean_survey_comment(older)
+    if kept is None:
+        return newer
+    if newer in kept.split(SURVEY_COMMENTS_SEPARATOR):
+        return kept
+    combined = f"{kept}{SURVEY_COMMENTS_SEPARATOR}{newer}"
+    return combined if len(combined) <= SURVEY_COMMENTS_MAX else None
+
+
+def _fields_bytes(payload: dict) -> int:
+    """A payload's fields in UTF-8 bytes, keys and values, measured the way the
+    route's `_oversized_submission` measures a request. The comment has its own
+    cap, and the route does not count it either."""
+    return sum(
+        len(key.encode()) + len(_text(value).encode())
+        for key, value in payload.items()
+        if key != COMMENTS_KEY
+    )
+
+
+async def _record_values(
+    session: AsyncSession, alum: Alumni, alumni_id: int
+) -> dict[str, str]:
+    """What is on file for every survey field, in `_current`'s display form."""
+    contacts, jobs, engs = await _load_side_rows(session, [alumni_id])
+    by_group = {
+        "alumni": alum,
+        "contact": contacts.get(alumni_id),
+        "employment": jobs.get(alumni_id),
+        "engagement": engs.get(alumni_id),
+    }
+    return {f.key: _current(f, by_group.get(f.group)) for f in _FIELDS}
+
+
+def _echoes_whole_form(submitted: dict, record: dict[str, str]) -> bool:
+    """Whether a submission carries every answer the survey pre-fills for this
+    alum, which marks it as a posted form rather than a list of edits.
+
+    Read off the raw ``submitted`` keys: an off-list value on file ("Separated")
+    is dropped from the staged payload but is still proof the form sent it.
+
+    `bool` fields are left out because `get_respondent` does not pre-fill them, and
+    an unticked designation reads "No" here but is omitted there.
+    """
+    prefilled = {
+        f.key
+        for f in _FIELDS
+        if f.kind != "bool"
+        and record[f.key]
+        and not (f.kind == "designation" and record[f.key] == "No")
+    }
+    return bool(prefilled) and prefilled <= submitted.keys()
+
+
+async def _merged_payload(
+    session: AsyncSession,
+    alum: Alumni,
+    pending: SurveyResponse,
+    newer: dict,
+    submitted: dict,
+) -> dict | None:
+    """The pending row's payload with *newer* folded in (#655) -- or ``None`` when
+    the result would break a public-path cap and must stage as its own row.
+
+    Newest answer wins on a field in both, a field only in the older one is kept,
+    and two comments are both kept (:func:`_combined_comment`).
+
+    "NEWEST WINS" NEEDS CARE, because of what a key in the payload means. The
+    survey page posts only the fields the alum touched (`editSubmitBody`, the
+    `edits` map), and it prefills from the RECORD, not from the pending row. So a
+    key that matches the record is a real answer: the alum changed something, then
+    came back and put it back, and that revert has to win.
+
+    A client posting the WHOLE form breaks that assumption. Every field it did not
+    change arrives holding the record's value, which would quietly undo the first
+    round's edits. So when a submission echoes everything the survey prefills, a
+    value equal to the record is treated as "left alone" and the older answer
+    stands. Comparing per key regardless of that check is the tempting version, and
+    it is wrong: it would discard every deliberate revert on the page we ship.
+
+    JOBS. The payload holds only flat `employment.current_*` answers, never a list
+    of jobs, and the role on file is archived by `apply_response` when the merged
+    answers are applied, exactly as for a single submission. So a merge cannot lose
+    a job on record. A staged employer replaced by a newer one was never on record.
+
+    THE SIZE CAP. The route caps one request, which does not bound a row that
+    accumulates: `bool`, `date` and `int` answers have no `max_length`, so repeat
+    submissions could stack up to 40 KiB under each of those keys. The same 64 KiB
+    total is therefore enforced on the merged result.
+    """
+    older = pending.payload or {}
+    keep_older: set[str] = set()
+    changed = [
+        key
+        for key, value in newer.items()
+        if key != COMMENTS_KEY and key in older and older[key] != value
+    ]
+    if changed:
+        record = await _record_values(session, alum, alum.alumni_id)
+        if _echoes_whole_form(submitted, record):
+            keep_older = {
+                key
+                for key in changed
+                if _after(_FIELD_BY_KEY[key], newer[key]) == record[key]
+            }
+
+    merged = {
+        **older,
+        **{
+            key: value
+            for key, value in newer.items()
+            if key != COMMENTS_KEY and key not in keep_older
+        },
+    }
+    comment = newer.get(COMMENTS_KEY)
+    if comment is not None:
+        combined = _combined_comment(older.get(COMMENTS_KEY), comment)
+        if combined is None:
+            return None
+        merged[COMMENTS_KEY] = combined
+    if _fields_bytes(merged) > SURVEY_SUBMIT_MAX_TOTAL_BYTES:
+        return None
+    return merged
+
+
 async def submit_response(
     session: AsyncSession,
     token: str,
@@ -1405,6 +1560,14 @@ async def submit_response(
     (and upgrades a confirmation), because a reviewer has to read it and the
     alum must never lose what they wrote for having changed nothing else. It is
     NOT counted in ``change_count``, which counts fields.
+
+    A SECOND SUBMISSION WHILE THE FIRST IS PENDING MERGES INTO IT (#655): same row
+    and id, the answers combined by :func:`_merged_payload`. ``change_count`` is
+    then the fields now on that row awaiting review, because the row is what this
+    result describes. Nothing merges into an applied or rejected row, or into one
+    a reset superseded -- :func:`_live_reply` finds neither -- and a merge that
+    would break a cap stages a new row instead, so no answer is ever discarded to
+    make one fit.
     """
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
@@ -1460,9 +1623,8 @@ async def submit_response(
     # having pressed the wrong button first, which is unacceptable on a public
     # page they reached from an email.
     #
-    # Only a `confirmed` row is ever touched. A live `pending` submission is left
-    # alone and a second one is staged beside it, exactly as before: those are
-    # two real submissions and a reviewer must see both.
+    # A live `pending` submission is NOT this case: it holds answers, so it is
+    # merged rather than overwritten, below.
     # LOCKED, because this branch WRITES to the row it finds. Two submissions
     # racing on one token would otherwise both upgrade the same confirmation and
     # the second would silently discard the first alum's answers -- see
@@ -1502,6 +1664,58 @@ async def submit_response(
             staged=True, change_count=field_count, survey_response_id=upgraded_id
         )
 
+    # SUBMIT AGAIN WHILE THE FIRST IS PENDING (#655). The two used to sit in the
+    # queue as separate rows, and if staff approved both, the last one APPROVED won
+    # on shared fields even when it was the older answer. Combined here, the newest
+    # answer is the one a reviewer sees. LOCKED for the same reason as the upgrade,
+    # and held to the commit; see `_live_reply` for why a request blocked on this
+    # lock then merges on top of the first rather than losing either answer.
+    #
+    # The newest row only: older duplicates already in the table stay as they are.
+    pending = await _live_reply(session, alumni_id, (STATUS_PENDING,), for_update=True)
+    if pending is not None:
+        merged = await _merged_payload(session, alum, pending, payload, fields or {})
+        if merged is not None:
+            pending.payload = merged
+            # The row keeps its id and its stamp and moves to now, for the same
+            # reasons as the upgrade above: `submitted_at` is the date the queue
+            # shows, and it only moves forward, on a row `_live_reply` has already
+            # shown is not superseded.
+            pending.submitted_at = func.now()
+            if pending.cycle_seq is None:
+                pending.cycle_seq = cycle_seq
+            if pending.stage is None:
+                pending.stage = stage
+            # The first measured time stands: the median reports how long the
+            # survey takes, and a return visit to fix a typo is not a second fill
+            # of it. Adding them could also walk an attacker-chosen number past
+            # `_FILL_SECONDS_MAX` a little at a time.
+            if fill is not None and pending.fill_seconds is None:
+                pending.fill_seconds = fill
+            # Read both BEFORE the commit expires the row.
+            merged_id = pending.survey_response_id
+            merged_count = payload_field_count(merged)
+            # Ids and counts only: never a submitted value.
+            log.info(
+                "survey submit: merged a repeat submission into pending response "
+                "%s for alumni_id=%s (%d fields)",
+                merged_id,
+                alumni_id,
+                merged_count,
+            )
+            await session.commit()
+            return SurveySubmitResult(
+                staged=True, change_count=merged_count, survey_response_id=merged_id
+            )
+        # Falls through to a new row. Both rows reach the reviewer, so nothing is
+        # lost, and the next submission merges into the new one.
+        log.info(
+            "survey submit: repeat submission for alumni_id=%s would overflow "
+            "pending response %s; staged separately",
+            alumni_id,
+            pending.survey_response_id,
+        )
+
     response = SurveyResponse(
         alumni_id=alumni_id,
         graduation_year=alum.graduation_year,
@@ -1535,7 +1749,12 @@ async def stage_photo(
     (token-gated, public). The token proves which alum is calling; the response
     must belong to that alum AND still be pending, else it's a 404. The image is
     uploaded to the private headshots bucket under a `survey-pending/<id>` key
-    (never an alum's live headshot) and recorded on the row for admin review."""
+    (never an alum's live headshot) and recorded on the row for admin review.
+
+    NEWEST PHOTO WINS (#655). A merged submission keeps its row id, so its photo
+    lands on the same key and `upload_object`'s upsert replaces the older staged
+    photo. A row whose stored path is some OTHER key would keep that object out of
+    reach, so it is removed once the new one is safely recorded."""
     alumni_id = verify_survey_token(token)
     if alumni_id is None:
         raise NotFoundError(LINK_DEAD_MESSAGE)
@@ -1551,9 +1770,15 @@ async def stage_photo(
     if resp is None or resp.alumni_id != alumni_id or resp.status != "pending":
         raise NotFoundError("Survey response not found.")
     path = _staged_photo_path(survey_response_id)
+    previous = resp.staged_photo_path
     await supabase_storage.upload_object(_HEADSHOT_BUCKET, path, data, content_type)
     resp.staged_photo_path = path
     await session.commit()
+    if previous and previous != path:
+        # Cleanup only: the new photo is already saved, so a storage hiccup here
+        # must not report the upload as failed.
+        with contextlib.suppress(ServiceError):
+            await supabase_storage.delete_object(_HEADSHOT_BUCKET, previous)
 
 
 # ------------------------------------------------------------- review --------

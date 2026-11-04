@@ -79,6 +79,7 @@ from app.services.geo_search import (
     alumni_location_filter,
     haversine_miles,
 )
+from app.services.report_view import ReportView
 from app.utils.phone import format_phone
 
 log = logging.getLogger(__name__)
@@ -463,16 +464,19 @@ REPORT_ROW_COLUMNS = (
 )
 
 
-#: Every report's sort: last name, then first name, then id for a total order.
-REPORT_ORDER_BY = (Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
-
-
-def _report_select(key, kind, keys):
+def report_select(list_predicate, view: ReportView):
+    """One list's rows: the population, the list's own predicate and the view.
+    The ONE query behind every NetTrek report and Outreach list, page and CSV
+    alike."""
     return (
         report_from_clause(select(*REPORT_ROW_COLUMNS))
-        .where(*population_conditions(), report_predicate(key, kind, keys))
-        .order_by(*REPORT_ORDER_BY)
+        .where(*population_conditions(), list_predicate)
+        .order_by(*view.order_by())
     )
+
+
+def _report_select(key, kind, keys, view: ReportView | None = None):
+    return report_select(report_predicate(key, kind, keys), view or ReportView())
 
 
 def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
@@ -510,9 +514,11 @@ async def list_report(
     limit: int,
     offset: int,
     can_edit: bool,
+    view: ReportView | None = None,
 ) -> NetTrekReportPage:
+    view = (view or ReportView()).for_caller(can_edit=can_edit)
     keys = await resolve_report_keys(session)
-    stmt = _report_select(key, kind, keys)
+    stmt = _report_select(key, kind, keys, view)
     total = await session.scalar(
         select(func.count()).select_from(stmt.order_by(None).subquery())
     )

@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.params import ReportViewParam
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.core.rate_limit import (
@@ -81,17 +82,24 @@ async def outreach_list(
     key: OutreachListKey,
     user: ContactListReadRateLimit,
     session: SessionDep,
+    view: ReportViewParam,
     industry: IndustryParam = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> OutreachListPage:
-    """One list's people, sorted by last name, paginated — the NetTrek report
-    rows. 404 for a list the group does not have, an ``industry`` list without
+    """One list's people, paginated — the NetTrek report rows, sorted by last
+    name, or by ``sort`` and ``dir`` with blanks last. 404 for a list the group does not have, an ``industry`` list without
     ``industry``, or ``industry`` on any other list. Gender is null for a
-    caller who cannot edit alumni. Audited as ``view`` on ``outreach_list``."""
+    caller who cannot edit alumni, and ``sort=gender`` is ignored for them.
+    Audited as ``view`` on ``outreach_list``."""
     ref = _ref(group, key, industry)
     page = await svc.list_page(
-        session, ref, limit=limit, offset=offset, can_edit=user.can_edit_alumni
+        session,
+        ref,
+        limit=limit,
+        offset=offset,
+        can_edit=user.can_edit_alumni,
+        view=view,
     )
     # After the page is built: the audit commit expires loaded ORM state.
     await alumni_service.log_read(

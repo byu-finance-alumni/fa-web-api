@@ -53,6 +53,7 @@ from app.schemas.outreach import (
     OutreachListPage,
 )
 from app.services import nettreks
+from app.services.report_view import ReportView
 
 log = logging.getLogger(__name__)
 
@@ -194,12 +195,8 @@ def list_predicate(ref: ListRef):
     raise NoSuchList(ref.key)  # pragma: no cover - make_ref rules it out
 
 
-def _list_select(ref: ListRef):
-    return (
-        nettreks.report_from_clause(select(*nettreks.REPORT_ROW_COLUMNS))
-        .where(*nettreks.population_conditions(), list_predicate(ref))
-        .order_by(*nettreks.REPORT_ORDER_BY)
-    )
+def _list_select(ref: ListRef, view: ReportView | None = None):
+    return nettreks.report_select(list_predicate(ref), view or ReportView())
 
 
 async def _count(session: AsyncSession, ref: ListRef) -> int:
@@ -295,8 +292,10 @@ async def list_page(
     limit: int,
     offset: int,
     can_edit: bool,
+    view: ReportView | None = None,
 ) -> OutreachListPage:
-    stmt = _list_select(ref)
+    view = (view or ReportView()).for_caller(can_edit=can_edit)
+    stmt = _list_select(ref, view)
     total = await session.scalar(
         select(func.count()).select_from(stmt.order_by(None).subquery())
     )

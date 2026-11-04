@@ -22,6 +22,7 @@ import csv
 import datetime
 import io
 import math
+import re
 import uuid
 
 import pytest
@@ -174,11 +175,16 @@ _CITIES = [
 ]
 
 
+def _regexp_replace(value, pattern, replacement, _flags):
+    return None if value is None else re.sub(pattern, replacement, value)
+
+
 def _register_pg_math(dbapi_conn, _record):
     dbapi_conn.create_function("radians", 1, math.radians)
     dbapi_conn.create_function("sin", 1, math.sin)
     dbapi_conn.create_function("cos", 1, math.cos)
     dbapi_conn.create_function("acos", 1, math.acos)
+    dbapi_conn.create_function("regexp_replace", 4, _regexp_replace)
     dbapi_conn.create_function("least", 2, min)
     dbapi_conn.create_function("greatest", 2, max)
 
@@ -231,16 +237,22 @@ class _World:
         email=None,
         employer=None,
         phone="555-0100",
+        first=None,
+        middle="M",
+        year=2010,
+        linkedin=None,
+        industry="Banking",
+        secondary="Tech",
     ):
         self.s.add(
             Alumni(
                 alumni_id=alumni_id,
-                first_name=f"F{alumni_id}",
-                middle_name="M",
+                first_name=first or f"F{alumni_id}",
+                middle_name=middle,
                 last_name=last or f"L{alumni_id:03d}",
                 gender=gender,
-                graduation_year=2010,
-                linkedin_url=f"https://linkedin.example/in/{alumni_id}",
+                graduation_year=year,
+                linkedin_url=linkedin or f"https://linkedin.example/in/{alumni_id}",
                 archived=archived,
                 is_alumni=is_alumni,
                 deceased=deceased,
@@ -252,8 +264,8 @@ class _World:
                     current_employment_id=alumni_id,
                     alumni_id=alumni_id,
                     current_employer=employer or f"Co{alumni_id}",
-                    current_industry="Banking",
-                    current_industry_secondary="Tech",
+                    current_industry=industry,
+                    current_industry_secondary=secondary,
                     current_city=city,
                     current_state=state,
                 )

@@ -32,6 +32,32 @@ class NetTrekReportKind(StrEnum):
     area_alumni = "area_alumni"
 
 
+class ReportSortColumn(StrEnum):
+    """Every column of an Outreach people table, named after its
+    :class:`NetTrekRow` field. The whitelist for the ``sort`` query parameter on
+    the NetTrek reports and the Outreach lists (fa-web-app #917)."""
+
+    first_name = "first_name"
+    middle_name = "middle_name"
+    last_name = "last_name"
+    company = "company"
+    industry = "industry"
+    secondary_industry = "secondary_industry"
+    company_city = "company_city"
+    company_state = "company_state"
+    permanent_email = "permanent_email"
+    work_email = "work_email"
+    phone = "phone"
+    linkedin_url = "linkedin_url"
+    gender = "gender"
+    graduation_year = "graduation_year"
+
+
+class ReportSortDir(StrEnum):
+    asc = "asc"
+    desc = "desc"
+
+
 class NetTrekReportCount(BaseModel):
     """One report link on the landing page."""
 

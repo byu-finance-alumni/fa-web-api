@@ -1,4 +1,4 @@
-"""Shared path-parameter types for API routes.
+"""Shared path- and query-parameter types for API routes.
 
 Numeric ``{..._id}`` path params are bounded so an id outside the PostgreSQL
 ``bigint`` range is rejected with a 422 *before* it reaches asyncpg. A bare
@@ -11,7 +11,10 @@ covers every id (``alumni_id``, ``event_id``, ``donation_id``, ...).
 
 from typing import Annotated
 
-from fastapi import Path
+from fastapi import Depends, Path, Query
+
+from app.schemas.nettreks import ReportSortColumn, ReportSortDir
+from app.services.report_view import ReportView
 
 # PostgreSQL ``bigint`` / ``bigserial`` ceiling — the largest id the DB can hold.
 INT64_MAX = 9223372036854775807
@@ -19,3 +22,15 @@ INT64_MAX = 9223372036854775807
 # A positive-identity path id, bounded to the bigint range. Ids are 1-based
 # identities, so ``ge=1`` also rejects 0 / negative segments up front.
 IdPath = Annotated[int, Path(ge=1, le=INT64_MAX)]
+
+
+def report_view_params(
+    sort: ReportSortColumn | None = None,
+    direction: Annotated[ReportSortDir, Query(alias="dir")] = ReportSortDir.asc,
+) -> ReportView:
+    """The sort of an Outreach people table, the same on the page and the CSV
+    routes of the NetTrek reports and the Outreach lists."""
+    return ReportView(sort=sort, direction=direction)
+
+
+ReportViewParam = Annotated[ReportView, Depends(report_view_params)]

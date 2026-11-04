@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.params import ReportViewParam
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.core.rate_limit import (
@@ -64,12 +65,14 @@ async def nettreks_report(
     kind: NetTrekReportKind,
     user: ContactListReadRateLimit,
     session: SessionDep,
+    view: ReportViewParam,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> NetTrekReportPage:
-    """One report's people, sorted by last name, paginated. 404 for Other's
-    Area Alumni (it has none). Gender is null for a caller who cannot edit
-    alumni. Audited as ``view`` on ``nettrek_report`` (who looked at which
+    """One report's people, paginated: sorted by last name, or by ``sort`` and
+    ``dir`` with blanks last. 404 for Other's Area Alumni (it has none). Gender
+    is null for a caller who cannot edit alumni, and ``sort=gender`` is ignored
+    for them. Audited as ``view`` on ``nettrek_report`` (who looked at which
     report — never the rows)."""
     if not svc.report_exists(area, kind):
         raise NotFoundError(_NO_SUCH_REPORT)
@@ -80,6 +83,7 @@ async def nettreks_report(
         limit=limit,
         offset=offset,
         can_edit=user.can_edit_alumni,
+        view=view,
     )
     # After the page is built: the audit commit expires loaded ORM state.
     await alumni_service.log_read(

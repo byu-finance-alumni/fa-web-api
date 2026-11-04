@@ -22,6 +22,7 @@ class NetTrekAreaKey(StrEnum):
     phoenix = "phoenix"
     seattle = "seattle"
     washington_dc = "washington_dc"
+    new_york = "new_york"
     wasatch = "wasatch"
     other = "other"
 

@@ -1,6 +1,6 @@
 """NetTreks tab: per-area Hosts and Area Alumni reports (fa-web-app #887).
 
-Amy's seven areas plus "Other". For each area there are two reports:
+Amy's seven areas and New York, plus "Other". For each area there are two reports:
 
   * **<Area> NetTrek Hosts** — alumni willing to host a NetTrek
     (``alumni_program_engagement.nettrek_host_willing``) whose company is in the
@@ -8,7 +8,7 @@ Amy's seven areas plus "Other". For each area there are two reports:
   * **<Area> Area Alumni** — everyone whose company is in the area's (wider)
     ALUMNI catchment. A host is therefore on both lists.
 
-"Other" has only a Hosts report: every host who is in NONE of the seven host
+"Other" has only a Hosts report: every host who is in NONE of the host
 catchments — including a host with no company city at all, or one whose city
 does not resolve in ``city_geo``.
 
@@ -125,7 +125,8 @@ class NetTrekArea:
     host_corridor: tuple[LatLng, LatLng] | None = None
 
 
-#: THE list of NetTrek areas (Amy's seven), in landing-page order. "Other" is
+#: THE list of NetTrek areas (Amy's seven plus New York, #916), in landing-page
+#: order. "Other" is
 #: not an area — it is the complement of every host catchment below.
 NETTREK_AREAS: tuple[NetTrekArea, ...] = (
     NetTrekArea(
@@ -150,6 +151,13 @@ NETTREK_AREAS: tuple[NetTrekArea, ...] = (
     ),
     NetTrekArea(
         NetTrekAreaKey.washington_dc, "Washington D.C.", (38.9072, -77.0369),
+        HOST_RADIUS_MILES, ALUMNI_RADIUS_MILES,
+    ),
+    # Centered on Manhattan. The match is by distance, not state: 40 mi reaches
+    # into NJ and CT. city_geo holds Census places, so the boroughs ("Brooklyn",
+    # "Manhattan", "Queens"...) have no row and do not resolve; "New York" does.
+    NetTrekArea(
+        NetTrekAreaKey.new_york, "New York", (40.7831, -73.9712),
         HOST_RADIUS_MILES, ALUMNI_RADIUS_MILES,
     ),
     NetTrekArea(

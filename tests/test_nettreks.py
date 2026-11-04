@@ -59,7 +59,7 @@ def _north(center, miles):
 _CITY_AREAS = [a for a in nt.NETTREK_AREAS if a.host_corridor is None]
 
 
-def test_the_seven_areas_are_amys():
+def test_the_areas_are_amys_seven_plus_new_york():
     assert [a.name for a in nt.NETTREK_AREAS] == [
         "Dallas",
         "San Francisco",
@@ -67,6 +67,7 @@ def test_the_seven_areas_are_amys():
         "Phoenix",
         "Seattle",
         "Washington D.C.",
+        "New York",
         "Wasatch",
     ]
     for area in _CITY_AREAS:
@@ -140,6 +141,17 @@ def test_corridor_tolerance_is_measured_from_the_line_not_the_ends():
     assert nt.point_to_segment_miles(
         past, nt.PROVO, nt.SALT_LAKE_CITY
     ) == pytest.approx(12, abs=0.3)
+
+
+def test_new_york_reaches_nj_and_ct_by_distance_not_state():
+    # Hoboken NJ and Stamford CT are inside 40 mi of Manhattan, Princeton NJ is
+    # only inside 60, and Philadelphia is outside both.
+    assert (A.new_york, K.hosts) in nt.reports_for_point(40.7440, -74.0324)
+    assert (A.new_york, K.hosts) in nt.reports_for_point(41.0534, -73.5387)
+    princeton = nt.reports_for_point(40.3573, -74.6672)
+    assert (A.new_york, K.area_alumni) in princeton
+    assert (A.new_york, K.hosts) not in princeton
+    assert nt.reports_for_point(39.9526, -75.1652) == set()
 
 
 def test_a_far_away_city_is_in_no_report():
@@ -376,6 +388,14 @@ def test_other_hosts_include_no_city_and_exclude_area_hosts(world):
     assert other == {4, 7, 8, 9, 10, 11}
     for key in (A.dallas, A.wasatch):
         assert not other & _ids(world, key, K.hosts)
+
+
+def test_a_new_york_host_is_automatically_not_an_other_host(world):
+    world.s.add(CityGeo(city_norm="hoboken", state="NJ", lat=40.7440, lng=-74.0324))
+    world.alum(30, city="Hoboken", state="New Jersey", host=True)
+    assert _ids(world, A.new_york, K.hosts) == {30}
+    assert _ids(world, A.new_york, K.area_alumni) == {30}
+    assert 30 not in _ids(world, A.other, K.hosts)
 
 
 def test_archived_and_friends_are_excluded_everywhere(world):

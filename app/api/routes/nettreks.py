@@ -52,7 +52,7 @@ MAX_OFFSET = 1_000_000
 async def nettreks_summary(
     user: NetTreksBrowseReadRateLimit, session: SessionDep
 ) -> NetTrekSummary:
-    """Every NetTrek report with its count, in landing-page order: the seven
+    """Every NetTrek report with its count, in landing-page order: the
     areas (each with a Hosts and an Area Alumni report), then Other (Hosts
     only; ``area_alumni`` is null)."""
     return await svc.get_summary(session)

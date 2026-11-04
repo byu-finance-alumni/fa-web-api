@@ -1,8 +1,13 @@
-"""Sorting and filtering the Outreach people tables (fa-web-app #917, #918)."""
+"""Sorting, filtering and exporting the Outreach people tables (fa-web-app #917,
+#918, #919)."""
 
 from __future__ import annotations
 
 import asyncio
+import csv
+import datetime
+import io
+import json
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -16,8 +21,11 @@ from app.schemas.outreach import OutreachGroupKey as G
 from app.schemas.outreach import OutreachListKey as L
 from app.services import nettreks as nt
 from app.services import outreach_lists as ol
-from app.services.report_view import ReportView, clean_filters, dropdown_options
-from tests.test_nettreks import _ctx, _get, world  # noqa: F401
+from app.services.report_view import ReportView, audit_safe, clean_filters, dropdown_options
+from tests.test_nettreks import _ctx, _get
+from tests.test_nettreks import world as _world
+
+world = _world
 
 
 def _ids(w, view=None, *, can_edit=True, limit=50, offset=0, key=A.dallas, kind=K.area_alumni):
@@ -413,3 +421,127 @@ def test_filter_routes_answer(world):
     assert [r["alumni_id"] for r in body["items"]] == [3, 1]
     assert body["total"] == 2
     assert body["filter_options"]["gender"] == ["F"]
+
+
+# --- export --------------------------------------------------------------------
+
+
+def _export(w, view, *, can_edit=True):
+    return list(
+        csv.reader(
+            io.StringIO(
+                asyncio.run(
+                    nt.export_report_csv(
+                        w.db, A.dallas, K.area_alumni,
+                        actor_user_id=42, can_edit=can_edit, view=view,
+                    )
+                )
+            )
+        )
+    )
+
+
+def test_export_is_the_list_with_the_same_filters_and_order(world):
+    _people(world)
+    view = ReportView(
+        sort=C.first_name,
+        direction=D.desc,
+        filters=clean_filters({C.industry: "banking"}),
+    )
+    listed = [r.last_name for r in _page(world, view).items]
+    assert [r[2] for r in _export(world, view)[1:]] == listed == ["Davis", "Baker"]
+
+
+def test_export_with_no_view_is_the_whole_list(world):
+    _people(world)
+    assert len(_export(world, None)) == 1 + 3
+    assert world.db.added[0].new_value == "report=dallas:area_alumni; rows=3"
+
+
+def test_export_ignores_a_gender_filter_and_sort_for_a_non_editor(world):
+    _people(world)
+    view = ReportView(sort=C.gender, filters=clean_filters({C.gender: "M"}))
+    rows = _export(world, view, can_edit=False)
+    assert len(rows) == 1 + 3
+    assert [r[2] for r in rows[1:]] == ["Baker", "Carter", "Davis"]
+    assert "filters" not in world.db.added[0].new_value
+
+
+def test_export_audit_records_the_filters_safely(world):
+    _people(world)
+    view = ReportView(filters=clean_filters({C.last_name: 'bak"\r\ner; rows=999'}))
+    _export(world, view)
+    (entry,) = world.db.added
+    detail = entry.new_value
+    assert "\n" not in detail and "\r" not in detail
+    assert detail.count(";") == 2  # report; rows; filters: no field was added
+    assert detail.startswith("report=dallas:area_alumni; rows=0; filters={")
+    used = json.loads(detail.split("filters=", 1)[1])
+    assert used == {"last_name": 'bak" er  rows=999'}
+
+
+def test_audit_safe_strips_separators_and_control_characters():
+    assert audit_safe(" a;\x00b\nc ") == "a b c"
+
+
+def test_export_filenames_show_filtered():
+    day = datetime.date(2026, 11, 4)
+    assert (
+        nt.export_filename(A.new_york, K.hosts, day, filtered=True)
+        == "new_york_nettrek_hosts_filtered_2026-11-04.csv"
+    )
+    assert (
+        nt.export_filename(A.new_york, K.area_alumni, day)
+        == "new_york_area_alumni_2026-11-04.csv"
+    )
+    ref = ol.make_ref(G.mentors, L.industry, "Sales")
+    assert (
+        ol.export_filename(ref, day, filtered=True)
+        == "mentors_industry_sales_filtered_2026-11-04.csv"
+    )
+
+
+def test_outreach_export_uses_the_view_and_audits_it(world):
+    world.alum(1, city="Provo", state="Utah", employer="Bolt")
+    world.alum(2, city="Lehi", state="UT", employer="Acme")
+    _willing(world, 1, guest_speaker_willing=True)
+    _willing(world, 2, guest_speaker_willing=True)
+    ref = ol.make_ref(G.speakers, L.utah, None)
+    view = ReportView(filters=clean_filters({C.company: "acme"}))
+    text = asyncio.run(
+        ol.export_list_csv(world.db, ref, actor_user_id=7, can_edit=True, view=view)
+    )
+    rows = list(csv.reader(io.StringIO(text)))
+    assert [r[3] for r in rows[1:]] == ["Acme"]
+    assert world.db.added[0].new_value == (
+        'list=speakers:utah; rows=1; filters={"company": "acme"}'
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "name"),
+    [
+        (
+            "/nettreks/dallas/area_alumni/export?f_company=gold&sort=last_name&dir=desc",
+            "dallas_area_alumni_filtered_",
+        ),
+        ("/nettreks/dallas/area_alumni/export", "dallas_area_alumni_2"),
+    ],
+)
+def test_export_route_takes_the_page_params(world, path, name):
+    _people(world)
+    resp = _get(path, world.db, _ctx("full_access"))
+    assert resp.status_code == 200
+    assert name in resp.headers["content-disposition"]
+
+
+def test_export_route_bounds_the_params_like_the_page(world):
+    path = "/outreach/speakers/utah/export?f_company=a%0ab"
+    assert _get(path, world.db, _ctx("full_access")).status_code == 422
+
+
+def test_view_audit_records_the_filters(world):
+    _people(world)
+    _get("/nettreks/dallas/area_alumni?f_industry=Banking", world.db, _ctx("full_access"))
+    (entry,) = world.db.added
+    assert entry.new_value.endswith('total=2; filters={"industry": "banking"}')

@@ -603,14 +603,20 @@ NETTREK_EXPORT_ACTION = "export_nettrek_report"
 
 
 def export_filename(
-    key: NetTrekAreaKey, kind: NetTrekReportKind, today: datetime.date | None = None
+    key: NetTrekAreaKey,
+    kind: NetTrekReportKind,
+    today: datetime.date | None = None,
+    *,
+    filtered: bool = False,
 ) -> str:
-    """``dallas_nettrek_hosts_<date>.csv`` / ``dallas_area_alumni_<date>.csv``.
-    Built only from the validated enum values and a generated date — never
-    caller free text (header injection)."""
+    """``dallas_nettrek_hosts_<date>.csv`` / ``dallas_area_alumni_<date>.csv``,
+    with ``_filtered`` before the date when filters narrowed it. Built only from
+    the validated enum values and a generated date — never caller free text
+    (header injection)."""
     middle = "nettrek_hosts" if kind is _HOSTS else "area_alumni"
+    tag = "_filtered" if filtered else ""
     day = (today or datetime.date.today()).isoformat()
-    return f"{key.value}_{middle}_{day}.csv"
+    return f"{key.value}_{middle}{tag}_{day}.csv"
 
 
 def report_rows_csv(rows, *, can_edit: bool) -> str:
@@ -651,12 +657,15 @@ async def export_report_csv(
     *,
     actor_user_id: int | None,
     can_edit: bool,
+    view: ReportView | None = None,
 ) -> str:
-    """The whole report as CSV. Every cell goes through the shared
+    """The report as CSV: the whole report, or as the view filters and sorts it,
+    from the same query as the page. Every cell goes through the shared
     formula-injection guard. Audit-logged as :data:`NETTREK_EXPORT_ACTION` with
-    the report and row count — never the rows."""
+    the report, row count and filters — never the rows."""
+    view = (view or ReportView()).for_caller(can_edit=can_edit)
     keys = await resolve_report_keys(session)
-    rows = (await session.execute(_report_select(key, kind, keys))).all()
+    rows = (await session.execute(_report_select(key, kind, keys, view))).all()
 
     csv_text = report_rows_csv(rows, can_edit=can_edit)
 
@@ -669,7 +678,10 @@ async def export_report_csv(
                 action_type=NETTREK_EXPORT_ACTION,
                 entity_type="nettrek_report",
                 entity_id=None,
-                new_value=f"report={key.value}:{kind.value}; rows={len(rows)}",
+                new_value=(
+                    f"report={key.value}:{kind.value}; rows={len(rows)}"
+                    f"{view.audit_suffix()}"
+                ),
             )
         )
         await session.commit()

@@ -24,6 +24,7 @@ silently, like ``GET /alumni``.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -34,8 +35,8 @@ from app.core.us_states import CODE_BY_NAME
 from app.models.alumni import Alumni
 from app.models.contact import AlumniContactInfo
 from app.models.employment import CurrentEmployment
-from app.schemas.nettreks import ReportSortColumn as C
 from app.schemas.nettreks import ReportFilterOptions, ReportSortDir
+from app.schemas.nettreks import ReportSortColumn as C
 from app.services.geo_search import _alumni_state_code_expr
 from app.utils.sql import escape_like
 
@@ -103,6 +104,17 @@ _TEXT_COLUMNS = {
     C.work_email: AlumniContactInfo.work_email,
     C.linkedin_url: Alumni.linkedin_url,
 }
+
+
+# --- audit ------------------------------------------------------------------
+
+# Characters an audit value must not carry: control characters (newlines
+# included) and ``;``, the field separator of the audit detail line.
+_AUDIT_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f;]+")
+
+
+def audit_safe(value: str) -> str:
+    return _AUDIT_UNSAFE.sub(" ", value).strip()
 
 
 # --- filters ----------------------------------------------------------------
@@ -213,6 +225,20 @@ class ReportView:
             sort=None if self.sort is C.gender else self.sort,
             filters={c: v for c, v in self.filters.items() if c is not C.gender},
         )
+
+    @property
+    def is_filtered(self) -> bool:
+        return bool(self.filters)
+
+    def audit_suffix(self) -> str:
+        """``; filters={...}`` for the audit detail line, or nothing with no
+        filters: what narrowed the list, never the rows. Every value is caller
+        text, so it is reduced to one ``;``-free line and JSON-quoted, and
+        cannot add or alter a field of the line."""
+        if not self.filters:
+            return ""
+        used = {c.value: audit_safe(str(v)) for c, v in self.filters.items()}
+        return f"; filters={json.dumps(used, ensure_ascii=False)}"
 
     def conditions(self) -> list:
         """The WHERE clauses of every active filter."""

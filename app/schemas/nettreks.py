@@ -22,6 +22,7 @@ class NetTrekAreaKey(StrEnum):
     phoenix = "phoenix"
     seattle = "seattle"
     washington_dc = "washington_dc"
+    new_york = "new_york"
     wasatch = "wasatch"
     other = "other"
 
@@ -29,6 +30,32 @@ class NetTrekAreaKey(StrEnum):
 class NetTrekReportKind(StrEnum):
     hosts = "hosts"
     area_alumni = "area_alumni"
+
+
+class ReportSortColumn(StrEnum):
+    """Every column of an Outreach people table, named after its
+    :class:`NetTrekRow` field. The whitelist for the ``sort`` query parameter on
+    the NetTrek reports and the Outreach lists (fa-web-app #917)."""
+
+    first_name = "first_name"
+    middle_name = "middle_name"
+    last_name = "last_name"
+    company = "company"
+    industry = "industry"
+    secondary_industry = "secondary_industry"
+    company_city = "company_city"
+    company_state = "company_state"
+    permanent_email = "permanent_email"
+    work_email = "work_email"
+    phone = "phone"
+    linkedin_url = "linkedin_url"
+    gender = "gender"
+    graduation_year = "graduation_year"
+
+
+class ReportSortDir(StrEnum):
+    asc = "asc"
+    desc = "desc"
 
 
 class NetTrekReportCount(BaseModel):
@@ -72,7 +99,20 @@ class NetTrekRow(BaseModel):
     linkedin_url: str | None
     gender: str | None
     graduation_year: int | None
-    willing_to_host: bool
+
+
+class ReportFilterOptions(BaseModel):
+    """The choices for a list's dropdown filters: only values on the list, and
+    for each column only those still reachable under the OTHER active filters,
+    so no choice leads to an empty table (fa-web-app #918). ``gender`` is
+    ``None`` for a caller who cannot edit alumni: they may not filter or sort
+    on it."""
+
+    industry: list[str]
+    secondary_industry: list[str]
+    company_state: list[str]
+    gender: list[str] | None
+    graduation_year: list[int]
 
 
 class NetTrekReportPage(BaseModel):
@@ -81,6 +121,8 @@ class NetTrekReportPage(BaseModel):
     kind: NetTrekReportKind
     title: str
     items: list[NetTrekRow]
+    # The filtered total: everyone the active filters leave on the report.
     total: int
     limit: int
     offset: int
+    filter_options: ReportFilterOptions

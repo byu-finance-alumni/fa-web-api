@@ -416,19 +416,27 @@ def test_the_upgrade_fills_an_absent_stamp(monkeypatch):
     assert (confirmation.cycle_seq, confirmation.stage) == (7, 1)
 
 
-def test_a_live_pending_submission_is_never_upgraded(monkeypatch):
-    # Two real submissions are two answers and a reviewer must see both — only a
-    # CONFIRMATION is ever absorbed. The second submit stages a new row and
-    # leaves the first exactly as it was.
+def test_a_live_pending_submission_is_merged_not_upgraded(monkeypatch):
+    # Only a CONFIRMATION is overwritten by what arrives. A pending row holds
+    # answers, so a second submission folds into it (#655, tests/test_survey_merge)
+    # and an older field the new one does not mention survives.
     pending = _response(
-        survey_email.STATUS_PENDING, response_id=9, payload={"contact.city": "Provo"}
+        survey_email.STATUS_PENDING,
+        response_id=9,
+        payload={"contact.city": "Provo", "contact.state": "Utah"},
     )
     session = _Session(_alum(), responses=[pending])
+
+    async def no_side_rows(_s, _ids):
+        return ({}, {}, {})
+
+    monkeypatch.setattr(sr, "_load_side_rows", no_side_rows)
     result = _submit(session, monkeypatch, fields={"contact.city": "Orem"})
 
-    assert pending.payload == {"contact.city": "Provo"}
-    assert result.survey_response_id == 777
-    assert _staged(session)[0].payload == {"contact.city": "Orem"}
+    assert pending.payload == {"contact.city": "Orem", "contact.state": "Utah"}
+    assert pending.status == survey_email.STATUS_PENDING
+    assert result.survey_response_id == 9
+    assert _staged(session) == []
 
 
 def test_the_upgrade_takes_the_row_lock_before_it_writes(monkeypatch):
@@ -458,13 +466,21 @@ def test_the_idempotency_read_takes_no_lock_because_it_never_writes(monkeypatch)
     assert session.response_stmts[0]._for_update_arg is None
 
 
-def test_the_upgrade_only_looks_for_confirmations(monkeypatch):
-    # The status filter is read off the statement the fake receives, so this
-    # pins WHAT the upgrade lookup asks for rather than trusting the branch
-    # above to have asked the right question.
+def test_the_upgrade_looks_for_a_confirmation_and_then_a_pending_row(monkeypatch):
+    # Pins WHAT each lookup asks for rather than trusting the branches above to
+    # have asked the right question: the upgrade only ever finds a confirmation,
+    # and only then does a pending row get its turn (#655).
     session = _Session(_alum(), responses=[])
     _submit(session, monkeypatch, fields={"contact.city": "Provo"})
-    assert session.response_reads == 1
+
+    asked = [
+        next(v for k, v in stmt.compile().params.items() if k.startswith("status"))
+        for stmt in session.response_stmts
+    ]
+    assert asked == [
+        [survey_email.STATUS_CONFIRMED],
+        [survey_email.STATUS_PENDING],
+    ]
 
 
 def test_content_beats_the_flag(monkeypatch):

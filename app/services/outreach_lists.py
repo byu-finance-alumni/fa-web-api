@@ -53,6 +53,7 @@ from app.schemas.outreach import (
     OutreachListPage,
 )
 from app.services import nettreks
+from app.services.report_view import ReportView, audit_safe
 
 log = logging.getLogger(__name__)
 
@@ -194,12 +195,8 @@ def list_predicate(ref: ListRef):
     raise NoSuchList(ref.key)  # pragma: no cover - make_ref rules it out
 
 
-def _list_select(ref: ListRef):
-    return (
-        nettreks.report_from_clause(select(*nettreks.REPORT_ROW_COLUMNS))
-        .where(*nettreks.population_conditions(), list_predicate(ref))
-        .order_by(*nettreks.REPORT_ORDER_BY)
-    )
+def _list_select(ref: ListRef, view: ReportView | None = None):
+    return nettreks.report_select(list_predicate(ref), view or ReportView())
 
 
 async def _count(session: AsyncSession, ref: ListRef) -> int:
@@ -295,32 +292,29 @@ async def list_page(
     limit: int,
     offset: int,
     can_edit: bool,
+    view: ReportView | None = None,
 ) -> OutreachListPage:
-    stmt = _list_select(ref)
-    total = await session.scalar(
-        select(func.count()).select_from(stmt.order_by(None).subquery())
+    view = (view or ReportView()).for_caller(can_edit=can_edit)
+    items, total, options = await nettreks.report_page(
+        session,
+        list_predicate(ref),
+        view,
+        limit=limit,
+        offset=offset,
+        can_edit=can_edit,
     )
-    rows = (await session.execute(stmt.limit(limit).offset(offset))).all()
     return OutreachListPage(
         group=ref.group,
         group_title=GROUP_TITLES[ref.group],
         key=ref.key,
         industry=industry_label(ref.industry) if ref.industry else None,
         title=list_title(ref),
-        items=[nettreks.to_report_row(r, can_edit=can_edit) for r in rows],
-        total=int(total or 0),
+        items=items,
+        total=total,
         limit=limit,
         offset=offset,
+        filter_options=options,
     )
-
-
-# Characters an audit value must not carry: control characters (newlines
-# included) and ``;``, the field separator of the audit detail line.
-_AUDIT_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f;]+")
-
-
-def _audit_safe(value: str) -> str:
-    return _AUDIT_UNSAFE.sub(" ", value).strip()
 
 
 def audit_detail(ref: ListRef) -> str:
@@ -330,7 +324,7 @@ def audit_detail(ref: ListRef) -> str:
     base = f"list={ref.group.value}:{ref.key.value}"
     if not ref.industry:
         return base
-    return f"{base}:{_audit_safe(industry_label(ref.industry))}"
+    return f"{base}:{audit_safe(industry_label(ref.industry))}"
 
 
 # --- CSV --------------------------------------------------------------------------
@@ -340,14 +334,19 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")[:60] or "industry"
 
 
-def export_filename(ref: ListRef, today: datetime.date | None = None) -> str:
+def export_filename(
+    ref: ListRef, today: datetime.date | None = None, *, filtered: bool = False
+) -> str:
     """``conference_real_estate_<date>.csv`` /
-    ``mentors_industry_investment_banking_<date>.csv``. The industry part is
-    slugged to ``[a-z0-9_]`` — the only caller text in the name — so the
-    header can never be broken by it."""
+    ``mentors_industry_investment_banking_<date>.csv``, with ``_filtered``
+    before the date when filters narrowed it. The industry part is slugged to
+    ``[a-z0-9_]`` — the only caller text in the name — so the header can never
+    be broken by it."""
     parts = [ref.group.value, ref.key.value]
     if ref.industry:
         parts.append(_slug(ref.industry))
+    if filtered:
+        parts.append("filtered")
     day = (today or datetime.date.today()).isoformat()
     return f"{'_'.join(parts)}_{day}.csv"
 
@@ -358,11 +357,14 @@ async def export_list_csv(
     *,
     actor_user_id: int | None,
     can_edit: bool,
+    view: ReportView | None = None,
 ) -> str:
-    """The whole list as CSV — the NetTrek reports' columns and cell guard.
-    Audit-logged as :data:`OUTREACH_EXPORT_ACTION` with the list and row count
-    — never the rows."""
-    rows = (await session.execute(_list_select(ref))).all()
+    """The list as CSV — the whole list, or as the view filters and sorts it,
+    from the same query as the page, with the NetTrek reports' columns and cell
+    guard. Audit-logged as :data:`OUTREACH_EXPORT_ACTION` with the list, row
+    count and filters — never the rows."""
+    view = (view or ReportView()).for_caller(can_edit=can_edit)
+    rows = (await session.execute(_list_select(ref, view))).all()
     csv_text = nettreks.report_rows_csv(rows, can_edit=can_edit)
     if actor_user_id is None:
         log.warning(
@@ -375,7 +377,7 @@ async def export_list_csv(
                 action_type=OUTREACH_EXPORT_ACTION,
                 entity_type=OUTREACH_ENTITY,
                 entity_id=None,
-                new_value=f"{audit_detail(ref)}; rows={len(rows)}",
+                new_value=f"{audit_detail(ref)}; rows={len(rows)}{view.audit_suffix()}",
             )
         )
         await session.commit()

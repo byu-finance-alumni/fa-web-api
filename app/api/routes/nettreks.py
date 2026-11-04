@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.params import ReportViewParam
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.core.rate_limit import (
@@ -52,7 +53,7 @@ MAX_OFFSET = 1_000_000
 async def nettreks_summary(
     user: NetTreksBrowseReadRateLimit, session: SessionDep
 ) -> NetTrekSummary:
-    """Every NetTrek report with its count, in landing-page order: the seven
+    """Every NetTrek report with its count, in landing-page order: the
     areas (each with a Hosts and an Area Alumni report), then Other (Hosts
     only; ``area_alumni`` is null)."""
     return await svc.get_summary(session)
@@ -64,13 +65,17 @@ async def nettreks_report(
     kind: NetTrekReportKind,
     user: ContactListReadRateLimit,
     session: SessionDep,
+    view: ReportViewParam,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> NetTrekReportPage:
-    """One report's people, sorted by last name, paginated. 404 for Other's
-    Area Alumni (it has none). Gender is null for a caller who cannot edit
-    alumni. Audited as ``view`` on ``nettrek_report`` (who looked at which
-    report — never the rows)."""
+    """One report's people, paginated: sorted by last name, or by ``sort`` and
+    ``dir`` with blanks last, and narrowed by the ``f_*`` filters. ``total`` and
+    ``filter_options`` follow the filters. 404 for Other's Area Alumni (it has
+    none). Gender is null for a caller who cannot edit alumni, and
+    ``sort=gender`` and ``f_gender`` are ignored for them. Audited as ``view`` on
+    ``nettrek_report`` (who looked at which report, with any filters — never the
+    rows)."""
     if not svc.report_exists(area, kind):
         raise NotFoundError(_NO_SUCH_REPORT)
     page = await svc.list_report(
@@ -80,6 +85,7 @@ async def nettreks_report(
         limit=limit,
         offset=offset,
         can_edit=user.can_edit_alumni,
+        view=view,
     )
     # After the page is built: the audit commit expires loaded ORM state.
     await alumni_service.log_read(
@@ -87,7 +93,10 @@ async def nettreks_report(
         actor_user_id=user.user_id,
         action="view",
         entity_type="nettrek_report",
-        detail=f"report={area.value}:{kind.value}; offset={offset}; total={page.total}",
+        detail=(
+            f"report={area.value}:{kind.value}; offset={offset}; total={page.total}"
+            f"{view.for_caller(can_edit=user.can_edit_alumni).audit_suffix()}"
+        ),
     )
     return page
 
@@ -98,15 +107,17 @@ async def nettreks_report_export(
     kind: NetTrekReportKind,
     user: ExportReadRateLimit,
     session: SessionDep,
+    view: ReportViewParam,
 ) -> Response:
-    """The whole report as a CSV download, columns in the issue's order: First
+    """The report as a CSV download: the whole report, or as the page's ``sort``,
+    ``dir`` and ``f_*`` params order and narrow it, columns in the issue's order: First
     Name, Middle Name, Last Name, Company, Industry, Secondary Industry, Company
     City, Company State, Permanent Email, Work Email, Phone, LinkedIn URL,
-    Gender, Graduation Year, Willing to Host a NetTrek (Yes/blank).
-    Formula-injection-safe. Audit-logged as ``export_nettrek_report`` and
-    counted against the global export budget. 404 for Other's Area Alumni.
-    Returns ``text/csv`` as ``<area>_nettrek_hosts_<YYYY-MM-DD>.csv`` or
-    ``<area>_area_alumni_<YYYY-MM-DD>.csv``."""
+    Gender, Graduation Year. Formula-injection-safe. Audit-logged as ``export_nettrek_report``, with
+    any filters, and counted against the global export budget. 404 for Other's
+    Area Alumni. Returns ``text/csv`` as ``<area>_nettrek_hosts_<YYYY-MM-DD>.csv``
+    or ``<area>_area_alumni_<YYYY-MM-DD>.csv``, with ``_filtered`` before the date
+    when filters narrowed it."""
     if not svc.report_exists(area, kind):
         raise NotFoundError(_NO_SUCH_REPORT)
     csv_text = await svc.export_report_csv(
@@ -115,13 +126,12 @@ async def nettreks_report_export(
         kind,
         actor_user_id=user.user_id,
         can_edit=user.can_edit_alumni,
+        view=view,
     )
+    filtered = view.for_caller(can_edit=user.can_edit_alumni).is_filtered
+    filename = svc.export_filename(area, kind, filtered=filtered)
     return Response(
         content=csv_text,
         media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="{svc.export_filename(area, kind)}"'
-            )
-        },
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

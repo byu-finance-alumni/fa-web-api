@@ -407,6 +407,17 @@ def test_archived_and_friends_are_excluded_everywhere(world):
     assert not every & {12, 13, 14}
 
 
+def test_hosts_lists_still_select_on_the_host_flag_with_no_host_column(world):
+    _populate(world)
+    # 3 is a Dallas non-host: on Area Alumni, never on Hosts.
+    assert 3 in _ids(world, A.dallas, K.area_alumni)
+    assert 3 not in _ids(world, A.dallas, K.hosts)
+    page = asyncio.run(
+        nt.list_report(world.db, A.dallas, K.hosts, limit=50, offset=0, can_edit=True)
+    )
+    assert "willing_to_host" not in page.items[0].model_dump()
+
+
 def test_summary_counts_match_the_lists(world):
     _populate(world)
     summary = asyncio.run(nt.get_summary(world.db))
@@ -473,15 +484,13 @@ def test_csv_header_order_and_cells(world):
         "LinkedIn URL",
         "Gender",
         "Graduation Year",
-        "Willing to Host a NetTrek",
     ]
     assert len(rows) == 1 + 5  # 1, 2, 3, 121 (unrelated label) and 20
     first = rows[1]  # L001, a host
     assert first[:3] == ["F1", "M", "L001"]
     assert first[6:9] == ["Dallas", "Texas", "p1@dev.example"]
-    assert first[13:] == ["2010", "Yes"]
-    non_host = next(r for r in rows[1:] if r[2] == "L003")
-    assert non_host[14] == ""
+    assert first[13:] == ["2010"]
+    assert all(len(r) == 14 for r in rows)
     # The formula-injection guard is applied.
     evil = next(r for r in rows[1:] if r[2] == "L020")
     assert evil[3] == "\t=HYPERLINK(1)"

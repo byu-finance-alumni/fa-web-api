@@ -459,7 +459,6 @@ REPORT_ROW_COLUMNS = (
     Alumni.linkedin_url,
     Alumni.gender,
     Alumni.graduation_year,
-    _HOST_WILLING,
 )
 
 
@@ -478,7 +477,7 @@ def _report_select(key, kind, keys):
 def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
     (
         alumni_id, first, middle, last, employer, industry, industry2, city,
-        state, personal, work, phone, linkedin, gender, year, host,
+        state, personal, work, phone, linkedin, gender, year,
     ) = row
     return NetTrekRow(
         alumni_id=alumni_id,
@@ -499,7 +498,6 @@ def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
         # exports blank NetID. The column stays so the layout never moves.
         gender=gender if can_edit else None,
         graduation_year=year,
-        willing_to_host=bool(host),
     )
 
 
@@ -548,7 +546,6 @@ NETTREK_EXPORT_COLUMNS: tuple[str, ...] = (
     "LinkedIn URL",
     "Gender",
     "Graduation Year",
-    "Willing to Host a NetTrek",
 )
 
 #: The audit action every NetTrek CSV writes (counted in the global export
@@ -592,8 +589,6 @@ def report_rows_csv(rows, *, can_edit: bool) -> str:
                 _csv_cell(r.linkedin_url, "str"),
                 _csv_cell(r.gender, "str"),
                 _csv_cell(r.graduation_year, "int"),
-                # "Yes" or blank, per the issue (not the export's Yes/No).
-                "Yes" if r.willing_to_host else "",
             ]
         )
     return buffer.getvalue()

@@ -102,8 +102,7 @@ async def nettreks_report_export(
     """The whole report as a CSV download, columns in the issue's order: First
     Name, Middle Name, Last Name, Company, Industry, Secondary Industry, Company
     City, Company State, Permanent Email, Work Email, Phone, LinkedIn URL,
-    Gender, Graduation Year, Willing to Host a NetTrek (Yes/blank).
-    Formula-injection-safe. Audit-logged as ``export_nettrek_report`` and
+    Gender, Graduation Year. Formula-injection-safe. Audit-logged as ``export_nettrek_report`` and
     counted against the global export budget. 404 for Other's Area Alumni.
     Returns ``text/csv`` as ``<area>_nettrek_hosts_<YYYY-MM-DD>.csv`` or
     ``<area>_area_alumni_<YYYY-MM-DD>.csv``."""

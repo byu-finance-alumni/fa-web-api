@@ -343,7 +343,7 @@ def test_csv_uses_the_nettrek_columns_and_is_audited(world):
 
     assert rows[0] == list(nettreks.NETTREK_EXPORT_COLUMNS)
     assert [r[2] for r in rows[1:]] == ["L001", "L002", "L007", "L020"]
-    assert rows[-1][14] == "Yes" and rows[1][14] == ""
+    assert all(len(r) == 14 for r in rows)
     (entry,) = world.db.added
     assert entry.action_type == "export_outreach_list"
     assert entry.action_type in rate_limit.EXPORT_AUDIT_ACTIONS

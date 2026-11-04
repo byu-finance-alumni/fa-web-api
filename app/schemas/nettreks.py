@@ -73,7 +73,6 @@ class NetTrekRow(BaseModel):
     linkedin_url: str | None
     gender: str | None
     graduation_year: int | None
-    willing_to_host: bool
 
 
 class NetTrekReportPage(BaseModel):

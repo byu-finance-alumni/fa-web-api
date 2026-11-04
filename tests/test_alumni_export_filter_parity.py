@@ -395,3 +395,20 @@ def test_every_list_filter_param_exists_on_the_export_body():
     }
     fields = set(AlumniExportFilters.model_fields)
     assert params - fields == set()
+
+
+# --- "left a comment" (fa-web-app#923) --------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["survey_comment", "any_note"])
+def test_comment_filter_parity(client, captured, session, value):
+    list_sql = _list_sql(client, captured, f"comment_filter={value}")
+    assert list_sql == _export_sql(session, comment_filter=value)
+    # Guard against both sides agreeing because neither applied it.
+    assert list_sql != _list_sql(client, captured, "")
+
+
+def test_comment_filter_null_in_the_body_means_off(client, captured, session):
+    # The app sends every field, with null as "no predicate", and
+    # `exclude_unset` counts that null as SET. Off must stay off.
+    assert _list_sql(client, captured, "") == _export_sql(session, comment_filter=None)

@@ -22,6 +22,7 @@ import csv
 import datetime
 import io
 import math
+import re
 import uuid
 
 import pytest
@@ -59,7 +60,7 @@ def _north(center, miles):
 _CITY_AREAS = [a for a in nt.NETTREK_AREAS if a.host_corridor is None]
 
 
-def test_the_seven_areas_are_amys():
+def test_the_areas_are_amys_seven_plus_new_york():
     assert [a.name for a in nt.NETTREK_AREAS] == [
         "Dallas",
         "San Francisco",
@@ -67,6 +68,7 @@ def test_the_seven_areas_are_amys():
         "Phoenix",
         "Seattle",
         "Washington D.C.",
+        "New York",
         "Wasatch",
     ]
     for area in _CITY_AREAS:
@@ -142,6 +144,17 @@ def test_corridor_tolerance_is_measured_from_the_line_not_the_ends():
     ) == pytest.approx(12, abs=0.3)
 
 
+def test_new_york_reaches_nj_and_ct_by_distance_not_state():
+    # Hoboken NJ and Stamford CT are inside 40 mi of Manhattan, Princeton NJ is
+    # only inside 60, and Philadelphia is outside both.
+    assert (A.new_york, K.hosts) in nt.reports_for_point(40.7440, -74.0324)
+    assert (A.new_york, K.hosts) in nt.reports_for_point(41.0534, -73.5387)
+    princeton = nt.reports_for_point(40.3573, -74.6672)
+    assert (A.new_york, K.area_alumni) in princeton
+    assert (A.new_york, K.hosts) not in princeton
+    assert nt.reports_for_point(39.9526, -75.1652) == set()
+
+
 def test_a_far_away_city_is_in_no_report():
     assert nt.reports_for_point(43.6150, -116.2023) == set()  # Boise
 
@@ -162,11 +175,16 @@ _CITIES = [
 ]
 
 
+def _regexp_replace(value, pattern, replacement, _flags):
+    return None if value is None else re.sub(pattern, replacement, value)
+
+
 def _register_pg_math(dbapi_conn, _record):
     dbapi_conn.create_function("radians", 1, math.radians)
     dbapi_conn.create_function("sin", 1, math.sin)
     dbapi_conn.create_function("cos", 1, math.cos)
     dbapi_conn.create_function("acos", 1, math.acos)
+    dbapi_conn.create_function("regexp_replace", 4, _regexp_replace)
     dbapi_conn.create_function("least", 2, min)
     dbapi_conn.create_function("greatest", 2, max)
 
@@ -218,16 +236,23 @@ class _World:
         gender="F",
         email=None,
         employer=None,
+        phone="555-0100",
+        first=None,
+        middle="M",
+        year=2010,
+        linkedin=None,
+        industry="Banking",
+        secondary="Tech",
     ):
         self.s.add(
             Alumni(
                 alumni_id=alumni_id,
-                first_name=f"F{alumni_id}",
-                middle_name="M",
+                first_name=first or f"F{alumni_id}",
+                middle_name=middle,
                 last_name=last or f"L{alumni_id:03d}",
                 gender=gender,
-                graduation_year=2010,
-                linkedin_url=f"https://linkedin.example/in/{alumni_id}",
+                graduation_year=year,
+                linkedin_url=linkedin or f"https://linkedin.example/in/{alumni_id}",
                 archived=archived,
                 is_alumni=is_alumni,
                 deceased=deceased,
@@ -239,8 +264,8 @@ class _World:
                     current_employment_id=alumni_id,
                     alumni_id=alumni_id,
                     current_employer=employer or f"Co{alumni_id}",
-                    current_industry="Banking",
-                    current_industry_secondary="Tech",
+                    current_industry=industry,
+                    current_industry_secondary=secondary,
                     current_city=city,
                     current_state=state,
                 )
@@ -251,7 +276,7 @@ class _World:
                 alumni_id=alumni_id,
                 personal_email=email or f"p{alumni_id}@dev.example",
                 work_email=f"w{alumni_id}@dev.example",
-                phone="555-0100",
+                phone=phone,
             )
         )
         if label:
@@ -378,6 +403,14 @@ def test_other_hosts_include_no_city_and_exclude_area_hosts(world):
         assert not other & _ids(world, key, K.hosts)
 
 
+def test_a_new_york_host_is_automatically_not_an_other_host(world):
+    world.s.add(CityGeo(city_norm="hoboken", state="NJ", lat=40.7440, lng=-74.0324))
+    world.alum(30, city="Hoboken", state="New Jersey", host=True)
+    assert _ids(world, A.new_york, K.hosts) == {30}
+    assert _ids(world, A.new_york, K.area_alumni) == {30}
+    assert 30 not in _ids(world, A.other, K.hosts)
+
+
 def test_archived_and_friends_are_excluded_everywhere(world):
     _populate(world)
     every = set()
@@ -385,6 +418,17 @@ def test_archived_and_friends_are_excluded_everywhere(world):
         every |= _ids(world, area.key, K.hosts) | _ids(world, area.key, K.area_alumni)
     every |= _ids(world, A.other, K.hosts)
     assert not every & {12, 13, 14}
+
+
+def test_hosts_lists_still_select_on_the_host_flag_with_no_host_column(world):
+    _populate(world)
+    # 3 is a Dallas non-host: on Area Alumni, never on Hosts.
+    assert 3 in _ids(world, A.dallas, K.area_alumni)
+    assert 3 not in _ids(world, A.dallas, K.hosts)
+    page = asyncio.run(
+        nt.list_report(world.db, A.dallas, K.hosts, limit=50, offset=0, can_edit=True)
+    )
+    assert "willing_to_host" not in page.items[0].model_dump()
 
 
 def test_summary_counts_match_the_lists(world):
@@ -453,18 +497,31 @@ def test_csv_header_order_and_cells(world):
         "LinkedIn URL",
         "Gender",
         "Graduation Year",
-        "Willing to Host a NetTrek",
     ]
     assert len(rows) == 1 + 5  # 1, 2, 3, 121 (unrelated label) and 20
     first = rows[1]  # L001, a host
     assert first[:3] == ["F1", "M", "L001"]
     assert first[6:9] == ["Dallas", "Texas", "p1@dev.example"]
-    assert first[13:] == ["2010", "Yes"]
-    non_host = next(r for r in rows[1:] if r[2] == "L003")
-    assert non_host[14] == ""
+    assert first[13:] == ["2010"]
+    assert first[10] == "555-0100"  # a number the formatter does not know: as stored
+    assert all(len(r) == 14 for r in rows)
     # The formula-injection guard is applied.
     evil = next(r for r in rows[1:] if r[2] == "L020")
     assert evil[3] == "\t=HYPERLINK(1)"
+
+
+def test_csv_formats_the_phone_like_the_table_and_leaves_the_row_stored(world):
+    world.alum(30, city="Dallas", state="Texas", phone="+1 8015551234")
+    text = asyncio.run(
+        nt.export_report_csv(
+            world.db, A.dallas, K.area_alumni, actor_user_id=None, can_edit=True
+        )
+    )
+    assert _csv_rows(text)[1][10] == "(801) 555-1234"
+    page = asyncio.run(
+        nt.list_report(world.db, A.dallas, K.area_alumni, limit=5, offset=0, can_edit=True)
+    )
+    assert page.items[0].phone == "+1 8015551234"
 
 
 def test_csv_is_audited_without_the_rows(world):

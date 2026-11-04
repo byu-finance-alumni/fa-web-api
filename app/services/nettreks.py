@@ -1,6 +1,6 @@
 """NetTreks tab: per-area Hosts and Area Alumni reports (fa-web-app #887).
 
-Amy's seven areas plus "Other". For each area there are two reports:
+Amy's seven areas and New York, plus "Other". For each area there are two reports:
 
   * **<Area> NetTrek Hosts** — alumni willing to host a NetTrek
     (``alumni_program_engagement.nettrek_host_willing``) whose company is in the
@@ -8,7 +8,7 @@ Amy's seven areas plus "Other". For each area there are two reports:
   * **<Area> Area Alumni** — everyone whose company is in the area's (wider)
     ALUMNI catchment. A host is therefore on both lists.
 
-"Other" has only a Hosts report: every host who is in NONE of the seven host
+"Other" has only a Hosts report: every host who is in NONE of the host
 catchments — including a host with no company city at all, or one whose city
 does not resolve in ``city_geo``.
 
@@ -50,7 +50,7 @@ import logging
 import math
 from dataclasses import dataclass
 
-from sqlalchemy import String, and_, cast, false, func, not_, or_, select
+from sqlalchemy import String, and_, cast, false, func, not_, null, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS
@@ -69,6 +69,8 @@ from app.schemas.nettreks import (
     NetTrekReportPage,
     NetTrekRow,
     NetTrekSummary,
+    ReportFilterOptions,
+    ReportSortColumn,
 )
 from app.services.alumni_export import _fmt as _csv_cell
 from app.services.geo_regions import CityKey
@@ -79,6 +81,8 @@ from app.services.geo_search import (
     alumni_location_filter,
     haversine_miles,
 )
+from app.services.report_view import DROPDOWNS, ReportView, dropdown_options
+from app.utils.phone import format_phone
 
 log = logging.getLogger(__name__)
 
@@ -125,7 +129,8 @@ class NetTrekArea:
     host_corridor: tuple[LatLng, LatLng] | None = None
 
 
-#: THE list of NetTrek areas (Amy's seven), in landing-page order. "Other" is
+#: THE list of NetTrek areas (Amy's seven plus New York, #916), in landing-page
+#: order. "Other" is
 #: not an area — it is the complement of every host catchment below.
 NETTREK_AREAS: tuple[NetTrekArea, ...] = (
     NetTrekArea(
@@ -150,6 +155,13 @@ NETTREK_AREAS: tuple[NetTrekArea, ...] = (
     ),
     NetTrekArea(
         NetTrekAreaKey.washington_dc, "Washington D.C.", (38.9072, -77.0369),
+        HOST_RADIUS_MILES, ALUMNI_RADIUS_MILES,
+    ),
+    # Centered on Manhattan. The match is by distance, not state: 40 mi reaches
+    # into NJ and CT. city_geo holds Census places, so the boroughs ("Brooklyn",
+    # "Manhattan", "Queens"...) have no row and do not resolve; "New York" does.
+    NetTrekArea(
+        NetTrekAreaKey.new_york, "New York", (40.7831, -73.9712),
         HOST_RADIUS_MILES, ALUMNI_RADIUS_MILES,
     ),
     NetTrekArea(
@@ -451,26 +463,64 @@ REPORT_ROW_COLUMNS = (
     Alumni.linkedin_url,
     Alumni.gender,
     Alumni.graduation_year,
-    _HOST_WILLING,
 )
 
 
-#: Every report's sort: last name, then first name, then id for a total order.
-REPORT_ORDER_BY = (Alumni.last_name, Alumni.first_name, Alumni.alumni_id)
-
-
-def _report_select(key, kind, keys):
+def report_select(list_predicate, view: ReportView):
+    """One list's rows: the population, the list's own predicate and the view.
+    The ONE query behind every NetTrek report and Outreach list, page and CSV
+    alike."""
     return (
         report_from_clause(select(*REPORT_ROW_COLUMNS))
-        .where(*population_conditions(), report_predicate(key, kind, keys))
-        .order_by(*REPORT_ORDER_BY)
+        .where(*population_conditions(), list_predicate, *view.conditions())
+        .order_by(*view.order_by())
     )
+
+
+async def report_filter_options(
+    session: AsyncSession, list_predicate, view: ReportView, *, can_edit: bool
+) -> ReportFilterOptions:
+    """A list's dropdown choices (see ``report_view.dropdown_options``). One
+    query: gender is not even read for a caller who may not use it."""
+    columns = [
+        column if can_edit or name is not ReportSortColumn.gender else null()
+        for name, column in DROPDOWNS.items()
+    ]
+    stmt = (
+        report_from_clause(select(*columns).distinct())
+        .where(*population_conditions(), list_predicate, *view.text_conditions())
+    )
+    rows = (await session.execute(stmt)).all()
+    return dropdown_options(rows, view, can_edit=can_edit)
+
+
+async def report_page(
+    session: AsyncSession,
+    list_predicate,
+    view: ReportView,
+    *,
+    limit: int,
+    offset: int,
+    can_edit: bool,
+) -> tuple[list[NetTrekRow], int, ReportFilterOptions]:
+    """One page of a list: its rows, the filtered total and the dropdowns."""
+    stmt = report_select(list_predicate, view)
+    total = await session.scalar(
+        select(func.count()).select_from(stmt.order_by(None).subquery())
+    )
+    rows = (await session.execute(stmt.limit(limit).offset(offset))).all()
+    options = await report_filter_options(session, list_predicate, view, can_edit=can_edit)
+    return [to_report_row(r, can_edit=can_edit) for r in rows], int(total or 0), options
+
+
+def _report_select(key, kind, keys, view: ReportView | None = None):
+    return report_select(report_predicate(key, kind, keys), view or ReportView())
 
 
 def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
     (
         alumni_id, first, middle, last, employer, industry, industry2, city,
-        state, personal, work, phone, linkedin, gender, year, host,
+        state, personal, work, phone, linkedin, gender, year,
     ) = row
     return NetTrekRow(
         alumni_id=alumni_id,
@@ -491,7 +541,6 @@ def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
         # exports blank NetID. The column stays so the layout never moves.
         gender=gender if can_edit else None,
         graduation_year=year,
-        willing_to_host=bool(host),
     )
 
 
@@ -503,22 +552,28 @@ async def list_report(
     limit: int,
     offset: int,
     can_edit: bool,
+    view: ReportView | None = None,
 ) -> NetTrekReportPage:
+    view = (view or ReportView()).for_caller(can_edit=can_edit)
     keys = await resolve_report_keys(session)
-    stmt = _report_select(key, kind, keys)
-    total = await session.scalar(
-        select(func.count()).select_from(stmt.order_by(None).subquery())
+    items, total, options = await report_page(
+        session,
+        report_predicate(key, kind, keys),
+        view,
+        limit=limit,
+        offset=offset,
+        can_edit=can_edit,
     )
-    rows = (await session.execute(stmt.limit(limit).offset(offset))).all()
     return NetTrekReportPage(
         area=key,
         area_name=area_name(key),
         kind=kind,
         title=report_title(key, kind),
-        items=[to_report_row(r, can_edit=can_edit) for r in rows],
-        total=int(total or 0),
+        items=items,
+        total=total,
         limit=limit,
         offset=offset,
+        filter_options=options,
     )
 
 
@@ -540,7 +595,6 @@ NETTREK_EXPORT_COLUMNS: tuple[str, ...] = (
     "LinkedIn URL",
     "Gender",
     "Graduation Year",
-    "Willing to Host a NetTrek",
 )
 
 #: The audit action every NetTrek CSV writes (counted in the global export
@@ -549,14 +603,20 @@ NETTREK_EXPORT_ACTION = "export_nettrek_report"
 
 
 def export_filename(
-    key: NetTrekAreaKey, kind: NetTrekReportKind, today: datetime.date | None = None
+    key: NetTrekAreaKey,
+    kind: NetTrekReportKind,
+    today: datetime.date | None = None,
+    *,
+    filtered: bool = False,
 ) -> str:
-    """``dallas_nettrek_hosts_<date>.csv`` / ``dallas_area_alumni_<date>.csv``.
-    Built only from the validated enum values and a generated date — never
-    caller free text (header injection)."""
+    """``dallas_nettrek_hosts_<date>.csv`` / ``dallas_area_alumni_<date>.csv``,
+    with ``_filtered`` before the date when filters narrowed it. Built only from
+    the validated enum values and a generated date — never caller free text
+    (header injection)."""
     middle = "nettrek_hosts" if kind is _HOSTS else "area_alumni"
+    tag = "_filtered" if filtered else ""
     day = (today or datetime.date.today()).isoformat()
-    return f"{key.value}_{middle}_{day}.csv"
+    return f"{key.value}_{middle}{tag}_{day}.csv"
 
 
 def report_rows_csv(rows, *, can_edit: bool) -> str:
@@ -580,12 +640,11 @@ def report_rows_csv(rows, *, can_edit: bool) -> str:
                 _csv_cell(r.company_state, "str"),
                 _csv_cell(r.permanent_email, "str"),
                 _csv_cell(r.work_email, "str"),
-                _csv_cell(r.phone, "str"),
+                # As the table shows it; the stored value is not touched.
+                _csv_cell(format_phone(r.phone), "str"),
                 _csv_cell(r.linkedin_url, "str"),
                 _csv_cell(r.gender, "str"),
                 _csv_cell(r.graduation_year, "int"),
-                # "Yes" or blank, per the issue (not the export's Yes/No).
-                "Yes" if r.willing_to_host else "",
             ]
         )
     return buffer.getvalue()
@@ -598,12 +657,15 @@ async def export_report_csv(
     *,
     actor_user_id: int | None,
     can_edit: bool,
+    view: ReportView | None = None,
 ) -> str:
-    """The whole report as CSV. Every cell goes through the shared
+    """The report as CSV: the whole report, or as the view filters and sorts it,
+    from the same query as the page. Every cell goes through the shared
     formula-injection guard. Audit-logged as :data:`NETTREK_EXPORT_ACTION` with
-    the report and row count — never the rows."""
+    the report, row count and filters — never the rows."""
+    view = (view or ReportView()).for_caller(can_edit=can_edit)
     keys = await resolve_report_keys(session)
-    rows = (await session.execute(_report_select(key, kind, keys))).all()
+    rows = (await session.execute(_report_select(key, kind, keys, view))).all()
 
     csv_text = report_rows_csv(rows, can_edit=can_edit)
 
@@ -616,7 +678,10 @@ async def export_report_csv(
                 action_type=NETTREK_EXPORT_ACTION,
                 entity_type="nettrek_report",
                 entity_id=None,
-                new_value=f"report={key.value}:{kind.value}; rows={len(rows)}",
+                new_value=(
+                    f"report={key.value}:{kind.value}; rows={len(rows)}"
+                    f"{view.audit_suffix()}"
+                ),
             )
         )
         await session.commit()

@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import email_reach
 from app.core.dropdowns import (
+    COMMENT_FILTER_ANY_NOTE,
+    COMMENT_FILTER_SURVEY,
     DESIGNATION_NEGATIVES,
     EMPLOYER_NOT_APPLICABLE_BY_LOWER,
     WHEEL_INDUSTRIES,
@@ -36,6 +38,8 @@ from app.models.employment import (
 )
 from app.models.engagement import AlumniProgramEngagement, FinanceSocietyLeadership
 from app.models.event import Event, EventAttendance
+from app.models.note import Note
+from app.models.survey_response import COMMENTS_KEY, SurveyResponse
 from app.models.tags import AlumniStatusLabel, AlumniTag, StatusLabel, Tag
 from app.repositories.alumni_search import (
     friend_id_predicate,
@@ -372,6 +376,46 @@ def alumni_order_by(
     return mapping.get(sort or "name", (Alumni.last_name.asc(), Alumni.alumni_id.asc()))
 
 
+def _comment_filter_exists(comment_filter: str):
+    """The EXISTS behind the "left a comment" filter (fa-web-app#923). A correlated EXISTS
+    on an indexed ``alumni_id``, so an alum with many notes is still one row.
+
+    ``any_note``: a note on the PROFILE, which is exactly what the Notes tab
+    reads (``entity_type=alumni``, so ``notes.alumni_id``). Notes on one of the
+    alum's interactions show on that interaction instead and do not count. Notes
+    have no soft delete, so a deleted note is simply gone.
+
+    ``survey_comment``: an APPLIED response whose payload holds a comment (Jake,
+    2026-11-04: approved only — pending and rejected do not count; `confirmed`
+    rows have an empty payload). The response is the source, not the note text:
+    a staff note can start "Survey comment (", and a note can be edited away.
+    Consequently an alum still matches after staff delete the note, and after an
+    engineer reset — `response_not_superseded` is deliberately NOT applied, since
+    that asks "may we survey them again?", not "did they leave a comment?".
+
+    The two payload checks mirror ``survey_responses._payload_comment``. Unknown
+    values raise: a filter that fell through would widen the list to everyone.
+    """
+    if comment_filter == COMMENT_FILTER_ANY_NOTE:
+        return select(Note.note_id).where(Note.alumni_id == Alumni.alumni_id).exists()
+    if comment_filter == COMMENT_FILTER_SURVEY:
+        # Local: `survey_email` imports this module.
+        from app.services.survey_email import STATUS_APPLIED
+
+        comment = SurveyResponse.payload[COMMENTS_KEY]
+        return (
+            select(SurveyResponse.survey_response_id)
+            .where(
+                SurveyResponse.alumni_id == Alumni.alumni_id,
+                SurveyResponse.status == STATUS_APPLIED,
+                func.jsonb_typeof(comment) == "string",
+                func.btrim(comment.astext, " \t\n\r\f\v") != "",
+            )
+            .exists()
+        )
+    raise ValueError(f"Unknown comment filter: {comment_filter!r}")
+
+
 def build_alumni_query(
     *,
     q: str | None = None,
@@ -506,6 +550,9 @@ def build_alumni_query(
     # stops the list from going N+1 against storage.
     photo_filter=None,
     duplicate: bool = False,
+    # "Left a comment" (fa-web-app#923): ``survey_comment`` | ``any_note`` | ``None`` (off).
+    # See ``_comment_filter_exists``.
+    comment_filter: str | None = None,
     # Friends of the finance program (#218). ``True`` -> alumni only, ``False``
     # -> friends only, ``None`` -> both. The list route defaults this to ``True``
     # so the Alumni page is unchanged; friends are opt-in.
@@ -1173,6 +1220,8 @@ def build_alumni_query(
             .exists()
         )
         conditions.append(is_duplicate)
+    if comment_filter is not None:
+        conditions.append(_comment_filter_exists(comment_filter))
 
     stmt = select(Alumni)
     if conditions:

@@ -12,7 +12,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
-from app.schemas.nettreks import NetTrekRow
+from app.schemas.nettreks import NetTrekRow, ReportFilterOptions
 
 
 class OutreachGroupKey(StrEnum):
@@ -64,6 +64,8 @@ class OutreachListPage(BaseModel):
     industry: str | None
     title: str
     items: list[NetTrekRow]
+    # The filtered total: everyone the active filters leave on the list.
     total: int
     limit: int
     offset: int
+    filter_options: ReportFilterOptions

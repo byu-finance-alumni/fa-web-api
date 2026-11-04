@@ -13,6 +13,18 @@ from app.schemas.alumni import _INVISIBLE_CHARS, DuplicateWarning
 # after cleaning. The survey page shows a counter against the same number.
 SURVEY_COMMENTS_MAX = 2000
 
+# Sits between comments when a repeat submission is merged into a pending one
+# (#655): `comments` stays a single string, oldest first, and both the review
+# queue and the profile note show it with its line breaks. It counts toward
+# `SURVEY_COMMENTS_MAX`.
+SURVEY_COMMENTS_SEPARATOR = "\n\n---\n\n"
+
+# The most field text one survey submission may carry, in UTF-8 bytes, and so the
+# most one staged row may hold after a merge (#655). The reasoning is on the route
+# (`_SUBMIT_MAX_TOTAL_BYTES`); the number lives here so the route and the service
+# share it.
+SURVEY_SUBMIT_MAX_TOTAL_BYTES = 64 * 1024
+
 # Ceiling on the RAW comment, checked BEFORE any per-character cleaning so a
 # multi-megabyte body is refused without walking every character first.
 # Cleaning only ever shrinks the text, so this is deliberately generous (4x the
@@ -124,7 +136,9 @@ class SurveySubmitResult(BaseModel):
 
     `survey_response_id` is the id of the staged row (None when nothing was
     staged); the public survey page uses it to attach an optional profile photo
-    via `POST /survey/respond/{token}/photo`."""
+    via `POST /survey/respond/{token}/photo`. After a repeat submission that is
+    the existing pending row it merged into, and `change_count` is the fields now
+    on that row (#655)."""
 
     staged: bool
     change_count: int

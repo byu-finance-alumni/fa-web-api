@@ -15,6 +15,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.core.dropdowns import CommentFilter
+
 # Ceiling on every free-text search/filter string (#597), shared with the
 # ``GET /alumni`` query params so the list and the export refuse the same input.
 # 200 matches the other free-text search params (opportunity links). No real
@@ -149,6 +151,9 @@ class AlumniExportFilters(BaseModel):
     missing_linkedin: bool = False
     missing_photo: bool = False
     duplicate: bool = False
+    # "Left a comment" (fa-web-app#923). A plain ``build_alumni_query`` kwarg, so it reaches
+    # the same EXISTS the list uses; null (the app's "no predicate") means off.
+    comment_filter: CommentFilter | None = None
     # Friends/alumni split (#218, #594). ``kind`` mirrors GET /alumni's own
     # ``kind`` param: 'alumni' (default) | 'friend' | 'all'. The older
     # ``is_alumni`` field is still accepted for compatibility (``true`` ->

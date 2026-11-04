@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.params import ReportViewParam
 from app.core.database import get_session
 from app.core.errors import NotFoundError
 from app.core.rate_limit import (
@@ -81,17 +82,26 @@ async def outreach_list(
     key: OutreachListKey,
     user: ContactListReadRateLimit,
     session: SessionDep,
+    view: ReportViewParam,
     industry: IndustryParam = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
 ) -> OutreachListPage:
-    """One list's people, sorted by last name, paginated — the NetTrek report
-    rows. 404 for a list the group does not have, an ``industry`` list without
-    ``industry``, or ``industry`` on any other list. Gender is null for a
-    caller who cannot edit alumni. Audited as ``view`` on ``outreach_list``."""
+    """One list's people, paginated — the NetTrek report rows, sorted by last
+    name, or by ``sort`` and ``dir`` with blanks last, and narrowed by the ``f_*``
+    filters. ``total`` and ``filter_options`` follow the filters. 404 for a list
+    the group does not have, an ``industry`` list without ``industry``, or
+    ``industry`` on any other list. Gender is null for a
+    caller who cannot edit alumni, and ``sort=gender`` and ``f_gender`` are
+    ignored for them. Audited as ``view`` on ``outreach_list``."""
     ref = _ref(group, key, industry)
     page = await svc.list_page(
-        session, ref, limit=limit, offset=offset, can_edit=user.can_edit_alumni
+        session,
+        ref,
+        limit=limit,
+        offset=offset,
+        can_edit=user.can_edit_alumni,
+        view=view,
     )
     # After the page is built: the audit commit expires loaded ORM state.
     await alumni_service.log_read(
@@ -99,7 +109,10 @@ async def outreach_list(
         actor_user_id=user.user_id,
         action="view",
         entity_type=svc.OUTREACH_ENTITY,
-        detail=f"{svc.audit_detail(ref)}; offset={offset}; total={page.total}",
+        detail=(
+            f"{svc.audit_detail(ref)}; offset={offset}; total={page.total}"
+            f"{view.for_caller(can_edit=user.can_edit_alumni).audit_suffix()}"
+        ),
     )
     return page
 
@@ -110,22 +123,27 @@ async def outreach_list_export(
     key: OutreachListKey,
     user: ExportReadRateLimit,
     session: SessionDep,
+    view: ReportViewParam,
     industry: IndustryParam = None,
 ) -> Response:
-    """The whole list as a CSV download, in the NetTrek reports' columns.
-    Formula-injection-safe. Audit-logged as ``export_outreach_list`` and counted
-    against the global export budget. Same 404s as the list. Returns
-    ``text/csv`` as ``<group>_<key>[_<industry>]_<YYYY-MM-DD>.csv``."""
+    """The list as a CSV download, in the NetTrek reports' columns: the whole
+    list, or as the page's ``sort``, ``dir`` and ``f_*`` params order and narrow
+    it. Formula-injection-safe. Audit-logged as ``export_outreach_list``, with
+    any filters, and counted against the global export budget. Same 404s as the
+    list. Returns ``text/csv`` as
+    ``<group>_<key>[_<industry>][_filtered]_<YYYY-MM-DD>.csv``."""
     ref = _ref(group, key, industry)
     csv_text = await svc.export_list_csv(
-        session, ref, actor_user_id=user.user_id, can_edit=user.can_edit_alumni
+        session,
+        ref,
+        actor_user_id=user.user_id,
+        can_edit=user.can_edit_alumni,
+        view=view,
     )
+    filtered = view.for_caller(can_edit=user.can_edit_alumni).is_filtered
+    filename = svc.export_filename(ref, filtered=filtered)
     return Response(
         content=csv_text,
         media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="{svc.export_filename(ref)}"'
-            )
-        },
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

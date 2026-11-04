@@ -46,7 +46,12 @@ from app.api.dependencies.auth import (
 from app.api.params import IdPath
 from app.core.capabilities import Capability, effective_capabilities
 from app.core.database import get_session
-from app.core.dropdowns import EMPLOYMENT_STATUSES, parse_designation_tokens
+from app.core.dropdowns import (
+    COMMENT_FILTER_SURVEY,
+    EMPLOYMENT_STATUSES,
+    CommentFilter,
+    parse_designation_tokens,
+)
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
 from app.core.friend_id import parse_friend_id
 from app.core.rate_limit import (
@@ -525,6 +530,17 @@ async def list_alumni(
             )
         ),
     ] = None,
+    comment_filter: Annotated[
+        CommentFilter | None,
+        Query(
+            description=(
+                "Only alumni who left a comment: 'survey_comment' (an approved "
+                "survey response with a comment) or 'any_note' (any note on the "
+                "profile, including staff notes). 'survey_comment' is ignored for "
+                "a caller who can't edit alumni."
+            )
+        ),
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> AlumniPage:
@@ -550,6 +566,12 @@ async def list_alumni(
         net_id = net_id if parse_friend_id(net_id) is not None else None
         gender = None
         sort = None if sort in VIEW_ONLY_HIDDEN_FIELDS else sort
+        # fa-web-app#923, the same oracle rule. `survey_comment` reads survey_responses,
+        # and a non-editor's profile has its survey text stripped; a match that
+        # survives the note's deletion would tell them something they can't read.
+        # `any_note` stays: every view-access role reads profile notes.
+        if comment_filter == COMMENT_FILTER_SURVEY:
+            comment_filter = None
     # "Needs surveying" is an admin-tier view (engineer / super_admin /
     # full_access = "admin"). student and view_only ("professor") are denied
     # server-side — a 403, not a silent ignore, so the access decision is
@@ -648,6 +670,7 @@ async def list_alumni(
         missing_linkedin=missing_linkedin,
         photo_filter=photo_filter,
         duplicate=duplicate,
+        comment_filter=comment_filter,
         is_alumni=is_alumni_filter,
         include_archived=effective_include_archived,
         match_ids=can_see_hidden,
@@ -705,6 +728,7 @@ async def list_alumni(
             "cpa": cpa or None,
             "designations": "|".join(designation_filter) if designation_filter else None,
             "graduate_degree": graduate_degree or None,
+            "comment_filter": comment_filter,
             "spoke_after": spoke_after.isoformat() if spoke_after else None,
             "spoke_before": spoke_before.isoformat() if spoke_before else None,
             # Only record the friends/alumni split when it deviates from the
@@ -2210,6 +2234,9 @@ async def export_alumni(
         dropped |= set(VIEW_ONLY_HIDDEN_FIELDS)
         if parse_friend_id(filters.net_id) is not None:
             dropped.discard("net_id")
+        # fa-web-app#923: as on GET /alumni, `any_note` stays.
+        if filters.comment_filter == COMMENT_FILTER_SURVEY:
+            dropped.add("comment_filter")
     # Same tier rule as GET /alumni (#594): archived rows and the exact-email
     # contact-PII filter are full_access-and-up. ``alumni.export`` is assignable,
     # so without this a lower role granted it could export what its list view

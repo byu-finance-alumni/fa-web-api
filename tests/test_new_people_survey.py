@@ -103,6 +103,10 @@ class FakeSession:
         self.email_rows: list[tuple] = []
         self.name_rows: list[tuple] = []
         self.pending_override: int | None = None
+        # table name -> rows answered for `_load_side_rows`.
+        self.side: dict[str, list] = {}
+        self.locks = 0
+        self.locks_at_count: list[int] = []
         self.added: list = []
         self.commits = 0
         self._next_alumni_id = 9001
@@ -135,8 +139,28 @@ class FakeSession:
         if "new_people_survey_link" in froms:
             return _Res(one=self.link)
         if "new_people_submissions" in froms:
-            if "submission_id_1" in params:
-                return _Res(one=self.subs.get(params["submission_id_1"]))
+            ids = params.get("submission_id_1")
+            if isinstance(ids, list):  # bulk reject
+                rows = [
+                    self.subs[i]
+                    for i in sorted(ids)
+                    if i in self.subs and self.subs[i].status == "pending"
+                ]
+                return _Res(rows=rows)
+            if ids is not None:
+                return _Res(one=self.subs.get(ids))
+            if "payload_1" in params:  # the submit's email dedupe lookup
+                emails = set(params.get("lower_1", [])) | set(params.get("lower_2", []))
+                hits = [
+                    sub
+                    for sub in self.subs.values()
+                    if sub.status == "pending"
+                    and any(
+                        (sub.payload.get(k) or "").strip().lower() in emails
+                        for k in ("contact.personal_email", "contact.work_email")
+                    )
+                ]
+                return _Res(one=hits[-1] if hits else None)
             pending = sorted(
                 (s for s in self.subs.values() if s.status == "pending"),
                 key=lambda s: (s.submitted_at, s.submission_id),
@@ -151,10 +175,17 @@ class FakeSession:
                     return _Res(one=self.alumni.get(params["alumni_id_1"]))
                 return _Res(rows=[])  # the fuzzy duplicate check: no twins
             return _Res(rows=self.name_rows)
-        # Side rows (contact / employment / engagement), history: none on file.
+        # Side rows (contact / employment / engagement) as seeded; history none.
+        if len(froms) == 1:
+            (name,) = froms
+            if name in self.side:
+                return _Res(rows=self.side[name])
+        if any("pg_advisory_xact_lock" in str(c) for c in getattr(stmt, "selected_columns", [])):
+            self.locks += 1
         return _Res(rows=[])
 
     async def scalar(self, stmt):
+        self.locks_at_count.append(self.locks)
         if self.pending_override is not None:
             return self.pending_override
         return sum(1 for s in self.subs.values() if s.status == "pending")
@@ -330,9 +361,7 @@ def test_alum_submission_is_held_cleaned_and_not_applied(client, db):
             "contact.phone": "",
         }
     )
-    resp = _post(
-        client, fields=fields, comments="  Happy to help​!  ", fill_seconds=10**9
-    )
+    resp = _post(client, fields=fields, comments="  Happy to help​!  ", fill_seconds=10**9)
     assert resp.status_code == 200
     assert resp.json() == {"received": True}
     assert resp.headers["cache-control"] == "no-store"
@@ -725,11 +754,17 @@ def test_approve_merge_applies_like_a_survey_and_ignores_new_keys(client, db):
     db.alumni[500] = existing
     sub = db.seed_sub(comments="Moved to Denver")
     _as("super_admin")
-    resp = _approve(client, action="merge", alumni_id=500)
+    resp = _approve(client, action="merge", alumni_id=500, overwrite_fields=["profile.first_name"])
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"alumni_id": 500, "created": False, "duplicate_warnings": []}
+    assert resp.json() == {
+        "alumni_id": 500,
+        "created": False,
+        "duplicate_warnings": [],
+        "warnings": [],
+    }
     assert db.added_of(Alumni) == []
-    assert existing.first_name == "Pat"  # the survey answer applied
+    assert existing.first_name == "Pat"  # listed in overwrite_fields: replaced
+    assert existing.linkedin_url == "https://www.linkedin.com/in/patquinn"  # blank: filled
     assert existing.graduation_year == 1998  # new.* ignored on merge
     assert db.added_of(EducationHistory) == []
     (note,) = db.added_of(Note)
@@ -838,8 +873,9 @@ def test_reject_purges_held_answers(client, db):
 
 def test_held_submissions_do_not_create_alumni_or_survey_rows(client, db):
     db.seed_link()
-    for _ in range(3):
-        assert _post(client).status_code == 200
+    for i in range(3):
+        fields = _alum_payload(**{"contact.personal_email": f"p{i}@example.org"})
+        assert _post(client, fields=fields).status_code == 200
     assert len(db.added_of(NewPersonSubmission)) == 3
     assert db.alumni == {}
     assert db.added_of(Alumni) == [] and db.added_of(SurveyResponse) == []
@@ -872,9 +908,7 @@ def test_migration_is_additive_and_locked_down():
     sql = (REPO / "database" / "migrations" / "2026-11-10_new_people_survey.sql").read_text(
         encoding="utf-8"
     )
-    body = "\n".join(
-        line for line in sql.splitlines() if not line.lstrip().startswith("--")
-    )
+    body = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
     body = body.replace("ON DELETE SET NULL", "")
     assert not re.search(r"\b(DROP|TRUNCATE|DELETE|UPDATE)\b", body, re.IGNORECASE)
     assert re.findall(r"ALTER TABLE (\w+)", body) == [
@@ -887,3 +921,370 @@ def test_migration_is_additive_and_locked_down():
         assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;" in body
         assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;" in rls
         assert f"CREATE TABLE {table} (" in schema
+
+
+# ================================================== round 2 (security fixes) ==
+
+
+def _existing(db, alumni_id=500, *, deceased=False, is_alumni=True, **cols):
+    alum = Alumni(
+        alumni_id=alumni_id,
+        first_name="Patrick",
+        last_name="Quinn",
+        graduation_year=1998,
+        is_alumni=is_alumni,
+        archived=False,
+        deceased=deceased,
+        **cols,
+    )
+    db.alumni[alumni_id] = alum
+    return alum
+
+
+def _seed_contact(db, alumni_id=500, **cols):
+    contact = AlumniContactInfo(alumni_id=alumni_id, **cols)
+    db.side["alumni_contact_info"] = [contact]
+    return contact
+
+
+# ------------------------------------------------------- merge: fill blanks --
+
+
+def test_merge_never_changes_a_populated_email_by_default(client, db):
+    _existing(db)
+    contact = _seed_contact(db, personal_email="old@family.example", work_email=None)
+    db.seed_sub(payload=_alum_payload(**{"contact.work_email": "pat@acme.example"}))
+    _as("super_admin")
+    resp = _approve(client, action="merge", alumni_id=500)
+    assert resp.status_code == 200, resp.text
+    assert contact.personal_email == "old@family.example"  # populated: kept
+    assert contact.work_email == "pat@acme.example"  # blank: filled
+    assert db.alumni[500].first_name == "Patrick"  # populated name kept too
+    (summary,) = db.audits("apply_new_person_submission")
+    assert "kept=" in summary.new_value
+    changed = {a.field_name for a in db.audits("update")}
+    assert "contact.personal_email" not in changed
+    assert "contact.work_email" in changed
+
+
+def test_merge_replaces_a_populated_email_only_when_listed(client, db):
+    _existing(db)
+    contact = _seed_contact(db, personal_email="old@family.example")
+    db.seed_sub()
+    _as("super_admin")
+    resp = _approve(
+        client, action="merge", alumni_id=500, overwrite_fields=["contact.personal_email"]
+    )
+    assert resp.status_code == 200
+    assert contact.personal_email == "pat@example.org"
+    assert db.alumni[500].first_name == "Patrick"  # not listed: kept
+
+
+def test_merge_turns_on_an_unset_flag_without_overwrite(client, db):
+    _existing(db)
+    db.seed_sub(payload=_alum_payload(**{"program.mentor_willing": "yes"}))
+    _as("super_admin")
+    assert _approve(client, action="merge", alumni_id=500).status_code == 200
+    (eng,) = db.added_of(AlumniProgramEngagement)
+    assert eng.mentor_willing is True
+
+
+def test_merge_into_deceased_is_409(client, db):
+    _existing(db, deceased=True)
+    sub = db.seed_sub()
+    _as("super_admin")
+    resp = _approve(client, action="merge", alumni_id=500)
+    assert resp.status_code == 409
+    assert resp.json()["error"]["message"] == "This person is marked deceased."
+    assert sub.status == "pending" and sub.payload is not None
+    assert db.alumni[500].first_name == "Patrick"
+
+
+@pytest.mark.parametrize(
+    ("sub_kind", "target_is_alum", "expect"),
+    [
+        ("friend", True, ["kind_mismatch"]),
+        ("alum", False, ["kind_mismatch"]),
+        ("alum", True, []),
+        ("friend", False, []),
+    ],
+)
+def test_merge_kind_mismatch_is_a_warning_not_a_block(client, db, sub_kind, target_is_alum, expect):
+    _existing(db, is_alumni=target_is_alum)
+    payload = _alum_payload() if sub_kind == "alum" else _friend_fields()
+    db.seed_sub(kind=sub_kind, payload=payload)
+    _as("super_admin")
+    resp = _approve(client, action="merge", alumni_id=500)
+    assert resp.status_code == 200
+    assert resp.json()["warnings"] == expect
+
+
+def test_create_has_no_warnings(client, db):
+    db.seed_sub()
+    _as("super_admin")
+    assert _approve(client, action="create").json()["warnings"] == []
+
+
+# ---------------------------------------------------------------- preview ---
+
+
+def test_preview_shows_changes_and_overwrites(client, db):
+    _existing(db, linkedin_url=None)
+    _seed_contact(db, personal_email="old@family.example")
+    sub = db.seed_sub()
+    _as("super_admin")
+    resp = client.get(f"/survey/new-people/submissions/{sub.submission_id}/preview?alumni_id=500")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["alumni_id"] == 500
+    assert body["name"] == "Patrick Quinn"
+    assert body["deceased"] is False
+    changes = {c["field_key"]: c for c in body["changes"]}
+    assert changes["contact.personal_email"] == {
+        "field_key": "contact.personal_email",
+        "label": "Personal email",
+        "before": "old@family.example",
+        "after": "pat@example.org",
+    }
+    assert "profile.last_name" not in changes  # unchanged: not listed
+    assert not any(k.startswith("new.") for k in changes)
+    assert set(body["overwrites"]) == {"contact.personal_email", "profile.first_name"}
+    assert changes["profile.linkedin_url"]["before"] == ""
+    # Read-only: nothing written but the disclosure audit.
+    assert sub.status == "pending"
+    assert [a.action_type for a in db.audits()] == ["preview_new_person_merge"]
+
+
+def test_preview_reports_deceased(client, db):
+    _existing(db, deceased=True)
+    db.seed_sub()
+    _as("super_admin")
+    resp = client.get("/survey/new-people/submissions/1/preview?alumni_id=500")
+    assert resp.status_code == 200
+    assert resp.json()["deceased"] is True
+
+
+def test_preview_404s(client, db):
+    _existing(db)
+    _existing(db, alumni_id=501).archived = True
+    done = db.seed_sub()
+    pending = db.seed_sub()
+    done.status = "rejected"
+    _as("super_admin")
+    base = "/survey/new-people/submissions"
+    assert client.get(f"{base}/{done.submission_id}/preview?alumni_id=500").status_code == 404
+    assert client.get(f"{base}/999/preview?alumni_id=500").status_code == 404
+    assert client.get(f"{base}/{pending.submission_id}/preview?alumni_id=999").status_code == 404
+    assert client.get(f"{base}/{pending.submission_id}/preview?alumni_id=501").status_code == 404
+    assert client.get(f"{base}/{pending.submission_id}/preview").status_code == 422
+
+
+# ------------------------------------------------------------- bulk reject --
+
+
+def test_bulk_reject_purges_pending_and_skips_the_rest(client, db):
+    a = db.seed_sub(comments="a")
+    b = db.seed_sub(comments="b")
+    done = db.seed_sub()
+    done.status = "approved"
+    done.payload = None
+    keep = db.seed_sub()
+    _as("super_admin")
+    resp = client.post(
+        "/survey/new-people/submissions/reject",
+        json={
+            "submission_ids": [
+                b.submission_id,
+                a.submission_id,
+                done.submission_id,
+                999,
+                a.submission_id,
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"rejected": 2}
+    for sub in (a, b):
+        assert sub.status == "rejected" and sub.payload is None and sub.comments is None
+        assert sub.decided_by_user_id == 42
+    assert done.status == "approved"
+    assert keep.status == "pending" and keep.payload is not None
+    (audit,) = db.audits()
+    assert audit.action_type == "bulk_reject_new_person_submissions"
+    assert audit.new_value == "rejected=2 requested=4"
+
+
+@pytest.mark.parametrize("ids", [[], list(range(1, 502))])
+def test_bulk_reject_bounds(client, db, ids):
+    _as("super_admin")
+    resp = client.post("/survey/new-people/submissions/reject", json={"submission_ids": ids})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("role", ["view_only", "student"])
+def test_round_two_staff_routes_forbid_non_managers(client, db, role):
+    _existing(db)
+    sub = db.seed_sub()
+    _as(role)
+    assert (
+        client.post(
+            "/survey/new-people/submissions/reject", json={"submission_ids": [1]}
+        ).status_code
+        == 403
+    )
+    assert client.get("/survey/new-people/submissions/1/preview?alumni_id=500").status_code == 403
+    assert sub.status == "pending"
+
+
+def test_single_reject_route_still_takes_an_id(client, db):
+    sub = db.seed_sub()
+    _as("super_admin")
+    assert (
+        client.post(f"/survey/new-people/submissions/{sub.submission_id}/reject").status_code == 204
+    )
+    assert db.audits()[0].action_type == "reject_new_person_submission"
+
+
+# ----------------------------------------------------- submit: dedupe + cap --
+
+
+def test_same_email_replaces_the_pending_row(client, db):
+    db.seed_link()
+    assert _post(client, comments="first").status_code == 200
+    (first,) = db.added_of(NewPersonSubmission)
+    newer = _friend_fields(
+        **{
+            "contact.personal_email": "  PAT@Example.org ",
+            "employment.current_employer": "New Co",
+        }
+    )
+    assert _post(client, kind="friend", fields=newer, fill_seconds=90).status_code == 200
+    assert len(db.subs) == 1  # no second row
+    assert db.added_of(NewPersonSubmission) == [first]
+    assert first.kind == "friend"
+    assert first.payload["employment.current_employer"] == "New Co"
+    assert "new.graduation_year" not in first.payload
+    assert first.comments is None  # replaced whole, newest wins
+    assert first.fill_seconds == 90
+    assert first.submitted_at != T0  # bumped: a stale reviewer gets the 409
+
+
+def test_matching_on_the_work_email_also_dedupes(client, db):
+    db.seed_link()
+    fields = _friend_fields(**{"contact.work_email": "pat@acme.example"})
+    assert _post(client, kind="friend", fields=fields).status_code == 200
+    other = _friend_fields(**{"contact.personal_email": "pat@acme.example"})
+    assert _post(client, kind="friend", fields=other).status_code == 200
+    assert len(db.subs) == 1
+
+
+def test_different_emails_are_different_rows(client, db):
+    db.seed_link()
+    assert _post(client).status_code == 200
+    other = _alum_payload(**{"contact.personal_email": "someone.else@example.org"})
+    assert _post(client, fields=other).status_code == 200
+    assert len(db.subs) == 2
+
+
+def test_decided_rows_are_not_replaced(client, db):
+    db.seed_link()
+    old = db.seed_sub()
+    old.status = "rejected"
+    old.payload = None
+    assert _post(client).status_code == 200
+    assert len(db.subs) == 2
+
+
+def test_replacement_is_allowed_at_the_cap(client, db):
+    db.seed_link()
+    db.seed_sub()
+    db.pending_override = nps.PENDING_CAP
+    assert _post(client).status_code == 200
+    assert len(db.subs) == 1
+
+
+def test_cap_count_runs_under_the_advisory_lock(client, db):
+    db.seed_link()
+    assert _post(client).status_code == 200
+    assert db.locks == 1
+    assert db.locks_at_count == [1]  # the lock was taken before the count
+
+
+# ------------------------------------------------------------ queue alert ---
+
+
+@pytest.fixture
+def alerts(monkeypatch):
+    sent = []
+
+    async def fake_deliver(subject, intro, rows, *, purpose, slack_summary=None):
+        sent.append(
+            {
+                "subject": subject,
+                "intro": intro,
+                "rows": rows,
+                "purpose": purpose,
+                "summary": slack_summary,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(nps.failure_alert, "alerting_enabled", lambda: True)
+    monkeypatch.setattr(nps.failure_alert, "deliver_alert", fake_deliver)
+    return sent
+
+
+def test_one_alert_when_the_queue_reaches_eighty_percent(client, db, alerts):
+    assert nps.PENDING_ALERT_AT == nps.PENDING_CAP * 8 // 10
+    db.seed_link()
+    db.pending_override = nps.PENDING_ALERT_AT - 2
+    assert (
+        _post(client, fields=_alum_payload(**{"contact.personal_email": "a@x.org"})).status_code
+        == 200
+    )
+    assert alerts == []
+    db.pending_override = nps.PENDING_ALERT_AT - 1  # this one crosses the line
+    assert (
+        _post(client, fields=_alum_payload(**{"contact.personal_email": "b@x.org"})).status_code
+        == 200
+    )
+    db.pending_override = nps.PENDING_ALERT_AT  # past it: no repeat
+    assert (
+        _post(client, fields=_alum_payload(**{"contact.personal_email": "c@x.org"})).status_code
+        == 200
+    )
+    assert len(alerts) == 1
+    (alert,) = alerts
+    assert alert["purpose"] == nps.failure_alert.SECURITY
+    text = repr(alert)
+    assert str(nps.PENDING_ALERT_AT) in text
+    for pii in ("b@x.org", "Pat", "Quinn", "Acme"):
+        assert pii not in text
+
+
+def test_a_replacement_never_alerts(client, db, alerts):
+    db.seed_link()
+    db.seed_sub()
+    db.pending_override = nps.PENDING_ALERT_AT - 1
+    assert _post(client).status_code == 200
+    assert alerts == []
+
+
+def test_a_failing_alerter_does_not_fail_the_submit(client, db, monkeypatch):
+    async def boom(*_a, **_k):
+        raise RuntimeError("slack down")
+
+    monkeypatch.setattr(nps.failure_alert, "alerting_enabled", lambda: True)
+    monkeypatch.setattr(nps.failure_alert, "deliver_alert", boom)
+    db.seed_link()
+    db.pending_override = nps.PENDING_ALERT_AT - 1
+    assert _post(client).status_code == 200
+    assert len(db.subs) == 1
+
+
+def test_new_audit_actions_are_classified_for_record_history():
+    from app.services import alumni_history
+
+    assert "apply_new_person_submission" in alumni_history.HISTORY_ACTIONS
+    assert "apply_new_person_submission" in alumni_history._SUMMARY_ACTIONS
+    assert "preview_new_person_merge" in alumni_history.NON_HISTORY_ACTIONS

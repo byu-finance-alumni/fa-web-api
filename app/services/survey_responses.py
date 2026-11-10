@@ -2023,10 +2023,6 @@ async def apply_response(
     ).scalar_one_or_none()
     if alum is None:
         raise NotFoundError("Alum not found.")
-    contacts, jobs, engs = await _load_side_rows(session, [resp.alumni_id])
-    contact = contacts.get(resp.alumni_id)
-    job = jobs.get(resp.alumni_id)
-    eng = engs.get(resp.alumni_id)
 
     # Promote a staged photo (if any) into the alum's real headshot: download the
     # staged copy, re-encode it, upload OUR bytes under the headshot key (net_id,
@@ -2105,6 +2101,67 @@ async def apply_response(
         # nothing.
         resp.staged_photo_path = None
 
+    resp.status = "applied"
+    resp.reviewed_by_user_id = actor_user_id
+    resp.reviewed_at = datetime.datetime.now(datetime.UTC)
+    duplicate_warnings = await apply_payload_to_record(
+        session,
+        alum,
+        resp.payload,
+        actor_user_id=actor_user_id,
+        submitted_at=getattr(resp, "submitted_at", None),
+        summary_action="apply_survey_response",
+        summary_ref=f"survey_response={response_id}",
+        log_label=f"Survey response {response_id}",
+        # The audit row is the record that outlives the reviewer's screen: a
+        # dropped photo has to be visible here even if nobody was watching the
+        # response body when it happened.
+        summary_extra=(
+            f" photo={'dropped' if photo_dropped else 'applied'}" if had_photo else ""
+        ),
+    )
+    await session.commit()
+    return ApplyOutcome(
+        duplicate_warnings=duplicate_warnings, photo_dropped=photo_dropped
+    )
+
+
+async def apply_payload_to_record(
+    session: AsyncSession,
+    alum: Alumni,
+    payload: dict | None,
+    *,
+    actor_user_id: int | None,
+    submitted_at: object,
+    summary_action: str,
+    summary_ref: str,
+    log_label: str,
+    summary_extra: str = "",
+    change_set_id: str | None = None,
+) -> list[dict]:
+    """Write a survey *payload* onto *alum* -- the field half of an apply.
+
+    Shared by :func:`apply_response` and the new-people survey's approve
+    (api#661), so a held new-person submission lands on a record EXACTLY the way
+    a normal survey reply does: the same whitelist and server-side coercion, the
+    same side-row creation, the same #446 role archiving, the same rename
+    duplicate check, the same comment-to-Note (#890) and the same field-level
+    audit (#45). See :func:`apply_response` for why each of those exists.
+
+    Adds rows to *session* and never commits; the caller owns the transaction
+    (and whatever row it locked). Returns the soft duplicate warnings.
+
+    *summary_action* / *summary_ref* / *summary_extra* shape the one summary
+    audit row (``apply_survey_response`` / ``survey_response=<id>`` for the
+    normal survey). *log_label* prefixes the log lines and holds no PII.
+    *change_set_id* lets a caller that writes its own audit rows (the
+    new-people create) put them in the same version as these.
+    """
+    contacts, jobs, engs = await _load_side_rows(session, [alum.alumni_id])
+    contact = contacts.get(alum.alumni_id)
+    job = jobs.get(alum.alumni_id)
+    eng = engs.get(alum.alumni_id)
+
     # An apply that writes NOTHING used to report success: a payload key missing
     # from `_FIELDS` was skipped silently, no log, no error, and the response
     # still flipped to "applied". Any future rename on either side of the wire
@@ -2161,7 +2218,7 @@ async def apply_response(
             return
         field_changes.append((_audit_field_name(field), old, new))
 
-    for key, raw in (resp.payload or {}).items():
+    for key, raw in (payload or {}).items():
         if key == COMMENTS_KEY:
             # Not a field (#890) — saved as a Note below, never `dropped`.
             continue
@@ -2236,18 +2293,18 @@ async def apply_response(
 
     if dropped:
         log.warning(
-            "Survey response %s: %d submitted field key(s) are not in the apply "
+            "%s: %d submitted field key(s) are not in the apply "
             "whitelist and wrote NOTHING to alumni %s: %s",
-            response_id,
+            log_label,
             len(dropped),
             alum.alumni_id,
             _log_safe_keys(dropped),
         )
     if ignored:
         log.info(
-            "Survey response %s: %d submitted value(s) were not writable and left "
+            "%s: %d submitted value(s) were not writable and left "
             "alumni %s unchanged: %s",
-            response_id,
+            log_label,
             len(ignored),
             alum.alumni_id,
             ", ".join(sorted(ignored)),
@@ -2288,9 +2345,9 @@ async def apply_response(
     # `pending`, so a second apply — a double-click, a retry, a second reviewer —
     # raises before reaching this line, and the note shares the one commit below
     # with the status flip, so a failed apply leaves neither.
-    comment = _payload_comment(resp.payload)
+    comment = _payload_comment(payload)
     note_body = (
-        survey_comment_note_body(comment, getattr(resp, "submitted_at", None))
+        survey_comment_note_body(comment, submitted_at)
         if comment is not None
         else None
     )
@@ -2304,16 +2361,15 @@ async def apply_response(
             )
         )
 
-    resp.status = "applied"
-    resp.reviewed_by_user_id = actor_user_id
-    resp.reviewed_at = datetime.datetime.now(datetime.UTC)
+
 
     # One approval = one version (#45), shared by the summary row and every field
     # row below, so the whole apply reads as a single change set. Minted
     # unconditionally rather than only when something changed, because the summary
     # row is written either way and an ungrouped summary row could not be tied to
     # the field rows that belong with it.
-    change_set_id = new_change_set_id()
+    if change_set_id is None:
+        change_set_id = new_change_set_id()
     # `source` reaches the rows through the request-scoped contextvar, the same
     # mechanism `import_csv.commit_update` uses, rather than a literal typed in at
     # each `AuditLog(...)`: the value is registered once in `app.core.audit_context`
@@ -2330,22 +2386,18 @@ async def apply_response(
         session.add(
             AuditLog(
                 user_id=actor_user_id,
-                action_type="apply_survey_response",
+                action_type=summary_action,
                 entity_type="alumni",
                 entity_id=alum.alumni_id,
                 new_value=(
-                    f"survey_response={response_id} "
-                    f"fields={payload_field_count(resp.payload)} "
+                    f"{summary_ref} "
+                    f"fields={payload_field_count(payload)} "
                     f"written={written} dropped={len(dropped)} ignored={len(ignored)}"
                     + (f" duplicate_warnings={len(duplicate_warnings)}" if name_changed else "")
                     # The audit row is the record that outlives the reviewer's
                     # screen: a dropped photo has to be visible here even if
                     # nobody was watching the response body when it happened.
-                    + (
-                        f" photo={'dropped' if photo_dropped else 'applied'}"
-                        if had_photo
-                        else ""
-                    )
+                    + summary_extra
                     + (" comment_note=added" if note_body is not None else "")
                 ),
                 change_set_id=change_set_id,
@@ -2401,10 +2453,7 @@ async def apply_response(
                 archived=archived_role,
                 change_set_id=change_set_id,
             )
-    await session.commit()
-    return ApplyOutcome(
-        duplicate_warnings=duplicate_warnings, photo_dropped=photo_dropped
-    )
+    return duplicate_warnings
 
 
 async def reject_response(

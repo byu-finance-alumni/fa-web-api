@@ -71,6 +71,9 @@ class _Res:
     def scalar_one_or_none(self):
         return self._one
 
+    def first(self):
+        return self._rows[0] if self._rows else None
+
     def scalars(self):
         return self
 
@@ -106,6 +109,11 @@ class FakeSession:
         # table name -> rows answered for `_load_side_rows`.
         self.side: dict[str, list] = {}
         self.locks = 0
+        self.byu_lookups: list[dict] = []
+        self.rollbacks = 0
+        # Test hook: the next commit raises this (after running `on_fail`).
+        self.fail_commit: Exception | None = None
+        self.on_fail = None
         self.locks_at_count: list[int] = []
         self.added: list = []
         self.commits = 0
@@ -168,6 +176,8 @@ class FakeSession:
             return _Res(rows=pending)
         if froms == {"alumni", "alumni_contact_info"}:
             return _Res(rows=self.email_rows)
+        if froms == {"alumni"} and "byu_id_1" in params:
+            return _Res(rows=self._byu_rows(stmt, params))
         if froms == {"alumni"}:
             cols = stmt.column_descriptions
             if len(cols) == 1 and cols[0].get("expr") is Alumni:
@@ -183,6 +193,24 @@ class FakeSession:
         if any("pg_advisory_xact_lock" in str(c) for c in getattr(stmt, "selected_columns", [])):
             self.locks += 1
         return _Res(rows=[])
+
+    def _byu_rows(self, stmt, params):
+        """The BYU ID lookups (possible match: IN; collision: == and maybe
+        != alumni_id), answered from the seeded ACTIVE records."""
+        wanted = params["byu_id_1"]
+        wanted = set(wanted) if isinstance(wanted, list) else {wanted}
+        exclude = params.get("alumni_id_1")
+        names = [c["name"] for c in stmt.column_descriptions]
+        hits = sorted(
+            (
+                a
+                for a in self.alumni.values()
+                if not a.archived and a.byu_id in wanted and a.alumni_id != exclude
+            ),
+            key=lambda a: a.alumni_id,
+        )
+        self.byu_lookups.append(params)
+        return [tuple(getattr(a, n) for n in names) for a in hits]
 
     async def scalar(self, stmt):
         self.locks_at_count.append(self.locks)
@@ -203,6 +231,7 @@ class FakeSession:
                 self.alumni[obj.alumni_id] = obj
 
     async def commit(self):
+        await self._maybe_fail_commit()
         await self.flush()
         for obj in self.added:
             if isinstance(obj, NewPersonSubmission) and obj.submission_id is None:
@@ -213,7 +242,14 @@ class FakeSession:
         self.commits += 1
 
     async def rollback(self):
-        pass
+        self.rollbacks += 1
+
+    async def _maybe_fail_commit(self):
+        if self.fail_commit is not None:
+            exc, self.fail_commit = self.fail_commit, None
+            if self.on_fail is not None:
+                self.on_fail()
+            raise exc
 
     # -- helpers --
     def added_of(self, cls):
@@ -232,6 +268,7 @@ def _alum_payload(**extra):
         "employment.current_employer": "Acme Capital",
         "employment.current_industry": "Investment Banking",
         "employment.current_city": "Denver",
+        "employment.current_state": "Colorado",
         "employment.current_country": "United States",
         "profile.linkedin_url": "https://www.linkedin.com/in/patquinn",
         "new.graduation_year": "2009",
@@ -311,6 +348,14 @@ def test_required_fields_match_the_contract(client, db):
             "alum": friend + [["new.graduation_year"], ["new.byu_degree"]],
             "friend": friend,
         },
+        "state_required_countries": [
+            "united states",
+            "united states of america",
+            "usa",
+            "us",
+            "u.s.",
+            "u.s.a.",
+        ],
         "support_contact": None,
     }
 
@@ -927,11 +972,9 @@ def test_migration_is_additive_and_locked_down():
 
 
 def _existing(db, alumni_id=500, *, deceased=False, is_alumni=True, **cols):
+    cols = {"first_name": "Patrick", "last_name": "Quinn", "graduation_year": 1998, **cols}
     alum = Alumni(
         alumni_id=alumni_id,
-        first_name="Patrick",
-        last_name="Quinn",
-        graduation_year=1998,
         is_alumni=is_alumni,
         archived=False,
         deceased=deceased,
@@ -1298,3 +1341,336 @@ def test_payload_column_purges_to_sql_null_not_json_null():
     from app.models.new_people import NewPersonSubmission
 
     assert NewPersonSubmission.__table__.c.payload.type.none_as_null is True
+
+
+# ===================================== review tweaks (Jake, 2026-11-10) ======
+
+from sqlalchemy.exc import IntegrityError  # noqa: E402
+
+BYU = "123456789"
+
+
+def _byu_violation(index="uq_alumni_byu_id_active"):
+    return IntegrityError(
+        "UPDATE alumni ...",
+        {},
+        Exception(f'duplicate key value violates unique constraint "{index}"'),
+    )
+
+
+# ------------------------------------------------- state required for the US --
+
+
+@pytest.mark.parametrize(
+    "country",
+    ["United States", "united states of america", " USA ", "us", "U.S.", "u.s.a.", "US"],
+)
+@pytest.mark.parametrize("kind", ["alum", "friend"])
+def test_state_is_required_for_every_us_spelling(client, db, country, kind):
+    db.seed_link()
+    base = _alum_payload() if kind == "alum" else _friend_fields()
+    fields = {**base, "employment.current_country": country}
+    del fields["employment.current_state"]
+    resp = _post(client, kind=kind, fields=fields)
+    assert resp.status_code == 422
+    err = resp.json()["error"]
+    assert err["code"] == "validation_error"
+    assert err["message"] == "Please answer the required questions."
+    assert err["fields"] == [
+        {"field": "employment.current_state", "message": "This field is required."}
+    ]
+    assert db.added_of(NewPersonSubmission) == []
+    # Answered: held.
+    fields["employment.current_state"] = "Utah"
+    assert _post(client, kind=kind, fields=fields).status_code == 200
+
+
+@pytest.mark.parametrize("country", ["Canada", "United Kingdom", "USSR", "U.S.A"])
+@pytest.mark.parametrize("kind", ["alum", "friend"])
+def test_state_stays_optional_outside_the_us(client, db, country, kind):
+    db.seed_link()
+    base = _alum_payload() if kind == "alum" else _friend_fields()
+    fields = {**base, "employment.current_country": country}
+    del fields["employment.current_state"]
+    assert _post(client, kind=kind, fields=fields).status_code == 200
+
+
+def test_unusable_state_for_a_us_country_is_422_not_valid(client, db):
+    db.seed_link()
+    resp = _post(client, fields=_alum_payload(**{"employment.current_state": "=CMD()"}))
+    assert resp.status_code == 422
+    assert resp.json()["error"]["fields"] == [
+        {"field": "employment.current_state", "message": "This answer is not valid."}
+    ]
+
+
+def test_state_required_countries_are_lower_case_and_match_the_rule():
+    for country in nps.STATE_REQUIRED_COUNTRIES:
+        assert country == country.lower()
+        assert nps.state_required_for(f"  {country.upper()} ")
+    assert not nps.state_required_for("")
+    assert not nps.state_required_for(None)
+
+
+# ---------------------------------------------------------------- BYU ID ------
+
+
+@pytest.mark.parametrize(
+    ("raw", "held"),
+    [("123456789", BYU), ("123-45-6789", BYU), (" 123 456 789 ", BYU), ("12-34 56-789", BYU)],
+)
+def test_byu_id_is_held_digits_only(client, db, raw, held):
+    db.seed_link()
+    assert _post(client, fields=_alum_payload(**{"new.byu_id": raw})).status_code == 200
+    (sub,) = db.added_of(NewPersonSubmission)
+    assert sub.payload["new.byu_id"] == held
+
+
+@pytest.mark.parametrize("raw", ["", "   ", " - - "])
+def test_blank_byu_id_is_not_given(client, db, raw):
+    db.seed_link()
+    assert _post(client, fields=_alum_payload(**{"new.byu_id": raw})).status_code == 200
+    (sub,) = db.added_of(NewPersonSubmission)
+    assert "new.byu_id" not in sub.payload
+
+
+@pytest.mark.parametrize(
+    "bad", ["12345678", "1234567890", "12345678a", "123.456.789", "１２３４５６７８９", "=1+2"]
+)
+def test_bad_byu_id_is_422_on_its_key(client, db, bad):
+    db.seed_link()
+    resp = _post(client, fields=_alum_payload(**{"new.byu_id": bad}))
+    assert resp.status_code == 422
+    assert resp.json()["error"]["fields"] == [
+        {"field": "new.byu_id", "message": "BYU ID must be 9 digits."}
+    ]
+    assert db.added_of(NewPersonSubmission) == []
+
+
+@pytest.mark.parametrize("value", [BYU, "not an id"])
+def test_friend_byu_id_is_ignored(client, db, value):
+    db.seed_link()
+    resp = _post(client, kind="friend", fields=_friend_fields(**{"new.byu_id": value}))
+    assert resp.status_code == 200
+    (sub,) = db.added_of(NewPersonSubmission)
+    assert "new.byu_id" not in sub.payload
+
+
+def test_queue_shows_byu_id_and_matches_on_it_first(client, db):
+    db.alumni[61] = Alumni(
+        alumni_id=61, first_name="Patricia", last_name="Q", graduation_year=2008,
+        is_alumni=True, archived=False, byu_id=BYU,
+    )
+    db.alumni[62] = Alumni(
+        alumni_id=62, first_name="Ghost", last_name="Q", is_alumni=True, archived=True,
+        byu_id=BYU,
+    )
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    db.email_rows = [(77, "Pat", "Quinn", 2009, True, "pat@example.org", None)]
+    _as("super_admin")
+    (item,) = client.get("/survey/new-people/submissions").json()
+    shown = {f["field_key"]: f for f in item["fields"]}
+    assert shown["new.byu_id"] == {"field_key": "new.byu_id", "label": "BYU ID", "value": BYU}
+    assert [(m["alumni_id"], m["match_reason"]) for m in item["possible_matches"]] == [
+        (61, "byu_id"),
+        (77, "email"),
+    ]
+    assert item["possible_matches"][0]["name"] == "Patricia Q"
+    (audit,) = db.audits("read_new_people_submissions")
+    assert BYU not in (audit.new_value or "")
+
+
+def test_no_byu_lookup_without_a_byu_id(client, db):
+    db.seed_sub()
+    _as("super_admin")
+    client.get("/survey/new-people/submissions")
+    assert db.byu_lookups == []
+
+
+def test_approve_create_sets_byu_id(client, db):
+    db.alumni[62] = Alumni(alumni_id=62, is_alumni=True, archived=True, byu_id=BYU)  # ghost
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    resp = _approve(client, action="create")
+    assert resp.status_code == 200, resp.text
+    (alum,) = db.added_of(Alumni)
+    assert alum.byu_id == BYU
+    byu_audit = [a for a in db.audits("update") if a.field_name == "byu_id"]
+    assert [a.new_value for a in byu_audit] == [BYU]
+
+
+def test_approve_create_as_friend_drops_byu_id(client, db):
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    assert _approve(client, action="create", kind="friend").status_code == 200
+    (alum,) = db.added_of(Alumni)
+    assert alum.byu_id is None
+
+
+def test_approve_create_byu_collision_is_409(client, db):
+    _existing(db, alumni_id=70, byu_id=BYU)
+    sub = db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    resp = _approve(client, action="create")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["message"] == (
+        "That BYU ID already belongs to Patrick Quinn. Use Update instead."
+    )
+    assert db.added_of(Alumni) == []
+    assert sub.status == "pending" and sub.payload is not None
+    assert db.commits == 0
+
+
+def test_racing_create_unique_index_violation_is_409_not_500(client, db):
+    sub = db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    db.fail_commit = _byu_violation()
+    # The racing writer's record lands between our check and our commit.
+    db.on_fail = lambda: _existing(db, alumni_id=71, byu_id=BYU, first_name="Dana")
+    _as("super_admin")
+    resp = _approve(client, action="create")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["message"] == (
+        "That BYU ID already belongs to Dana Quinn. Use Update instead."
+    )
+    assert db.rollbacks == 1
+    assert db.commits == 0
+    assert sub.submission_id in db.subs
+
+
+def test_other_integrity_errors_are_not_swallowed(db):
+    import asyncio
+
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    db.fail_commit = _byu_violation(index="some_other_constraint")
+    body = nps.NewPersonApproveRequest(action="create", submitted_at=T0.isoformat())
+    with pytest.raises(IntegrityError):
+        asyncio.run(nps.approve(db, 1, body, 42))
+
+
+def test_merge_fills_a_blank_byu_id(client, db):
+    alum = _existing(db)
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    assert _approve(client, action="merge", alumni_id=500).status_code == 200
+    assert alum.byu_id == BYU
+    (audit,) = [a for a in db.audits("update") if a.field_name == "byu_id"]
+    assert (audit.old_value, audit.new_value) == (None, BYU)
+
+
+def test_merge_keeps_a_populated_byu_id_unless_replace(client, db):
+    alum = _existing(db, byu_id="999999999")
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    assert _approve(client, action="merge", alumni_id=500).status_code == 200
+    assert alum.byu_id == "999999999"
+    assert not [a for a in db.audits("update") if a.field_name == "byu_id"]
+    (summary,) = db.audits("apply_new_person_submission")
+    assert "kept=" in summary.new_value and "kept=0" not in summary.new_value
+
+
+def test_merge_replaces_a_populated_byu_id_when_listed(client, db):
+    alum = _existing(db, byu_id="999999999")
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    resp = _approve(client, action="merge", alumni_id=500, overwrite_fields=["new.byu_id"])
+    assert resp.status_code == 200
+    assert alum.byu_id == BYU
+
+
+def test_merge_same_byu_id_is_no_change(client, db):
+    alum = _existing(db, byu_id="123-45-6789")  # a legacy formatted value
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    assert _approve(client, action="merge", alumni_id=500).status_code == 200
+    assert alum.byu_id == "123-45-6789"
+    assert db.byu_lookups == []  # nothing to write, nothing to check
+
+
+@pytest.mark.parametrize("overwrite", [[], ["new.byu_id"]])
+def test_merge_byu_collision_with_another_record_is_409(client, db, overwrite):
+    target = _existing(db, byu_id=None if not overwrite else "999999999")
+    _existing(db, alumni_id=70, byu_id=BYU, first_name="Dana")
+    sub = db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    resp = _approve(client, action="merge", alumni_id=500, overwrite_fields=overwrite)
+    assert resp.status_code == 409
+    assert resp.json()["error"]["message"] == (
+        "That BYU ID already belongs to Dana Quinn. Use Update instead."
+    )
+    assert target.byu_id in (None, "999999999")
+    assert sub.status == "pending"
+    assert db.commits == 0
+
+
+def test_merge_kept_byu_id_never_checks_for_collisions(client, db):
+    alum = _existing(db, byu_id="999999999")
+    _existing(db, alumni_id=70, byu_id=BYU)
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    assert _approve(client, action="merge", alumni_id=500).status_code == 200
+    assert alum.byu_id == "999999999"
+
+
+def test_merge_byu_index_race_is_409(client, db):
+    _existing(db)
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    db.fail_commit = _byu_violation()
+    db.on_fail = lambda: _existing(db, alumni_id=72, byu_id=BYU, first_name="Lee")
+    _as("super_admin")
+    resp = _approve(client, action="merge", alumni_id=500)
+    assert resp.status_code == 409
+    assert "Lee Quinn" in resp.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("stored", "before", "overwrite"), [(None, "", False), ("999999999", "999999999", True)]
+)
+def test_preview_lists_the_byu_id_change(client, db, stored, before, overwrite):
+    _existing(db, byu_id=stored)
+    sub = db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    body = client.get(
+        f"/survey/new-people/submissions/{sub.submission_id}/preview?alumni_id=500"
+    ).json()
+    changes = {c["field_key"]: c for c in body["changes"]}
+    assert changes["new.byu_id"] == {
+        "field_key": "new.byu_id",
+        "label": "BYU ID",
+        "before": before,
+        "after": BYU,
+    }
+    assert ("new.byu_id" in body["overwrites"]) is overwrite
+    (audit,) = db.audits("preview_new_person_merge")
+    assert BYU not in (audit.new_value or "")
+
+
+def test_preview_omits_an_unchanged_byu_id(client, db):
+    _existing(db, byu_id=BYU)
+    sub = db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    body = client.get(
+        f"/survey/new-people/submissions/{sub.submission_id}/preview?alumni_id=500"
+    ).json()
+    assert "new.byu_id" not in {c["field_key"] for c in body["changes"]}
+
+
+def test_byu_id_is_purged_on_decision(client, db):
+    sub = db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    assert _approve(client, action="create").status_code == 200
+    assert sub.payload is None
+    decision = db.audits("approve_new_person_submission")[0]
+    assert BYU not in decision.new_value
+
+
+def test_byu_id_is_never_logged(client, db, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    db.seed_link()
+    _post(client, fields=_alum_payload(**{"new.byu_id": "123-45-6789"}))
+    _post(client, fields=_alum_payload(**{"new.byu_id": "12345"}))
+    db.seed_sub(payload=_alum_payload(**{"new.byu_id": BYU}))
+    _as("super_admin")
+    _approve(client, sub_id=db._next_sub_id - 1, action="create")
+    assert BYU not in caplog.text and "12345" not in caplog.text

@@ -79,6 +79,7 @@ async def new_people_survey_info(
     await new_people_survey.verify_key(session, key)
     return NewPeopleSurveyInfo(
         required_fields=new_people_survey.required_fields(),
+        state_required_countries=list(new_people_survey.STATE_REQUIRED_COUNTRIES),
         support_contact=await survey_email.survey_support_contact(session),
     )
 
@@ -102,8 +103,9 @@ async def new_people_survey_submit(
     * Honeypot (``website``) filled: 200 ``{"received": true}`` and NOTHING is
       stored, so a bot learns nothing from the response.
     * Over the survey's size caps: 413, nothing stored.
-    * A required group unanswered (or answered with a value the survey refuses):
-      422 naming the field keys.
+    * A required group unanswered (or answered with a value the survey refuses),
+      no state for a US country, or a BYU ID that is not 9 digits: 422 naming
+      the field keys.
     * Holding queue full: 429, nothing stored.
     """
     response.headers["Cache-Control"] = "no-store"

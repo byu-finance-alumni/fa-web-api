@@ -75,3 +75,29 @@ class NewPersonSubmission(Base):
     alumni_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("alumni.alumni_id", ondelete="SET NULL")
     )
+
+
+class NewPeopleInvite(Base):
+    """One new-people survey invite email that Resend accepted (api#661 add-on).
+
+    The LEDGER behind two rules: the shared Resend budget
+    (``survey_email.get_send_usage`` counts these rows) and the 30-day
+    "recently invited" skip. NO ADDRESS is stored: ``email_hash`` is the sha256
+    hex of the trimmed, lower-cased address.
+
+    See migration ``database/migrations/2026-11-10_new_people_invites.sql``.
+    """
+
+    __tablename__ = "new_people_invites"
+
+    invite_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    email_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    sent_by_user_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("users.user_id", ondelete="SET NULL")
+    )
+    # Database clock, like the other two usage ledgers, so all three are
+    # bucketed into UTC days by the same clock.
+    sent_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    resend_email_id: Mapped[str | None] = mapped_column(Text)

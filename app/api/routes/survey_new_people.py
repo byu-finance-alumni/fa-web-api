@@ -19,6 +19,7 @@ STAFF (``surveys.manage``, the same capability as the survey review queue):
 * ``POST /survey/new-people/submissions/reject`` -- bulk reject
 * ``POST /survey/new-people/submissions/{id}/approve``
 * ``POST /survey/new-people/submissions/{id}/reject``
+* ``POST /survey/new-people/invite``         -- email the link to pasted addresses
 """
 
 import logging
@@ -34,11 +35,14 @@ from app.core.database import get_session
 from app.core.rate_limit import (
     NEW_PEOPLE_READ_LIMITER,
     NEW_PEOPLE_SUBMIT_LIMITER,
+    NewPeopleInviteRateLimit,
     SurveysBrowseReadRateLimit,
 )
 from app.schemas.new_people import (
     NewPeopleBulkRejectRequest,
     NewPeopleBulkRejectResult,
+    NewPeopleInviteRequest,
+    NewPeopleInviteResult,
     NewPeopleLinkRead,
     NewPeopleLinkUpdate,
     NewPeopleSurveyInfo,
@@ -49,7 +53,7 @@ from app.schemas.new_people import (
     NewPersonSubmitRequest,
     NewPersonSubmitResult,
 )
-from app.services import new_people_survey, survey_email
+from app.services import new_people_invites, new_people_survey, survey_email
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -254,3 +258,21 @@ async def reject_new_people_submission(
     """Refuse it. The held answers are purged; an audit row (no PII) remains."""
     await new_people_survey.reject(session, submission_id, user.user_id)
     return Response(status_code=204)
+
+
+@router.post("/new-people/invite", response_model=NewPeopleInviteResult)
+async def invite_new_people(
+    body: NewPeopleInviteRequest, user: NewPeopleInviteRateLimit, session: SessionDep
+) -> NewPeopleInviteResult:
+    """Email the shared survey link to the pasted addresses (one email each).
+
+    * 422: nothing to send to, or more than 50 unique addresses.
+    * 409: the link is off; the send does not fit the shared Resend budget
+      (nothing is sent, never a partial send); or a survey send holds the
+      shared send lock.
+    * 502: Resend did not accept the batch. Nothing was sent and nothing is
+      recorded.
+    * 200 with ``sent=0`` when every address was skipped.
+
+    One audit row per send with the COUNTS only, never an address."""
+    return await new_people_invites.send_invites(session, body.emails, user.user_id)

@@ -163,3 +163,36 @@ class NewPeopleBulkRejectResult(BaseModel):
     """How many of the ids were pending and are now rejected (and purged)."""
 
     rejected: int
+
+
+# ---------------------------------------------------------------- invites ----
+
+#: The longest paste ``POST /survey/new-people/invite`` accepts, in characters.
+INVITE_EMAILS_MAX_CHARS = 20_000
+
+NewPeopleInviteSkipReason = Literal["invalid", "duplicate", "in_database", "recently_invited"]
+
+
+class NewPeopleInviteRequest(BaseModel):
+    """``POST /survey/new-people/invite``: the raw pasted text. Addresses may be
+    separated by any mix of commas, semicolons, spaces and new lines."""
+
+    emails: str = Field(max_length=INVITE_EMAILS_MAX_CHARS)
+
+
+class NewPeopleInviteSkipped(BaseModel):
+    """One pasted address that was NOT emailed, and why."""
+
+    email: str
+    reason: NewPeopleInviteSkipReason
+
+
+class NewPeopleInviteResult(BaseModel):
+    """What the invite send did. ``sent_to`` holds the normalised (trimmed,
+    lower-cased) addresses actually emailed. ``skipped`` reports every address
+    that was not emailed, once, with its reason; an address listed twice is
+    emailed once AND reported once as ``duplicate``."""
+
+    sent: int
+    sent_to: list[str]
+    skipped: list[NewPeopleInviteSkipped]

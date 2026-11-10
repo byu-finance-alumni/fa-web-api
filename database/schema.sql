@@ -1263,6 +1263,23 @@ CREATE TABLE new_people_submissions (
 );
 CREATE INDEX IF NOT EXISTS idx_new_people_submissions_status_submitted ON new_people_submissions (status, submitted_at);
 
+-- Ledger of new-people survey invites emailed from the New people tab (api#661).
+-- One row per email Resend accepted. NO ADDRESS: `email_hash` is sha256 (hex) of
+-- the trimmed, lower-cased address. Counted into the shared Resend usage and used
+-- for the 30-day "recently invited" skip. See
+-- migrations/2026-11-10_new_people_invites.sql.
+CREATE TABLE new_people_invites (
+    invite_id        bigserial PRIMARY KEY,
+    email_hash       text NOT NULL,
+    sent_by_user_id  bigint,
+    sent_at          timestamptz NOT NULL DEFAULT now(),
+    resend_email_id  text,
+    CONSTRAINT ck_new_people_invites_email_hash CHECK (email_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT fk_new_people_invites_sent_by FOREIGN KEY (sent_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_new_people_invites_hash_sent ON new_people_invites (email_hash, sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_new_people_invites_sent_at ON new_people_invites (sent_at);
+
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded
 -- from the frontend crosswalk. Keys are normalized: city_norm = lower(trim(city)),

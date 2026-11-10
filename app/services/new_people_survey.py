@@ -87,6 +87,29 @@ PENDING_CAP_MESSAGE = (
     "We can't take new submissions right now. Please try again in a few days."
 )
 
+# Tanya's intro message, as the public intro page shows it, and the email the
+# staff "Email the link" send uses (`new_people_invites`). ⚠️ The public page
+# renders its OWN copy (fa-web-app `src/lib/newPeopleSurvey.ts`,
+# NEW_PEOPLE_INTRO_PARAGRAPHS / NEW_PEOPLE_INTRO_SIGNOFF) because it draws before
+# any API call; the two MUST stay word for word identical. Change both or neither.
+NEW_PEOPLE_INTRO_HEADING = "Stay connected with BYU Finance"
+NEW_PEOPLE_INTRO_PARAGRAPHS: tuple[str, ...] = (
+    "Whether you're a BYU Finance alum or a professional who stays engaged with "
+    "our students, your experience and willingness to help are a valued part of "
+    "our community.",
+    "We're updating our records so we can stay connected with you throughout your "
+    "career. Please take a moment to complete this survey with your current career "
+    "and contact information. A few optional questions will also help us "
+    "understand how you'd like to stay involved and support our students.",
+    "Thank you for being part of the BYU Finance community. We look forward to "
+    "staying connected with you in the years ahead!",
+)
+NEW_PEOPLE_INTRO_SIGNOFF: tuple[str, ...] = (
+    "Warmest regards,",
+    "Tanya Harmon & Amy Densley",
+    "BYU Finance Career Directors",
+)
+
 # The single link row's id (a CHECK pins it).
 _LINK_ID = 1
 # `secrets.token_urlsafe(32)` is 43 URL-safe characters (256 bits).

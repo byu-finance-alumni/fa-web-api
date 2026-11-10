@@ -66,6 +66,9 @@ HISTORY_ACTIONS: frozenset[str] = frozenset(
         "confirm_current",
         "archive_current_role",
         "apply_survey_response",
+        # The new-people survey's approve (api#661): the same survey apply,
+        # summarised under its own action so it can be told apart.
+        "apply_new_person_submission",
         # Headshot.
         "upload_headshot",
         "delete_headshot",
@@ -115,6 +118,7 @@ NON_HISTORY_ACTIONS: frozenset[str] = frozenset(
         "upload_headshot_started",
         "upload_headshot_rejected",
         "read_survey_alumni_state",
+        "preview_new_person_merge",
         "reset_survey_campaign",
         "reject_survey_response",
         "add_opportunity_link",
@@ -128,7 +132,7 @@ NON_HISTORY_ACTIONS: frozenset[str] = frozenset(
 # A survey approval writes one summary row ("survey_response=12 fields=8 ...")
 # next to its field rows. It is bookkeeping, not a change: it supplies the
 # group's source but is not listed as a change when the group has real ones.
-_SUMMARY_ACTIONS = frozenset({"apply_survey_response"})
+_SUMMARY_ACTIONS = frozenset({"apply_survey_response", "apply_new_person_submission"})
 
 _SOURCES = frozenset({"manual", "import", "survey"})
 
@@ -340,7 +344,7 @@ def _build_group(
 ) -> AlumniHistoryGroup:
     actor_name = next((r.actor_name for r in rows if r.actor_name), None)
     source = next((r.source for r in rows if r.source in _SOURCES), None)
-    if source is None and any(r.action_type == "apply_survey_response" for r in rows):
+    if source is None and any(r.action_type in _SUMMARY_ACTIONS for r in rows):
         source = "survey"
 
     shown = [r for r in rows if r.action_type not in _SUMMARY_ACTIONS] or rows

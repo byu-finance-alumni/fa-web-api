@@ -31,6 +31,11 @@ from app.models.login_event import LoginEvent
 from app.models.login_failure import LoginFailure
 from app.models.login_ip_block import LoginIpBlock
 from app.models.maintenance import MaintenanceMode
+from app.models.new_people import (
+    NewPeopleInvite,
+    NewPeopleSurveyLink,
+    NewPersonSubmission,
+)
 from app.models.note import Note
 from app.models.opportunity_link import OpportunityLink
 from app.models.opportunity_link_digest import (
@@ -78,6 +83,9 @@ __all__ = [
     "LoginFailure",
     "LoginIpBlock",
     "MaintenanceMode",
+    "NewPeopleInvite",
+    "NewPeopleSurveyLink",
+    "NewPersonSubmission",
     "Note",
     "OpportunityLink",
     "OpportunityLinkDigestConfig",

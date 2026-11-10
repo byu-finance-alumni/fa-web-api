@@ -69,6 +69,28 @@ def clean_survey_comment(value: object) -> str | None:
     return text or None
 
 
+def validate_survey_comment(value: object) -> str | None:
+    """The request-schema rule for a survey comment (#890): text only, cleaned
+    by :func:`clean_survey_comment`, and over ``SURVEY_COMMENTS_MAX`` characters
+    is a ``ValueError`` (a 422 at the route), never a silent truncation.
+
+    Shared by ``SurveySubmitRequest`` and the new-people survey's
+    ``NewPersonSubmitRequest`` (api#661) so the two comment boxes cannot drift.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Comments must be text.")
+    # Cheap length check first: refuse a huge raw string before the
+    # per-character clean. Same message as the post-clean cap.
+    if len(value) > SURVEY_COMMENTS_RAW_MAX:
+        raise ValueError(f"Comments must be at most {SURVEY_COMMENTS_MAX} characters.")
+    cleaned = clean_survey_comment(value)
+    if cleaned is not None and len(cleaned) > SURVEY_COMMENTS_MAX:
+        raise ValueError(f"Comments must be at most {SURVEY_COMMENTS_MAX} characters.")
+    return cleaned
+
+
 class SurveySubmitRequest(BaseModel):
     """The alum's submitted values, keyed by survey field keys (`table.column`).
     Only recognized survey fields are kept; anything else is ignored."""
@@ -113,22 +135,7 @@ class SurveySubmitRequest(BaseModel):
     @field_validator("comments", mode="before")
     @classmethod
     def _clean_comments(cls, value: object) -> str | None:
-        if value is None:
-            return None
-        if not isinstance(value, str):
-            raise ValueError("Comments must be text.")
-        # Cheap length check first: refuse a huge raw string before the
-        # per-character clean. Same message as the post-clean cap.
-        if len(value) > SURVEY_COMMENTS_RAW_MAX:
-            raise ValueError(
-                f"Comments must be at most {SURVEY_COMMENTS_MAX} characters."
-            )
-        cleaned = clean_survey_comment(value)
-        if cleaned is not None and len(cleaned) > SURVEY_COMMENTS_MAX:
-            raise ValueError(
-                f"Comments must be at most {SURVEY_COMMENTS_MAX} characters."
-            )
-        return cleaned
+        return validate_survey_comment(value)
 
 
 class SurveySubmitResult(BaseModel):

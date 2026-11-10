@@ -36,6 +36,7 @@ from app.api.routes import (
     storage,
     support,
     survey,
+    survey_new_people,
     tasks,
     vocabulary,
     webhooks,
@@ -260,6 +261,7 @@ app.include_router(vocabulary.admin_router)
 app.include_router(support.router)
 app.include_router(support.admin_router)
 app.include_router(survey.router)
+app.include_router(survey_new_people.router)
 app.include_router(storage.router)
 app.include_router(webhooks.router)
 

@@ -399,6 +399,19 @@ BulkHeadshotRateLimit = Annotated[
     UserContext, Depends(BULK_HEADSHOT_LIMITER)
 ]
 
+# "Email the link" on the New people tab (api#661). Each call can send up to 50
+# real emails from the shared Resend account, so it gets its own, tight brake on
+# top of the account budget the send itself enforces: 10 sends / 10 minutes is
+# far above a person pasting lists, and stops a runaway loop or a compromised
+# session from churning the budget. Gated on the route's own capability.
+NEW_PEOPLE_INVITE_LIMITER = rate_limiter(
+    "survey:new_people_invite",
+    limit=10,
+    window_seconds=600,
+    actor_guard=require_surveys_manage,
+)
+NewPeopleInviteRateLimit = Annotated[UserContext, Depends(NEW_PEOPLE_INVITE_LIMITER)]
+
 # --- Note writes ------------------------------------------------------------------
 #
 # Create / edit / delete on /notes share one per-user stream with two windows:
@@ -566,6 +579,63 @@ SURVEY_PHOTO_LIMITER = public_token_rate_limiter(
 # brake on a replayed link.
 OPPORTUNITY_LINK_SUBMIT_LIMITER = public_token_rate_limiter(
     "survey:respond_links", token_limit=10, ip_limit=60, window_seconds=_SURVEY_WINDOW
+)
+
+
+# --- The new-people survey's SHARED link (api#661) ---------------------------
+#
+# `/survey/new/{key}` is public like `/survey/respond/{token}`, with one
+# difference that changes which budget matters: the key is ONE link shared by
+# everyone the career directors email, not a credential for one alum. So:
+#
+# * per KEY is a ceiling on the WHOLE LINK (per warm instance), not on one
+#   person. It is sized for a real mailing going out at once and is what brakes
+#   a leaked link being replayed from many addresses. Hashed like a token, since
+#   the key is a live credential too.
+# * per CLIENT IP is the one that tracks a single abuser, and is the tight one
+#   on submit. A real person submits once; a few retries and a colleague on the
+#   same office network still fit.
+#
+# Neither is the backstop. Each submit holds a row for staff review, so the
+# service also refuses new submissions outright once
+# `new_people_survey.PENDING_CAP` are already waiting, which bounds what a
+# leaked link can put in the database however the requests are spread.
+#
+# Same in-process caveat as every limiter here. The IP is `_client_key`'s
+# (rightmost, edge-added hop), never anything from the request body.
+
+
+def public_link_rate_limiter(
+    bucket: str, *, key_limit: int, ip_limit: int, window_seconds: float
+):
+    """:func:`public_token_rate_limiter` for a route whose path secret is
+    ``{key}`` rather than ``{token}``. Same two budgets, same hashing."""
+
+    async def _dependency(request: Request, key: str) -> None:
+        _check(
+            f"{bucket}:key",
+            _token_key(key),
+            limit=key_limit,
+            window_seconds=window_seconds,
+        )
+        _check(
+            f"{bucket}:ip",
+            _client_key(request),
+            limit=ip_limit,
+            window_seconds=window_seconds,
+        )
+
+    return _dependency
+
+
+# Reading the form's rules. A read, and people reopen the email link, so loose.
+NEW_PEOPLE_READ_LIMITER = public_link_rate_limiter(
+    "survey:new_read", key_limit=600, ip_limit=60, window_seconds=_SURVEY_WINDOW
+)
+# Submitting. Every call can hold a row of PII for review, so the per-IP budget
+# is tight: 10 per ten minutes is a person, a retry and a few colleagues.
+NEW_PEOPLE_SUBMIT_LIMITER = public_link_rate_limiter(
+    "survey:new_submit", key_limit=200, ip_limit=10, window_seconds=_SURVEY_WINDOW
 )
 
 

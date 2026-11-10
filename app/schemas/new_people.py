@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.alumni import DuplicateWarning
-from app.schemas.survey import SurveySupportContact, validate_survey_comment
+from app.schemas.survey import SurveyChange, SurveySupportContact, validate_survey_comment
 
 NewPersonKind = Literal["alum", "friend"]
 
@@ -123,6 +123,9 @@ class NewPersonApproveRequest(BaseModel):
     kind: NewPersonKind | None = None
     alumni_id: int | None = None
     submitted_at: str
+    # Merge only. A merge always FILLS blank fields on the existing record; a
+    # POPULATED field is replaced only when its field_key is listed here.
+    overwrite_fields: list[str] = Field(default_factory=list, max_length=200)
 
 
 class NewPersonApproveResult(BaseModel):
@@ -132,3 +135,31 @@ class NewPersonApproveResult(BaseModel):
     alumni_id: int
     created: bool
     duplicate_warnings: list[DuplicateWarning] = []
+    # Non-blocking notes for the reviewer. "kind_mismatch": a friend submission
+    # merged into an alum record, or the reverse.
+    warnings: list[str] = []
+
+
+class NewPersonMergePreview(BaseModel):
+    """What a MERGE of a submission into ``alumni_id`` would change."""
+
+    alumni_id: int
+    name: str
+    deceased: bool
+    # Only fields that would actually change.
+    changes: list[SurveyChange]
+    # field_keys in ``changes`` that would replace POPULATED data, i.e. the ones
+    # a merge leaves alone unless they are listed in ``overwrite_fields``.
+    overwrites: list[str]
+
+
+class NewPeopleBulkRejectRequest(BaseModel):
+    """``POST /survey/new-people/submissions/reject``."""
+
+    submission_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class NewPeopleBulkRejectResult(BaseModel):
+    """How many of the ids were pending and are now rejected (and purged)."""
+
+    rejected: int

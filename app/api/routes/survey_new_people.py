@@ -15,6 +15,8 @@ STAFF (``surveys.manage``, the same capability as the survey review queue):
 * ``PUT  /survey/new-people/link``           -- switch it on or off
 * ``POST /survey/new-people/link/reissue``   -- new key; the old one dies at once
 * ``GET  /survey/new-people/submissions``    -- pending, oldest first
+* ``GET  /survey/new-people/submissions/{id}/preview?alumni_id=`` -- merge diff
+* ``POST /survey/new-people/submissions/reject`` -- bulk reject
 * ``POST /survey/new-people/submissions/{id}/approve``
 * ``POST /survey/new-people/submissions/{id}/reject``
 """
@@ -22,7 +24,7 @@ STAFF (``surveys.manage``, the same capability as the survey review queue):
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,11 +37,14 @@ from app.core.rate_limit import (
     SurveysBrowseReadRateLimit,
 )
 from app.schemas.new_people import (
+    NewPeopleBulkRejectRequest,
+    NewPeopleBulkRejectResult,
     NewPeopleLinkRead,
     NewPeopleLinkUpdate,
     NewPeopleSurveyInfo,
     NewPersonApproveRequest,
     NewPersonApproveResult,
+    NewPersonMergePreview,
     NewPersonSubmissionItem,
     NewPersonSubmitRequest,
     NewPersonSubmitResult,
@@ -184,6 +189,45 @@ async def list_new_people_submissions(
         scope=f"pending; rows={len(items)}",
     )
     return items
+
+
+@router.post("/new-people/submissions/reject", response_model=NewPeopleBulkRejectResult)
+async def bulk_reject_new_people_submissions(
+    body: NewPeopleBulkRejectRequest, user: RequireSurveysManage, session: SessionDep
+) -> NewPeopleBulkRejectResult:
+    """Reject many at once (1-500 ids). Each pending one is purged like a single
+    reject; ids that are not pending are skipped. One audit row with the count.
+
+    No path collision with ``/{submission_id}/reject``: that one has an extra
+    segment, so ``/submissions/reject`` can never be read as an id."""
+    rejected = await new_people_survey.reject_many(session, body.submission_ids, user.user_id)
+    return NewPeopleBulkRejectResult(rejected=rejected)
+
+
+@router.get(
+    "/new-people/submissions/{submission_id}/preview",
+    response_model=NewPersonMergePreview,
+)
+async def preview_new_people_merge(
+    submission_id: int,
+    alumni_id: Annotated[int, Query()],
+    user: SurveysBrowseReadRateLimit,
+    session: SessionDep,
+) -> NewPersonMergePreview:
+    """What a MERGE into ``alumni_id`` would change, and which of those changes
+    would replace populated data. 404 when the submission is not pending or the
+    record does not exist or is archived. Audit-logged: it shows the record's
+    current values."""
+    preview = await new_people_survey.preview_merge(session, submission_id, alumni_id)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="preview_new_person_merge",
+        entity_type="alumni",
+        entity_id=alumni_id,
+        scope=f"new_people_submission={submission_id}; changes={len(preview.changes)}",
+    )
+    return preview
 
 
 @router.post(

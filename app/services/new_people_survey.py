@@ -26,6 +26,7 @@ tallies, ``survey_responses`` or the normal review queue.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hmac
 import logging
@@ -36,6 +37,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit_context import AUDIT_SOURCE_SURVEY, audit_source_scope, new_change_set_id
+from app.core.config import get_settings
 from app.core.errors import ConflictError, InvalidRequestError, NotFoundError
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
@@ -55,11 +57,13 @@ from app.schemas.new_people import (
     NewPeopleRequiredFields,
     NewPersonApproveRequest,
     NewPersonApproveResult,
+    NewPersonMergePreview,
     NewPersonPossibleMatch,
     NewPersonSubmissionField,
     NewPersonSubmissionItem,
 )
-from app.schemas.survey import SURVEY_COMMENTS_MAX, clean_survey_comment
+from app.schemas.survey import SURVEY_COMMENTS_MAX, SurveyChange, clean_survey_comment
+from app.services import failure_alert
 from app.services import survey_responses as sr
 from app.services.alumni import _audit
 from app.services.attendee_match import _norm_col, _norm_email
@@ -349,6 +353,40 @@ class PendingCapReached(Exception):
 # ------------------------------------------------------------------- submit --
 
 
+# Serialises the dedupe lookup, the pending count and the insert across every
+# concurrent submit (and every serverless instance): a transaction-scoped
+# Postgres advisory lock, released by the commit or rollback that ends it. An
+# arbitrary constant, unique to this feature.
+_SUBMIT_LOCK_KEY = 661_000_001
+
+# One alert when the queue fills to this many pending rows. See `_maybe_alert`.
+PENDING_ALERT_AT = PENDING_CAP * 8 // 10
+_ALERT_TIMEOUT_SECONDS = 5.0
+
+
+async def _pending_with_email(
+    session: AsyncSession, emails: list[str]
+) -> NewPersonSubmission | None:
+    """The newest PENDING submission sharing any of *emails* (normalised, in
+    either email field), row-locked, or None."""
+    if not emails:
+        return None
+    personal = func.lower(func.trim(NewPersonSubmission.payload["contact.personal_email"].astext))
+    work = func.lower(func.trim(NewPersonSubmission.payload["contact.work_email"].astext))
+    return (
+        await session.execute(
+            select(NewPersonSubmission)
+            .where(
+                NewPersonSubmission.status == STATUS_PENDING,
+                or_(personal.in_(emails), work.in_(emails)),
+            )
+            .order_by(NewPersonSubmission.submitted_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
 async def submit(
     session: AsyncSession,
     *,
@@ -358,36 +396,126 @@ async def submit(
     fill_seconds: int | None,
 ) -> None:
     """Hold one submission for review. The caller has already checked the key,
-    the size caps and the honeypot."""
+    the size caps and the honeypot.
+
+    ONE PENDING ROW PER EMAIL. A second submission from an email that already
+    has a pending row REPLACES that row in place (newest wins, like the normal
+    survey's #655 merge, but whole rather than per field: these people have no
+    record whose values a partial answer could fall back on). ``submitted_at``
+    moves to now, so a reviewer holding the old version gets the 409 stale check
+    rather than approving answers that have since been replaced.
+
+    RACE-SAFE CAP. The lookup, the count and the insert all run under one
+    transaction-scoped advisory lock, so two requests cannot both read 499 and
+    both insert. A replacement adds no row, so it is allowed at the cap.
+    """
     payload, refused = clean_fields(kind, fields)
     errors = missing_required(kind, payload, refused)
     if errors:
         raise MissingRequiredFields(errors)
-
-    pending = await session.scalar(
-        select(func.count())
-        .select_from(NewPersonSubmission)
-        .where(NewPersonSubmission.status == STATUS_PENDING)
-    )
-    if (pending or 0) >= PENDING_CAP:
-        log.warning("new-people survey: pending cap (%d) reached; submission refused", PENDING_CAP)
-        raise PendingCapReached()
-
     comment = clean_survey_comment(comments)
     if comment is not None and len(comment) > SURVEY_COMMENTS_MAX:
         comment = None
+    fill = sr._sane_fill_seconds(fill_seconds)
+
+    await session.execute(select(func.pg_advisory_xact_lock(_SUBMIT_LOCK_KEY)))
+
+    existing = await _pending_with_email(session, _emails(payload))
+    if existing is not None:
+        existing.kind = kind
+        existing.payload = payload
+        existing.comments = comment
+        existing.fill_seconds = fill
+        existing.submitted_at = func.now()
+        replaced_id = existing.submission_id
+        await session.commit()
+        # Ids and counts only: never a submitted value.
+        log.info(
+            "new-people survey: replaced pending submission %s (%d fields)",
+            replaced_id,
+            len(payload),
+        )
+        return
+
+    pending = (
+        await session.scalar(
+            select(func.count())
+            .select_from(NewPersonSubmission)
+            .where(NewPersonSubmission.status == STATUS_PENDING)
+        )
+        or 0
+    )
+    if pending >= PENDING_CAP:
+        await session.rollback()  # releases the advisory lock
+        log.warning("new-people survey: pending cap (%d) reached; submission refused", PENDING_CAP)
+        raise PendingCapReached()
+
     session.add(
         NewPersonSubmission(
             kind=kind,
             payload=payload,
             comments=comment,
-            fill_seconds=sr._sane_fill_seconds(fill_seconds),
+            fill_seconds=fill,
             status=STATUS_PENDING,
         )
     )
     await session.commit()
-    # Kind and counts only: never a submitted value.
     log.info("new-people survey: held a %s submission (%d fields)", kind, len(payload))
+    await _maybe_alert(pending + 1)
+
+
+async def _maybe_alert(pending_now: int) -> None:
+    """ONE alert when the queue fills to ``PENDING_ALERT_AT``.
+
+    Deduplicated by construction rather than by a cooldown: the count and the
+    insert run under the advisory lock, so exactly one request across every
+    instance is the one that takes the queue from ``PENDING_ALERT_AT - 1`` to
+    ``PENDING_ALERT_AT``, and only that request sends. It re-arms only if
+    reviewers work the queue back below the line and it fills again. A cooldown
+    in process memory would instead send once per warm instance.
+
+    Best-effort, after the commit: the submission is already held, and a
+    failing alerter must never turn it into an error for the person submitting.
+    Counts only, never anything a person submitted.
+    """
+    if pending_now != PENDING_ALERT_AT:
+        return
+    log.warning(
+        "new-people survey: %d submissions pending (alert threshold, cap %d)",
+        pending_now,
+        PENDING_CAP,
+    )
+    if not failure_alert.alerting_enabled():
+        return
+    env = get_settings().environment
+    rows = [
+        ("Environment", str(env)),
+        ("Pending submissions", str(pending_now)),
+        ("Cap", f"{PENDING_CAP} (new submissions are refused at the cap)"),
+    ]
+    summary = (
+        f"The new-people survey queue holds {pending_now} pending submissions "
+        f"({PENDING_ALERT_AT * 100 // PENDING_CAP}% of the {PENDING_CAP} cap). "
+        "Review the queue, and if it is junk, switch the link off or reissue it."
+    )
+    try:
+        landed = await asyncio.wait_for(
+            failure_alert.deliver_alert(
+                f"[fa-web-api {env}] New-people survey queue is {pending_now}/{PENDING_CAP}",
+                "The shared new-people survey link has filled most of its review "
+                "queue. A real mailing rarely does this; a leaked or scripted link "
+                "does. Check the queue, then switch the link off or reissue it if "
+                "the submissions are junk.",
+                rows,
+                purpose=failure_alert.SECURITY,
+                slack_summary=summary,
+            ),
+            timeout=_ALERT_TIMEOUT_SECONDS,
+        )
+        if not landed:
+            log.error("new-people survey: the queue alert landed nowhere")
+    except Exception:  # noqa: BLE001 - the alert must never fail the submit
+        log.error("new-people survey: could not deliver the queue alert")
 
 
 # -------------------------------------------------------------- review queue --
@@ -684,6 +812,82 @@ async def _create_record(
     return alum
 
 
+DECEASED_MESSAGE = "This person is marked deceased."
+
+
+async def _live_alum(session: AsyncSession, alumni_id: int) -> Alumni:
+    """A live (not archived) record, or 404."""
+    alum = (
+        await session.execute(select(Alumni).where(Alumni.alumni_id == alumni_id))
+    ).scalar_one_or_none()
+    if alum is None or alum.archived:
+        raise NotFoundError("Alum not found.")
+    return alum
+
+
+def _populated(field, before: str) -> bool:
+    """Whether the record's value for *field* is real data a merge would REPLACE.
+
+    A yes/no answer reads "No" when nothing is on file (a missing engagement row
+    or an unset flag), so for those only "Yes" counts as populated: turning an
+    unset flag on is filling a blank, not overwriting one."""
+    if field.kind in ("bool", "designation"):
+        return before == "Yes"
+    return bool(before)
+
+
+async def _merge_plan(session: AsyncSession, alum: Alumni, payload: dict) -> list[tuple]:
+    """``(field, before, after)`` for every submitted survey field that a merge
+    into *alum* would actually change, in form order, by the normal survey's own
+    display rules (the same comparison its review queue diff makes)."""
+    contacts, jobs, engs = await sr._load_side_rows(session, [alum.alumni_id])
+    by_group = {
+        "alumni": alum,
+        "contact": contacts.get(alum.alumni_id),
+        "employment": jobs.get(alum.alumni_id),
+        "engagement": engs.get(alum.alumni_id),
+    }
+    plan = []
+    for field in sr._FIELDS:
+        if field.key not in payload:
+            continue
+        raw = payload[field.key]
+        if sr._coerce(field, raw) is sr._IGNORE:
+            continue
+        before = sr._current(field, by_group.get(field.group))
+        after = sr._after(field, raw)
+        if before != after:
+            plan.append((field, before, after))
+    return plan
+
+
+async def preview_merge(
+    session: AsyncSession, submission_id: int, alumni_id: int
+) -> NewPersonMergePreview:
+    """What merging a pending submission into *alumni_id* would change. Reads
+    only; nothing is locked or written here."""
+    row = (
+        await session.execute(
+            select(NewPersonSubmission).where(NewPersonSubmission.submission_id == submission_id)
+        )
+    ).scalar_one_or_none()
+    if row is None or row.status != STATUS_PENDING:
+        raise NotFoundError(NOT_PENDING_MESSAGE)
+    alum = await _live_alum(session, alumni_id)
+    payload = {k: v for k, v in (row.payload or {}).items() if k not in NEW_KEYS}
+    plan = await _merge_plan(session, alum, payload)
+    return NewPersonMergePreview(
+        alumni_id=alum.alumni_id,
+        name=_name_of(alum.first_name, alum.last_name, "Unnamed record"),
+        deceased=bool(alum.deceased),
+        changes=[
+            SurveyChange(field_key=f.key, label=f.label, before=before, after=after)
+            for f, before, after in plan
+        ],
+        overwrites=[f.key for f, before, _ in plan if _populated(f, before)],
+    )
+
+
 async def approve(
     session: AsyncSession,
     submission_id: int,
@@ -702,14 +906,27 @@ async def approve(
         apply_payload[COMMENTS_KEY] = row.comments
 
     change_set_id = new_change_set_id()
+    notes: list[str] = []
+    summary_extra = f" action={body.action}"
     if body.action == "merge":
         if body.alumni_id is None:
             raise InvalidRequestError("Choose the record to update.")
-        alum = (
-            await session.execute(select(Alumni).where(Alumni.alumni_id == body.alumni_id))
-        ).scalar_one_or_none()
-        if alum is None or alum.archived:
-            raise NotFoundError("Alum not found.")
+        alum = await _live_alum(session, body.alumni_id)
+        if alum.deceased:
+            raise ConflictError(DECEASED_MESSAGE)
+        if (row.kind == "alum") != bool(alum.is_alumni):
+            notes.append("kind_mismatch")
+        # FILL BLANKS ONLY unless told otherwise: a populated field is replaced
+        # only when the reviewer listed it in `overwrite_fields` (after seeing
+        # it in the preview). An unrecognised key there is simply never matched.
+        overwrite = set(body.overwrite_fields)
+        plan = await _merge_plan(session, alum, apply_payload)
+        kept = [f.key for f, before, _ in plan if _populated(f, before) and f.key not in overwrite]
+        allowed = {f.key for f, _, _ in plan} - set(kept)
+        apply_payload = {
+            k: v for k, v in apply_payload.items() if k in allowed or k == COMMENTS_KEY
+        }
+        summary_extra += f" kept={len(kept)}"
         kind = row.kind
         created = False
     else:
@@ -727,7 +944,7 @@ async def approve(
         summary_action="apply_new_person_submission",
         summary_ref=f"new_people_submission={submission_id}",
         log_label=f"New-people submission {submission_id}",
-        summary_extra=f" action={body.action}",
+        summary_extra=summary_extra,
         change_set_id=change_set_id,
     )
     _purge(row, STATUS_APPROVED, actor_user_id)
@@ -745,7 +962,7 @@ async def approve(
     )
     await session.commit()
     return NewPersonApproveResult(
-        alumni_id=alumni_id, created=created, duplicate_warnings=warnings
+        alumni_id=alumni_id, created=created, duplicate_warnings=warnings, warnings=notes
     )
 
 
@@ -765,3 +982,41 @@ async def reject(session: AsyncSession, submission_id: int, actor_user_id: int |
         )
     )
     await session.commit()
+
+
+async def reject_many(
+    session: AsyncSession, submission_ids: list[int], actor_user_id: int | None
+) -> int:
+    """Bulk reject: every id that is still pending is purged like a single
+    reject; ids that are not pending (or do not exist) are skipped. Rows are
+    locked in id order so two overlapping bulk rejects cannot deadlock. ONE
+    audit row records the count."""
+    ids = sorted(set(submission_ids))
+    rows = (
+        (
+            await session.execute(
+                select(NewPersonSubmission)
+                .where(
+                    NewPersonSubmission.submission_id.in_(ids),
+                    NewPersonSubmission.status == STATUS_PENDING,
+                )
+                .order_by(NewPersonSubmission.submission_id.asc())
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        _purge(row, STATUS_REJECTED, actor_user_id)
+    session.add(
+        AuditLog(
+            user_id=actor_user_id,
+            action_type="bulk_reject_new_person_submissions",
+            entity_type="new_people_submission",
+            new_value=f"rejected={len(rows)} requested={len(ids)}",
+        )
+    )
+    await session.commit()
+    return len(rows)
+

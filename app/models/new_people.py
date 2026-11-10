@@ -55,7 +55,11 @@ class NewPersonSubmission(Base):
     # `alum` (BYU Alumni Professional) or `friend` (Non-BYU Alumni Professional).
     kind: Mapped[str] = mapped_column(String(10), nullable=False)
     # Cleaned answers keyed by survey field key. NULL once decided (purged).
-    payload: Mapped[dict | None] = mapped_column(JSONB)
+    # ⚠️ none_as_null=True is REQUIRED: without it SQLAlchemy writes Python None
+    # as the JSON literal `null`, which is NOT SQL NULL, and the purge violates
+    # ck_new_people_submissions_payload_state on real Postgres (fake-session
+    # tests can't see this).
+    payload: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     comments: Mapped[str | None] = mapped_column(Text)
     # Clamped by the service before it lands here; NULL = not measured.
     fill_seconds: Mapped[int | None] = mapped_column(Integer)

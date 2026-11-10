@@ -1288,3 +1288,13 @@ def test_new_audit_actions_are_classified_for_record_history():
     assert "apply_new_person_submission" in alumni_history.HISTORY_ACTIONS
     assert "apply_new_person_submission" in alumni_history._SUMMARY_ACTIONS
     assert "preview_new_person_merge" in alumni_history.NON_HISTORY_ACTIONS
+
+
+def test_payload_column_purges_to_sql_null_not_json_null():
+    """Regression (found on dev 2026-11-10): without none_as_null, a purged
+    payload is written as JSON `null`, which violates
+    ck_new_people_submissions_payload_state on real Postgres. The fake session
+    in this file can't see that, so pin the column setting directly."""
+    from app.models.new_people import NewPersonSubmission
+
+    assert NewPersonSubmission.__table__.c.payload.type.none_as_null is True

@@ -95,11 +95,13 @@ def mail_ready(monkeypatch):
 
 
 class _UsageSession:
-    """Answers the two usage aggregates: survey_send_log and the digest log."""
+    """Answers the usage aggregates: survey_send_log, the digest log and the
+    new-people invite ledger (api#661)."""
 
-    def __init__(self, survey=(0, 0), digest=(0, 0), digest_breaks=False):
+    def __init__(self, survey=(0, 0), digest=(0, 0), digest_breaks=False, invites=(0, 0)):
         self._survey = survey  # (month, today)
         self._digest = digest  # (month, today)
+        self._invites = invites  # (month, today)
         self._breaks = digest_breaks
         self.savepoints = 0
 
@@ -114,6 +116,8 @@ class _UsageSession:
             if self._breaks:
                 raise RuntimeError('relation "opportunity_link_digest_send_log" does not exist')
             row = self._digest
+        elif "new_people_invites" in sql:
+            row = self._invites
         else:
             row = self._survey
         return SimpleNamespace(first=lambda: row)
@@ -134,8 +138,9 @@ def test_usage_counts_the_digest_emails_in_both_the_day_and_the_month(no_baselin
     usage = _run(survey_email.get_send_usage(session))
     assert usage.sent_today == 9
     assert usage.sent_this_month == 36
-    # Read inside a SAVEPOINT, so a failure cannot poison the send's transaction.
-    assert session.savepoints == 1
+    # Read inside a SAVEPOINT, so a failure cannot poison the send's transaction
+    # (one for the digest ledger, one for the new-people invite ledger).
+    assert session.savepoints == 2
 
 
 def test_an_unreadable_digest_ledger_counts_as_zero_and_never_blocks_a_send(

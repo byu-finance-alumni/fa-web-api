@@ -498,6 +498,18 @@ async def get_send_usage(session: AsyncSession) -> SurveyUsage:
     )
     sent_today += digest_today
     sent_this_month += digest_month
+    # NEW-PEOPLE INVITES spend from the same account too (api#661): one ledger
+    # row per invite email Resend accepted, read under the same never-raising
+    # SAVEPOINT contract as the digest. Imported here, not at module level,
+    # because `new_people_invites` reaches this module through
+    # `survey_responses`.
+    from app.services import new_people_invites
+
+    invite_today, invite_month = await new_people_invites.sent_counts(
+        session, start_today=start_today, start_month=start_month, after=anchor
+    )
+    sent_today += invite_today
+    sent_this_month += invite_month
     if anchor is not None:
         # Add the baseline only while we're still in the anchor's day / month.
         if now.date() == anchor.date():

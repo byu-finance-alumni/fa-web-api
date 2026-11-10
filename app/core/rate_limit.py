@@ -399,6 +399,19 @@ BulkHeadshotRateLimit = Annotated[
     UserContext, Depends(BULK_HEADSHOT_LIMITER)
 ]
 
+# "Email the link" on the New people tab (api#661). Each call can send up to 50
+# real emails from the shared Resend account, so it gets its own, tight brake on
+# top of the account budget the send itself enforces: 10 sends / 10 minutes is
+# far above a person pasting lists, and stops a runaway loop or a compromised
+# session from churning the budget. Gated on the route's own capability.
+NEW_PEOPLE_INVITE_LIMITER = rate_limiter(
+    "survey:new_people_invite",
+    limit=10,
+    window_seconds=600,
+    actor_guard=require_surveys_manage,
+)
+NewPeopleInviteRateLimit = Annotated[UserContext, Depends(NEW_PEOPLE_INVITE_LIMITER)]
+
 # --- Note writes ------------------------------------------------------------------
 #
 # Create / edit / delete on /notes share one per-user stream with two windows:

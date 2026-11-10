@@ -3,8 +3,9 @@
 One shared link the career directors email to people who are not in the database
 yet. Public routes read the form's rules and HOLD a submission; staff routes
 manage the link and review what was held. Field keys are the existing survey
-field keys (``profile.first_name``, ``contact.personal_email``, ...) plus two
-new ones for the BYU-alum path: ``new.graduation_year`` and ``new.byu_degree``.
+field keys (``profile.first_name``, ``contact.personal_email``, ...) plus three
+new ones for the BYU-alum path: ``new.graduation_year``, ``new.byu_degree`` and
+the optional ``new.byu_id`` (9 digits once spaces and dashes are stripped).
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ class NewPeopleSurveyInfo(BaseModel):
     The server is the single source of truth for which fields are required."""
 
     required_fields: NewPeopleRequiredFields
+    # Lower-case country names. When ``employment.current_country`` (trimmed,
+    # case-insensitive) is one of these, ``employment.current_state`` is
+    # REQUIRED too, for both kinds.
+    state_required_countries: list[str]
     support_contact: SurveySupportContact | None = None
 
 
@@ -87,13 +92,14 @@ class NewPersonSubmissionField(BaseModel):
 
 
 class NewPersonPossibleMatch(BaseModel):
-    """A live record that may be the same person (email or first + last name)."""
+    """A live record that may be the same person (same BYU ID, email, or
+    first + last name)."""
 
     alumni_id: int
     name: str
     graduation_year: int | None = None
     is_friend: bool
-    match_reason: Literal["email", "name"]
+    match_reason: Literal["byu_id", "email", "name"]
 
 
 class NewPersonSubmissionItem(BaseModel):
@@ -124,7 +130,8 @@ class NewPersonApproveRequest(BaseModel):
     alumni_id: int | None = None
     submitted_at: str
     # Merge only. A merge always FILLS blank fields on the existing record; a
-    # POPULATED field is replaced only when its field_key is listed here.
+    # POPULATED field is replaced only when its field_key is listed here
+    # (``new.byu_id`` included).
     overwrite_fields: list[str] = Field(default_factory=list, max_length=200)
 
 

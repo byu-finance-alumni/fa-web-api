@@ -14,8 +14,9 @@ survey apply runs, so the record ends up exactly as if the person had answered
 the normal survey: same whitelist, same side rows, same comment-to-Note, same
 field-level audit.
 
-What is NEW is small: the two BYU-alum keys (``new.graduation_year``,
-``new.byu_degree``), the required ANY-OF groups (the normal survey has none,
+What is NEW is small: the three BYU-alum keys (``new.graduation_year``,
+``new.byu_degree``, the optional ``new.byu_id``), the required ANY-OF groups
+(plus the state, required when the country is the US) (the normal survey has none,
 because it edits a record that already exists), the link itself, and the
 global cap on pending rows.
 
@@ -34,6 +35,7 @@ import re
 import secrets
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit_context import AUDIT_SOURCE_SURVEY, audit_source_scope, new_change_set_id
@@ -116,14 +118,39 @@ _LINK_ID = 1
 _KEY_BYTES = 32
 _KEY_MAX = 128
 
-# The two keys only the BYU-alum path carries.
+# The keys only the BYU-alum path carries. A friend's answers to them are
+# dropped on submit.
 NEW_GRADUATION_YEAR = "new.graduation_year"
 NEW_BYU_DEGREE = "new.byu_degree"
-NEW_KEYS = (NEW_GRADUATION_YEAR, NEW_BYU_DEGREE)
+# Optional. Held and stored DIGITS ONLY, the `alumni.byu_id` convention (the
+# partial unique index `uq_alumni_byu_id_active` compares the raw column). PII:
+# never logged.
+NEW_BYU_ID = "new.byu_id"
+NEW_KEYS = (NEW_GRADUATION_YEAR, NEW_BYU_DEGREE, NEW_BYU_ID)
 NEW_KEY_LABELS = {
     NEW_GRADUATION_YEAR: "BYU graduation year",
     NEW_BYU_DEGREE: "BYU degree",
+    NEW_BYU_ID: "BYU ID",
 }
+BYU_ID_INVALID_MESSAGE = "BYU ID must be 9 digits."
+# A person may type spaces or dashes ("123-45-6789"); nothing else is forgiven.
+_BYU_ID_SEPARATORS = re.compile(r"[\s-]")
+_BYU_ID_RE = re.compile(r"^[0-9]{9}$")
+# The Postgres name of the index a racing BYU ID write would trip.
+_BYU_ID_UNIQUE_INDEX = "uq_alumni_byu_id_active"
+
+_COUNTRY_KEY = "employment.current_country"
+_STATE_KEY = "employment.current_state"
+# When the country is one of these (trimmed, case-insensitive) the state is
+# REQUIRED, for both kinds. Served to the form by GET so it never hard-codes it.
+STATE_REQUIRED_COUNTRIES: tuple[str, ...] = (
+    "united states",
+    "united states of america",
+    "usa",
+    "us",
+    "u.s.",
+    "u.s.a.",
+)
 # education_history.degree is varchar(255); a degree name is short, and a cap
 # well under the column keeps the queue readable.
 _DEGREE_MAX = 100
@@ -141,7 +168,7 @@ REQUIRED_FRIEND: tuple[tuple[str, ...], ...] = (
     ("employment.current_employer",),
     ("employment.current_industry",),
     ("employment.current_city",),
-    ("employment.current_country",),
+    (_COUNTRY_KEY,),
     ("profile.linkedin_url",),
 )
 REQUIRED_ALUM: tuple[tuple[str, ...], ...] = REQUIRED_FRIEND + (
@@ -165,6 +192,20 @@ def required_fields() -> NewPeopleRequiredFields:
 
 def _required_for(kind: str) -> tuple[tuple[str, ...], ...]:
     return REQUIRED_ALUM if kind == "alum" else REQUIRED_FRIEND
+
+
+def state_required_for(country: object) -> bool:
+    """Whether *country* is one the state is required for."""
+    return sr._text(country).lower() in STATE_REQUIRED_COUNTRIES
+
+
+def clean_byu_id(value: object) -> str | None:
+    """A BYU ID as stored (9 digits), ``""`` when nothing was given, or ``None``
+    when it is unusable. Spaces and dashes are stripped first."""
+    stripped = _BYU_ID_SEPARATORS.sub("", sr._text(value))
+    if not stripped:
+        return ""
+    return stripped if _BYU_ID_RE.match(stripped) else None
 
 
 # ------------------------------------------------------------------ the link --
@@ -301,6 +342,8 @@ def _clean_new_value(key: str, value: str) -> str | None:
         if len(value) > _DEGREE_MAX or not sr._valid_free_text(value):
             return None
         return value
+    if key == NEW_BYU_ID:
+        return clean_byu_id(value)
     return None
 
 
@@ -308,11 +351,12 @@ def clean_fields(kind: str, fields: dict[str, str]) -> tuple[dict[str, str], set
     """``(payload, refused)`` for a public submission.
 
     *payload* holds only recognised, non-blank answers the apply path would
-    actually write, by the normal survey's own ``_coerce`` rules (plus the two
-    ``new.*`` keys on the alum path). Unknown keys are dropped silently, exactly
-    as the normal survey drops them. *refused* names known keys whose answer was
-    not usable, so a REQUIRED one can be reported back by key; an optional one
-    is simply left out, which is what the normal survey does with it.
+    actually write, by the normal survey's own ``_coerce`` rules (plus the
+    ``new.*`` keys on the alum path; a friend's are dropped). Unknown keys are
+    dropped silently, exactly as the normal survey drops them. *refused* names
+    known keys whose answer was not usable, so a REQUIRED one (or a BYU ID) can
+    be reported back by key; an optional one is simply left out, which is what
+    the normal survey does with it.
     """
     payload: dict[str, str] = {}
     refused: set[str] = set()
@@ -324,6 +368,8 @@ def clean_fields(kind: str, fields: dict[str, str]) -> tuple[dict[str, str], set
             if kind != "alum":
                 continue
             cleaned = _clean_new_value(key, value)
+            if cleaned == "":
+                continue  # a BYU ID of only spaces/dashes: not given
         else:
             field = sr._FIELD_BY_KEY.get(key)
             if field is None:
@@ -345,19 +391,27 @@ def clean_fields(kind: str, fields: dict[str, str]) -> tuple[dict[str, str], set
 def missing_required(
     kind: str, payload: dict[str, str], refused: set[str]
 ) -> list[dict[str, str]]:
-    """The error-envelope ``fields`` entries for every unmet required group."""
+    """The error-envelope ``fields`` entries for every unmet required group,
+    the state when the country is the US, and an unusable BYU ID (optional,
+    but a wrong one is reported rather than silently dropped)."""
     errors: list[dict[str, str]] = []
+
+    def _missing(key: str) -> dict[str, str]:
+        message = "This answer is not valid." if key in refused else "This field is required."
+        return {"field": key, "message": message}
+
     for group in _required_for(kind):
         if any(payload.get(k) for k in group):
             continue
         for key in group:
             if group == _EMAIL_GROUP:
-                message = "Enter a personal or work email."
-            elif key in refused:
-                message = "This answer is not valid."
+                errors.append({"field": key, "message": "Enter a personal or work email."})
             else:
-                message = "This field is required."
-            errors.append({"field": key, "message": message})
+                errors.append(_missing(key))
+    if state_required_for(payload.get(_COUNTRY_KEY)) and not payload.get(_STATE_KEY):
+        errors.append(_missing(_STATE_KEY))
+    if NEW_BYU_ID in refused:
+        errors.append({"field": NEW_BYU_ID, "message": BYU_ID_INVALID_MESSAGE})
     return errors
 
 
@@ -580,6 +634,11 @@ def _emails(payload: dict) -> list[str]:
     return out
 
 
+def _byu_id_of(payload: dict) -> str | None:
+    """The held BYU ID (re-cleaned, so only a valid 9-digit value), or None."""
+    return clean_byu_id(payload.get(NEW_BYU_ID)) or None
+
+
 def _name_key(payload: dict) -> tuple[str, str] | None:
     first = sr._text(payload.get("profile.first_name")).lower()
     last = sr._text(payload.get("profile.last_name")).lower()
@@ -589,12 +648,34 @@ def _name_key(payload: dict) -> tuple[str, str] | None:
 async def _possible_matches(
     session: AsyncSession, payloads: list[dict]
 ) -> list[list[NewPersonPossibleMatch]]:
-    """Live records that may be each payload's person, in two batched queries:
-    case-insensitive email against personal/work email, then first + last name
-    (preferred first name counts). Friends included. Email hits come first;
-    capped at ``_MATCH_CAP`` per payload."""
+    """Live records that may be each payload's person, in up to three batched
+    queries: the BYU ID against ``alumni.byu_id``, case-insensitive email
+    against personal/work email, then first + last name (preferred first name
+    counts). Friends included. BYU ID hits come first, then email; capped at
+    ``_MATCH_CAP`` per payload."""
     all_emails = sorted({e for p in payloads for e in _emails(p)})
     all_lasts = sorted({k[1] for p in payloads if (k := _name_key(p))})
+    all_byu = sorted({b for p in payloads if (b := _byu_id_of(p))})
+
+    by_byu: dict[str, list[tuple]] = {}
+    if all_byu:
+        rows = (
+            await session.execute(
+                select(
+                    Alumni.alumni_id,
+                    Alumni.first_name,
+                    Alumni.last_name,
+                    Alumni.graduation_year,
+                    Alumni.is_alumni,
+                    Alumni.byu_id,
+                )
+                .where(Alumni.archived.is_(False), Alumni.byu_id.in_(all_byu))
+                .order_by(Alumni.alumni_id.asc())
+                .limit(_MATCH_LOOKUP_ROWS)
+            )
+        ).all()
+        for alumni_id, first, last, year, is_alumni, byu in rows:
+            by_byu.setdefault(byu, []).append((alumni_id, first, last, year, is_alumni))
 
     by_email: dict[str, list[tuple]] = {}
     if all_emails:
@@ -657,7 +738,8 @@ async def _possible_matches(
     for payload in payloads:
         seen: set[int] = set()
         matches: list[NewPersonPossibleMatch] = []
-        candidates = [(row, "email") for e in _emails(payload) for row in by_email.get(e, [])]
+        candidates = [(row, "byu_id") for row in by_byu.get(_byu_id_of(payload) or "", [])]
+        candidates += [(row, "email") for e in _emails(payload) for row in by_email.get(e, [])]
         key = _name_key(payload)
         if key is not None:
             candidates += [(row, "name") for row in by_name.get(key, [])]
@@ -775,12 +857,14 @@ async def _create_record(
     kind: str,
     actor_user_id: int | None,
     change_set_id: str,
+    byu_id: str | None = None,
 ) -> Alumni:
     """A brand-new alum or friend record, holding only what the survey fields
     cannot write: the kind, and for an alum the BYU graduation year (the real
-    ``alumni.graduation_year`` column) and degree (an ``education_history``
-    row, the profile's Education section). Everything else is written by the
-    shared apply afterwards.
+    ``alumni.graduation_year`` column), degree (an ``education_history`` row,
+    the profile's Education section) and BYU ID (``alumni.byu_id``; the caller
+    has already checked no active record holds it). Everything else is written
+    by the shared apply afterwards.
 
     A friend is simply ``is_alumni = false``: the visible ``FRIEND-00042`` id
     (#538) is derived from the primary key, so there is nothing else to mint.
@@ -803,6 +887,7 @@ async def _create_record(
         archived=False,
         deceased=False,
         graduation_year=year,
+        byu_id=byu_id if is_alum and byu_id else None,
         profile_updated_by_user_id=actor_user_id,
     )
     session.add(alum)
@@ -817,6 +902,16 @@ async def _create_record(
                 alum.alumni_id,
                 field_name="graduation_year",
                 new_value=year,
+                change_set_id=change_set_id,
+            )
+        if alum.byu_id is not None:
+            _audit(
+                session,
+                actor_user_id,
+                "update",
+                alum.alumni_id,
+                field_name="byu_id",
+                new_value=alum.byu_id,
                 change_set_id=change_set_id,
             )
         if degree is not None:
@@ -859,6 +954,54 @@ def _populated(field, before: str) -> bool:
     return bool(before)
 
 
+async def _byu_owner(
+    session: AsyncSession, byu_id: str, exclude_alumni_id: int | None = None
+) -> tuple | None:
+    """``(alumni_id, first_name, last_name)`` of the ACTIVE record holding
+    *byu_id* (other than *exclude_alumni_id*), or None. The same scope as the
+    ``uq_alumni_byu_id_active`` partial unique index."""
+    stmt = select(Alumni.alumni_id, Alumni.first_name, Alumni.last_name).where(
+        Alumni.archived.is_(False), Alumni.byu_id == byu_id
+    )
+    if exclude_alumni_id is not None:
+        stmt = stmt.where(Alumni.alumni_id != exclude_alumni_id)
+    return (await session.execute(stmt.order_by(Alumni.alumni_id.asc()).limit(1))).first()
+
+
+def _byu_conflict_message(owner: tuple | None) -> str:
+    name = _name_of(owner[1], owner[2], "another record") if owner else "another record"
+    return f"That BYU ID already belongs to {name}. Use Update instead."
+
+
+async def _ensure_byu_free(
+    session: AsyncSession, byu_id: str, exclude_alumni_id: int | None = None
+) -> None:
+    """409 when another active record already holds *byu_id*. Checked BEFORE the
+    write so the unique index never sees the collision; ``approve`` still maps
+    the index's IntegrityError to the same 409 for a racing write."""
+    owner = await _byu_owner(session, byu_id, exclude_alumni_id)
+    if owner is not None:
+        raise ConflictError(_byu_conflict_message(owner))
+
+
+def _byu_change(alum: Alumni, payload: dict) -> tuple[str, str] | None:
+    """``(before, after)`` when a merge would change *alum*'s BYU ID, else None.
+
+    Compared as digits, so a legacy stored value with dashes that names the same
+    ID is no change."""
+    after = _byu_id_of(payload)
+    if after is None:
+        return None
+    before = sr._text(alum.byu_id)
+    if re.sub(r"[^0-9]", "", before) == after:
+        return None
+    return before, after
+
+
+def _is_byu_index_violation(exc: IntegrityError) -> bool:
+    return _BYU_ID_UNIQUE_INDEX in str(getattr(exc, "orig", None) or exc)
+
+
 async def _merge_plan(session: AsyncSession, alum: Alumni, payload: dict) -> list[tuple]:
     """``(field, before, after)`` for every submitted survey field that a merge
     into *alum* would actually change, in form order, by the normal survey's own
@@ -897,17 +1040,31 @@ async def preview_merge(
     if row is None or row.status != STATUS_PENDING:
         raise NotFoundError(NOT_PENDING_MESSAGE)
     alum = await _live_alum(session, alumni_id)
-    payload = {k: v for k, v in (row.payload or {}).items() if k not in NEW_KEYS}
+    held = dict(row.payload or {})
+    payload = {k: v for k, v in held.items() if k not in NEW_KEYS}
     plan = await _merge_plan(session, alum, payload)
+    changes = [
+        SurveyChange(field_key=f.key, label=f.label, before=before, after=after)
+        for f, before, after in plan
+    ]
+    overwrites = [f.key for f, before, _ in plan if _populated(f, before)]
+    # The BYU ID is the one `new.*` key a merge writes (fill-blank, like the rest).
+    byu = _byu_change(alum, held)
+    if byu is not None:
+        before, after = byu
+        changes.append(
+            SurveyChange(
+                field_key=NEW_BYU_ID, label=NEW_KEY_LABELS[NEW_BYU_ID], before=before, after=after
+            )
+        )
+        if before:
+            overwrites.append(NEW_BYU_ID)
     return NewPersonMergePreview(
         alumni_id=alum.alumni_id,
         name=_name_of(alum.first_name, alum.last_name, "Unnamed record"),
         deceased=bool(alum.deceased),
-        changes=[
-            SurveyChange(field_key=f.key, label=f.label, before=before, after=after)
-            for f, before, after in plan
-        ],
-        overwrites=[f.key for f, before, _ in plan if _populated(f, before)],
+        changes=changes,
+        overwrites=overwrites,
     )
 
 
@@ -917,13 +1074,40 @@ async def approve(
     body: NewPersonApproveRequest,
     actor_user_id: int | None,
 ) -> NewPersonApproveResult:
+    """Create a record from the submission, or merge it into one.
+
+    BYU ID: both paths check that no OTHER active record holds it before
+    writing (409 naming the holder). The partial unique index is the backstop
+    for a write that races the check; its IntegrityError is rolled back and
+    answered with the same 409, never a 500."""
+    byu_written: list = []  # [(byu_id, exclude_alumni_id)] once a write is staged
+    try:
+        return await _approve(session, submission_id, body, actor_user_id, byu_written)
+    except IntegrityError as exc:
+        if not byu_written or not _is_byu_index_violation(exc):
+            raise
+        await session.rollback()
+        byu_id, exclude = byu_written[0]
+        log.warning("new-people survey: BYU ID collision on approve of %s", submission_id)
+        raise ConflictError(
+            _byu_conflict_message(await _byu_owner(session, byu_id, exclude))
+        ) from None
+
+
+async def _approve(
+    session: AsyncSession,
+    submission_id: int,
+    body: NewPersonApproveRequest,
+    actor_user_id: int | None,
+    byu_written: list,
+) -> NewPersonApproveResult:
     row = await _get_pending_locked(session, submission_id)
     if not _same_instant(body.submitted_at, row.submitted_at):
         raise ConflictError(STALE_MESSAGE)
 
     payload = dict(row.payload or {})
     # The survey fields only; the `new.*` keys are handled by the create step
-    # (and ignored on merge).
+    # (on merge only the BYU ID is used, below).
     apply_payload = {k: v for k, v in payload.items() if k not in NEW_KEYS and k != COMMENTS_KEY}
     if row.comments:
         apply_payload[COMMENTS_KEY] = row.comments
@@ -949,12 +1133,39 @@ async def approve(
         apply_payload = {
             k: v for k, v in apply_payload.items() if k in allowed or k == COMMENTS_KEY
         }
+        # The BYU ID: fill a blank, replace a populated one only when listed.
+        byu = _byu_change(alum, payload)
+        if byu is not None and byu[0] and NEW_BYU_ID not in overwrite:
+            kept.append(NEW_BYU_ID)
+        elif byu is not None:
+            before, after = byu
+            await _ensure_byu_free(session, after, alum.alumni_id)
+            byu_written.append((after, alum.alumni_id))
+            alum.byu_id = after
+            with audit_source_scope(AUDIT_SOURCE_SURVEY):
+                _audit(
+                    session,
+                    actor_user_id,
+                    "update",
+                    alum.alumni_id,
+                    field_name="byu_id",
+                    old_value=before or None,
+                    new_value=after,
+                    change_set_id=change_set_id,
+                )
         summary_extra += f" kept={len(kept)}"
         kind = row.kind
         created = False
     else:
         kind = body.kind or row.kind
-        alum = await _create_record(session, payload, kind, actor_user_id, change_set_id)
+        # A friend record never takes a BYU ID (like the year and degree).
+        byu_id = _byu_id_of(payload) if kind == "alum" else None
+        if byu_id:
+            await _ensure_byu_free(session, byu_id)
+            byu_written.append((byu_id, None))
+        alum = await _create_record(
+            session, payload, kind, actor_user_id, change_set_id, byu_id=byu_id
+        )
         created = True
 
     alumni_id = alum.alumni_id

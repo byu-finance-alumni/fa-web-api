@@ -641,7 +641,13 @@ async def _create_record(
         raw_year = _clean_new_value(NEW_GRADUATION_YEAR, sr._text(payload.get(NEW_GRADUATION_YEAR)))
         year = int(raw_year) if raw_year else None
         degree = _clean_new_value(NEW_BYU_DEGREE, sr._text(payload.get(NEW_BYU_DEGREE)))
+    # Every alumni column the shared apply will READ is set explicitly (to None),
+    # so it is loaded state after the flush below. An attribute never set on a
+    # new row is absent from its state, and reading one on a flushed row makes
+    # SQLAlchemy lazy-load it, which an AsyncSession cannot do (MissingGreenlet).
+    blank = {f.column: None for f in sr._FIELDS if f.group == "alumni"}
     alum = Alumni(
+        **blank,
         is_alumni=is_alum,
         archived=False,
         deceased=False,

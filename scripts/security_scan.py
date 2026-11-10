@@ -87,6 +87,18 @@ EXPECTED_PUBLIC_ROUTES = {
     # GET /support-contacts stays authenticated: this is a named exception, not
     # the start of a public directory of staff addresses.
     ("GET", "/survey/contact"),
+    # The new-people survey (api#661, Jake 2026-11-10): ONE shared link the
+    # career directors email to people not in the database yet. The credential
+    # is the link's random 256-bit key in the path, compared in constant time
+    # and reissuable; a wrong key and a switched-off link both 404 alike. The
+    # GET returns no PII (the required field keys and the survey's one support
+    # contact). The POST only HOLDS a submission for staff review -- nothing
+    # reaches `alumni` until a reviewer approves it -- behind per-key and
+    # per-IP rate limits, the survey's 413 size caps, a honeypot, and a global
+    # cap on pending rows. Because the key is shared it can leak; that is the
+    # accepted trade-off, and why the review step and the cap exist.
+    ("GET", "/survey/new/{key}"),
+    ("POST", "/survey/new/{key}"),
     # Public on purpose: the maintenance page has to render for signed-out
     # visitors, and the readiness probe has to answer before anyone is signed in.
     # /health/db opens a database connection per call and returns no detail on

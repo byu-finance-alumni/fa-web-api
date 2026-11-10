@@ -474,7 +474,7 @@ def test_missing_mail_config_is_502_before_sending(client, db, resend, state):
 # -------------------------------------------------------------------- email ---
 
 
-def test_email_body_has_intro_link_footer_and_no_unsubscribe(client, db, resend):
+def test_email_body_has_intro_link_and_no_unsubscribe_and_no_guessed_footer(client, db, resend):
     db.seed_link()
     _as("super_admin")
     _invite(client, "a@example.org")
@@ -483,12 +483,12 @@ def test_email_body_has_intro_link_footer_and_no_unsubscribe(client, db, resend)
     for part in (msg["html"], msg["text"]):
         assert link in part
         assert "Start the survey" in part
-        assert "Tanya Harmon" in part and "tanya_harmon@byu.edu" in part
+        # No survey contact configured -> no footer line, never a guessed address.
+        assert "Questions?" not in part and "tanya_harmon" not in part
         assert "unsubscribe" not in part.lower()
         for paragraph in new_people_survey.NEW_PEOPLE_INTRO_PARAGRAPHS:
             # The HTML escapes the apostrophes.
             assert paragraph in part or paragraph.replace("'", "&#x27;") in part
-    assert "Questions? Email Tanya Harmon at tanya_harmon@byu.edu" in msg["text"]
     assert f'href="{link}"' in msg["html"]
 
 

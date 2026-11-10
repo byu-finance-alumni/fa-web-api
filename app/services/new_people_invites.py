@@ -74,12 +74,10 @@ RESEND_FAILED_MESSAGE = "The email service didn't accept the send. Nothing was s
 NOT_CONFIGURED_MESSAGE = "Email sending is not set up on this server. Nothing was sent."
 BUSY_MESSAGE = "A survey send is running right now. Try again in a minute."
 
-# Footer fallback when no support contact is labelled for the survey. The
-# survey's own "email us" contact (`survey_email.survey_support_contact`, the
-# engineer-console row labelled "survey") wins when it resolves, so changing
-# who the survey names changes this email too.
-_FALLBACK_CONTACT_NAME = "Tanya Harmon"
-_FALLBACK_CONTACT_EMAIL = "tanya_harmon@byu.edu"
+# The footer names the survey's own "email us" contact
+# (`survey_email.survey_support_contact`, the engineer-console row labelled
+# "survey"). When none is set the footer line is LEFT OFF -- never a guessed
+# address, same rule as the survey itself.
 
 _TIMEOUT_SECONDS = 20.0
 # How long to wait for a running survey send to release the shared lock.
@@ -246,12 +244,15 @@ def survey_url(base_url: str, key: str) -> str:
     return f"{base_url.rstrip('/')}/survey/new/{key}"
 
 
-def render_invite_email(link: str, contact_name: str, contact_email: str) -> tuple[str, str, str]:
+def render_invite_email(
+    link: str, contact_name: str | None, contact_email: str | None
+) -> tuple[str, str, str]:
     """``(subject, html, text)``. Everything interpolated is HTML-escaped. NO
     unsubscribe link (standing project rule)."""
     paragraphs = new_people_survey.NEW_PEOPLE_INTRO_PARAGRAPHS
     signoff = new_people_survey.NEW_PEOPLE_INTRO_SIGNOFF
-    footer_text = f"Questions? Email {contact_name} at {contact_email}"
+    has_contact = bool(contact_name and contact_email)
+    footer_text = f"Questions? Email {contact_name} at {contact_email}" if has_contact else ""
 
     text = "\n".join(
         [
@@ -259,8 +260,7 @@ def render_invite_email(link: str, contact_name: str, contact_email: str) -> tup
             *signoff,
             "",
             f"{BUTTON_LABEL}: {link}",
-            "",
-            footer_text,
+            *(["", footer_text] if has_contact else []),
         ]
     )
 
@@ -269,9 +269,12 @@ def render_invite_email(link: str, contact_name: str, contact_email: str) -> tup
     signoff_html = "<br>".join(escape(line) for line in signoff)
     heading_html = escape(new_people_survey.NEW_PEOPLE_INTRO_HEADING)
     footer_html = (
-        f"Questions? Email {escape(contact_name)} at "
-        f'<a href="mailto:{escape(contact_email)}" style="color:#1e2a4a;">'
-        f"{escape(contact_email)}</a>"
+        '<p style="margin:0;font-size:14px;color:#4b5563;">'
+        f"Questions? Email {escape(contact_name or '')} at "
+        f'<a href="mailto:{escape(contact_email or "")}" style="color:#1e2a4a;">'
+        f"{escape(contact_email or '')}</a></p>"
+        if has_contact
+        else ""
     )
     html = f"""\
 <div style="margin:0;padding:0;background:#f3f4f6;">
@@ -285,7 +288,7 @@ def render_invite_email(link: str, contact_name: str, contact_email: str) -> tup
       <div style="margin:20px 0;">
         <a href="{escape(link)}" style="{_BTN_STYLE}">{escape(BUTTON_LABEL)}</a>
       </div>
-      <p style="margin:0;font-size:14px;color:#4b5563;">{footer_html}</p>
+      {footer_html}
     </div>
     <div style="padding:16px 24px;border-top:1px solid #e5e7eb;font-family:Arial,sans-serif;
          font-size:12px;color:#9ca3af;">BYU Marriott School of Business</div>
@@ -371,8 +374,8 @@ async def _send_locked(
         ):
             raise ServiceError(NOT_CONFIGURED_MESSAGE)
         contact = await survey_email.survey_support_contact(session)
-        contact_name = contact.name if contact else _FALLBACK_CONTACT_NAME
-        contact_email = contact.email if contact else _FALLBACK_CONTACT_EMAIL
+        contact_name = contact.name if contact else None
+        contact_email = contact.email if contact else None
         subject, html, text = render_invite_email(
             survey_url(settings.survey_app_base_url, key), contact_name, contact_email
         )

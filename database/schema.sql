@@ -1224,6 +1224,45 @@ CREATE TABLE opportunity_link_digest_send_log (
 );
 CREATE INDEX IF NOT EXISTS idx_opportunity_link_digest_send_log_sent_at ON opportunity_link_digest_send_log (sent_at);
 
+-- The new-people survey (api#661). ONE shared link the career directors email to
+-- people who are not in the database yet, and the HOLDING table for what they
+-- submit. Nothing here is counted as an alum: a reviewer approves each
+-- submission into a new record (alum or friend) or onto an existing one, or
+-- rejects it. `payload`/`comments` are PII while pending and purged once the
+-- submission is decided. See migrations/2026-11-10_new_people_survey.sql.
+CREATE TABLE new_people_survey_link (
+    id                  int PRIMARY KEY DEFAULT 1,
+    link_key            varchar(128) NOT NULL,
+    enabled             boolean NOT NULL DEFAULT false,
+    updated_by_user_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_new_people_survey_link_singleton CHECK (id = 1),
+    CONSTRAINT ck_new_people_survey_link_key_length CHECK (char_length(link_key) BETWEEN 32 AND 128),
+    CONSTRAINT fk_new_people_survey_link_updated_by FOREIGN KEY (updated_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+
+CREATE TABLE new_people_submissions (
+    submission_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind                varchar(10) NOT NULL,
+    payload             jsonb,
+    comments            text,
+    fill_seconds        int,
+    submitted_at        timestamptz NOT NULL DEFAULT now(),
+    status              varchar(20) NOT NULL DEFAULT 'pending',
+    decided_by_user_id  bigint,
+    decided_at          timestamptz,
+    alumni_id           bigint,
+    CONSTRAINT ck_new_people_submissions_kind CHECK (kind IN ('alum', 'friend')),
+    CONSTRAINT ck_new_people_submissions_status CHECK (status IN ('pending', 'approved', 'rejected')),
+    CONSTRAINT ck_new_people_submissions_fill_seconds CHECK (fill_seconds IS NULL OR fill_seconds >= 0),
+    CONSTRAINT ck_new_people_submissions_payload_state CHECK ((status = 'pending') = (payload IS NOT NULL)),
+    CONSTRAINT ck_new_people_submissions_comments_purged CHECK (status = 'pending' OR comments IS NULL),
+    CONSTRAINT fk_new_people_submissions_decided_by FOREIGN KEY (decided_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_new_people_submissions_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_new_people_submissions_status_submitted ON new_people_submissions (status, submitted_at);
+
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded
 -- from the frontend crosswalk. Keys are normalized: city_norm = lower(trim(city)),

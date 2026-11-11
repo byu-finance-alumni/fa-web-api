@@ -74,7 +74,7 @@ from app.schemas.profile import (
     TaskCreate,
     TaskRead,
 )
-from app.services import survey_email
+from app.services import survey_email, survey_one_off
 
 
 def _now() -> datetime.datetime:
@@ -200,6 +200,14 @@ _SEND_STAGE_LABELS = {
     2: "2-week reminder sent",
 }
 
+# One-off sends from the profile (api#669) say so, so staff can tell them from
+# the class campaign's emails.
+_ONE_OFF_STAGE_LABELS = {
+    0: "Survey sent (one-off)",
+    1: "1-week reminder sent (one-off)",
+    2: "2-week reminder sent (one-off)",
+}
+
 
 async def _derive_survey_history(
     session: AsyncSession,
@@ -245,7 +253,11 @@ async def _derive_survey_history(
             )
         ).all()
     )
-    if not responses and not sends:
+    # One-off sends from the profile (api#669) live in their own log so they
+    # never read as the class campaign's stage rows; they are still sends, so
+    # they count toward the open "sent, no reply yet" row below.
+    one_off_sends = await survey_one_off.sends_for_alum(session, alumni_id)
+    if not responses and not sends and not one_off_sends:
         return []
 
     # The alum's latest engineer reset, if any (#395). Everything submitted at or
@@ -309,18 +321,50 @@ async def _derive_survey_history(
         )
 
     # An open cycle: we emailed them and nothing has come back since. One row at
-    # most — `survey_send_log` is unique on (year, alumni, stage), so an alum has
-    # a single campaign's worth of sends.
-    if sends:
-        first_sent = sends[0].sent_at
-        last = sends[-1]
-        answered = any(r.submitted_at >= first_sent for r in responses)
+    # most.
+    #
+    # Every email we sent them, class and one-off (api#669), as
+    # (sent_at, stage, label), oldest first. Compared as aware UTC so a naive
+    # driver value cannot reorder them. "Answered" is measured from the LATEST
+    # initial ask (stage 0, of either kind): a one-off re-sent after an earlier
+    # reply is a new, still-open ask.
+    sent_events = sorted(
+        [
+            (
+                _as_utc(s.sent_at),
+                s.stage,
+                False,
+                _SEND_STAGE_LABELS.get(s.stage, "Survey sent"),
+            )
+            for s in sends
+        ]
+        + [
+            (_as_utc(at), stage, True, _ONE_OFF_STAGE_LABELS.get(stage, "Survey sent"))
+            for at, stage in one_off_sends
+        ],
+        key=lambda e: e[0],
+    )
+    if sent_events:
+        initials = [(at, one_off) for at, stage, one_off, _l in sent_events if stage == 0]
+        asked_at, asked_one_off = initials[-1] if initials else (sent_events[0][0], False)
+        last_at, _last_stage, _last_one_off, last_label = sent_events[-1]
+        answered = any(_as_utc(r.submitted_at) >= asked_at for r in responses)
+        # A one-off has its own day 0, so its deadline is measured from it rather
+        # than from the class campaign's start.
+        open_year = (
+            asked_at.year if asked_one_off else (campaign_start or asked_at.date()).year
+        )
+        open_due = (
+            asked_at.date() + datetime.timedelta(days=_CAMPAIGN_WINDOW_DAYS)
+            if asked_one_off
+            else campaign_due
+        )
         if not answered:
             rows.append(
                 SurveyRead(
                     survey_id=_OPEN_CYCLE_SURVEY_ID,
-                    survey_year=(campaign_start or first_sent.date()).year,
-                    survey_due_date=campaign_due,
+                    survey_year=open_year,
+                    survey_due_date=open_due,
                     completed=False,
                     completed_at=None,
                     # Left None on purpose: the UI derives "Overdue" vs
@@ -328,8 +372,7 @@ async def _derive_survey_history(
                     # the deadline passes without anything re-deriving here.
                     survey_status=None,
                     survey_notes=(
-                        f"{_SEND_STAGE_LABELS.get(last.stage, 'Survey sent')}"
-                        f" {last.sent_at.date().isoformat()} - no reply yet"
+                        f"{last_label} {last_at.date().isoformat()} - no reply yet"
                     ),
                 )
             )

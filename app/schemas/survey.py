@@ -785,6 +785,9 @@ class SurveyScheduleRunSummary(BaseModel):
     # an empty `ran` is never ambiguous between "nothing was owed" and "someone
     # else is already doing it".
     skipped_locked: bool = False
+    # Day-7 / day-14 reminders sent this run for one-off sends from a profile
+    # (api#669). They spend from the same daily budget as the class sends.
+    one_off_reminders_sent: int = 0
 
 
 class SurveyNonResponder(BaseModel):
@@ -1050,3 +1053,45 @@ class SurveyResetResult(BaseModel):
     # Of those, how many are still `pending`: awaiting review, still in the
     # review queue, still applicable to the record, staged photo intact.
     pending_preserved: int
+
+
+# ------------------------------------------------ one-off send (api#669) ------
+
+
+class SurveyOneOffPreview(BaseModel):
+    """What "Send survey" on a profile would do for this alum, before it does it.
+
+    The confirm dialog shows ``name`` and ``email`` (the ONE address the email
+    goes to, personal first then work), and ``last_sent_at`` as the "Last sent
+    on <date>" warning. When ``can_send`` is false the button is disabled and
+    ``reason`` says why in plain words; ``reason_code`` is the stable key."""
+
+    alumni_id: int
+    name: str
+    graduation_year: int | None = None
+    email: str | None = None
+    # "personal" or "work": which column `email` came from.
+    email_source: str | None = None
+    can_send: bool
+    # One of: not_alumni, archived, suppressed, unreachable,
+    # no_graduation_year, campaign_paused, campaign_cancelled. None when
+    # `can_send` is true.
+    reason_code: str | None = None
+    reason: str | None = None
+    # The last survey email of any kind (class or one-off) this alum was sent.
+    last_sent_at: datetime.datetime | None = None
+    # Their last survey reply within the past year, if any. A one-off is still
+    # allowed; the dialog just says so.
+    last_replied_at: datetime.datetime | None = None
+
+
+class SurveyOneOffResult(BaseModel):
+    """A one-off survey email that Resend accepted."""
+
+    alumni_id: int
+    email: str
+    email_source: str
+    sent_at: datetime.datetime
+    # Day-7 and day-14 reminders go out from the daily cron if they have not
+    # replied by then (Jake, 2026-11-11).
+    reminders_scheduled: bool = True

@@ -118,6 +118,9 @@ class _UsageSession:
             row = self._digest
         elif "new_people_invites" in sql:
             row = self._invites
+        elif "survey_one_off_send_log" in sql:
+            # One-off profile sends (api#669) -- their own ledger, none here.
+            row = (0, 0)
         else:
             row = self._survey
         return SimpleNamespace(first=lambda: row)
@@ -139,8 +142,9 @@ def test_usage_counts_the_digest_emails_in_both_the_day_and_the_month(no_baselin
     assert usage.sent_today == 9
     assert usage.sent_this_month == 36
     # Read inside a SAVEPOINT, so a failure cannot poison the send's transaction
-    # (one for the digest ledger, one for the new-people invite ledger).
-    assert session.savepoints == 2
+    # (one each for the digest ledger, the new-people invite ledger and the
+    # one-off profile-send ledger, api#669).
+    assert session.savepoints == 3
 
 
 def test_an_unreadable_digest_ledger_counts_as_zero_and_never_blocks_a_send(

@@ -1894,7 +1894,11 @@ def test_cron_runs_with_correct_secret(client, monkeypatch):
         "/survey/cron/run", headers={"Authorization": "Bearer topsecret"}
     )
     assert resp.status_code == 200
-    assert resp.json() == {"ran": [], "skipped_locked": False}
+    assert resp.json() == {
+            "ran": [],
+            "skipped_locked": False,
+            "one_off_reminders_sent": 0,
+        }
     assert ran == [True]
 
 

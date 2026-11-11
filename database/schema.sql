@@ -1280,6 +1280,35 @@ CREATE TABLE new_people_invites (
 CREATE INDEX IF NOT EXISTS idx_new_people_invites_hash_sent ON new_people_invites (email_hash, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_new_people_invites_sent_at ON new_people_invites (sent_at);
 
+-- One-off survey sends from an alum's profile (api#669). Kept OUT of
+-- survey_send_log so a one-off never reads as the class campaign's stage row.
+-- Counted into the shared Resend usage. See
+-- migrations/2026-11-11_survey_one_off_sends.sql.
+CREATE TABLE survey_one_off (
+    survey_one_off_id  bigserial PRIMARY KEY,
+    alumni_id          bigint NOT NULL,
+    graduation_year    integer NOT NULL,
+    sent_by_user_id    bigint,
+    started_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_survey_one_off_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
+    CONSTRAINT fk_survey_one_off_sent_by FOREIGN KEY (sent_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_survey_one_off_alumni_started ON survey_one_off (alumni_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_survey_one_off_started ON survey_one_off (started_at);
+
+CREATE TABLE survey_one_off_send_log (
+    survey_one_off_send_log_id  bigserial PRIMARY KEY,
+    survey_one_off_id           bigint NOT NULL,
+    stage                       smallint NOT NULL,
+    sent_at                     timestamptz NOT NULL DEFAULT now(),
+    resend_email_id             varchar(100),
+    sent_to                     varchar(320),
+    CONSTRAINT fk_survey_one_off_send_log_one_off FOREIGN KEY (survey_one_off_id) REFERENCES survey_one_off (survey_one_off_id) ON DELETE CASCADE,
+    CONSTRAINT ck_survey_one_off_send_log_stage CHECK (stage IN (0, 1, 2)),
+    CONSTRAINT uq_survey_one_off_send_log_stage UNIQUE (survey_one_off_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_survey_one_off_send_log_sent_at ON survey_one_off_send_log (sent_at);
+
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded
 -- from the frontend crosswalk. Keys are normalized: city_norm = lower(trim(city)),

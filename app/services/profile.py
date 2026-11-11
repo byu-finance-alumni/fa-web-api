@@ -15,6 +15,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import data_rules
 from app.core.audit_context import audit_source, new_change_set_id
 from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
@@ -74,7 +75,7 @@ from app.schemas.profile import (
     TaskCreate,
     TaskRead,
 )
-from app.services import survey_email
+from app.services import survey_email, survey_one_off
 
 
 def _now() -> datetime.datetime:
@@ -200,6 +201,14 @@ _SEND_STAGE_LABELS = {
     2: "2-week reminder sent",
 }
 
+# One-off sends from the profile (api#669) say so, so staff can tell them from
+# the class campaign's emails.
+_ONE_OFF_STAGE_LABELS = {
+    0: "Survey sent (one-off)",
+    1: "1-week reminder sent (one-off)",
+    2: "2-week reminder sent (one-off)",
+}
+
 
 async def _derive_survey_history(
     session: AsyncSession,
@@ -245,7 +254,11 @@ async def _derive_survey_history(
             )
         ).all()
     )
-    if not responses and not sends:
+    # One-off sends from the profile (api#669) live in their own log so they
+    # never read as the class campaign's stage rows; they are still sends, so
+    # they count toward the open "sent, no reply yet" row below.
+    one_off_sends = await survey_one_off.sends_for_alum(session, alumni_id)
+    if not responses and not sends and not one_off_sends:
         return []
 
     # The alum's latest engineer reset, if any (#395). Everything submitted at or
@@ -309,18 +322,50 @@ async def _derive_survey_history(
         )
 
     # An open cycle: we emailed them and nothing has come back since. One row at
-    # most — `survey_send_log` is unique on (year, alumni, stage), so an alum has
-    # a single campaign's worth of sends.
-    if sends:
-        first_sent = sends[0].sent_at
-        last = sends[-1]
-        answered = any(r.submitted_at >= first_sent for r in responses)
+    # most.
+    #
+    # Every email we sent them, class and one-off (api#669), as
+    # (sent_at, stage, label), oldest first. Compared as aware UTC so a naive
+    # driver value cannot reorder them. "Answered" is measured from the LATEST
+    # initial ask (stage 0, of either kind): a one-off re-sent after an earlier
+    # reply is a new, still-open ask.
+    sent_events = sorted(
+        [
+            (
+                _as_utc(s.sent_at),
+                s.stage,
+                False,
+                _SEND_STAGE_LABELS.get(s.stage, "Survey sent"),
+            )
+            for s in sends
+        ]
+        + [
+            (_as_utc(at), stage, True, _ONE_OFF_STAGE_LABELS.get(stage, "Survey sent"))
+            for at, stage in one_off_sends
+        ],
+        key=lambda e: e[0],
+    )
+    if sent_events:
+        initials = [(at, one_off) for at, stage, one_off, _l in sent_events if stage == 0]
+        asked_at, asked_one_off = initials[-1] if initials else (sent_events[0][0], False)
+        last_at, _last_stage, _last_one_off, last_label = sent_events[-1]
+        answered = any(_as_utc(r.submitted_at) >= asked_at for r in responses)
+        # A one-off has its own day 0, so its deadline is measured from it rather
+        # than from the class campaign's start.
+        open_year = (
+            asked_at.year if asked_one_off else (campaign_start or asked_at.date()).year
+        )
+        open_due = (
+            asked_at.date() + datetime.timedelta(days=_CAMPAIGN_WINDOW_DAYS)
+            if asked_one_off
+            else campaign_due
+        )
         if not answered:
             rows.append(
                 SurveyRead(
                     survey_id=_OPEN_CYCLE_SURVEY_ID,
-                    survey_year=(campaign_start or first_sent.date()).year,
-                    survey_due_date=campaign_due,
+                    survey_year=open_year,
+                    survey_due_date=open_due,
                     completed=False,
                     completed_at=None,
                     # Left None on purpose: the UI derives "Overdue" vs
@@ -328,8 +373,7 @@ async def _derive_survey_history(
                     # the deadline passes without anything re-deriving here.
                     survey_status=None,
                     survey_notes=(
-                        f"{_SEND_STAGE_LABELS.get(last.stage, 'Survey sent')}"
-                        f" {last.sent_at.date().isoformat()} - no reply yet"
+                        f"{last_label} {last_at.date().isoformat()} - no reply yet"
                     ),
                 )
             )
@@ -1099,16 +1143,23 @@ async def add_employment(
 ) -> EmploymentHistoryRead:
     """Insert a prior role into an alumnus's employment history (full_access)."""
     await _require_alumni(session, alumni_id)
+    # api#671/#672/#673: spelling fixes + the company-forces-industry rule.
+    values = data_rules.apply_job_rules(
+        {
+            "employer_name": payload.employer_name,
+            "employment_title": payload.employment_title,
+            "employment_industry": payload.employment_industry,
+            "city": payload.city,
+            "state": payload.state,
+        },
+        data_rules.HISTORY_JOB,
+    )
     row = EmploymentHistory(
         alumni_id=alumni_id,
-        employer_name=payload.employer_name,
-        employment_title=payload.employment_title,
-        employment_industry=payload.employment_industry,
-        city=payload.city,
-        state=payload.state,
         start_year=payload.start_year,
         end_year=payload.end_year,
         is_current=payload.is_current,
+        **values,
     )
     session.add(row)
     # Flush to obtain the surrogate id BEFORE auditing, so the trail names the row
@@ -1143,7 +1194,14 @@ async def update_employment(
         raise NotFoundError(
             f"Employment history {employment_history_id} not found."
         )
-    data = payload.model_dump(exclude_unset=True)
+    # api#671/#672/#673: judged against the effective employer (sent, else
+    # stored), so editing only the industry of an Unknown-company row still
+    # lands on Unknown.
+    data = data_rules.apply_job_rules(
+        payload.model_dump(exclude_unset=True),
+        data_rules.HISTORY_JOB,
+        stored_employer=row.employer_name,
+    )
     # Audit each field that actually changes with its old + new value (#45),
     # mirroring update_interaction — until now this path recorded only that an
     # edit happened, so a corrected employer or title was unrecoverable. One
@@ -1206,15 +1264,22 @@ async def add_education(
 ) -> EducationRead:
     """Add an education entry to an alumnus's record (full_access)."""
     await _require_alumni(session, alumni_id)
+    # api#672: any spelling of unknown is stored as "Unknown".
+    values = data_rules.normalize_values(
+        "education_history",
+        {
+            "university": payload.university,
+            "college": payload.college,
+            "department": payload.department,
+            "degree": payload.degree,
+            "major": payload.major,
+            "degree_status": payload.degree_status,
+        },
+    )
     row = EducationHistory(
         alumni_id=alumni_id,
-        university=payload.university,
-        college=payload.college,
-        department=payload.department,
-        degree=payload.degree,
-        major=payload.major,
-        degree_status=payload.degree_status,
         degree_year=payload.degree_year,
+        **values,
     )
     session.add(row)
     # Flush for the surrogate id before auditing (see add_employment).
@@ -1245,7 +1310,9 @@ async def update_education(
     row = await session.get(EducationHistory, education_id)
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Education {education_id} not found.")
-    data = payload.model_dump(exclude_unset=True)
+    data = data_rules.normalize_values(
+        "education_history", payload.model_dump(exclude_unset=True)
+    )
     # Per-field old/new capture, as in update_employment (#45).
     change_set_id = new_change_set_id()
     for field, value in data.items():

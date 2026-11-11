@@ -635,11 +635,18 @@ def test_invalid_industry_rejected():
     assert "industry" in row["error"].lower()
 
 
-@pytest.mark.parametrize("placeholder", ["unknown", "Unknown", "UNKNOWN", "n/a", "N/A", "na"])
+@pytest.mark.parametrize("placeholder", ["n/a", "N/A", "na"])
 def test_industry_placeholder_maps_to_other(placeholder):
     # Real intake sheets use these tokens for "no known industry" — map to Other
     # instead of rejecting the row (import-only leniency).
     assert import_csv._coerce_industry("Current industry", placeholder) == "Other"
+
+
+@pytest.mark.parametrize("spelling", ["unknown", "Unknown", "UNKNOWN", " unkown ", "Unknwn"])
+def test_industry_unknown_spelling_imports_as_unknown(spelling):
+    # api#672: any spelling of unknown is the Unknown industry (a real option
+    # since #295), no longer folded into Other.
+    assert import_csv._coerce_industry("Current industry", spelling) == "Unknown"
 
 
 def test_industry_placeholder_row_imports():

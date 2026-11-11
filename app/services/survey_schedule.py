@@ -100,7 +100,7 @@ from app.schemas.survey import (
     SurveyScheduleRunSummary,
     SurveySendConfigItem,
 )
-from app.services import survey_email
+from app.services import survey_email, survey_one_off
 
 # The formula-injection-safe cell renderer every CSV export shares, imported
 # rather than re-derived (same rule as `opportunity_links._cell`).
@@ -2483,6 +2483,21 @@ async def _run_due_schedules_locked(
     # Shared daily/monthly send budget for this whole run (None = cap disabled).
     allowance = await _run_allowance(session)
 
+    # ONE-OFF REMINDERS FIRST (api#669): the day-7 / day-14 follow-ups for
+    # surveys sent to one alum from their profile. A handful at most, each one
+    # a promise made to a specific person on a specific day, so they are not
+    # left behind a large cohort draining the day's budget. They spend from the
+    # same allowance and stop the run on a 429 like any class send. They never
+    # touch `survey_send_log`, so no class campaign below sees them.
+    one_off = await survey_one_off.send_due_reminders(session, limit=allowance)
+    if allowance is not None:
+        allowance -= one_off.sent
+    if one_off.retry_after is not None:
+        await session.commit()
+        return SurveyScheduleRunSummary(
+            ran=[], one_off_reminders_sent=one_off.sent
+        )
+
     ran: list[SurveyScheduleRunItem] = []
     for sched, year, start_date in due:
         elapsed = (today - start_date).days
@@ -2599,4 +2614,4 @@ async def _run_due_schedules_locked(
             break
 
     await session.commit()
-    return SurveyScheduleRunSummary(ran=ran)
+    return SurveyScheduleRunSummary(ran=ran, one_off_reminders_sent=one_off.sent)

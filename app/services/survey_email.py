@@ -510,6 +510,17 @@ async def get_send_usage(session: AsyncSession) -> SurveyUsage:
     )
     sent_today += invite_today
     sent_this_month += invite_month
+    # ONE-OFF SENDS from a profile (api#669) are logged apart from this table on
+    # purpose (a row here would read as the class campaign's stage), so they are
+    # added from their own ledger, under the same never-raising contract.
+    # Imported locally: `survey_one_off` imports this module.
+    from app.services import survey_one_off
+
+    one_off_today, one_off_month = await survey_one_off.sent_counts(
+        session, start_today=start_today, start_month=start_month, after=anchor
+    )
+    sent_today += one_off_today
+    sent_this_month += one_off_month
     if anchor is not None:
         # Add the baseline only while we're still in the anchor's day / month.
         if now.date() == anchor.date():

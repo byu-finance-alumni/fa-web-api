@@ -46,6 +46,7 @@ from app.models.role_capability import RoleCapability
 from app.models.service_incident import ServiceIncident
 from app.models.survey_email_event import SurveyEmailEvent
 from app.models.survey_email_message import SurveyEmailMessage
+from app.models.survey_one_off import SurveyOneOff, SurveyOneOffSendLog
 from app.models.survey_reset import SurveyResetLog
 from app.models.survey_response import SurveyResponse
 from app.models.survey_retirement import SurveyCampaignRetirement
@@ -98,6 +99,8 @@ __all__ = [
     "SurveyCampaignRetirement",
     "SurveyEmailEvent",
     "SurveyEmailMessage",
+    "SurveyOneOff",
+    "SurveyOneOffSendLog",
     "SurveyResetLog",
     "SurveyResponse",
     "SurveySchedule",

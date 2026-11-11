@@ -136,6 +136,7 @@ from app.services import (
     hygiene,
     images,
     import_csv,
+    secondary_industry_groups,
     supabase_storage,
 )
 from app.services import profile as profile_service
@@ -264,6 +265,30 @@ async def list_alumni(
             )
         ),
     ] = None,
+    secondary_industry_group: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "SECONDARY industry GROUP (fa-web-app#936) — repeatable (OR). "
+                "Matches every stored spelling that folds into the named group: "
+                "case and spacing are ignored, detail after ' - ', ':', ',' or "
+                "'(' is dropped, a known name followed by more words folds into "
+                "it, and anything starting with 'Healthcare' is Healthcare. The "
+                "same grouping the dashboard's Other table counts with."
+            )
+        ),
+    ] = None,
+    no_secondary_industry: Annotated[
+        bool,
+        Query(
+            description=(
+                "Only alumni with NO current secondary industry (blank or "
+                "unset) — the 'No secondary industry' row of the dashboard's "
+                "Other table (fa-web-app#936). OR-ed with "
+                "'secondary_industry_group' when both are given."
+            )
+        ),
+    ] = False,
     title: Annotated[
         list[str] | None,
         Query(description="Current job title(s) — repeatable, exact match."),
@@ -611,6 +636,12 @@ async def list_alumni(
     # returned every alumnus is the export/list-parity failure this repo keeps
     # re-learning.
     photo_filter = await headshot_index.resolve_missing_photo(missing_photo)
+    # Secondary-industry group (fa-web-app#936): resolved from the stored values
+    # through the SAME shared function the export and the dashboard's Other
+    # table use, so a row's count, its list and its CSV are one population.
+    secondary_group_filter = await secondary_industry_groups.resolve_group_filter(
+        session, secondary_industry_group, no_secondary_industry
+    )
     items, total = await service.list_alumni(
         session,
         limit=limit,
@@ -669,6 +700,7 @@ async def list_alumni(
         missing_phone=missing_phone,
         missing_linkedin=missing_linkedin,
         photo_filter=photo_filter,
+        secondary_group_filter=secondary_group_filter,
         duplicate=duplicate,
         comment_filter=comment_filter,
         is_alumni=is_alumni_filter,
@@ -701,6 +733,10 @@ async def list_alumni(
             "secondary_industry": (
                 "|".join(secondary_industry) if secondary_industry else None
             ),
+            "secondary_industry_group": (
+                "|".join(secondary_industry_group) if secondary_industry_group else None
+            ),
+            "no_secondary_industry": no_secondary_industry or None,
             "title": "|".join(title) if title else None,
             "seniority": "|".join(seniority) if seniority else None,
             "employment_status": (

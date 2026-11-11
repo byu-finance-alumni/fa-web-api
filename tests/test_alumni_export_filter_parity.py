@@ -412,3 +412,47 @@ def test_comment_filter_null_in_the_body_means_off(client, captured, session):
     # The app sends every field, with null as "no predicate", and
     # `exclude_unset` counts that null as SET. Off must stay off.
     assert _list_sql(client, captured, "") == _export_sql(session, comment_filter=None)
+
+
+# --- secondary-industry group (fa-web-app#936) ----------------------------------
+#
+# Resolved from the stored secondary values (like ``missing_photo`` from the
+# bucket), so both sides must call the SAME resolver; the stored-value lookup is
+# faked identically for both.
+
+_STORED_SECONDARY = ["Healthcare", "Healthcare - Biotech", "healthcare services", "Law", "Other"]
+
+
+@pytest.fixture
+def stored_secondary(monkeypatch):
+    from app.services import secondary_industry_groups
+
+    async def _fake(_session):
+        return list(_STORED_SECONDARY)
+
+    monkeypatch.setattr(secondary_industry_groups, "stored_secondary_values", _fake)
+
+
+def test_secondary_industry_group_parity(client, captured, session, stored_secondary):
+    _assert_same_population(
+        client, captured, session,
+        "industry_group=other&secondary_industry_group=Healthcare",
+        industry_group="other", secondary_industry_group=["Healthcare"],
+    )
+
+
+def test_no_secondary_industry_parity(client, captured, session, stored_secondary):
+    _assert_same_population(
+        client, captured, session,
+        "industry_group=other&no_secondary_industry=true",
+        industry_group="other", no_secondary_industry=True,
+    )
+
+
+def test_secondary_industry_group_export_is_narrower(client, captured, session, stored_secondary):
+    grouped, params = _export_sql(session, secondary_industry_group=["Healthcare"])
+    unfiltered, _ = _export_sql(session)
+    assert grouped != unfiltered
+    # Every Healthcare spelling is matched, and nothing else.
+    values = {v for p in params.values() if isinstance(p, list) for v in p}
+    assert values == {"Healthcare", "Healthcare - Biotech", "healthcare services"}

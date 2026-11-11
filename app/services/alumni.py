@@ -21,6 +21,7 @@ import re
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import data_rules
 from app.core.audit_context import audit_source, new_change_set_id
 from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
@@ -576,6 +577,10 @@ async def archive_current_role(
         target: outgoing.get(source)
         for source, target in _ROLE_ARCHIVE_COLUMNS.items()
     }
+    # The archived row is a job row being saved like any other, so it gets the
+    # api#671/#672/#673 rules (an outgoing "UNKNOWN" employer lands in history as
+    # Unknown / industry Unknown).
+    values = data_rules.apply_job_rules(values, data_rules.HISTORY_JOB)
     # Nothing but blanks means there is no role here to preserve; writing the row
     # anyway would leave an empty entry on the Employment panel that a human then
     # has to go and delete. Mirrors `_upsert_section`'s all-blank rule.
@@ -820,6 +825,22 @@ async def create_alumni(
         if k not in SECTION_KEYS and k not in CONTROL_KEYS
     }
     await _validate_spouse_link(session, core.get("spouse_alumni_id"))
+    # api#671/#672/#673 — the company forces the industry (and, for the current
+    # job, the employment status). `career` was already spelling-fixed by the
+    # hygiene pass; `former` is not a hygiene section, so it is fixed here.
+    if cleaned.get("career"):
+        cleaned["career"] = data_rules.apply_job_rules(
+            cleaned["career"], data_rules.CURRENT_JOB
+        )
+        forced_status = data_rules.employment_status_for(
+            cleaned["career"].get("current_employer")
+        )
+        if forced_status is not None:
+            core["employment_status"] = forced_status
+    if cleaned.get("former"):
+        cleaned["former"] = data_rules.apply_job_rules(
+            cleaned["former"], data_rules.HISTORY_JOB
+        )
     # Last-updated provenance (#285): stamp the creator as the updater so a brand
     # new record reads "Last updated <created> by <name>" instead of falling back
     # to the intake sheet's free-text name. Never set from the client — the FK is
@@ -1130,6 +1151,37 @@ async def update_alumni(
         await _validate_spouse_link(
             session, changes["spouse_alumni_id"], self_id=alumni_id
         )
+    career = getattr(payload, "career", None)
+    career_values = (
+        hygiene.clean_section("career", career.model_dump(exclude_unset=True))
+        if career is not None and career.has_values()
+        else {}
+    )
+    # api#671/#673 — the company forces the industry (and the employment status)
+    # on every save that touches the job or the status. Judged against the
+    # EFFECTIVE employer: the one this save sends, else the one on file, so a
+    # save that changes only the industry of an "Unknown"-company job still lands
+    # on Unknown. Folded into `career_values` / `changes` BEFORE the writes below,
+    # so the no-op check, the audit trail and "last updated" all see the forced
+    # value exactly as if the user had typed it.
+    if career_values or "employment_status" in changes:
+        stored_job = await session.scalar(
+            select(CurrentEmployment)
+            .where(CurrentEmployment.alumni_id == alumni_id)
+            .order_by(CurrentEmployment.current_employment_id.desc())
+            .limit(1)
+        )
+        stored_employer = getattr(stored_job, "current_employer", None)
+        if career_values or stored_job is not None:
+            career_values = data_rules.apply_job_rules(
+                career_values,
+                data_rules.CURRENT_JOB,
+                stored_employer=stored_employer,
+            )
+        effective_employer = career_values.get("current_employer", stored_employer)
+        forced_status = data_rules.employment_status_for(effective_employer)
+        if forced_status is not None:
+            changes["employment_status"] = forced_status
     # Only audit fields that actually changed; capture before/after per field.
     applied: dict[str, tuple[object, object]] = {}
     for field, value in changes.items():
@@ -1148,7 +1200,6 @@ async def update_alumni(
     # omitted. A field sent as an explicit null IS "set", so intentional clears
     # still apply; a merely-absent field is left untouched.
     contact = getattr(payload, "contact", None)
-    career = getattr(payload, "career", None)
     education = getattr(payload, "education", None)
     engagement = getattr(payload, "engagement", None)
     # {"<section>.<field>": (old, new)} for every nested-section field that
@@ -1222,12 +1273,12 @@ async def update_alumni(
         # being entered has no previous role to demote.
         if stored_role is not None:
             outgoing_role = career_snapshot(stored_role)
-    if career is not None and career.has_values():
+    if career_values:
         career_changes = await _upsert_section(
             session,
             CurrentEmployment,
             alumni_id,
-            hygiene.clean_section("career", career.model_dump(exclude_unset=True)),
+            career_values,
             order_by=CurrentEmployment.current_employment_id.desc(),
         )
         section_applied.update(_namespaced("career", career_changes))

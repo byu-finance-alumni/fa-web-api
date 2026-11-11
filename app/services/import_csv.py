@@ -39,6 +39,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit_context import AUDIT_SOURCE_IMPORT, audit_source_scope
+from app.core.data_rules import UNKNOWN, is_unknown
 from app.core.dropdowns import (
     holds_designation,
     normalize_designation,
@@ -577,6 +578,11 @@ def _reconcile_best_contact(contact: dict) -> str | None:
 
 
 def _coerce_industry(header: str, raw: str) -> str:
+    # Any spelling of "unknown" is the Unknown industry (api#672) -- a real
+    # vocabulary option since #295, and what the sheet literally says. The
+    # other placeholders ("n/a") still fold into the "Other" catch-all.
+    if is_unknown(raw):
+        return UNKNOWN
     if raw.strip().lower() in _PLACEHOLDER_TOKENS:
         return "Other"
     try:
@@ -893,9 +899,9 @@ def _map_row(
         # A free-text location / secondary-industry cell filled with a
         # placeholder ("unknown", "n/a") isn't known — store blank, not the
         # literal token.
-        if (
-            field in _PLACEHOLDER_BLANK_FIELDS
-            and raw.strip().lower() in _PLACEHOLDER_TOKENS
+        # A misspelt "unkown" is the same placeholder (api#672).
+        if field in _PLACEHOLDER_BLANK_FIELDS and (
+            raw.strip().lower() in _PLACEHOLDER_TOKENS or is_unknown(raw)
         ):
             continue
 

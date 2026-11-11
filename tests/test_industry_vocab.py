@@ -47,7 +47,8 @@ MIGRATIONS_DIR = DATABASE_DIR / "migrations"
 DROPDOWNS_MD = DATABASE_DIR / "dropdowns.md"
 
 # The four industries Tanya asked to drop from the PRIMARY dropdown (2026-07-16),
-# plus FP&A (Jake, 2026-10-21, fa-web-app #875).
+# plus FP&A (Jake, 2026-10-21, fa-web-app #875), plus "Not in the Labor Force"
+# (Jake, 2026-11-11, api#673).
 # NOTE the stored value is "Sales and Trading", not "Sales & Trading".
 SECONDARY_ONLY = (
     "Law",
@@ -55,6 +56,7 @@ SECONDARY_ONLY = (
     "Sales and Trading",
     "Credit Risk",
     "FP&A",
+    "Not in the Labor Force",
 )
 
 # A ('industry', 'Some Value', 12) tuple inside a vocabulary_terms INSERT.
@@ -164,7 +166,8 @@ def test_db_vocab_sort_order_is_tuple_index_with_other_pinned_last() -> None:
     assert terms["Other"] == 99
     assert terms["Graduate Student"] == 98
     assert terms["Unknown"] == 97
-    for index, value in enumerate(INDUSTRIES[:-3]):
+    assert terms["Not in the Labor Force"] == 96
+    for index, value in enumerate(INDUSTRIES[:-4]):
         assert terms[value] == index, f"{value} sort_order {terms[value]} != {index}"
 
 
@@ -190,10 +193,21 @@ def test_unknown_is_pinned_third_to_last() -> None:
     assert INDUSTRIES[-3] == "Unknown"
 
 
+def test_not_in_labor_force_is_pinned_fourth_to_last() -> None:
+    """"Not in the Labor Force" (api#673) heads the pinned tail, above "Unknown":
+    a status rather than a sector, secondary-only, and never a wheel bar."""
+    from app.core.dropdowns import _NON_WHEEL_INDUSTRIES
+
+    assert INDUSTRIES[-4] == "Not in the Labor Force"
+    assert "Not in the Labor Force" not in PRIMARY_INDUSTRIES
+    assert "Not in the Labor Force" in SECONDARY_INDUSTRIES
+    assert "Not in the Labor Force" in _NON_WHEEL_INDUSTRIES
+
+
 def test_industries_are_alphabetical_ignoring_case_other_aside() -> None:
-    # Exclude the three pinned tail options ("Unknown", "Graduate Student",
-    # "Other"); the rest of the list is alphabetical case-insensitively.
-    body = list(INDUSTRIES[:-3])
+    # Exclude the four pinned tail options ("Not in the Labor Force", "Unknown",
+    # "Graduate Student", "Other"); the rest is alphabetical case-insensitively.
+    body = list(INDUSTRIES[:-4])
     assert body == sorted(body, key=str.casefold)
 
 

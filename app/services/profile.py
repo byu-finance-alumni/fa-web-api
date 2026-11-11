@@ -15,6 +15,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import data_rules
 from app.core.audit_context import audit_source, new_change_set_id
 from app.core.dropdowns import ENGAGEMENT_FLAG_TAGS, engagement_flag_for_tag
 from app.core.errors import ConflictError, NotFoundError
@@ -1099,16 +1100,23 @@ async def add_employment(
 ) -> EmploymentHistoryRead:
     """Insert a prior role into an alumnus's employment history (full_access)."""
     await _require_alumni(session, alumni_id)
+    # api#671/#672/#673: spelling fixes + the company-forces-industry rule.
+    values = data_rules.apply_job_rules(
+        {
+            "employer_name": payload.employer_name,
+            "employment_title": payload.employment_title,
+            "employment_industry": payload.employment_industry,
+            "city": payload.city,
+            "state": payload.state,
+        },
+        data_rules.HISTORY_JOB,
+    )
     row = EmploymentHistory(
         alumni_id=alumni_id,
-        employer_name=payload.employer_name,
-        employment_title=payload.employment_title,
-        employment_industry=payload.employment_industry,
-        city=payload.city,
-        state=payload.state,
         start_year=payload.start_year,
         end_year=payload.end_year,
         is_current=payload.is_current,
+        **values,
     )
     session.add(row)
     # Flush to obtain the surrogate id BEFORE auditing, so the trail names the row
@@ -1143,7 +1151,14 @@ async def update_employment(
         raise NotFoundError(
             f"Employment history {employment_history_id} not found."
         )
-    data = payload.model_dump(exclude_unset=True)
+    # api#671/#672/#673: judged against the effective employer (sent, else
+    # stored), so editing only the industry of an Unknown-company row still
+    # lands on Unknown.
+    data = data_rules.apply_job_rules(
+        payload.model_dump(exclude_unset=True),
+        data_rules.HISTORY_JOB,
+        stored_employer=row.employer_name,
+    )
     # Audit each field that actually changes with its old + new value (#45),
     # mirroring update_interaction — until now this path recorded only that an
     # edit happened, so a corrected employer or title was unrecoverable. One
@@ -1206,15 +1221,22 @@ async def add_education(
 ) -> EducationRead:
     """Add an education entry to an alumnus's record (full_access)."""
     await _require_alumni(session, alumni_id)
+    # api#672: any spelling of unknown is stored as "Unknown".
+    values = data_rules.normalize_values(
+        "education_history",
+        {
+            "university": payload.university,
+            "college": payload.college,
+            "department": payload.department,
+            "degree": payload.degree,
+            "major": payload.major,
+            "degree_status": payload.degree_status,
+        },
+    )
     row = EducationHistory(
         alumni_id=alumni_id,
-        university=payload.university,
-        college=payload.college,
-        department=payload.department,
-        degree=payload.degree,
-        major=payload.major,
-        degree_status=payload.degree_status,
         degree_year=payload.degree_year,
+        **values,
     )
     session.add(row)
     # Flush for the surrogate id before auditing (see add_employment).
@@ -1245,7 +1267,9 @@ async def update_education(
     row = await session.get(EducationHistory, education_id)
     if row is None or row.alumni_id != alumni_id:
         raise NotFoundError(f"Education {education_id} not found.")
-    data = payload.model_dump(exclude_unset=True)
+    data = data_rules.normalize_values(
+        "education_history", payload.model_dump(exclude_unset=True)
+    )
     # Per-field old/new capture, as in update_employment (#45).
     change_set_id = new_change_set_id()
     for field, value in data.items():

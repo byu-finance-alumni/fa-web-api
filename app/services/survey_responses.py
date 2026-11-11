@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import data_rules
 from app.core.audit_context import (
     AUDIT_SOURCE_SURVEY,
     audit_source,
@@ -1182,7 +1183,20 @@ def _coerce(field: _Field, raw: object):
         # storing the value or NULLing a column that may hold a good one. The
         # caller counts this in `ignored` and logs the KEY, never the value.
         return _IGNORE
+    # api#672/#673: "UNKOWN" is stored as "Unknown", "not in labor force" as the
+    # canonical label -- the same `data_rules` the staff and import paths use.
+    table = _RULE_TABLE_BY_GROUP.get(field.group)
+    if value and table is not None:
+        value = data_rules.normalize_value(table, field.column, value)
     return value or None
+
+
+# `_Field.group` -> the table `data_rules` keys its column lists by.
+_RULE_TABLE_BY_GROUP = {
+    "alumni": "alumni",
+    "contact": "alumni_contact_info",
+    "employment": "current_employment",
+}
 
 
 # --------------------------------------------------------------- submit ------
@@ -2126,6 +2140,30 @@ async def apply_response(
     )
 
 
+def _capture_forced(
+    field_changes: list[tuple[str, object, object]],
+    field_name: str,
+    old: object,
+    new: object,
+) -> None:
+    """Record a value a data rule forced (api#671/#673) in the apply's audit.
+
+    When the loop already captured this field (the alum's own answer), its row is
+    rewritten to end at the forced value, keeping the ORIGINAL old value -- one
+    row saying what the column held before the approval and what it holds after.
+    A field that ends where it started drops out entirely.
+    """
+    for i, (name, first_old, _new) in enumerate(field_changes):
+        if name == field_name:
+            if _unchanged(first_old, new):
+                del field_changes[i]
+            else:
+                field_changes[i] = (name, first_old, new)
+            return
+    if not _unchanged(old, new):
+        field_changes.append((field_name, old, new))
+
+
 async def apply_payload_to_record(
     session: AsyncSession,
     alum: Alumni,
@@ -2263,6 +2301,24 @@ async def apply_payload_to_record(
             old = getattr(eng, field.column, None)
             setattr(eng, field.column, value)
             _capture(field, old, value)
+
+    # api#671/#673 — the company forces the industry, the secondary industry and
+    # (this is the CURRENT job) the employment status, whatever the alum picked.
+    # Applied to the row as it now stands, so a re-confirm that leaves an
+    # "Unknown" company alone still fixes an industry it disagrees with. Each
+    # forced value is folded into the field-level audit as part of this approval.
+    if job is not None:
+        for column, (old, new) in data_rules.apply_rules_to_row(
+            job, data_rules.CURRENT_JOB
+        ).items():
+            _capture_forced(field_changes, f"career.{column}", old, new)
+        forced_status = data_rules.employment_status_for(
+            getattr(job, "current_employer", None)
+        )
+        if forced_status is not None and alum.employment_status != forced_status:
+            old_status = alum.employment_status
+            alum.employment_status = forced_status
+            _capture_forced(field_changes, "employment_status", old_status, forced_status)
 
     # #446 — demote the outgoing role once the loop has written the new one, so
     # the comparison is against what this apply actually stored. Done here rather

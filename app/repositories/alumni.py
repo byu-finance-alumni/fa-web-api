@@ -549,6 +549,12 @@ def build_alumni_query(
     # function stay pure and the export compile it without a session — and what
     # stops the list from going N+1 against storage.
     photo_filter=None,
+    # Secondary-industry GROUP (fa-web-app#936) — the resolved predicate from
+    # ``services.secondary_industry_groups.resolve_group_filter``, which folds
+    # "Healthcare - Biotech" / "healthcare services" into one Healthcare group
+    # from the values on file. Resolved by the route / export (it needs the
+    # distinct stored values), exactly like ``photo_filter``; ``None`` -> off.
+    secondary_group_filter=None,
     duplicate: bool = False,
     # "Left a comment" (fa-web-app#923): ``survey_comment`` | ``any_note`` | ``None`` (off).
     # See ``_comment_filter_exists``.
@@ -1208,6 +1214,10 @@ def build_alumni_query(
         # and an unset filter is ``None`` (no predicate) rather than a silent
         # match-everything.
         conditions.append(photo_filter)
+    if secondary_group_filter is not None:
+        # Already alumni-level (EXISTS / NOT EXISTS over current_employment),
+        # built by the SAME grouper the dashboard "Other" table counts with.
+        conditions.append(secondary_group_filter)
     if duplicate:
         is_duplicate = (
             select(DuplicateCandidate.duplicate_candidate_id)

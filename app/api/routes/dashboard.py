@@ -29,7 +29,11 @@ from app.models.employment import CurrentEmployment, EmploymentHistory
 from app.models.engagement import AlumniProgramEngagement
 from app.models.event import Event, EventAttendance
 from app.models.user import User
-from app.repositories.alumni import has_employer_or_not_applicable, has_linkedin_url
+from app.repositories.alumni import (
+    build_alumni_query,
+    has_employer_or_not_applicable,
+    has_linkedin_url,
+)
 from app.schemas.auth import UserContext
 from app.schemas.dashboard import (
     ActivityFeed,
@@ -39,8 +43,9 @@ from app.schemas.dashboard import (
     EventParticipationRow,
     FollowUpRow,
     InteractionActivity,
+    OtherSecondaryIndustries,
 )
-from app.services import headshot_index
+from app.services import headshot_index, secondary_industry_groups
 from app.services.employment_display import employer_display
 from app.utils.sql import escape_like
 
@@ -719,6 +724,62 @@ async def summary(_: RequireViewAccess, session: SessionDep) -> dict:
             "graduate_student": graduate_student_count,
         },
     }
+
+
+@router.get("/other-industries", response_model=OtherSecondaryIndustries)
+async def other_industries(_: RequireViewAccess, session: SessionDep) -> dict:
+    """The people in the industry chart's "Other" bar, grouped by SECONDARY
+    industry (fa-web-app#936). Aggregate counts only, like ``/summary``.
+
+    The population is ``build_alumni_query(industry_group="other")`` — the very
+    statement the alumni list runs for ``?industry_group=other`` — so the rows
+    sum to that list's total. Each stored secondary value is folded into its
+    group by ``secondary_industry_groups``, the same grouper the list's
+    ``secondary_industry_group`` / ``no_secondary_industry`` filters resolve
+    through, so a row's count equals the list (and CSV) it links to.
+
+    current_employment is unique per alumnus, so grouping on its secondary
+    column counts each person exactly once.
+    """
+    other_ids = build_alumni_query(industry_group="other").with_only_columns(
+        Alumni.alumni_id
+    )
+    raw_rows = (
+        await session.execute(
+            select(
+                CurrentEmployment.current_industry_secondary,
+                func.count(func.distinct(CurrentEmployment.alumni_id)),
+            )
+            .where(CurrentEmployment.alumni_id.in_(other_ids))
+            .group_by(CurrentEmployment.current_industry_secondary)
+        )
+    ).all()
+    stored = await secondary_industry_groups.stored_secondary_values(session)
+    grouper = secondary_industry_groups.SecondaryIndustryGrouper(stored)
+    counts: dict[str | None, int] = {}
+    for raw, n in raw_rows:
+        counts[raw] = counts.get(raw, 0) + int(n)
+    names = grouper.display_names(counts, stored)
+    by_group: dict[str | None, int] = {}
+    for raw, n in counts.items():
+        group = grouper.group_key(raw)
+        by_group[group] = by_group.get(group, 0) + n
+    rows = [
+        {
+            "name": (
+                names[group]
+                if group is not None
+                else secondary_industry_groups.NO_SECONDARY_LABEL
+            ),
+            "group": names[group] if group is not None else None,
+            "no_secondary": group is None,
+            "count": n,
+        }
+        for group, n in by_group.items()
+        if n > 0
+    ]
+    rows.sort(key=lambda r: (-r["count"], r["no_secondary"], r["name"].casefold()))
+    return {"total": sum(r["count"] for r in rows), "rows": rows}
 
 
 @router.get("/birthdays", response_model=list[BirthdayRow])

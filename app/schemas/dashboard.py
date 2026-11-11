@@ -126,6 +126,31 @@ class DashboardSummary(BaseModel):
     industry_breakdown: DashboardIndustryBreakdown
 
 
+class OtherSecondaryIndustryRow(BaseModel):
+    """One row of the dashboard "Other" table (fa-web-app#936).
+
+    ``name`` is the clean display name ("Healthcare", "Law", or "No secondary
+    industry"). To open the alumni in this row, the client sends
+    ``industry_group=other`` plus ``secondary_industry_group=<group>`` — or
+    ``no_secondary_industry=true`` when ``no_secondary`` is set (``group`` is
+    then null).
+    """
+
+    name: str
+    group: str | None = None
+    no_secondary: bool = False
+    count: int
+
+
+class OtherSecondaryIndustries(BaseModel):
+    """``GET /dashboard/other-industries``: the people in the "Other" bar,
+    grouped by secondary industry, highest count first. ``total`` is the sum of
+    the rows — the size of the ``industry_group=other`` population."""
+
+    total: int
+    rows: list[OtherSecondaryIndustryRow]
+
+
 class BirthdayRow(BaseModel):
     """One alumnus with a birthday this month (``GET /dashboard/birthdays``).
     Only the recurring month+day is exposed — never the birth year (FERPA)."""

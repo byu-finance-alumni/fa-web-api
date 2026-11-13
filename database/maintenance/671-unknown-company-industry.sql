@@ -1,4 +1,7 @@
 -- ============================================================================
+-- NOTE: SUPERSEDED 2026-11-13: this now runs automatically as
+--    database/migrations/2026-11-13_cleanup_unknown_and_nilf.sql (Jake asked).
+--    Kept for reference / the read-only preview. Do NOT also run it by hand.
 -- 671-unknown-company-industry.sql
 -- Issue fa-web-api #671 -- a job whose company is Unknown gets industry Unknown
 --              (not Other). Decisions, Jake 2026-11-11:

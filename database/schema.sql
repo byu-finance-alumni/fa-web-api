@@ -1309,6 +1309,20 @@ CREATE TABLE survey_one_off_send_log (
 );
 CREATE INDEX IF NOT EXISTS idx_survey_one_off_send_log_sent_at ON survey_one_off_send_log (sent_at);
 
+-- Old values saved by the one-time #672/#671/#673 cleanup migration
+-- (migrations/2026-11-13_cleanup_unknown_and_nilf.sql), so it can be reversed.
+-- Drop once the cleanup is confirmed.
+CREATE TABLE data_cleanup_backup (
+    data_cleanup_backup_id  bigserial PRIMARY KEY,
+    cleanup                 text NOT NULL,
+    table_name              text NOT NULL,
+    row_id                  bigint NOT NULL,
+    column_name             text NOT NULL,
+    old_value               text,
+    old_updated_at          timestamptz,
+    backed_up_at            timestamptz NOT NULL DEFAULT now()
+);
+
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded
 -- from the frontend crosswalk. Keys are normalized: city_norm = lower(trim(city)),

@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.data_rules import normalize_value
 from app.core.dropdowns import employer_applies
 from app.core.us_states import is_us_country as _is_us_country
 from app.core.us_states import to_full_name as _state_full_name
@@ -400,17 +401,35 @@ _COLLAPSE_FIELDS = {
 }
 
 
+# Hygiene section -> the table its fields live on, for the save-time spelling
+# rules in ``app.core.data_rules`` (#672/#673).
+_SECTION_TABLES = {
+    "core": "alumni",
+    "contact": "alumni_contact_info",
+    "career": "current_employment",
+    "education": "education_history",
+}
+
+
 def _clean_field(section: str, field: str, value: object) -> object:
-    """Clean a single field's value per its rule. Non-strings pass through."""
+    """Clean a single field's value per its rule. Non-strings pass through.
+
+    Every string then gets the #672/#673 spelling fix (any spelling of
+    "unknown" -> ``Unknown``; "not in labor force" -> the canonical label), so
+    ``/preview`` shows it and the write path stores it.
+    """
     cleaner = _CLEANERS.get((section, field))
     if cleaner is not None:
-        return cleaner(value)
-    if section in _NAME_FIELDS and field in _NAME_FIELDS[section]:
-        return _smart_title(value)
-    # Generic: collapse any string; leave non-strings (ints, bools, dates).
-    if isinstance(value, str):
-        return _collapse(value)
-    return value
+        cleaned = cleaner(value)
+    elif section in _NAME_FIELDS and field in _NAME_FIELDS[section]:
+        cleaned = _smart_title(value)
+    elif isinstance(value, str):
+        # Generic: collapse any string; leave non-strings (ints, bools, dates).
+        cleaned = _collapse(value)
+    else:
+        return value
+    table = _SECTION_TABLES.get(section)
+    return normalize_value(table, field, cleaned) if table else cleaned
 
 
 def _label(section: str, field: str) -> str:

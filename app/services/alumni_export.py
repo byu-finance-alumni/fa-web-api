@@ -40,7 +40,7 @@ from app.schemas.alumni_export import (
     ExportColumn,
     ExportColumnCatalog,
 )
-from app.services import geo_search, headshot_index
+from app.services import geo_search, headshot_index, secondary_industry_groups
 from app.services.employment_display import employer_display
 
 log = logging.getLogger(__name__)
@@ -456,7 +456,16 @@ def _filters_dict(filters: AlumniExportFilters) -> dict:
     """
     out = filters.model_dump(
         exclude_unset=True,
-        exclude={"sort", "near", "radius", "missing_photo", "kind", "is_alumni"},
+        exclude={
+            "sort",
+            "near",
+            "radius",
+            "missing_photo",
+            "secondary_industry_group",
+            "no_secondary_industry",
+            "kind",
+            "is_alumni",
+        },
     )
     # The friends/alumni split is ALWAYS passed, resolved from ``kind`` /
     # ``is_alumni`` (#594): leaving it to ``exclude_unset`` is what let an
@@ -512,6 +521,13 @@ async def build_export_query(
     photo_filter = await headshot_index.resolve_missing_photo(filters.missing_photo)
     if photo_filter is not None:
         kwargs["photo_filter"] = photo_filter
+    # Secondary-industry group (fa-web-app#936): the same resolver as the list
+    # route, so a dashboard Other-table row's CSV is the people it counted.
+    secondary_group_filter = await secondary_industry_groups.resolve_group_filter(
+        session, filters.secondary_industry_group, filters.no_secondary_industry
+    )
+    if secondary_group_filter is not None:
+        kwargs["secondary_group_filter"] = secondary_group_filter
     return build_alumni_query(**kwargs)
 
 

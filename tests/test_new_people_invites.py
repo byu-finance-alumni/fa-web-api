@@ -577,6 +577,9 @@ class _UsageSession:
             row = self._invites
         elif "opportunity_link_digest_send_log" in sql:
             row = (0, 0)
+        elif "survey_one_off_send_log" in sql:
+            # One-off profile sends (api#669) -- their own ledger, none here.
+            row = (0, 0)
         else:
             row = self._survey
         return SimpleNamespace(first=lambda: row)

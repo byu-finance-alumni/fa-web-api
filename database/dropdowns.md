@@ -28,11 +28,12 @@ Used by:
 > `migrations/*.sql`. Change all three together — order included.
 
 Listed in **dropdown order**: alphabetical, compared case-insensitively (so
-"Financial Services" precedes "FP&A"), with `Unknown`, `Graduate Student` and the
-`Other` catch-all pinned last (in that order). This order is mirrored by
-`vocabulary_terms.sort_order` (the tuple index for the alphabetical body;
-`Unknown` is pinned at 97, `Graduate Student` at 98 and `Other` at 99 so new
-options can be appended without a re-sort).
+"Financial Services" precedes "FP&A"), with `Not in the Labor Force`, `Unknown`,
+`Graduate Student` and the `Other` catch-all pinned last (in that order). This
+order is mirrored by `vocabulary_terms.sort_order` (the tuple index for the
+alphabetical body; `Not in the Labor Force` is pinned at 96, `Unknown` at 97,
+`Graduate Student` at 98 and `Other` at 99 so new options can be appended
+without a re-sort).
 
 Options:
 - Asset Management
@@ -56,6 +57,7 @@ Options:
 - Valuation & Advisory
 - Venture Capital
 - Wealth Management
+- Not in the Labor Force *(secondary only)*
 - Unknown
 - Graduate Student
 - Other
@@ -63,7 +65,8 @@ Options:
 ### Primary vs secondary (#282)
 
 Requested by Tanya, 2026-07-16 (FP&A added by Jake, 2026-10-21, fa-web-app
-#875). The five options marked *(secondary only)* are
+#875; Not in the Labor Force by Jake, 2026-11-11, api#673). The six options
+marked *(secondary only)* are
 **not offered as an alumnus's primary industry** — they aren't dashboard
 industries — but they remain fully valid as a **secondary** industry.
 
@@ -120,6 +123,27 @@ It is a **valid primary industry** (selectable and filterable, NOT in
 `_NON_WHEEL_INDUSTRIES` and simply **folds into `Other`** on the wheel. Unlike
 `Graduate Student` it gets **no** separate dashboard indicator. It is pinned in
 the dropdown just above `Graduate Student` (`sort_order` 97).
+
+### Save-time rules: Unknown and Not in the Labor Force (api#671/#672/#673)
+
+Jake, 2026-11-11. Applied on every save (staff form, employment rows, survey
+apply, CSV import) by `app/core/data_rules.py`; existing records are fixed by
+the hand-run files in `database/maintenance/` (672-, 671-, 673-).
+
+- Any spelling of unknown (`UNKNOWN`, `unkown`, ` unknwn `) that is the WHOLE
+  value is stored as exactly `Unknown`. `Unknown startup` is left alone.
+- Company `Unknown` → industry `Unknown`, always, even over a real industry.
+- Company `Not in the Labor Force` (any casing/spacing, with or without "the")
+  → company text `Not in the Labor Force`, industry `Other`, secondary
+  `Not in the Labor Force`, and (current job only) employment status
+  `Not in the Labor Force`.
+
+### Not in the Labor Force (api#673)
+
+A **secondary-only** industry (offered on the staff form and the survey's
+secondary dropdown, hidden from every primary dropdown). It only exists to
+record the company rule above. Not a wheel slice: such alumni count in the
+`Other` bar. Pinned at the head of the tail (`sort_order` 96).
 
 ### Military (#608)
 

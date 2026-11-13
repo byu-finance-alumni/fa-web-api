@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
+    RequireAlumniEdit,
     RequireEngineer,
     RequireSurveysManage,
     RequireSurveysProgress,
@@ -70,6 +71,8 @@ from app.schemas.survey import (
     SurveyNewCyclePreview,
     SurveyNewCycleRequest,
     SurveyNonResponder,
+    SurveyOneOffPreview,
+    SurveyOneOffResult,
     SurveyRecipientBreakdown,
     SurveyResetResult,
     SurveyResponders,
@@ -96,6 +99,7 @@ from app.services import (
     survey_bounces,
     survey_email,
     survey_message,
+    survey_one_off,
     survey_reset,
     survey_responses,
     survey_schedule,
@@ -1446,6 +1450,57 @@ async def survey_reset_alumnus(
     cohort re-run is `POST /schedules/{grad_year}/new-cycle`.
     """
     return await survey_reset.reset_alumnus(
+        session, alumni_id, actor_user_id=user.user_id
+    )
+
+
+# ------------------------------------------- one-off send (api#669) ----------
+
+
+@router.get(
+    "/alumni/{alumni_id}/one-off",
+    response_model=SurveyOneOffPreview,
+)
+async def survey_one_off_preview(
+    alumni_id: Annotated[int, Path(ge=1, le=2**63 - 1)],
+    user: RequireAlumniEdit,
+    session: SessionDep,
+) -> SurveyOneOffPreview:
+    """What the profile's "Send survey" button would do for this alum.
+
+    Who it goes to (name + the ONE address: personal, then work), when they were
+    last sent a survey of any kind, and -- when it can't be sent -- why
+    (deceased / Do Not Contact, no usable email, no graduation year, their
+    class's campaign paused or stopped). Sends nothing.
+
+    Gated like the profile's Edit button (`alumni.edit`)."""
+    return await survey_one_off.get_preview(session, alumni_id)
+
+
+@router.post(
+    "/alumni/{alumni_id}/one-off",
+    response_model=SurveyOneOffResult,
+)
+async def survey_one_off_send(
+    alumni_id: Annotated[int, Path(ge=1, le=2**63 - 1)],
+    user: RequireAlumniEdit,
+    session: SessionDep,
+) -> SurveyOneOffResult:
+    """Send the survey to this ONE alum now (a REAL send -- there is no dry run;
+    `GET` this same path is the preview).
+
+    Same email, copy and 7-day link as the class send, and the same day-7 and
+    day-14 reminders if they don't reply. It is NOT the class campaign: it is
+    logged apart from `survey_send_log`, so it never uses up, completes or
+    blocks their class's one-time send, and the class send still emails them.
+
+    Counts toward the daily/monthly send cap, takes the send lock, and is
+    refused (409, nothing sent) when they can't be sent to, the cap is spent,
+    another send is running, or their class's campaign is paused or stopped.
+    Re-sending to the same person is allowed. Audited on the alum's record.
+
+    Gated like the profile's Edit button (`alumni.edit`)."""
+    return await survey_one_off.send_one_off(
         session, alumni_id, actor_user_id=user.user_id
     )
 

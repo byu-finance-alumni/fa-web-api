@@ -16,14 +16,16 @@ from __future__ import annotations
 
 from typing import Literal
 
+from app.core.data_rules import normalize_unknown
 from app.core.errors import InvalidRequestError
 
 # Industries — current_industry, current_industry_secondary, employment_industry.
 #
 # ORDER IS THE DROPDOWN ORDER and is mirrored by ``vocabulary_terms.sort_order``
 # (category 'industry'), where sort_order == the index below EXCEPT for the three
-# pinned tail options: "Unknown" (97), "Graduate Student" (98) and "Other" (99),
-# which are held at the bottom out of alphabetical order.
+# pinned tail options: "Not in the Labor Force" (96), "Unknown" (97), "Graduate
+# Student" (98) and "Other" (99), which are held at the bottom out of
+# alphabetical order.
 # ``tests/test_industry_vocab.py`` parses the migrations and fails if the two
 # sources drift — do NOT reorder this tuple without a matching migration.
 #
@@ -36,6 +38,13 @@ from app.core.errors import InvalidRequestError
 # not a status indicator, so it is not pinned to the tail. Inserting it there
 # shifts every later body index by one, which is why its migration re-upserts
 # the whole body's sort_order rather than appending a single row.
+#
+# "Not in the Labor Force" (api#673, Jake 2026-11-11) is pinned at the head of
+# the tail, like "Graduate Student" a status rather than a sector. It is a
+# SECONDARY-only industry (in ``_PRIMARY_EXCLUDED_INDUSTRIES``): a job whose
+# company is "Not in the Labor Force" is stored as industry Other + secondary
+# "Not in the Labor Force" (``app.core.data_rules``). On the dashboard it folds
+# into Other like every non-wheel industry.
 INDUSTRIES: tuple[str, ...] = (
     "Asset Management",
     "Commercial Banking",
@@ -58,13 +67,18 @@ INDUSTRIES: tuple[str, ...] = (
     "Valuation & Advisory",
     "Venture Capital",
     "Wealth Management",
+    "Not in the Labor Force",
     "Unknown",
     "Graduate Student",
     "Other",
 )
 
-# Mentor industries — the same list plus Law/Government (multi-select field).
-MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
+# Mentor industries — the same list plus Law/Government (multi-select field),
+# minus "Not in the Labor Force" (api#673), which is not a field to mentor in.
+MENTOR_INDUSTRIES: tuple[str, ...] = (
+    *(i for i in INDUSTRIES if i != "Not in the Labor Force"),
+    "Law/Government",
+)
 
 # --- primary vs secondary industry (#282) ------------------------------------
 # Tanya, 2026-07-16: these four (five since #875 added FP&A) aren't dashboard
@@ -87,8 +101,18 @@ MENTOR_INDUSTRIES: tuple[str, ...] = (*INDUSTRIES, "Law/Government")
 # on-file value is left untouched). The existing prod rows are moved by hand with
 # database/maintenance/875-fpa-to-corporate-finance.sql (primary -> Corporate
 # Finance, FP&A kept as secondary).
+#
+# "Not in the Labor Force" joined on 2026-11-11 (api#673): it only ever appears
+# as the secondary industry of a job whose company says so (industry Other).
 _PRIMARY_EXCLUDED_INDUSTRIES = frozenset(
-    {"Law", "Corporate Banking", "Sales and Trading", "Credit Risk", "FP&A"}
+    {
+        "Law",
+        "Corporate Banking",
+        "Sales and Trading",
+        "Credit Risk",
+        "FP&A",
+        "Not in the Labor Force",
+    }
 )
 _PRIMARY_EXCLUDED_BY_LOWER = frozenset(
     v.lower() for v in _PRIMARY_EXCLUDED_INDUSTRIES
@@ -143,6 +167,7 @@ _NON_WHEEL_INDUSTRIES = frozenset(
         "Sales and Trading",
         "Credit Risk",
         "Military",
+        "Not in the Labor Force",
         "Unknown",
         "Graduate Student",
         "Other",
@@ -193,6 +218,9 @@ def validate_industry(value: str | None) -> str | None:
     value = value.strip()
     if not value:
         return None
+    # Any spelling of "unknown" ("UNKOWN", "unknwn") is the Unknown industry
+    # (api#672), rather than a 422 for a typo of a value that IS on the list.
+    value = normalize_unknown(value)
     canonical = _INDUSTRIES_BY_LOWER.get(value.lower())
     if canonical is None:
         raise ValueError("Must be one of: " + ", ".join(INDUSTRIES))

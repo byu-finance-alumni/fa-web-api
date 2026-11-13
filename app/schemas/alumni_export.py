@@ -78,6 +78,12 @@ class AlumniExportFilters(BaseModel):
     # export of a filtered view still returns exactly that view.
     industry: list[str] | None = None
     secondary_industry: list[str] | None = None
+    # Secondary-industry GROUP + "no secondary" (fa-web-app#936). Like
+    # ``missing_photo`` these are EXCLUDED from ``_filters_dict`` and resolved by
+    # ``build_export_query`` through the SAME
+    # ``secondary_industry_groups.resolve_group_filter`` the list route calls.
+    secondary_industry_group: list[str] | None = None
+    no_secondary_industry: bool = False
     title: list[str] | None = None
     seniority: list[str] | None = None
     employment_status: list[str] | None = None

@@ -1,4 +1,7 @@
 -- ============================================================================
+-- NOTE: SUPERSEDED 2026-11-13: this now runs automatically as
+--    database/migrations/2026-11-13_cleanup_unknown_and_nilf.sql (Jake asked).
+--    Kept for reference / the read-only preview. Do NOT also run it by hand.
 -- 672-unify-unknown.sql
 -- Issue fa-web-api #672 -- every spelling of "unknown" becomes exactly "Unknown"
 --              (Jake, 2026-11-11): capital U, the rest lowercase -- what the

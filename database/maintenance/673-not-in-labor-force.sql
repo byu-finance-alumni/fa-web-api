@@ -1,4 +1,7 @@
 -- ============================================================================
+-- NOTE: SUPERSEDED 2026-11-13: this now runs automatically as
+--    database/migrations/2026-11-13_cleanup_unknown_and_nilf.sql (Jake asked).
+--    Kept for reference / the read-only preview. Do NOT also run it by hand.
 -- 673-not-in-labor-force.sql
 -- Issue fa-web-api #673 -- a job whose company is listed as "Not in the Labor
 --              Force" gets (Jake, 2026-11-11):

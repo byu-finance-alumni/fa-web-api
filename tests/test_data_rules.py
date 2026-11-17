@@ -823,44 +823,22 @@ def test_681_migration_shape():
     assert names.index("2026-11-13_cleanup_unknown_and_nilf.sql") < names.index(MIGRATION_681.name)
 
 
-# --- the maintenance SQL --------------------------------------------------------
+# --- the cleanup migration (replaced the hand-run maintenance SQL) -----------
 
-
-_SQL_FILES = (
-    "672-unify-unknown.sql",
-    "671-unknown-company-industry.sql",
-    "673-not-in-labor-force.sql",
+CLEANUP_MIGRATION = (
+    MAINTENANCE.parent / "migrations" / "2026-11-13_cleanup_unknown_and_nilf.sql"
 )
 
 
-@pytest.mark.parametrize("name", _SQL_FILES)
-def test_maintenance_sql_shape(name):
-    """Hand-run files: transaction opened, COMMIT left for the human, never in
-    migrations/ (which auto-runs on prod)."""
-    sql = (MAINTENANCE / name).read_text(encoding="utf-8")
-    assert not (MAINTENANCE.parent / "migrations" / name).exists()
-    code = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
-    assert re.search(r"^BEGIN;", code, re.M)
-    assert "UPDATE " in code
-    assert not re.search(r"^\s*COMMIT;", code, re.M), "COMMIT must stay commented out"
-    assert "-- COMMIT;" in sql
-    # Balanced parentheses and quotes: a cheap "it at least parses" guard.
-    assert code.count("(") == code.count(")")
-    assert code.count("'") % 2 == 0
-
-
-@pytest.mark.parametrize("name", _SQL_FILES)
-def test_maintenance_sql_uses_the_python_patterns(name):
-    sql = (MAINTENANCE / name).read_text(encoding="utf-8")
-    if name != "673-not-in-labor-force.sql":
-        assert f"'{data_rules.UNKNOWN_SQL_REGEX}'" in sql
-    if name == "673-not-in-labor-force.sql":
-        assert f"'{data_rules.NLF_SQL_REGEX}'" in sql
+def test_cleanup_migration_uses_the_python_patterns():
+    sql = CLEANUP_MIGRATION.read_text(encoding="utf-8")
+    assert f"'{data_rules.UNKNOWN_SQL_REGEX}'" in sql
+    assert f"'{data_rules.NLF_SQL_REGEX}'" in sql
 
 
 def test_unknown_cleanup_covers_exactly_the_rule_columns():
-    sql = (MAINTENANCE / "672-unify-unknown.sql").read_text(encoding="utf-8")
-    pairs = set(re.findall(r"UPDATE (\w+)\s+SET (\w+) = 'Unknown'", sql))
+    sql = CLEANUP_MIGRATION.read_text(encoding="utf-8")
+    pairs = set(re.findall(r"\('(\w+)', '\w+', '(\w+)'\)", sql))
     expected = {
         (table, column)
         for table, columns in data_rules.UNKNOWN_COLUMNS.items()

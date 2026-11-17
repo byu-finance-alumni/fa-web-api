@@ -4,7 +4,8 @@ ONE place decides these rules, and every write path calls it, so the staff form,
 the per-row employment endpoints, the survey apply, the new-people approve and
 the CSV import (which goes through the staff create/update service) can never
 disagree about what gets stored. The one-time cleanup of records that already
-exist is hand-run SQL in ``database/maintenance/`` (672-, 671-, 673-), which
+exist ran as the migrations 2026-11-13_cleanup_unknown_and_nilf.sql and
+2026-11-17_nilf_by_employment_status.sql, which
 restates these same patterns in Postgres regex form -- change one, change both;
 ``tests/test_data_rules.py`` pins the two against each other.
 
@@ -97,8 +98,8 @@ def normalize_not_in_labor_force(value):
 
 # --- which columns ------------------------------------------------------------
 #
-# Free-text columns where "unknown" plausibly appears, by table. The maintenance
-# SQL (672-unify-unknown.sql) touches EXACTLY these; a test keeps them in step.
+# Free-text columns where "unknown" plausibly appears, by table. The cleanup
+# migration (2026-11-13) touches EXACTLY these; a test keeps them in step.
 # Deliberately absent: names, emails, phones, URLs, notes, and ``gender`` (a
 # validated vocabulary that does not include Unknown).
 UNKNOWN_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -293,7 +294,7 @@ def apply_rules_to_row(
 
 # --- SQL mirror ---------------------------------------------------------------
 #
-# The maintenance files restate the two spellings in Postgres. Kept here as
+# The cleanup migrations restate the two spellings in Postgres. Kept here as
 # strings so a test can assert they match the Python patterns above.
 SQL_TRIM_CHARS = "E' \\t\\n\\r\\f' || chr(11) || chr(160)"
 UNKNOWN_SQL_REGEX = _UNKNOWN_RE.pattern

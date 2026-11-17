@@ -71,6 +71,7 @@ from app.core.dropdowns import (
     holds_designation,
 )
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
+from app.core.security_log import log_safe
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -982,7 +983,9 @@ def _log_safe_keys(keys: list[str]) -> str:
     rendered = ", ".join(repr(k[:_LOG_KEY_MAX]) for k in shown)
     if len(keys) > _LOG_KEYS_MAX:
         rendered += f", ... ({len(keys) - _LOG_KEYS_MAX} more)"
-    return rendered
+    # `repr` already escaped every line break; `log_safe` is the belt to that
+    # brace, and the form CodeQL's py/log-injection recognises as a sanitiser.
+    return log_safe(rendered)
 
 
 def _audit_field_name(field: _Field) -> str:
@@ -2307,13 +2310,22 @@ async def apply_payload_to_record(
     # Applied to the row as it now stands, so a re-confirm that leaves an
     # "Unknown" company alone still fixes an industry it disagrees with. Each
     # forced value is folded into the field-level audit as part of this approval.
+    #
+    # api#681 -- an employment status of "Not in the Labor Force" (as it stands
+    # after this apply) forces the same industry/secondary; an alum with no job
+    # row gets one holding just those (company left blank, never invented).
+    alum_status = getattr(alum, "employment_status", None)
+    if job is None and data_rules.is_not_in_labor_force(alum_status):
+        job = CurrentEmployment(alumni_id=alum.alumni_id)
+        session.add(job)
+        created_rows.add("employment")
     if job is not None:
         for column, (old, new) in data_rules.apply_rules_to_row(
-            job, data_rules.CURRENT_JOB
+            job, data_rules.CURRENT_JOB, employment_status=alum_status
         ).items():
             _capture_forced(field_changes, f"career.{column}", old, new)
         forced_status = data_rules.employment_status_for(
-            getattr(job, "current_employer", None)
+            getattr(job, "current_employer", None), alum_status
         )
         if forced_status is not None and alum.employment_status != forced_status:
             old_status = alum.employment_status
@@ -2363,7 +2375,7 @@ async def apply_payload_to_record(
             log_label,
             len(ignored),
             alum.alumni_id,
-            ", ".join(sorted(ignored)),
+            _log_safe_keys(ignored),
         )
 
     # A rename can collide with an existing alumnus, and until now the survey was

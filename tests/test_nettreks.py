@@ -243,6 +243,7 @@ class _World:
         linkedin=None,
         industry="Banking",
         secondary="Tech",
+        title=None,
     ):
         self.s.add(
             Alumni(
@@ -264,6 +265,7 @@ class _World:
                     current_employment_id=alumni_id,
                     alumni_id=alumni_id,
                     current_employer=employer or f"Co{alumni_id}",
+                    current_title=title if title is not None else f"Title{alumni_id}",
                     current_industry=industry,
                     current_industry_secondary=secondary,
                     current_city=city,
@@ -487,6 +489,7 @@ def test_csv_header_order_and_cells(world):
         "Middle Name",
         "Last Name",
         "Company",
+        "Job Title",
         "Industry",
         "Secondary Industry",
         "Company City",
@@ -501,10 +504,12 @@ def test_csv_header_order_and_cells(world):
     assert len(rows) == 1 + 5  # 1, 2, 3, 121 (unrelated label) and 20
     first = rows[1]  # L001, a host
     assert first[:3] == ["F1", "M", "L001"]
-    assert first[6:9] == ["Dallas", "Texas", "p1@dev.example"]
-    assert first[13:] == ["2010"]
-    assert first[10] == "555-0100"  # a number the formatter does not know: as stored
-    assert all(len(r) == 14 for r in rows)
+    assert first[3:5] == ["Co1", "Title1"]  # Job Title right after Company (#945)
+    assert first[7:10] == ["Dallas", "Texas", "p1@dev.example"]
+    assert first[10] == "w1@dev.example"  # the CSV keeps Work Email…
+    assert first[11] == "555-0100"  # …and Phone, as stored when not recognized
+    assert first[14:] == ["2010"]
+    assert all(len(r) == 15 for r in rows)
     # The formula-injection guard is applied.
     evil = next(r for r in rows[1:] if r[2] == "L020")
     assert evil[3] == "\t=HYPERLINK(1)"
@@ -517,7 +522,7 @@ def test_csv_formats_the_phone_like_the_table_and_leaves_the_row_stored(world):
             world.db, A.dallas, K.area_alumni, actor_user_id=None, can_edit=True
         )
     )
-    assert _csv_rows(text)[1][10] == "(801) 555-1234"
+    assert _csv_rows(text)[1][11] == "(801) 555-1234"
     page = asyncio.run(
         nt.list_report(world.db, A.dallas, K.area_alumni, limit=5, offset=0, can_edit=True)
     )

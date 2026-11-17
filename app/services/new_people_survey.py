@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit_context import AUDIT_SOURCE_SURVEY, audit_source_scope, new_change_set_id
 from app.core.config import get_settings
 from app.core.errors import ConflictError, InvalidRequestError, NotFoundError
+from app.core.security_log import log_safe
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -537,7 +538,11 @@ async def submit(
         )
     )
     await session.commit()
-    log.info("new-people survey: held a %s submission (%d fields)", kind, len(payload))
+    # A fixed label, never the submitted text itself (log injection).
+    kind_label = "friend" if kind == "friend" else "alum"
+    log.info(
+        "new-people survey: held a %s submission (%d fields)", kind_label, len(payload)
+    )
     await _maybe_alert(pending + 1)
 
 
@@ -1088,7 +1093,10 @@ async def approve(
             raise
         await session.rollback()
         byu_id, exclude = byu_written[0]
-        log.warning("new-people survey: BYU ID collision on approve of %s", submission_id)
+        log.warning(
+            "new-people survey: BYU ID collision on approve of %s",
+            log_safe(submission_id),
+        )
         raise ConflictError(
             _byu_conflict_message(await _byu_owner(session, byu_id, exclude))
         ) from None

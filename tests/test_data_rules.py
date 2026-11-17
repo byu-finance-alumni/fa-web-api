@@ -821,6 +821,8 @@ def test_681_migration_shape():
     # Sorts after the migration that creates data_cleanup_backup.
     names = sorted(p.name for p in MIGRATION_681.parent.glob("*.sql"))
     assert names.index("2026-11-13_cleanup_unknown_and_nilf.sql") < names.index(MIGRATION_681.name)
+    # ...and BEFORE the migration that drops it.
+    assert names.index(MIGRATION_681.name) < names.index("2026-11-17_purge_data_cleanup_backup.sql")
 
 
 # --- the cleanup migration (replaced the hand-run maintenance SQL) -----------

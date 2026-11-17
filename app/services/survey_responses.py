@@ -71,6 +71,7 @@ from app.core.dropdowns import (
     holds_designation,
 )
 from app.core.errors import InvalidRequestError, NotFoundError, ServiceError
+from app.core.security_log import log_safe
 from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
@@ -982,7 +983,9 @@ def _log_safe_keys(keys: list[str]) -> str:
     rendered = ", ".join(repr(k[:_LOG_KEY_MAX]) for k in shown)
     if len(keys) > _LOG_KEYS_MAX:
         rendered += f", ... ({len(keys) - _LOG_KEYS_MAX} more)"
-    return rendered
+    # `repr` already escaped every line break; `log_safe` is the belt to that
+    # brace, and the form CodeQL's py/log-injection recognises as a sanitiser.
+    return log_safe(rendered)
 
 
 def _audit_field_name(field: _Field) -> str:
@@ -2372,7 +2375,7 @@ async def apply_payload_to_record(
             log_label,
             len(ignored),
             alum.alumni_id,
-            ", ".join(sorted(ignored)),
+            _log_safe_keys(ignored),
         )
 
     # A rename can collide with an existing alumnus, and until now the survey was

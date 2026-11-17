@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 import unicodedata
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.alumni import _INVISIBLE_CHARS, DuplicateWarning
 
@@ -1083,6 +1083,20 @@ class SurveyOneOffPreview(BaseModel):
     # Their last survey reply within the past year, if any. A one-off is still
     # allowed; the dialog just says so.
     last_replied_at: datetime.datetime | None = None
+
+
+class SurveyOneOffSendRequest(BaseModel):
+    """Optional body of ``POST /survey/alumni/{alumni_id}/one-off``.
+
+    ``confirm_resend`` must be true to email someone who was sent a survey (class
+    or one-off) in the last 24 hours; without it that send is refused with a 409
+    whose ``error.code`` is ``resend_confirm_required`` and whose
+    ``error.last_sent_at`` is the previous send. An empty body (or ``{}``) means
+    "not confirmed"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_resend: bool = False
 
 
 class SurveyOneOffResult(BaseModel):

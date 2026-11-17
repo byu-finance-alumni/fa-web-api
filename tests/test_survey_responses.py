@@ -1681,3 +1681,18 @@ def test_secondary_industry_blank_is_a_clear_not_a_rejection():
     assert field.blankable is True
     assert _coerce(field, "") is None
     assert _coerce(field, "   ") is None
+
+
+def test_log_safe_keys_output_never_holds_a_line_break():
+    """CodeQL py/log-injection (2026-11-17): `ignored` was joined raw. It now
+    goes through `_log_safe_keys` like `dropped`, so its output never holds a
+    raw CR or LF."""
+    rendered = sr._log_safe_keys(["a\r\nINFO:forged", "b\nc"])
+    assert "\n" not in rendered and "\r" not in rendered
+
+
+def test_log_safe_strips_line_breaks():
+    from app.core.security_log import log_safe
+
+    assert log_safe("12\r\nWARNING:forged") == "12WARNING:forged"
+    assert log_safe(12) == "12"

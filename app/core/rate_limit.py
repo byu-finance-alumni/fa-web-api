@@ -412,6 +412,22 @@ NEW_PEOPLE_INVITE_LIMITER = rate_limiter(
 )
 NewPeopleInviteRateLimit = Annotated[UserContext, Depends(NEW_PEOPLE_INVITE_LIMITER)]
 
+# "Send survey" on a profile (api#669): each call is one REAL email from the
+# shared Resend account, and the gate is ``alumni.edit`` -- a broader set of
+# people than ``surveys.manage``. Same budget as the invite brake above: 10 sends
+# per editor per 10 minutes is far above anyone working through profiles by
+# hand, and stops a compromised editor session or a runaway loop from burning
+# the account's daily cap (or spamming alumni) before anyone notices. The send
+# itself adds a per-alum 24h re-send confirm (``survey_one_off.RESEND_COOLDOWN``).
+# Only the SEND is braked; the GET preview is not.
+SURVEY_ONE_OFF_SEND_LIMITER = rate_limiter(
+    "survey:one_off_send",
+    limit=10,
+    window_seconds=600,
+    actor_guard=require_alumni_edit,
+)
+SurveyOneOffSendRateLimit = Annotated[UserContext, Depends(SURVEY_ONE_OFF_SEND_LIMITER)]
+
 # --- Note writes ------------------------------------------------------------------
 #
 # Create / edit / delete on /notes share one per-user stream with two windows:

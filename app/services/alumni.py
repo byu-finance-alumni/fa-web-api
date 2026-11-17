@@ -828,12 +828,20 @@ async def create_alumni(
     # api#671/#672/#673 — the company forces the industry (and, for the current
     # job, the employment status). `career` was already spelling-fixed by the
     # hygiene pass; `former` is not a hygiene section, so it is fixed here.
-    if cleaned.get("career"):
+    # api#681: a status of "Not in the Labor Force" forces the same outcome, and
+    # creates the job row (company blank) when the payload carried none.
+    status = core.get("employment_status")
+    nlf_job_forced = not cleaned.get("career") and data_rules.is_not_in_labor_force(
+        status
+    )
+    if cleaned.get("career") or nlf_job_forced:
         cleaned["career"] = data_rules.apply_job_rules(
-            cleaned["career"], data_rules.CURRENT_JOB
+            cleaned.get("career") or {},
+            data_rules.CURRENT_JOB,
+            employment_status=status,
         )
         forced_status = data_rules.employment_status_for(
-            cleaned["career"].get("current_employer")
+            cleaned["career"].get("current_employer"), status
         )
         if forced_status is not None:
             core["employment_status"] = forced_status
@@ -874,7 +882,7 @@ async def create_alumni(
                 alumni_id=alumnus.alumni_id, **cleaned.get("contact", {})
             )
         )
-    if career is not None and career.has_values():
+    if (career is not None and career.has_values()) or nlf_job_forced:
         session.add(
             CurrentEmployment(
                 alumni_id=alumnus.alumni_id, **cleaned.get("career", {})
@@ -1169,6 +1177,13 @@ async def update_alumni(
     # on Unknown. Folded into `career_values` / `changes` BEFORE the writes below,
     # so the no-op check, the audit trail and "last updated" all see the forced
     # value exactly as if the user had typed it.
+    #
+    # api#681 — the employment status is a trigger too: a status of "Not in the
+    # Labor Force" (the one this save sends, else the one on file) forces the
+    # current job's industry to Other + secondary "Not in the Labor Force". An
+    # alum with no job row yet gets one holding just those two values (company
+    # left blank -- never invented), so they show up under Other on the
+    # dashboard like everyone else in that status.
     if career_values or "employment_status" in changes:
         stored_job = await session.scalar(
             select(CurrentEmployment)
@@ -1177,14 +1192,24 @@ async def update_alumni(
             .limit(1)
         )
         stored_employer = getattr(stored_job, "current_employer", None)
-        if career_values or stored_job is not None:
+        effective_status = changes.get(
+            "employment_status", getattr(alumnus, "employment_status", None)
+        )
+        if (
+            career_values
+            or stored_job is not None
+            or data_rules.is_not_in_labor_force(effective_status)
+        ):
             career_values = data_rules.apply_job_rules(
                 career_values,
                 data_rules.CURRENT_JOB,
                 stored_employer=stored_employer,
+                employment_status=effective_status,
             )
         effective_employer = career_values.get("current_employer", stored_employer)
-        forced_status = data_rules.employment_status_for(effective_employer)
+        forced_status = data_rules.employment_status_for(
+            effective_employer, effective_status
+        )
         if forced_status is not None:
             changes["employment_status"] = forced_status
     # Only audit fields that actually changed; capture before/after per field.

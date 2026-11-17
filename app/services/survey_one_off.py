@@ -5,6 +5,12 @@ just aimed at one person. Decisions (Jake, 2026-11-11):
 
 * Anyone who can edit alumni may press it (``RequireAlumniEdit``).
 * Re-sending is allowed. The confirm dialog warns "Last sent on <date>".
+  Within :data:`RESEND_COOLDOWN` of the last survey email (class or one-off)
+  the server refuses a re-send unless the request says ``confirm_resend`` --
+  a 409 carrying ``last_sent_at`` (:class:`ResendNeedsConfirm`), so an
+  accidental double click or a scripted loop cannot email the same alum twice
+  in a day without an explicit confirm. The per-editor brake on the route is
+  ``rate_limit.SURVEY_ONE_OFF_SEND_LIMITER``.
 * The class's later send does NOT skip them. That is why one-off emails are
   logged in their own tables (``models.survey_one_off``) and never in
   ``survey_send_log``: a row there is the class campaign's "already emailed"
@@ -74,6 +80,10 @@ REMINDER_GIVE_UP_DAYS = 28
 
 AUDIT_ACTION = "send_survey_one_off"
 
+#: A re-send to the same alum inside this window needs ``confirm_resend``.
+RESEND_COOLDOWN = datetime.timedelta(hours=24)
+REASON_RESEND_CONFIRM = "resend_confirm_required"
+
 # Stable reason codes (the frontend may key on them) and their plain wording.
 REASON_NOT_ALUMNI = "not_alumni"
 REASON_ARCHIVED = "archived"
@@ -103,6 +113,22 @@ THROTTLED_MESSAGE = (
     "The email service asked us to slow down. Try again in a minute. "
     "Nothing was sent."
 )
+
+
+
+class ResendNeedsConfirm(ConflictError):
+    """409: they were sent a survey less than :data:`RESEND_COOLDOWN` ago and
+    the request did not set ``confirm_resend``. Nothing was sent. The route
+    renders it with ``code`` = :data:`REASON_RESEND_CONFIRM` and
+    ``last_sent_at`` so the UI can ask and retry with the confirm."""
+
+    def __init__(self, last_sent_at: datetime.datetime) -> None:
+        self.last_sent_at = last_sent_at
+        super().__init__(
+            f"They were last sent a survey on {last_sent_at:%Y-%m-%d %H:%M} UTC, "
+            "less than 24 hours ago. Confirm to send it again. Nothing was sent."
+        )
+
 
 _STOPPED_STATUSES = {
     "paused": REASON_CAMPAIGN_PAUSED,
@@ -399,7 +425,11 @@ def _audit(
 
 
 async def send_one_off(
-    session: AsyncSession, alumni_id: int, *, actor_user_id: int | None
+    session: AsyncSession,
+    alumni_id: int,
+    *,
+    actor_user_id: int | None,
+    confirm_resend: bool = False,
 ) -> SurveyOneOffResult:
     """Send the survey to one alum now. Raises instead of sending nothing quietly:
 
@@ -407,6 +437,8 @@ async def send_one_off(
     * :class:`ConflictError` (409) -- they can't be sent to (the reason, in plain
       words), another send holds the lock, the budget is spent, or Resend asked
       us to slow down. Nothing was sent in any of these;
+    * :class:`ResendNeedsConfirm` (409) -- they were sent a survey (any kind)
+      within :data:`RESEND_COOLDOWN` and ``confirm_resend`` is not set;
     * :class:`ServiceError` -- Resend refused, or the outcome is unknown.
     """
     base_url, from_field = _from_field()
@@ -423,6 +455,11 @@ async def send_one_off(
     async with survey_email.send_lock() as acquired:
         if not acquired:
             raise ConflictError(BUSY_MESSAGE)
+        # Checked UNDER the send lock so two quick clicks can't both pass it.
+        if not confirm_resend:
+            previous = await last_sent_at(session, alumni_id)
+            if previous is not None and _now() - previous < RESEND_COOLDOWN:
+                raise ResendNeedsConfirm(previous)
         allowance = await survey_email.remaining_send_allowance(session)
         if allowance is not None and allowance <= 0:
             raise ConflictError(BUDGET_MESSAGE)
@@ -775,6 +812,8 @@ async def sent_counts(
 __all__ = [
     "REASON_TEXT",
     "REMINDER_GIVE_UP_DAYS",
+    "RESEND_COOLDOWN",
+    "ResendNeedsConfirm",
     "ReminderOutcome",
     "get_preview",
     "last_sent_at",

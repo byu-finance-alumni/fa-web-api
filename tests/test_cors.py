@@ -106,6 +106,7 @@ def test_development_keeps_localhost(monkeypatch):
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
     monkeypatch.delenv("CORS_ORIGIN", raising=False)
     origins = _settings(environment="development").cors_origins_list
-    assert ALLOWED_ORIGIN in origins
-    assert "https://dev-fa-web-app.vercel.app" in origins
+    # A set comparison, not `"https://..." in origins`: `origins` is a list, but
+    # CodeQL reads a URL literal `in` anything as a substring check (alert #32).
+    assert {ALLOWED_ORIGIN, "https://dev-fa-web-app.vercel.app"} <= set(origins)
 

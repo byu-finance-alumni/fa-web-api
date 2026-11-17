@@ -16,6 +16,7 @@ from typing import Annotated, Literal
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File,
     Form,
@@ -51,6 +52,7 @@ from app.core.rate_limit import (
     SURVEY_SUBMIT_LIMITER,
     EngineerBrowseReadRateLimit,
     ExportReadRateLimit,
+    SurveyOneOffSendRateLimit,
     SurveysBrowseReadRateLimit,
     SurveysProgressBrowseReadRateLimit,
 )
@@ -73,6 +75,7 @@ from app.schemas.survey import (
     SurveyNonResponder,
     SurveyOneOffPreview,
     SurveyOneOffResult,
+    SurveyOneOffSendRequest,
     SurveyRecipientBreakdown,
     SurveyResetResult,
     SurveyResponders,
@@ -1483,9 +1486,10 @@ async def survey_one_off_preview(
 )
 async def survey_one_off_send(
     alumni_id: Annotated[int, Path(ge=1, le=2**63 - 1)],
-    user: RequireAlumniEdit,
+    user: SurveyOneOffSendRateLimit,
     session: SessionDep,
-) -> SurveyOneOffResult:
+    body: Annotated[SurveyOneOffSendRequest | None, Body()] = None,
+) -> SurveyOneOffResult | JSONResponse:
     """Send the survey to this ONE alum now (a REAL send -- there is no dry run;
     `GET` this same path is the preview).
 
@@ -1497,12 +1501,32 @@ async def survey_one_off_send(
     Counts toward the daily/monthly send cap, takes the send lock, and is
     refused (409, nothing sent) when they can't be sent to, the cap is spent,
     another send is running, or their class's campaign is paused or stopped.
-    Re-sending to the same person is allowed. Audited on the alum's record.
+    Re-sending to the same person is allowed, but within 24 hours of their last
+    survey email (class or one-off) only with `{"confirm_resend": true}`;
+    without it the answer is 409 with `error.code` = `resend_confirm_required`
+    and `error.last_sent_at` (ISO 8601), and nothing is sent. Audited on the
+    alum's record.
 
-    Gated like the profile's Edit button (`alumni.edit`)."""
-    return await survey_one_off.send_one_off(
-        session, alumni_id, actor_user_id=user.user_id
-    )
+    Gated like the profile's Edit button (`alumni.edit`), and braked to 10 sends
+    per editor per 10 minutes (429)."""
+    try:
+        return await survey_one_off.send_one_off(
+            session,
+            alumni_id,
+            actor_user_id=user.user_id,
+            confirm_resend=bool(body and body.confirm_resend),
+        )
+    except survey_one_off.ResendNeedsConfirm as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": survey_one_off.REASON_RESEND_CONFIRM,
+                    "message": exc.message,
+                    "last_sent_at": exc.last_sent_at.isoformat(),
+                }
+            },
+        )
 
 
 async def _run_cron(request: Request, session: AsyncSession) -> SurveyScheduleRunSummary:

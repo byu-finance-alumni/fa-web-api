@@ -1152,9 +1152,14 @@ async def update_alumni(
             session, changes["spouse_alumni_id"], self_id=alumni_id
         )
     career = getattr(payload, "career", None)
+    # `model_fields_set` as well as `has_values` (app#943): a career section whose
+    # only field is an explicit null — clearing the secondary industry and
+    # nothing else — carries no "value", yet it IS an instruction to clear that
+    # column. Gating on `has_values` alone dropped it and the save silently kept
+    # the old value. An empty or omitted section still writes nothing.
     career_values = (
         hygiene.clean_section("career", career.model_dump(exclude_unset=True))
-        if career is not None and career.has_values()
+        if career is not None and (career.has_values() or career.model_fields_set)
         else {}
     )
     # api#671/#673 — the company forces the industry (and the employment status)

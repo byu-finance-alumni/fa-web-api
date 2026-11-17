@@ -1672,3 +1672,12 @@ def test_a_flood_of_unknown_keys_does_not_write_one_enormous_log_record():
     # A very long key is truncated rather than logged whole.
     long_key = sr._log_safe_keys(["z" * 5000])
     assert len(long_key) < 100
+
+
+def test_secondary_industry_blank_is_a_clear_not_a_rejection():
+    """app#943: Secondary industry may be left blank on the survey too — a blank
+    is the "clear this column" instruction (blankable), unlike the primary."""
+    field = sr._FIELD_BY_KEY["employment.current_industry_secondary"]
+    assert field.blankable is True
+    assert _coerce(field, "") is None
+    assert _coerce(field, "   ") is None

@@ -283,6 +283,66 @@ def test_update_career_partial_preserves_omitted_siblings(monkeypatch):
     assert employment_row.current_city == "Boston"  # sibling preserved
 
 
+def _secondary_row() -> CurrentEmployment:
+    return CurrentEmployment(
+        current_employment_id=3,
+        alumni_id=1,
+        current_employer="Acme Capital",
+        current_industry="Private Equity",
+        current_industry_secondary="Private Equity",
+    )
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_update_career_clears_secondary_industry_with_siblings(monkeypatch, blank):
+    """app#943: clearing Secondary industry on the staff Employment form (sent
+    alongside the other career fields) stores NULL; primary is untouched."""
+    _patch_get(
+        monkeypatch, Alumni(alumni_id=1, first_name="M", last_name="M", archived=False)
+    )
+    row = _secondary_row()
+    payload = AlumniUpdateFull(
+        career=CareerCreate(
+            current_employer="Acme Capital",
+            current_industry="Private Equity",
+            current_industry_secondary=blank,
+        )
+    )
+    asyncio.run(service.update_alumni(_CareerSession(row), 1, payload))
+    assert row.current_industry_secondary is None
+    assert row.current_industry == "Private Equity"
+    assert row.current_employer == "Acme Capital"
+
+
+def test_update_career_clears_secondary_industry_alone(monkeypatch):
+    """app#943: a career section whose ONLY field is an explicit null secondary
+    industry is still a clear — `has_values()` is False for it, which used to
+    drop the whole section and keep the old value."""
+    _patch_get(
+        monkeypatch, Alumni(alumni_id=1, first_name="M", last_name="M", archived=False)
+    )
+    row = _secondary_row()
+    payload = AlumniUpdateFull(career=CareerCreate(current_industry_secondary=None))
+    asyncio.run(service.update_alumni(_CareerSession(row), 1, payload))
+    assert row.current_industry_secondary is None
+    assert row.current_industry == "Private Equity"
+    assert row.current_employer == "Acme Capital"
+
+
+def test_update_empty_career_section_writes_nothing(monkeypatch):
+    """An empty career section (no fields sent) is still not a write."""
+    _patch_get(
+        monkeypatch, Alumni(alumni_id=1, first_name="M", last_name="M", archived=False)
+    )
+    row = _secondary_row()
+    asyncio.run(
+        service.update_alumni(
+            _CareerSession(row), 1, AlumniUpdateFull(career=CareerCreate())
+        )
+    )
+    assert row.current_industry_secondary == "Private Equity"
+
+
 def test_get_alumni_missing_raises(monkeypatch):
     _patch_get(monkeypatch, None)
     with pytest.raises(NotFoundError):

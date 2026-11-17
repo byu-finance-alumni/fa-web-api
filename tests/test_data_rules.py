@@ -6,6 +6,8 @@
 * #673 -- company "Not in the Labor Force" (variants) -> canonical company text,
   industry Other, secondary "Not in the Labor Force", and (current job)
   employment status "Not in the Labor Force".
+* #681 -- the same outcome for the current job when the EMPLOYMENT STATUS is
+  "Not in the Labor Force"; the company is left as it is.
 
 One shared module (``app.core.data_rules``) owns the rules; these tests pin
 that each write path -- staff create, staff update, the per-row employment and
@@ -575,44 +577,268 @@ def test_survey_text_fields_fix_unknown_spelling(monkeypatch):
     assert job.current_city == "Unknown"
 
 
-# --- the maintenance SQL --------------------------------------------------------
+# --- #681: Not in the Labor Force by EMPLOYMENT STATUS ------------------------------
 
 
-_SQL_FILES = (
-    "672-unify-unknown.sql",
-    "671-unknown-company-industry.sql",
-    "673-not-in-labor-force.sql",
+@pytest.mark.parametrize("employer", [None, "", "Acme Corp"])
+def test_681_nlf_status_forces_other_and_leaves_the_company(employer):
+    values = {"current_employer": employer, "current_industry": "Consulting"}
+    out = data_rules.apply_job_rules(
+        values, data_rules.CURRENT_JOB, employment_status="not in labor force"
+    )
+    assert out == {
+        "current_employer": employer,
+        "current_industry": "Other",
+        "current_industry_secondary": NLF,
+    }
+    assert data_rules.employment_status_for(employer, " NOT IN THE LABOUR FORCE ") == NLF
+
+
+def test_681_nlf_status_wins_over_an_unknown_company():
+    out = data_rules.apply_job_rules(
+        {"current_employer": "unkown", "current_industry": "Investment Banking"},
+        data_rules.CURRENT_JOB,
+        employment_status=NLF,
+    )
+    assert out == {
+        "current_employer": "Unknown",
+        "current_industry": "Other",
+        "current_industry_secondary": NLF,
+    }
+
+
+def test_681_partial_save_with_nlf_status_does_not_write_the_company():
+    out = data_rules.apply_job_rules(
+        {}, data_rules.CURRENT_JOB, stored_employer="Acme", employment_status=NLF
+    )
+    assert out == {"current_industry": "Other", "current_industry_secondary": NLF}
+
+
+def test_681_other_statuses_change_nothing():
+    values = {"current_employer": "Acme", "current_industry": "Consulting"}
+    for status in (None, "Full-time", "Unemployed", "Unknown"):
+        assert (
+            data_rules.apply_job_rules(values, data_rules.CURRENT_JOB, employment_status=status)
+            == values
+        )
+        assert data_rules.employment_status_for("Acme", status) is None
+
+
+def test_681_apply_rules_to_row_takes_the_status():
+    job = _stored_job(current_employer=None)
+    changed = data_rules.apply_rules_to_row(
+        job, data_rules.CURRENT_JOB, employment_status=NLF
+    )
+    assert changed == {
+        "current_industry": ("Investment Banking", "Other"),
+        "current_industry_secondary": (None, NLF),
+    }
+    assert job.current_employer is None
+
+
+def test_681_staff_update_nlf_status_moves_the_current_job(monkeypatch):
+    job = _stored_job()
+    alum = _alumnus()
+    alum.employment_status = "Full-time"
+    session, alum = _update(
+        monkeypatch,
+        AlumniUpdateFull(employment_status="not in the labor force"),
+        job=job,
+        alum=alum,
+    )
+    assert alum.employment_status == NLF
+    assert (job.current_employer, job.current_industry, job.current_industry_secondary) == (
+        "Acme Corp",
+        "Other",
+        NLF,
+    )
+    audits = _audit_map(session)
+    assert audits["employment_status"] == ("Full-time", NLF)
+    assert audits["career.current_industry"] == ("Investment Banking", "Other")
+
+
+def test_681_staff_update_career_only_is_judged_against_the_stored_status(monkeypatch):
+    job = _stored_job(current_industry="Other", current_industry_secondary=NLF)
+    alum = _alumnus()
+    alum.employment_status = NLF
+    _update(
+        monkeypatch,
+        AlumniUpdateFull(career=CareerCreate(current_industry="Consulting")),
+        job=job,
+        alum=alum,
+    )
+    assert job.current_industry == "Other"
+    assert job.current_industry_secondary == NLF
+
+
+def test_681_staff_update_leaving_nlf_status_is_not_forced_back(monkeypatch):
+    job = _stored_job(current_industry="Other", current_industry_secondary=NLF)
+    alum = _alumnus()
+    alum.employment_status = NLF
+    _session, alum = _update(
+        monkeypatch,
+        AlumniUpdateFull(
+            employment_status="Full-time",
+            career=CareerCreate(current_industry="Consulting"),
+        ),
+        job=job,
+        alum=alum,
+    )
+    assert alum.employment_status == "Full-time"
+    assert job.current_industry == "Consulting"
+
+
+def test_681_staff_update_nlf_status_without_a_job_creates_one(monkeypatch):
+    alum = _alumnus()
+    alum.employment_status = "Full-time"
+    session, alum = _update(monkeypatch, AlumniUpdateFull(employment_status=NLF), alum=alum)
+    (job,) = _created(session, CurrentEmployment)
+    assert job.current_employer is None
+    assert (job.current_industry, job.current_industry_secondary) == ("Other", NLF)
+    assert alum.employment_status == NLF
+
+
+def test_681_staff_create_nlf_status_without_career_creates_the_job():
+    session = FakeSession()
+    payload = AlumniCreateFull(
+        first_name="Jane", last_name="Doe", employment_status="Not In Labor Force"
+    )
+    asyncio.run(service.create_alumni(session, payload, actor_user_id=9))
+    (alum,) = _created(session, Alumni)
+    (job,) = _created(session, CurrentEmployment)
+    assert alum.employment_status == NLF
+    assert job.current_employer is None
+    assert (job.current_industry, job.current_industry_secondary) == ("Other", NLF)
+
+
+def test_681_staff_create_nlf_status_keeps_a_named_company():
+    session = FakeSession()
+    payload = AlumniCreateFull(
+        first_name="Jane",
+        last_name="Doe",
+        employment_status=NLF,
+        career=CareerCreate(current_employer="Acme", current_industry="Consulting"),
+    )
+    asyncio.run(service.create_alumni(session, payload, actor_user_id=9))
+    (job,) = _created(session, CurrentEmployment)
+    assert (job.current_employer, job.current_industry, job.current_industry_secondary) == (
+        "Acme",
+        "Other",
+        NLF,
+    )
+
+
+def test_681_staff_create_ordinary_status_without_career_adds_no_job():
+    session = FakeSession()
+    payload = AlumniCreateFull(first_name="Jane", last_name="Doe", employment_status="Full-time")
+    asyncio.run(service.create_alumni(session, payload, actor_user_id=9))
+    assert _created(session, CurrentEmployment) == []
+
+
+def test_681_csv_import_create_applies_the_status_rule():
+    cells = _row_values(
+        first_name="John",
+        last_name="Roe",
+        current_employer="Acme",
+        current_industry="Consulting",
+    )
+    cells[list(import_csv.EXPECTED_HEADERS).index("Employment Status")] = "not in labor force"
+    csv = _csv_bytes(cells)
+    rows, _ = import_csv.parse_and_map(csv)
+    session = FakeSession()
+    result = asyncio.run(import_csv.commit_import(session, rows))
+    assert result["imported"] == 1
+    (job,) = _created(session, CurrentEmployment)
+    assert (job.current_employer, job.current_industry, job.current_industry_secondary) == (
+        "Acme",
+        "Other",
+        NLF,
+    )
+
+
+def test_681_survey_nlf_status_moves_the_current_job(monkeypatch):
+    job = _survey_job()
+    alum = _survey_alum(employment_status="Full-time")
+    session = _SurveySession(alum)
+    _apply(
+        session,
+        _fake_resp(payload={"profile.employment_status": NLF}),
+        monkeypatch,
+        side_rows=({}, {5: job}, {}),
+    )
+    assert alum.employment_status == NLF
+    assert job.current_employer == "Old Bank"
+    assert (job.current_industry, job.current_industry_secondary) == ("Other", NLF)
+    fields = _fields(session)
+    assert fields["career.current_industry"] == ("Investment Banking", "Other")
+    assert fields["career.current_industry_secondary"] == (None, NLF)
+
+
+def test_681_survey_nlf_status_without_a_job_creates_one(monkeypatch):
+    alum = _survey_alum(employment_status="Full-time")
+    session = _SurveySession(alum)
+    _apply(
+        session,
+        _fake_resp(payload={"profile.employment_status": NLF}),
+        monkeypatch,
+    )
+    (job,) = _created(session, CurrentEmployment)
+    assert job.current_employer is None
+    assert (job.current_industry, job.current_industry_secondary) == ("Other", NLF)
+
+
+def test_681_survey_ordinary_status_without_a_job_adds_none(monkeypatch):
+    session = _SurveySession(_survey_alum(employment_status=None))
+    _apply(
+        session,
+        _fake_resp(payload={"profile.employment_status": "Full-time"}),
+        monkeypatch,
+    )
+    assert _created(session, CurrentEmployment) == []
+
+
+MIGRATION_681 = (
+    MAINTENANCE.parent / "migrations" / "2026-11-17_nilf_by_employment_status.sql"
 )
 
 
-@pytest.mark.parametrize("name", _SQL_FILES)
-def test_maintenance_sql_shape(name):
-    """Hand-run files: transaction opened, COMMIT left for the human, never in
-    migrations/ (which auto-runs on prod)."""
-    sql = (MAINTENANCE / name).read_text(encoding="utf-8")
-    assert not (MAINTENANCE.parent / "migrations" / name).exists()
+def test_681_migration_shape():
+    """Auto-run migration: one transaction, COMMITted, backs up first, uses the
+    same NLF pattern as the app, and sorts after the 11-13 backup table."""
+    sql = MIGRATION_681.read_text(encoding="utf-8")
     code = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
     assert re.search(r"^BEGIN;", code, re.M)
-    assert "UPDATE " in code
-    assert not re.search(r"^\s*COMMIT;", code, re.M), "COMMIT must stay commented out"
-    assert "-- COMMIT;" in sql
-    # Balanced parentheses and quotes: a cheap "it at least parses" guard.
+    assert len(re.findall(r"^COMMIT;", code, re.M)) == 1
+    assert f"'{data_rules.NLF_SQL_REGEX}'" in code
     assert code.count("(") == code.count(")")
     assert code.count("'") % 2 == 0
+    # Every UPDATE is preceded by a backup INSERT under cleanup '681'.
+    assert code.count("INSERT INTO data_cleanup_backup") >= code.count("UPDATE ")
+    assert "'681'" in code
+    # Never touches the company or past jobs.
+    assert "employment_history" not in code
+    assert not re.search(r"SET[^;]*current_employer", code)
+    # Sorts after the migration that creates data_cleanup_backup.
+    names = sorted(p.name for p in MIGRATION_681.parent.glob("*.sql"))
+    assert names.index("2026-11-13_cleanup_unknown_and_nilf.sql") < names.index(MIGRATION_681.name)
 
 
-@pytest.mark.parametrize("name", _SQL_FILES)
-def test_maintenance_sql_uses_the_python_patterns(name):
-    sql = (MAINTENANCE / name).read_text(encoding="utf-8")
-    if name != "673-not-in-labor-force.sql":
-        assert f"'{data_rules.UNKNOWN_SQL_REGEX}'" in sql
-    if name == "673-not-in-labor-force.sql":
-        assert f"'{data_rules.NLF_SQL_REGEX}'" in sql
+# --- the cleanup migration (replaced the hand-run maintenance SQL) -----------
+
+CLEANUP_MIGRATION = (
+    MAINTENANCE.parent / "migrations" / "2026-11-13_cleanup_unknown_and_nilf.sql"
+)
+
+
+def test_cleanup_migration_uses_the_python_patterns():
+    sql = CLEANUP_MIGRATION.read_text(encoding="utf-8")
+    assert f"'{data_rules.UNKNOWN_SQL_REGEX}'" in sql
+    assert f"'{data_rules.NLF_SQL_REGEX}'" in sql
 
 
 def test_unknown_cleanup_covers_exactly_the_rule_columns():
-    sql = (MAINTENANCE / "672-unify-unknown.sql").read_text(encoding="utf-8")
-    pairs = set(re.findall(r"UPDATE (\w+)\s+SET (\w+) = 'Unknown'", sql))
+    sql = CLEANUP_MIGRATION.read_text(encoding="utf-8")
+    pairs = set(re.findall(r"\('(\w+)', '\w+', '(\w+)'\)", sql))
     expected = {
         (table, column)
         for table, columns in data_rules.UNKNOWN_COLUMNS.items()

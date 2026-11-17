@@ -6,7 +6,9 @@ The rules this pins, from the issue and Jake's decisions (2026-11-11):
 * A one-off must NEVER count as the class's campaign: it writes nothing to
   ``survey_send_log``, creates no campaign, and the later class send STILL
   emails the person.
-* Re-sending is allowed; the preview reports "last sent".
+* Re-sending is allowed; the preview reports "last sent". Inside 24 hours of
+  the last survey email a re-send needs ``confirm_resend`` (409 otherwise), and
+  the send route is braked to 10 per editor per 10 minutes.
 * Never to deceased / Do Not Contact / no-email people -- refused with a reason.
 * It counts toward the daily/monthly cap, takes the send lock, and is stopped
   while the alum's class campaign is paused or cancelled.
@@ -326,9 +328,14 @@ class _World:
     def preview(self, alumni_id=_ANN):
         return asyncio.run(survey_one_off.get_preview(self.session, alumni_id))
 
-    def send(self, alumni_id=_ANN, actor_user_id=7):
+    def send(self, alumni_id=_ANN, actor_user_id=7, confirm_resend=False):
         return asyncio.run(
-            survey_one_off.send_one_off(self.session, alumni_id, actor_user_id=actor_user_id)
+            survey_one_off.send_one_off(
+                self.session,
+                alumni_id,
+                actor_user_id=actor_user_id,
+                confirm_resend=confirm_resend,
+            )
         )
 
     def class_send(self):
@@ -533,9 +540,48 @@ def test_re_send_is_allowed_and_preview_reports_last_sent(world):
     world.send()
     first = world.preview().last_sent_at
     assert first is not None
-    world.send()
+    world.send(confirm_resend=True)
     assert world.to() == ["alum1@byu.edu", "alum1@byu.edu"]
     assert len({one_off for one_off, _stage in world.one_off_rows()}) == 2
+
+
+def test_a_re_send_within_24_hours_needs_the_confirm(world):
+    world.alum(_ANN)
+    world.send()
+    with pytest.raises(survey_one_off.ResendNeedsConfirm) as refused:
+        world.send()
+    # A 409 (ConflictError) that carries when they were last sent; nothing sent.
+    assert isinstance(refused.value, ConflictError)
+    assert refused.value.last_sent_at == world.preview().last_sent_at
+    assert "Confirm to send it again" in refused.value.message
+    assert world.to() == ["alum1@byu.edu"]
+    assert len(world.one_off_rows()) == 1
+    # The same click with the confirm goes through.
+    world.send(confirm_resend=True)
+    assert world.to() == ["alum1@byu.edu", "alum1@byu.edu"]
+
+
+def test_a_class_email_in_the_last_24_hours_also_needs_the_confirm(world):
+    world.alum(_ANN)
+    world.class_send()
+    with pytest.raises(survey_one_off.ResendNeedsConfirm):
+        world.send()
+    assert len(world.emails) == 1
+
+
+def test_no_confirm_needed_once_24_hours_have_passed(world):
+    world.alum(_ANN)
+    world.send()
+    world.age_one_offs(1)
+    world.send()
+    assert world.to() == ["alum1@byu.edu", "alum1@byu.edu"]
+
+
+def test_the_confirm_does_not_override_the_other_refusals(world):
+    world.alum(_ANN, deceased=True)
+    with pytest.raises(ConflictError, match="deceased"):
+        world.send(confirm_resend=True)
+    assert world.emails == []
 
 
 def test_last_sent_also_counts_class_emails(world):
@@ -576,7 +622,7 @@ def test_resend_message_id_is_recorded(world):
 def test_one_off_emails_count_toward_the_send_usage(world):
     world.alum(_ANN)
     world.send()
-    world.send()
+    world.send(confirm_resend=True)
     usage = asyncio.run(survey_email.get_send_usage(world.session))
     assert (usage.sent_today, usage.sent_this_month) == (2, 2)
 
@@ -850,3 +896,100 @@ def test_migration_is_additive_and_locked_down():
     rls = (repo / "database" / "rls_lockdown.sql").read_text(encoding="utf-8")
     assert "ALTER TABLE survey_one_off ENABLE ROW LEVEL SECURITY;" in rls
     assert "ALTER TABLE survey_one_off_send_log ENABLE ROW LEVEL SECURITY;" in rls
+
+
+# ------------------------------------------- route: brake + confirm contract ---
+
+
+@pytest.fixture
+def route_client(monkeypatch):
+    """The real POST route, with auth, the permission config, the session and
+    the send itself replaced: these tests pin the route's own contract (the
+    per-editor brake, the body, the 409 envelope), not the send."""
+    import uuid
+
+    from fastapi.testclient import TestClient
+
+    from app.core import rate_limit
+    from app.core.database import get_session
+    from app.schemas.auth import UserContext
+    from app.schemas.survey import SurveyOneOffResult
+
+    calls: list[dict] = []
+    state = {"refuse_unconfirmed": False}
+    last = datetime.datetime(2026, 11, 17, 9, 30, tzinfo=datetime.UTC)
+
+    async def _fake_send(_session, alumni_id, *, actor_user_id, confirm_resend=False):
+        calls.append({"alumni_id": alumni_id, "confirm_resend": confirm_resend})
+        if state["refuse_unconfirmed"] and not confirm_resend:
+            raise survey_one_off.ResendNeedsConfirm(last)
+        return SurveyOneOffResult(
+            alumni_id=alumni_id, email="a@x.org", email_source="personal", sent_at=last
+        )
+
+    async def _session():
+        yield None
+
+    monkeypatch.setattr(survey_one_off, "send_one_off", _fake_send)
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[auth_deps.get_permission_config] = lambda: {}
+    app.dependency_overrides[auth_deps.get_current_db_user] = lambda: UserContext(
+        user_id=42,
+        auth_user_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        roles=["engineer"],
+    )
+    rate_limit.reset()
+    with TestClient(app) as client:
+        yield client, calls, state, last
+    for dep in (get_session, auth_deps.get_permission_config, auth_deps.get_current_db_user):
+        app.dependency_overrides.pop(dep, None)
+    rate_limit.reset()
+
+
+_POST = "/survey/alumni/1/one-off"
+
+
+def test_send_route_is_braked_to_ten_per_editor_per_ten_minutes(route_client):
+    client, calls, _state, _last = route_client
+    codes = [client.post(_POST, json={}).status_code for _ in range(11)]
+    assert codes[:10] == [200] * 10
+    assert codes[10] == 429
+    assert len(calls) == 10  # the 11th never reached the send
+
+
+def test_send_route_preview_is_not_braked():
+    from app.core import rate_limit
+
+    guards, _route = _guards("/survey/alumni/{alumni_id}/one-off", "GET")
+    assert rate_limit.SURVEY_ONE_OFF_SEND_LIMITER not in guards
+    guards, _route = _guards("/survey/alumni/{alumni_id}/one-off", "POST")
+    assert rate_limit.SURVEY_ONE_OFF_SEND_LIMITER in guards
+
+
+def test_send_route_without_confirm_answers_409_with_last_sent(route_client):
+    client, calls, state, last = route_client
+    state["refuse_unconfirmed"] = True
+    for body in ({}, None, {"confirm_resend": False}):
+        resp = (
+            client.post(_POST) if body is None else client.post(_POST, json=body)
+        )
+        assert resp.status_code == 409
+        error = resp.json()["error"]
+        assert error["code"] == "resend_confirm_required"
+        assert error["last_sent_at"] == last.isoformat()
+        assert "2026-11-17 09:30 UTC" in error["message"]
+    assert [c["confirm_resend"] for c in calls] == [False, False, False]
+
+
+def test_send_route_passes_the_confirm_through(route_client):
+    client, calls, state, _last = route_client
+    state["refuse_unconfirmed"] = True
+    resp = client.post(_POST, json={"confirm_resend": True})
+    assert resp.status_code == 200
+    assert calls[-1] == {"alumni_id": 1, "confirm_resend": True}
+
+
+def test_send_route_rejects_unknown_body_fields(route_client):
+    client, calls, _state, _last = route_client
+    assert client.post(_POST, json={"confirm": True}).status_code == 422
+    assert calls == []

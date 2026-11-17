@@ -453,6 +453,7 @@ REPORT_ROW_COLUMNS = (
     Alumni.middle_name,
     Alumni.last_name,
     CurrentEmployment.current_employer,
+    CurrentEmployment.current_title,
     CurrentEmployment.current_industry,
     CurrentEmployment.current_industry_secondary,
     CurrentEmployment.current_city,
@@ -519,8 +520,8 @@ def _report_select(key, kind, keys, view: ReportView | None = None):
 
 def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
     (
-        alumni_id, first, middle, last, employer, industry, industry2, city,
-        state, personal, work, phone, linkedin, gender, year,
+        alumni_id, first, middle, last, employer, title, industry, industry2,
+        city, state, personal, work, phone, linkedin, gender, year,
     ) = row
     return NetTrekRow(
         alumni_id=alumni_id,
@@ -528,6 +529,7 @@ def to_report_row(row, *, can_edit: bool) -> NetTrekRow:
         middle_name=middle,
         last_name=last,
         company=employer,
+        job_title=title,
         industry=industry,
         secondary_industry=industry2,
         company_city=city,
@@ -579,12 +581,15 @@ async def list_report(
 
 # --- CSV ---------------------------------------------------------------------
 
-#: The issue's columns, in its order.
+#: The issue's columns, in its order, plus Job Title next to Company
+#: (fa-web-app #945). The on-screen table drops Work Email and Work Phone; the
+#: CSV keeps every column.
 NETTREK_EXPORT_COLUMNS: tuple[str, ...] = (
     "First Name",
     "Middle Name",
     "Last Name",
     "Company",
+    "Job Title",
     "Industry",
     "Secondary Industry",
     "Company City",
@@ -634,6 +639,7 @@ def report_rows_csv(rows, *, can_edit: bool) -> str:
                 _csv_cell(r.middle_name, "str"),
                 _csv_cell(r.last_name, "str"),
                 _csv_cell(r.company, "str"),
+                _csv_cell(r.job_title, "str"),
                 _csv_cell(r.industry, "str"),
                 _csv_cell(r.secondary_industry, "str"),
                 _csv_cell(r.company_city, "str"),

@@ -53,6 +53,7 @@ def _dallas(w, n, **fields):
         (C.middle_name, ("middle", "ann", "Bob", "CAT")),
         (C.last_name, ("last", "adams", "Baker", "CARTER")),
         (C.company, ("employer", "acme", "Bolt", "CRANE")),
+        (C.job_title, ("title", "analyst", "Banker", "CFO")),
         (C.industry, ("industry", "banking", "Consulting", "TECH")),
         (C.secondary_industry, ("secondary", "banking", "Consulting", "TECH")),
         (C.permanent_email, ("email", "a@x.example", "B@x.example", "c@x.example")),
@@ -72,12 +73,14 @@ def test_each_column_sorts_both_ways_case_insensitively(world, column, fields, d
 
 @pytest.mark.parametrize("direction", list(D))
 def test_blanks_stay_last_both_ways(world, direction):
-    _dallas(world, 1, employer=" ", middle="  ", year=None, phone="", linkedin=" ")
+    _dallas(world, 1, employer=" ", middle="  ", year=None, phone="", linkedin=" ",
+            title=" ")
     _dallas(world, 2, employer="Acme", middle="A", year=2000, phone="2015551234",
             linkedin="https://a.example")
     _dallas(world, 3, employer="Bolt", middle="B", year=2010, phone="3015551234",
             linkedin="https://b.example")
-    for column in (C.company, C.middle_name, C.graduation_year, C.phone, C.linkedin_url):
+    for column in (C.company, C.job_title, C.middle_name, C.graduation_year, C.phone,
+                   C.linkedin_url):
         order = _ids(world, _sorted(column, direction))
         assert order[-1] == 1, column
         assert order[:2] == ([2, 3] if direction is D.asc else [3, 2]), column
@@ -226,6 +229,7 @@ def _page(w, view, *, can_edit=True, key=A.dallas, kind=K.area_alumni):
 def _people(w):
     w.alum(1, city="Dallas", state="Texas", first="Ann", middle="Lee", last="Baker",
            employer="Goldman Sachs", industry="Banking", secondary="Tech",
+           title="Vice President",
            email="ann@corp.example", phone="801-555-1234", gender="Female", year=2010,
            linkedin="https://linkedin.example/in/ann")
     w.alum(2, city="Fort Worth", state="TX", first="Bob", middle="Ray", last="Carter",
@@ -246,6 +250,7 @@ def _people(w):
         ({"middle_name": "ra"}, {2}),
         ({"last_name": "dav"}, {3}),
         ({"company": "GOLD"}, {1}),
+        ({"job_title": "vice pres"}, {1}),
         ({"industry": "banking"}, {1, 3}),
         ({"industry": " Banking "}, {1, 3}),
         ({"secondary_industry": "energy"}, {3}),

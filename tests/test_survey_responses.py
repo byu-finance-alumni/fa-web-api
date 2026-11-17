@@ -1672,3 +1672,27 @@ def test_a_flood_of_unknown_keys_does_not_write_one_enormous_log_record():
     # A very long key is truncated rather than logged whole.
     long_key = sr._log_safe_keys(["z" * 5000])
     assert len(long_key) < 100
+
+
+def test_secondary_industry_blank_is_a_clear_not_a_rejection():
+    """app#943: Secondary industry may be left blank on the survey too — a blank
+    is the "clear this column" instruction (blankable), unlike the primary."""
+    field = sr._FIELD_BY_KEY["employment.current_industry_secondary"]
+    assert field.blankable is True
+    assert _coerce(field, "") is None
+    assert _coerce(field, "   ") is None
+
+
+def test_log_safe_keys_output_never_holds_a_line_break():
+    """CodeQL py/log-injection (2026-11-17): `ignored` was joined raw. It now
+    goes through `_log_safe_keys` like `dropped`, so its output never holds a
+    raw CR or LF."""
+    rendered = sr._log_safe_keys(["a\r\nINFO:forged", "b\nc"])
+    assert "\n" not in rendered and "\r" not in rendered
+
+
+def test_log_safe_strips_line_breaks():
+    from app.core.security_log import log_safe
+
+    assert log_safe("12\r\nWARNING:forged") == "12WARNING:forged"
+    assert log_safe(12) == "12"

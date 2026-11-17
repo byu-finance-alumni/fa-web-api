@@ -41,6 +41,7 @@ class ReportSortColumn(StrEnum):
     middle_name = "middle_name"
     last_name = "last_name"
     company = "company"
+    job_title = "job_title"
     industry = "industry"
     secondary_industry = "secondary_industry"
     company_city = "company_city"
@@ -89,6 +90,9 @@ class NetTrekRow(BaseModel):
     middle_name: str | None
     last_name: str | None
     company: str | None
+    # The current job title (``current_employment.current_title``) — the title
+    # the profile shows for the current job (fa-web-app #945).
+    job_title: str | None
     industry: str | None
     secondary_industry: str | None
     company_city: str | None

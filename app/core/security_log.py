@@ -22,6 +22,18 @@ from fastapi import Request
 _logger = logging.getLogger("security")
 
 
+def log_safe(value: object) -> str:
+    """*value* as text with every CR and LF removed, for a plain log line.
+
+    A request-derived value (a path id, a submitted key, a form field) passed to
+    ``log.info("... %s", value)`` can otherwise carry a line break and forge a
+    second, attacker-authored log line (CodeQL ``py/log-injection``). The final
+    ``.replace("\n", "")`` is the form CodeQL recognises as the sanitiser, so keep
+    it as the LAST call. Values that are already safe (ints, fixed labels) pass
+    through unchanged."""
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 def _client_ip(request: Request) -> str | None:
     """Best-effort real client IP. Vercel/proxies set X-Forwarded-For as
     ``client, proxy1, proxy2`` — the first hop is the originating client."""

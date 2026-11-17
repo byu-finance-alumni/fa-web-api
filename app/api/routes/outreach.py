@@ -1,6 +1,6 @@
 """Outreach interest-list routes: Conference Interest, Event Speakers, Event
-Sponsors and Alumni Mentors — see ``app.services.outreach_lists`` for who is on
-each list.
+Sponsors, Alumni Mentors, Case Competition Hosts and Event Help — see
+``app.services.outreach_lists`` for who is on each list.
 
 Gated exactly like the NetTrek reports (``alumni.export``): these are lists of
 named alumni with contact details, built to be downloaded.
@@ -9,8 +9,9 @@ named alumni with contact details, built to be downloaded.
     Counts only, no PII.
   * ``GET /outreach/{group}/{key}`` — one list's rows, paginated. Spends the
     contact-list budget (shared with the NetTrek reports, counted globally from
-    the audit rows it writes) and writes a disclosure-audit row. Alumni
-    Mentors' per-industry list takes ``?industry=<industry>``.
+    the audit rows it writes) and writes a disclosure-audit row. A
+    per-industry list (Alumni Mentors, Case Competition Hosts, Event Help)
+    takes ``?industry=<industry>``.
   * ``GET /outreach/{group}/{key}/export`` — the whole list as CSV. Spends the
     global export budget and is audit-logged as ``export_outreach_list``.
 """
@@ -72,7 +73,9 @@ async def outreach_summary(
     """One Outreach landing page: its lists, each with a count. Alumni Mentors
     has one ``industry`` link per industry with a mentor (most first, the
     industry in ``industry``), then ``no_industry`` if anyone is in it, then
-    ``women``."""
+    ``women``. Case Competition Hosts and Event Help have ``all`` first, then
+    one ``industry`` link for EVERY dashboard finance industry, zeros
+    included, most first."""
     return await svc.get_summary(session, group)
 
 
@@ -90,8 +93,9 @@ async def outreach_list(
     """One list's people, paginated — the NetTrek report rows, sorted by last
     name, or by ``sort`` and ``dir`` with blanks last, and narrowed by the ``f_*``
     filters. ``total`` and ``filter_options`` follow the filters. 404 for a list
-    the group does not have, an ``industry`` list without ``industry``, or
-    ``industry`` on any other list. Gender is null for a
+    the group does not have, an ``industry`` list without ``industry``,
+    ``industry`` on any other list, or (Case Competition Hosts, Event Help) an
+    ``industry`` that is not a dashboard finance industry. Gender is null for a
     caller who cannot edit alumni, and ``sort=gender`` and ``f_gender`` are
     ignored for them. Audited as ``view`` on ``outreach_list``."""
     ref = _ref(group, key, industry)

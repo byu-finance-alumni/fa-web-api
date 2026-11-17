@@ -97,6 +97,7 @@ _TEXT_COLUMNS = {
     C.middle_name: Alumni.middle_name,
     C.last_name: Alumni.last_name,
     C.company: CurrentEmployment.current_employer,
+    C.job_title: CurrentEmployment.current_title,
     C.industry: CurrentEmployment.current_industry,
     C.secondary_industry: CurrentEmployment.current_industry_secondary,
     C.company_city: CurrentEmployment.current_city,

@@ -1,5 +1,5 @@
 """Outreach interest lists: Conference Interest, Event Speakers, Event Sponsors,
-Alumni Mentors.
+Alumni Mentors, Case Competition Hosts, Event Help.
 
 Every predicate runs for real against an in-memory SQLite world built from the
 ORM tables (the NetTreks test harness), including each fallback (no industry ->
@@ -40,6 +40,8 @@ FLAGS = (
     "company_event_sponsor_willing",
     "mentor_willing",
     "women_in_finance_mentor_willing",
+    "case_competition_host_willing",
+    "help_at_event_willing",
 )
 
 
@@ -61,6 +63,7 @@ class _World:
         is_alumni=True,
         deceased=False,
         label=None,
+        title=None,
         **flags,
     ):
         self.s.add(
@@ -75,12 +78,13 @@ class _World:
                 deceased=deceased,
             )
         )
-        if industry or secondary or state or city:
+        if industry or secondary or state or city or title:
             self.s.add(
                 CurrentEmployment(
                     current_employment_id=alumni_id,
                     alumni_id=alumni_id,
                     current_employer=f"Co{alumni_id}",
+                    current_title=title,
                     current_industry=industry,
                     current_industry_secondary=secondary,
                     current_city=city,
@@ -343,7 +347,7 @@ def test_csv_uses_the_nettrek_columns_and_is_audited(world):
 
     assert rows[0] == list(nettreks.NETTREK_EXPORT_COLUMNS)
     assert [r[2] for r in rows[1:]] == ["L001", "L002", "L007", "L020"]
-    assert all(len(r) == 14 for r in rows)
+    assert all(len(r) == 15 for r in rows)
     (entry,) = world.db.added
     assert entry.action_type == "export_outreach_list"
     assert entry.action_type in rate_limit.EXPORT_AUDIT_ACTIONS
@@ -473,3 +477,190 @@ def test_audit_detail_keeps_industry_on_one_field():
     detail = ol.audit_detail(ref)
     assert detail == "list=mentors:industry:Sales  total=0 list=x"
     assert ";" not in detail and "\n" not in detail and "\r" not in detail
+
+
+# --- Case Competition Hosts / Event Help (api#682) ---------------------------------
+
+FINANCE_GROUPS = [
+    (G.case_competition, "case_competition_host_willing", "Case Competition Hosts",
+     "All Case Competition Hosts", "Case Competition Hosts"),
+    (G.event_help, "help_at_event_willing", "Event Help",
+     "All Alumni willing to help at a Finance Event",
+     "Alumni willing to help at a Finance Event"),
+]
+
+
+def _finance_world(w, flag, other_flag):
+    w.alum(1, industry="Investment Banking", title="Analyst", **{flag: True})
+    w.alum(2, industry=" investment banking ", **{flag: True})  # messy casing
+    w.alum(3, industry="Private Equity", **{flag: True})
+    # Displayed industry (#891): "Other" + a secondary shows the secondary.
+    w.alum(4, industry="Other", secondary="Private Equity", **{flag: True})
+    w.alum(5, industry="Real Estate", **{flag: True})
+    # Willing, but in no finance industry: on "All" only.
+    w.alum(6, **{flag: True})  # no employment row
+    w.alum(7, industry="Unknown", **{flag: True})
+    w.alum(8, industry="Graduate Student", **{flag: True})
+    w.alum(9, industry="Other", **{flag: True})
+    w.alum(10, industry="Law", **{flag: True})
+    w.alum(11, industry="Military", **{flag: True})
+    # Not willing on THIS flag: on no list here.
+    w.alum(12, industry="Investment Banking", **{other_flag: True})
+    w.alum(13, industry="Investment Banking")
+    _excluded(w, industry="Investment Banking", **{flag: True})
+
+
+@pytest.mark.parametrize(("group", "flag", "title", "all_title", "suffix"), FINANCE_GROUPS)
+def test_finance_summary_lists_all_then_every_finance_industry(
+    world, group, flag, title, all_title, suffix
+):
+    from app.core.dropdowns import WHEEL_INDUSTRIES
+
+    other = "help_at_event_willing" if group is G.case_competition else (
+        "case_competition_host_willing"
+    )
+    _finance_world(world, flag, other)
+    s = _summary(world, group)
+    assert s.title == title
+    first, *rest = s.links
+    assert (first.key, first.industry, first.title, first.count) == (
+        L.all, None, all_title, 11
+    )
+    # EVERY finance industry, zeros included, most first then A→Z, each titled
+    # with the industry alone; nothing outside the dashboard's finance set.
+    assert {link.key for link in rest} == {L.industry}
+    assert sorted(link.industry for link in rest) == sorted(WHEEL_INDUSTRIES)
+    assert all(link.title == link.industry for link in rest)
+    assert [(link.industry, link.count) for link in rest[:3]] == [
+        ("Investment Banking", 2),
+        ("Private Equity", 2),
+        ("Real Estate", 1),
+    ]
+    zeros = [link.industry for link in rest[3:]]
+    assert zeros == sorted(zeros, key=str.lower)
+    assert {link.count for link in rest[3:]} == {0}
+    for name in ("Other", "Unknown", "Graduate Student", "Law", "Military"):
+        assert name not in zeros
+
+
+@pytest.mark.parametrize(("group", "flag", "title", "all_title", "suffix"), FINANCE_GROUPS)
+def test_finance_counts_equal_list_lengths(world, group, flag, title, all_title, suffix):
+    other = "help_at_event_willing" if group is G.case_competition else (
+        "case_competition_host_willing"
+    )
+    _finance_world(world, flag, other)
+    assert _ids(world, group, L.all) == set(range(1, 12))
+    assert _ids(world, group, L.industry, "Investment Banking") == {1, 2}
+    assert _ids(world, group, L.industry, "private equity") == {3, 4}
+    assert _ids(world, group, L.industry, "Venture Capital") == set()
+    for link in _summary(world, group).links:
+        ids = _ids(world, group, link.key, link.industry)
+        assert len(ids) == link.count, link
+        assert not ids & EXCLUDED
+
+
+@pytest.mark.parametrize(("group", "flag", "title", "all_title", "suffix"), FINANCE_GROUPS)
+def test_finance_summary_with_nobody_willing_shows_every_industry_at_zero(
+    world, group, flag, title, all_title, suffix
+):
+    from app.core.dropdowns import WHEEL_INDUSTRIES
+
+    world.alum(1, industry="Investment Banking", mentor_willing=True)
+    s = _summary(world, group)
+    assert s.links[0].key is L.all and s.links[0].count == 0
+    rest = s.links[1:]
+    assert len(rest) == len(WHEEL_INDUSTRIES)
+    assert [link.industry for link in rest] == sorted(WHEEL_INDUSTRIES, key=str.lower)
+    assert {link.count for link in rest} == {0}
+
+
+@pytest.mark.parametrize(("group", "flag", "title", "all_title", "suffix"), FINANCE_GROUPS)
+def test_finance_list_page_titles_and_job_title(world, group, flag, title, all_title, suffix):
+    world.alum(1, industry="Investment Banking", title="Vice President", **{flag: True})
+    world.alum(2, industry="Investment Banking", **{flag: True})
+    ref = ol.make_ref(group, L.industry, " investment banking ")
+    page = asyncio.run(ol.list_page(world.db, ref, limit=50, offset=0, can_edit=True))
+    assert page.title == f"Investment Banking {suffix}"
+    assert page.group_title == title
+    assert page.industry == "Investment Banking"
+    assert [r.job_title for r in page.items] == ["Vice President", None]
+    page = asyncio.run(
+        ol.list_page(world.db, ol.make_ref(group, L.all, None), limit=50, offset=0,
+                     can_edit=True)
+    )
+    assert page.title == all_title
+    assert page.total == 2
+
+
+@pytest.mark.parametrize("group", [G.case_competition, G.event_help])
+@pytest.mark.parametrize(
+    ("key", "industry"),
+    [
+        (L.industry, None),
+        (L.all, "Investment Banking"),
+        (L.industry, "Other"),  # not a dashboard finance industry
+        (L.industry, "Unknown"),
+        (L.industry, "Graduate Student"),
+        (L.industry, "Law"),
+        (L.women, None),
+    ],
+)
+def test_finance_make_ref_rejects_what_is_not_a_list(group, key, industry):
+    with pytest.raises(ol.NoSuchList):
+        ol.make_ref(group, key, industry)
+
+
+def test_all_is_not_a_list_on_the_older_pages():
+    for group in (G.mentors, G.conference, G.speakers, G.sponsors):
+        with pytest.raises(ol.NoSuchList):
+            ol.make_ref(group, L.all, None)
+
+
+@pytest.mark.parametrize(("group", "flag", "title", "all_title", "suffix"), FINANCE_GROUPS)
+def test_finance_csv_columns_title_and_audit(world, group, flag, title, all_title, suffix):
+    world.alum(1, industry="Real Estate", title="Partner", **{flag: True})
+    ref = ol.make_ref(group, L.industry, "Real Estate")
+    text = asyncio.run(ol.export_list_csv(world.db, ref, actor_user_id=7, can_edit=True))
+    rows = list(csv.reader(io.StringIO(text)))
+    header = rows[0]
+    # Job Title right after Company; Work Email and Phone kept (fa-web-app #945).
+    assert header[3:5] == ["Company", "Job Title"]
+    assert "Work Email" in header and "Phone" in header
+    assert rows[1][3:5] == ["Co1", "Partner"]
+    (entry,) = world.db.added
+    assert entry.action_type == "export_outreach_list"
+    assert entry.new_value == f"list={group.value}:industry:Real Estate; rows=1"
+    assert ol.export_filename(ref, datetime.date(2026, 11, 17)) == (
+        f"{group.value}_industry_real_estate_2026-11-17.csv"
+    )
+
+
+def test_finance_routes(world):
+    _finance_world(world, "case_competition_host_willing", "help_at_event_willing")
+    resp = _get("/outreach/case_competition", world.db, _ctx("full_access"))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["links"][0] == {
+        "key": "all",
+        "industry": None,
+        "title": "All Case Competition Hosts",
+        "count": 11,
+    }
+    resp = _get(
+        "/outreach/event_help/industry?industry=Investment%20Banking",
+        world.db,
+        _ctx("full_access"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["title"] == "Investment Banking Alumni willing to help at a Finance Event"
+    assert [r["alumni_id"] for r in body["items"]] == [12]  # the event-help flag only
+    assert "job_title" in body["items"][0]
+    for path in (
+        "/outreach/case_competition/industry?industry=Other",
+        "/outreach/event_help/industry",
+        "/outreach/event_help/women",
+    ):
+        assert _get(path, world.db, _ctx("full_access")).status_code == 404
+    for path in ("/outreach/case_competition", "/outreach/event_help/all/export"):
+        assert _get(path, world.db, _ctx("view_only")).status_code == 403

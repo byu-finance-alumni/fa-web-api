@@ -1,9 +1,9 @@
 """Response schemas for the Outreach interest lists.
 
-Four landing pages under the Outreach menu — Conference Interest, Event
-Speakers, Event Sponsors, Alumni Mentors — each a set of report links with a
-count. Every list uses the NetTrek reports' people, sort, table and CSV, so a
-list's rows are :class:`app.schemas.nettreks.NetTrekRow`.
+Six landing pages under the Outreach menu — Conference Interest, Event
+Speakers, Event Sponsors, Alumni Mentors, Case Competition Hosts and Event Help
+— each a set of report links with a count. Every list uses the NetTrek
+reports' people, sort, table and CSV, so a list's rows are :class:`app.schemas.nettreks.NetTrekRow`.
 """
 
 from __future__ import annotations
@@ -22,12 +22,16 @@ class OutreachGroupKey(StrEnum):
     speakers = "speakers"
     sponsors = "sponsors"
     mentors = "mentors"
+    case_competition = "case_competition"
+    event_help = "event_help"
 
 
 class OutreachListKey(StrEnum):
     """One list on a landing page. Which keys a group has is fixed by the
-    backend (``outreach_lists.GROUP_LISTS``); ``industry`` (Alumni Mentors)
-    also takes an ``industry`` query parameter naming the industry."""
+    backend (``outreach_lists.GROUP_LISTS``); ``industry`` (Alumni Mentors,
+    Case Competition Hosts, Event Help) also takes an ``industry`` query
+    parameter naming the industry. ``all`` is everyone willing (Case
+    Competition Hosts, Event Help)."""
 
     real_estate = "real_estate"
     corporate_finance = "corporate_finance"
@@ -37,15 +41,18 @@ class OutreachListKey(StrEnum):
     industry = "industry"
     no_industry = "no_industry"
     women = "women"
+    all = "all"
 
 
 class OutreachListLink(BaseModel):
     """One report link on a landing page."""
 
     key: OutreachListKey
-    # The industry, for an Alumni Mentors ``industry`` link; else ``None``.
+    # The industry, for an ``industry`` link; else ``None``.
     industry: str | None
     # "Real Estate Conference Alumni Interest" / "Investment Banking Mentors".
+    # A Case Competition Hosts / Event Help industry link is titled with the
+    # industry alone ("Investment Banking"); its list page has the long title.
     title: str
     count: int
 

@@ -1,5 +1,5 @@
-"""Outreach interest lists: Conference Interest, Event Speakers, Event Sponsors
-and Alumni Mentors.
+"""Outreach interest lists: Conference Interest, Event Speakers, Event Sponsors,
+Alumni Mentors, Case Competition Hosts and Event Help.
 
 Each is a landing page of report links with counts, like NetTreks, built on the
 willingness flags on ``alumni_program_engagement`` (one row per alum, set from
@@ -16,6 +16,14 @@ engagement row has expressed none):
   * **Alumni Mentors** (``mentor_willing``): one list per industry with at
     least one mentor, plus Industry Not Listed, plus Alumni Mentors for Women
     (``women_in_finance_mentor_willing``, whether or not ``mentor_willing``).
+  * **Case Competition Hosts** (``case_competition_host_willing``) and **Event
+    Help** (``help_at_event_willing``), api#682: an "All" list of everyone
+    willing, then one list per dashboard FINANCE industry
+    (``dropdowns.WHEEL_INDUSTRIES`` — the industries the dashboard industry
+    chart gives a bar of their own), EVERY one of them even at zero, most first
+    (ties A→Z, the dashboard chart's order). "Other", "Unknown", "Graduate
+    Student" and the other non-wheel values are not finance industries and get
+    no row; anyone in them is on the "All" list only.
 
 Industry is the industry the alumni list DISPLAYS
 (``repositories.alumni.displayed_industry``, #891: the secondary industry when
@@ -40,7 +48,7 @@ from dataclasses import dataclass
 from sqlalchemy import String, cast, false, func, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dropdowns import INDUSTRIES
+from app.core.dropdowns import INDUSTRIES, WHEEL_INDUSTRIES
 from app.models.audit import AuditLog
 from app.models.employment import CurrentEmployment
 from app.models.engagement import AlumniProgramEngagement as APE
@@ -66,6 +74,8 @@ GROUP_TITLES: dict[OutreachGroupKey, str] = {
     G.speakers: "Event Speakers",
     G.sponsors: "Event Sponsors",
     G.mentors: "Alumni Mentors",
+    G.case_competition: "Case Competition Hosts",
+    G.event_help: "Event Help",
 }
 
 #: The lists each group has, in landing-page order.
@@ -74,6 +84,21 @@ GROUP_LISTS: dict[OutreachGroupKey, tuple[OutreachListKey, ...]] = {
     G.speakers: (L.utah, L.out_of_state),
     G.sponsors: (L.utah, L.out_of_state),
     G.mentors: (L.industry, L.no_industry, L.women),
+    G.case_competition: (L.all, L.industry),
+    G.event_help: (L.all, L.industry),
+}
+
+#: The groups whose ``industry`` lists are exactly the dashboard's finance
+#: industries (every one shown, zeros included; no other industry is a list).
+FINANCE_INDUSTRY_GROUPS: frozenset[OutreachGroupKey] = frozenset(
+    {G.case_competition, G.event_help}
+)
+
+#: Each group's per-industry list title, after the industry name.
+_INDUSTRY_TITLE_SUFFIX: dict[OutreachGroupKey, str] = {
+    G.mentors: "Mentors",
+    G.case_competition: "Case Competition Hosts",
+    G.event_help: "Alumni willing to help at a Finance Event",
 }
 
 _FIXED_TITLES: dict[tuple[OutreachGroupKey, OutreachListKey], str] = {
@@ -86,6 +111,8 @@ _FIXED_TITLES: dict[tuple[OutreachGroupKey, OutreachListKey], str] = {
     (G.sponsors, L.out_of_state): "Potential Alumni Sponsors Out of State",
     (G.mentors, L.no_industry): "Industry Not Listed Mentors",
     (G.mentors, L.women): "Alumni Mentors for Women",
+    (G.case_competition, L.all): "All Case Competition Hosts",
+    (G.event_help, L.all): "All Alumni willing to help at a Finance Event",
 }
 
 #: The audit action every Outreach list CSV writes (counted in the global
@@ -95,17 +122,20 @@ OUTREACH_EXPORT_ACTION = "export_outreach_list"
 OUTREACH_ENTITY = "outreach_list"
 
 _INDUSTRY_BY_LOWER = {v.lower(): v for v in INDUSTRIES}
+_FINANCE_BY_LOWER = {v.lower(): v for v in WHEEL_INDUSTRIES}
 
 
 class NoSuchList(LookupError):
     """The group has no such list, or an industry list was asked for without an
-    industry (or a non-industry list with one)."""
+    industry (or a non-industry list with one), or — on a Case Competition
+    Hosts / Event Help page — with an industry that is not a dashboard finance
+    industry."""
 
 
 @dataclass(frozen=True)
 class ListRef:
-    """One list: ``industry`` is set only for an Alumni Mentors ``industry``
-    list (the displayed industry, any casing)."""
+    """One list: ``industry`` is set only for an ``industry`` list (the
+    displayed industry, any casing)."""
 
     group: OutreachGroupKey
     key: OutreachListKey
@@ -121,6 +151,12 @@ def make_ref(
         raise NoSuchList(key)
     industry = (industry or "").strip() or None
     if (key is L.industry) != (industry is not None):
+        raise NoSuchList(key)
+    if (
+        industry is not None
+        and group in FINANCE_INDUSTRY_GROUPS
+        and industry.lower() not in _FINANCE_BY_LOWER
+    ):
         raise NoSuchList(key)
     return ListRef(group, key, industry)
 
@@ -138,6 +174,8 @@ _GROUP_FLAG = {
     G.speakers: APE.guest_speaker_willing,
     G.sponsors: APE.company_event_sponsor_willing,
     G.mentors: APE.mentor_willing,
+    G.case_competition: APE.case_competition_host_willing,
+    G.event_help: APE.help_at_event_willing,
 }
 
 
@@ -176,6 +214,8 @@ def list_predicate(ref: ListRef):
     if ref.key is L.women:
         return _willing(APE.women_in_finance_mentor_willing)
     willing = _willing(_GROUP_FLAG[ref.group])
+    if ref.key is L.all:
+        return willing
     ind = industry_key_expr()
     if ref.key is L.real_estate:
         return willing & (ind == "real estate")
@@ -218,18 +258,26 @@ def industry_label(industry: str) -> str:
 
 def list_title(ref: ListRef) -> str:
     if ref.key is L.industry:
-        return f"{industry_label(ref.industry or '')} Mentors"
+        suffix = _INDUSTRY_TITLE_SUFFIX[ref.group]
+        return f"{industry_label(ref.industry or '')} {suffix}"
     return _FIXED_TITLES[(ref.group, ref.key)]
 
 
 # --- landing pages ----------------------------------------------------------------
 
 
-async def _mentor_industries(session: AsyncSession) -> list[tuple[str, int]]:
-    """``(industry label, mentors)`` for every industry with at least one
-    mentor, most mentors first (ties A→Z). One grouped query; the key is
-    labelled in a subquery and grouped OUTSIDE it, so PostgreSQL never has to
-    match the displayed-industry CASE (with its bind parameters) between
+def _most_first(item: tuple[str, int]) -> tuple[int, str]:
+    """Most first, ties A→Z — the dashboard industry chart's order."""
+    return (-item[1], item[0].lower())
+
+
+async def _industry_counts(
+    session: AsyncSession, group: OutreachGroupKey
+) -> list[tuple[str, str, int]]:
+    """``(industry key, displayed spelling, n)`` for every displayed industry
+    with at least one alum willing on ``group``'s flag. One grouped query; the
+    key is labelled in a subquery and grouped OUTSIDE it, so PostgreSQL never
+    has to match the displayed-industry CASE (with its bind parameters) between
     SELECT and GROUP BY."""
     per_alum = (
         nettreks.report_from_clause(
@@ -238,7 +286,7 @@ async def _mentor_industries(session: AsyncSession) -> list[tuple[str, int]]:
                 _displayed_industry_expr().label("shown"),
             )
         )
-        .where(*nettreks.population_conditions(), _willing(APE.mentor_willing))
+        .where(*nettreks.population_conditions(), _willing(_GROUP_FLAG[group]))
         .subquery()
     )
     rows = (
@@ -248,9 +296,32 @@ async def _mentor_industries(session: AsyncSession) -> list[tuple[str, int]]:
             .group_by(per_alum.c.ind_key)
         )
     ).all()
-    out = [(industry_label(shown), int(n)) for _key, shown, n in rows]
-    out.sort(key=lambda item: (-item[1], item[0].lower()))
+    return [(key, shown, int(n)) for key, shown, n in rows]
+
+
+async def _mentor_industries(session: AsyncSession) -> list[tuple[str, int]]:
+    """``(industry label, mentors)`` for every industry with at least one
+    mentor, most mentors first (ties A→Z)."""
+    out = [
+        (industry_label(shown), n)
+        for _key, shown, n in await _industry_counts(session, G.mentors)
+    ]
+    out.sort(key=_most_first)
     return out
+
+
+async def _finance_industries(
+    session: AsyncSession, group: OutreachGroupKey
+) -> list[tuple[str, int]]:
+    """``(industry, n)`` for EVERY dashboard finance industry, zeros included,
+    most first (ties A→Z). Displayed industries outside that set are not
+    counted here (they are on the "All" list only)."""
+    counts = dict.fromkeys(WHEEL_INDUSTRIES, 0)
+    for key, _shown, n in await _industry_counts(session, group):
+        canonical = _FINANCE_BY_LOWER.get(key)
+        if canonical is not None:
+            counts[canonical] += n
+    return sorted(counts.items(), key=_most_first)
 
 
 async def get_summary(
@@ -258,8 +329,28 @@ async def get_summary(
 ) -> OutreachGroupSummary:
     """Every list on one landing page with its count. Alumni Mentors lists one
     link per industry that has a mentor (most first), then Industry Not Listed
-    (only when someone is in it), then Alumni Mentors for Women (always)."""
+    (only when someone is in it), then Alumni Mentors for Women (always). Case
+    Competition Hosts and Event Help list "All" first, then every dashboard
+    finance industry (most first, zeros included), each titled with the
+    industry alone."""
     links: list[OutreachListLink] = []
+    if group in FINANCE_INDUSTRY_GROUPS:
+        everyone = ListRef(group, L.all)
+        links.append(
+            OutreachListLink(
+                key=L.all,
+                industry=None,
+                title=list_title(everyone),
+                count=await _count(session, everyone),
+            )
+        )
+        for label, n in await _finance_industries(session, group):
+            links.append(
+                OutreachListLink(key=L.industry, industry=label, title=label, count=n)
+            )
+        return OutreachGroupSummary(
+            group=group, title=GROUP_TITLES[group], links=links
+        )
     if group is G.mentors:
         for label, n in await _mentor_industries(session):
             ref = ListRef(group, L.industry, label)

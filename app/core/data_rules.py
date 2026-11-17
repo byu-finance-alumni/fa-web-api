@@ -24,6 +24,16 @@ THE RULES (Jake, 2026-11-11)
   ``Not in the Labor Force`` and -- for the CURRENT job only, because employment
   status describes the person, not a past role -- the alum's employment status
   ``Not in the Labor Force``.
+* #681 -- the same #673 outcome when the alum's EMPLOYMENT STATUS is "Not in
+  the Labor Force" (any spelling), whatever the company says: the CURRENT job
+  gets industry ``Other`` + secondary ``Not in the Labor Force`` and the status
+  is stored canonically. The company is left exactly as it is (blank stays
+  blank, "Acme" stays "Acme") -- #673 only rewrites a company that is ITSELF a
+  "Not in the Labor Force" spelling, so it never invents one either. Past jobs
+  are untouched: status describes the person now, not a past role. When the
+  status says Not in the Labor Force but the company is ``Unknown``, the
+  Not-in-the-Labor-Force outcome wins over #671 (Jake, 2026-11-17: everyone in
+  that status lands in one place).
 
 Rules apply to every job row being saved: the current job (``current_employment``)
 and past jobs (``employment_history``, which has no secondary-industry column, so
@@ -185,38 +195,65 @@ CURRENT_JOB = JobColumns(
 HISTORY_JOB = JobColumns("employment_history", "employer_name", "employment_industry", None)
 
 
-def job_rule_updates(employer: object, cols: JobColumns) -> dict[str, str]:
-    """The column values the company forces on a job row, or ``{}``.
+def is_nlf_job(employer: object, employment_status: object = None) -> bool:
+    """True when a CURRENT job falls under #673/#681: the company OR the alum's
+    employment status is some spelling of "Not in the Labor Force"."""
+    return is_not_in_labor_force(employer) or is_not_in_labor_force(employment_status)
+
+
+def job_rule_updates(
+    employer: object, cols: JobColumns, *, employment_status: object = None
+) -> dict[str, str]:
+    """The column values the company (or status) forces on a job row, or ``{}``.
 
     Keyed by *cols*' column names. Includes the canonical employer text for a
-    "Not in the Labor Force" variant (#673) so the company is stored one way too.
+    "Not in the Labor Force" / unknown variant so the company is stored one way
+    too -- but never a company that is not itself such a variant (#681).
+
+    *employment_status* is the alum's status and only belongs with the CURRENT
+    job (#681); past-job callers leave it ``None``.
     """
-    if is_unknown(employer):
-        return {cols.employer: UNKNOWN, cols.industry: UNKNOWN}
-    if is_not_in_labor_force(employer):
-        updates = {cols.employer: NOT_IN_LABOR_FORCE, cols.industry: OTHER}
+    if is_nlf_job(employer, employment_status):
+        updates = {cols.industry: OTHER}
+        if is_not_in_labor_force(employer):
+            updates[cols.employer] = NOT_IN_LABOR_FORCE
+        elif is_unknown(employer):
+            updates[cols.employer] = UNKNOWN
         if cols.secondary is not None:
             updates[cols.secondary] = NOT_IN_LABOR_FORCE
         return updates
+    if is_unknown(employer):
+        return {cols.employer: UNKNOWN, cols.industry: UNKNOWN}
     return {}
 
 
-def employment_status_for(employer: object) -> str | None:
-    """The employment status the CURRENT job's company forces, or ``None``."""
-    return NOT_IN_LABOR_FORCE if is_not_in_labor_force(employer) else None
+def employment_status_for(employer: object, employment_status: object = None) -> str | None:
+    """The employment status the CURRENT job forces, or ``None``.
+
+    The company (#673) or the status itself (#681, any spelling) being "Not in
+    the Labor Force" pins the status to the canonical label.
+    """
+    return NOT_IN_LABOR_FORCE if is_nlf_job(employer, employment_status) else None
 
 
-def apply_job_rules(values: dict, cols: JobColumns, *, stored_employer: object = None) -> dict:
+def apply_job_rules(
+    values: dict,
+    cols: JobColumns,
+    *,
+    stored_employer: object = None,
+    employment_status: object = None,
+) -> dict:
     """Normalise a ``{column: value}`` dict about to be written to a job row.
 
     *values* may be partial (a PATCH): the employer it is judged by is the one in
     *values* when present, else *stored_employer* (what the row already holds).
-    Returns a NEW dict: the #672/#673 spelling fixes, plus the forced
-    industry/secondary columns when the company calls for them.
+    *employment_status* is the alum's EFFECTIVE status, for the current job only
+    (#681). Returns a NEW dict: the #672/#673 spelling fixes, plus the forced
+    industry/secondary columns when the company or status calls for them.
     """
     out = normalize_values(cols.table, values)
     employer = out[cols.employer] if cols.employer in out else stored_employer
-    forced = job_rule_updates(employer, cols)
+    forced = job_rule_updates(employer, cols, employment_status=employment_status)
     if cols.employer not in out:
         # Don't rewrite an employer the caller did not send; the stored one is
         # canonicalised by the maintenance SQL, not by an unrelated save.
@@ -225,12 +262,15 @@ def apply_job_rules(values: dict, cols: JobColumns, *, stored_employer: object =
     return out
 
 
-def apply_rules_to_row(row: object, cols: JobColumns) -> dict[str, tuple[object, object]]:
+def apply_rules_to_row(
+    row: object, cols: JobColumns, *, employment_status: object = None
+) -> dict[str, tuple[object, object]]:
     """Apply the spelling fixes + job rules to an ORM job row IN PLACE.
 
     Returns ``{column: (old, new)}`` for every column it changed, so the caller
     can audit it. Used where the row is built or edited attribute-by-attribute
     (archiving, the per-row employment endpoints, the survey apply).
+    *employment_status*: the alum's status, current job only (#681).
     """
     changed: dict[str, tuple[object, object]] = {}
 
@@ -243,7 +283,10 @@ def apply_rules_to_row(row: object, cols: JobColumns) -> dict[str, tuple[object,
     for column in UNKNOWN_COLUMNS.get(cols.table, ()):
         old = getattr(row, column, None)
         _set(column, normalize_value(cols.table, column, old))
-    for column, new in job_rule_updates(getattr(row, cols.employer, None), cols).items():
+    forced = job_rule_updates(
+        getattr(row, cols.employer, None), cols, employment_status=employment_status
+    )
+    for column, new in forced.items():
         _set(column, new)
     return changed
 

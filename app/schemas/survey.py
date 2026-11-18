@@ -385,8 +385,9 @@ class SurveyBouncedAlum(BaseModel):
     # Resend's bounce subtype as sent, e.g. "General", "NoEmail", "Suppressed".
     bounce_subtype: str | None = None
     bounced_at: datetime.datetime
-    # Whether that address is still one of the two on the profile. False means
-    # someone has already changed it since the bounce. None when unknown.
+    # Whether that address is still one of the two on the profile. None when
+    # unknown. Never False since #697: a bounce on an address that has since
+    # been changed no longer lists the person at all.
     address_still_on_file: bool | None = None
 
 
@@ -1073,9 +1074,10 @@ class SurveyOneOffPreview(BaseModel):
     # "personal" or "work": which column `email` came from.
     email_source: str | None = None
     can_send: bool
-    # One of: not_alumni, archived, suppressed, unreachable,
-    # no_graduation_year, campaign_paused, campaign_cancelled. None when
-    # `can_send` is true.
+    # One of: archived, suppressed, unreachable, no_graduation_year,
+    # campaign_paused, campaign_cancelled. None when `can_send` is true.
+    # (`not_alumni` is retired: friends are sendable since api#696. A friend is
+    # never refused for a missing year or a paused class campaign.)
     reason_code: str | None = None
     reason: str | None = None
     # The last survey email of any kind (class or one-off) this alum was sent.

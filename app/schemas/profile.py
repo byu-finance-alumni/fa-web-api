@@ -580,6 +580,13 @@ class ProfileRead(BaseModel):
     # Next scheduled survey send for this alum's graduation year, from the survey
     # send-scheduler (#364/#542). None when the class has no runnable schedule.
     next_survey_date: datetime.date | None = None
+    # The profile's survey box (fa-web-app #957). `survey_last_submitted_at`:
+    # their newest survey reply that staff have not rejected (pending, applied
+    # or confirmed) -- the box then reads "Last updated <date> by <them>".
+    # `survey_last_sent_at`: the last survey email of any kind (class campaign
+    # or one-off from the profile). None when there is none.
+    survey_last_submitted_at: datetime.datetime | None = None
+    survey_last_sent_at: datetime.datetime | None = None
     interactions: list[InteractionRead] = []
     interaction_count: int = 0
     tasks: list[TaskRead] = []

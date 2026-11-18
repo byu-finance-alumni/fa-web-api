@@ -769,6 +769,7 @@ CREATE TABLE survey_email_events (
 );
 CREATE INDEX IF NOT EXISTS ix_survey_email_events_year_type ON survey_email_events (graduation_year, event_type, bounce_type);
 CREATE INDEX IF NOT EXISTS ix_survey_email_events_resend_email_id ON survey_email_events (resend_email_id);
+CREATE INDEX IF NOT EXISTS idx_survey_email_events_alumni_type ON survey_email_events (alumni_id, event_type);
 
 -- Per-alumnus survey campaign resets (#395). A reset makes ONE person surveyable
 -- again and DELETES NOTHING: their responses and send-log rows stay exactly as
@@ -1287,7 +1288,7 @@ CREATE INDEX IF NOT EXISTS idx_new_people_invites_sent_at ON new_people_invites 
 CREATE TABLE survey_one_off (
     survey_one_off_id  bigserial PRIMARY KEY,
     alumni_id          bigint NOT NULL,
-    graduation_year    integer NOT NULL,
+    graduation_year    integer,  -- NULL for a friend with no year (#696)
     sent_by_user_id    bigint,
     started_at         timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_survey_one_off_alumni FOREIGN KEY (alumni_id) REFERENCES alumni (alumni_id) ON DELETE CASCADE,
@@ -1308,6 +1309,7 @@ CREATE TABLE survey_one_off_send_log (
     CONSTRAINT uq_survey_one_off_send_log_stage UNIQUE (survey_one_off_id, stage)
 );
 CREATE INDEX IF NOT EXISTS idx_survey_one_off_send_log_sent_at ON survey_one_off_send_log (sent_at);
+CREATE INDEX IF NOT EXISTS idx_survey_one_off_send_log_resend_email_id ON survey_one_off_send_log (resend_email_id);
 
 -- City -> lat/lng crosswalk backing the map radius/proximity search and the
 -- county rollups (#151). Non-sensitive public US Census reference data, seeded

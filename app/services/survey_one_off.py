@@ -1,4 +1,22 @@
-"""Send the survey to ONE alum from their profile (api#669).
+"""Send the survey to ONE alum -- or ONE friend -- from their profile (api#669).
+
+FRIENDS (api#696, Jake 2026-11-18). A friend of the program (``is_alumni`` is
+false) gets the same button with the same rules: needs an email, never to
+deceased / Do Not Contact, counts toward the caps, same day-7 / day-14
+reminders. The button used to be disabled for every friend because
+:func:`_resolve` refused anyone who was not an alum ("Only alumni get the
+survey.") -- and most friends have no graduation year, which was a second
+refusal behind the first. A friend belongs to no class campaign, so:
+
+* no class campaign is consulted for them (pause / cancel of a class never
+  holds a friend, and there is no year to require);
+* the link is minted with year ``0`` when they have none -- the token's year is
+  signed but never read back (``survey_email.verify_survey_token`` returns the
+  id only) -- and the ``graduation_year`` tag is left off the email;
+* their one-off row stores the year they have, or NULL.
+
+Nothing here ever writes ``survey_send_log``, so a friend's send can no more use
+up a class's one-time campaign cycle than an alum's one-off can.
 
 Same email, same copy, same 7-day link and same send rules as a class send --
 just aimed at one person. Decisions (Jake, 2026-11-11):
@@ -85,6 +103,8 @@ RESEND_COOLDOWN = datetime.timedelta(hours=24)
 REASON_RESEND_CONFIRM = "resend_confirm_required"
 
 # Stable reason codes (the frontend may key on them) and their plain wording.
+# Kept as a stable code although nothing returns it any more: friends are
+# sendable since api#696. An older frontend may still key on it.
 REASON_NOT_ALUMNI = "not_alumni"
 REASON_ARCHIVED = "archived"
 REASON_SUPPRESSED = "suppressed"
@@ -156,6 +176,9 @@ class _Target:
     graduation_year: int | None
     reason_code: str | None
     recipient: survey_email.Recipient | None
+    # A friend of the program (``is_alumni`` false, api#696): no class campaign
+    # applies to them, so no year is required and no campaign can hold them.
+    is_friend: bool = False
 
 
 async def _campaign_status(session: AsyncSession, graduation_year: int) -> str | None:
@@ -191,14 +214,15 @@ async def _resolve(session: AsyncSession, alumni_id: int) -> _Target:
     if alum is None:
         raise NotFoundError("Alumni not found.")
     first = (alum.preferred_first_name or alum.first_name or "").strip()
-    name = " ".join(p for p in (first, (alum.last_name or "").strip()) if p) or "This alum"
+    is_friend = not alum.is_alumni
+    name = " ".join(p for p in (first, (alum.last_name or "").strip()) if p) or (
+        "This friend" if is_friend else "This alum"
+    )
     year = alum.graduation_year
 
     def _target(reason: str | None, recipient=None) -> _Target:
-        return _Target(alumni_id, name, year, reason, recipient)
+        return _Target(alumni_id, name, year, reason, recipient, is_friend)
 
-    if not alum.is_alumni:
-        return _target(REASON_NOT_ALUMNI)
     if alum.archived:
         return _target(REASON_ARCHIVED)
     if alum.deceased or await _is_suppressed(session, alumni_id):
@@ -227,6 +251,9 @@ async def _resolve(session: AsyncSession, alumni_id: int) -> _Target:
         on_file=survey_email._build_on_file(alum, contact, job),
         email_source=source or email_reach.SOURCE_PERSONAL,
     )
+    if is_friend:
+        # No class campaign is theirs: nothing to require, nothing to pause.
+        return _target(None, recipient)
     if year is None:
         return _target(REASON_NO_YEAR, recipient)
     status = await _campaign_status(session, year)
@@ -343,26 +370,41 @@ def _from_field() -> tuple[str, str]:
     return base_url, f"{settings.survey_from_name} <{from_email}>"
 
 
+#: The year a link is minted with for someone who has none (a friend, api#696).
+#: Signed into the token but never read back -- ``verify_survey_token`` returns
+#: the alumni id only -- so it cannot point a reply at any class.
+NO_YEAR_TOKEN_VALUE = 0
+
+
 def _build_email(
     r: survey_email.Recipient,
     *,
-    graduation_year: int,
+    graduation_year: int | None,
     base_url: str,
     from_field: str,
     message: survey_message.SurveyMessage,
     stage: int,
 ) -> dict:
     """The class send's own email, with one extra tag so a bounce or a log line
-    can tell a one-off from a class send. Tags carry no PII."""
+    can tell a one-off from a class send. Tags carry no PII.
+
+    ``graduation_year`` None (a friend with no year, api#696): the link is
+    minted with :data:`NO_YEAR_TOKEN_VALUE` and the year tag is left off, so a
+    bounce for it can never be filed under a class."""
     email = survey_email._build_survey_email(
         r,
-        graduation_year=graduation_year,
+        graduation_year=(
+            graduation_year if graduation_year is not None else NO_YEAR_TOKEN_VALUE
+        ),
         base_url=base_url,
         from_field=from_field,
         message=message,
         stage=stage,
     )
-    email["tags"] = [*email.get("tags", []), {"name": "one_off", "value": "1"}]
+    tags = list(email.get("tags", []))
+    if graduation_year is None:
+        tags = [t for t in tags if t.get("name") != "graduation_year"]
+    email["tags"] = [*tags, {"name": "one_off", "value": "1"}]
     return email
 
 
@@ -403,7 +445,7 @@ def _audit(
     actor_user_id: int | None,
     alumni_id: int,
     one_off_id: int,
-    graduation_year: int,
+    graduation_year: int | None,
     stage: int,
     email_source: str,
     scheduled: bool,
@@ -449,8 +491,9 @@ async def send_one_off(
             " Nothing was sent."
         )
     recipient = target.recipient
+    # None only for a friend with no year (api#696); _resolve refuses an alum
+    # without one.
     year = target.graduation_year
-    assert year is not None  # _resolve refuses a missing year
 
     async with survey_email.send_lock() as acquired:
         if not acquired:
@@ -595,7 +638,7 @@ _Outer = aliased(SurveyOneOff, name="one_off_outer")
 
 async def _candidates(
     session: AsyncSession, now: datetime.datetime
-) -> list[tuple[int, int, int, datetime.datetime]]:
+) -> list[tuple[int, int, int | None, datetime.datetime]]:
     """``(one_off_id, alumni_id, year, started_at)`` for each alum's NEWEST
     one-off inside the reminder window, oldest first.
 
@@ -627,7 +670,9 @@ async def _candidates(
     except Exception:  # noqa: BLE001 - reminders must never break the class cron
         log.warning("survey_one_off: could not read one-off sends; no reminders")
         return []
-    return [(int(r[0]), int(r[1]), int(r[2]), r[3]) for r in rows]
+    return [
+        (int(r[0]), int(r[1]), None if r[2] is None else int(r[2]), r[3]) for r in rows
+    ]
 
 
 async def _sent_stages(session: AsyncSession, one_off_id: int) -> set[int]:
@@ -698,7 +743,7 @@ async def send_due_reminders(
         return ReminderOutcome()
     base_url, from_field = _from_field()
 
-    due: list[tuple[int, int, int, int, survey_email.Recipient]] = []
+    due: list[tuple[int, int, int | None, int, survey_email.Recipient]] = []
     for one_off_id, alumni_id, year, started_at in candidates:
         stage = owed_stage(started_at, await _sent_stages(session, one_off_id), now.date())
         if stage is None:
@@ -721,7 +766,7 @@ async def send_due_reminders(
     sent = 0
     for chunk_start in range(0, len(due), survey_email._BATCH_MAX):
         chunk = due[chunk_start : chunk_start + survey_email._BATCH_MAX]
-        claimed: list[tuple[int, int, int, int, survey_email.Recipient, int]] = []
+        claimed: list[tuple[int, int, int | None, int, survey_email.Recipient, int]] = []
         for one_off_id, alumni_id, year, stage, r in chunk:
             log_id = await _claim_reminder(session, one_off_id, stage, r.email)
             if log_id is not None:

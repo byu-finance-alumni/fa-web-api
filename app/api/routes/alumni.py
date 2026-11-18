@@ -214,6 +214,23 @@ async def list_alumni(
     graduation_year: int | None = None,
     grad_year_min: int | None = None,
     grad_year_max: int | None = None,
+    # "Class of" range (fa-web-app#959): the Marriott class year, inclusive.
+    graduation_class_min: Annotated[
+        int | None,
+        Query(
+            ge=_GRAD_YEAR_MIN,
+            le=_GRAD_YEAR_MAX,
+            description="'Class of' year, from (inclusive).",
+        ),
+    ] = None,
+    graduation_class_max: Annotated[
+        int | None,
+        Query(
+            ge=_GRAD_YEAR_MIN,
+            le=_GRAD_YEAR_MAX,
+            description="'Class of' year, to (inclusive).",
+        ),
+    ] = None,
     deceased: Annotated[bool | None, Query(description="Filter by deceased flag.")] = None,
     gender: Annotated[
         Literal["M", "F"] | None,
@@ -655,6 +672,8 @@ async def list_alumni(
         graduation_year=graduation_year,
         grad_year_min=grad_year_min,
         grad_year_max=grad_year_max,
+        graduation_class_min=graduation_class_min,
+        graduation_class_max=graduation_class_max,
         deceased=deceased,
         gender=gender,
         industry_group=industry_group,
@@ -723,6 +742,8 @@ async def list_alumni(
             "graduation_year": graduation_year,
             "grad_year_min": grad_year_min,
             "grad_year_max": grad_year_max,
+            "graduation_class_min": graduation_class_min,
+            "graduation_class_max": graduation_class_max,
             "gender": gender,
             "industry_group": industry_group,
             # Record the interpreted location phrase (never the resolved city set).

@@ -16,6 +16,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.core.dropdowns import CommentFilter
+from app.schemas.alumni import _YEAR_MAX, _YEAR_MIN
 
 # Ceiling on every free-text search/filter string (#597), shared with the
 # ``GET /alumni`` query params so the list and the export refuse the same input.
@@ -66,6 +67,9 @@ class AlumniExportFilters(BaseModel):
     graduation_year: int | None = None
     grad_year_min: int | None = None
     grad_year_max: int | None = None
+    # "Class of" range (fa-web-app#959), same bounds as GET /alumni.
+    graduation_class_min: int | None = Field(default=None, ge=_YEAR_MIN, le=_YEAR_MAX)
+    graduation_class_max: int | None = Field(default=None, ge=_YEAR_MIN, le=_YEAR_MAX)
     deceased: bool | None = None
     # Gender + industry-bucket facets (#360, #351/#352), kept in parity with
     # GET /alumni so an export matches the filtered view the user is looking at.

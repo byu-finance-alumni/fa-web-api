@@ -456,3 +456,30 @@ def test_secondary_industry_group_export_is_narrower(client, captured, session, 
     # Every Healthcare spelling is matched, and nothing else.
     values = {v for p in params.values() if isinstance(p, list) for v in p}
     assert values == {"Healthcare", "Healthcare - Biotech", "healthcare services"}
+
+
+# --- "Class of" range (fa-web-app#959) ----------------------------------------
+
+
+def test_graduation_class_range_parity(client, captured, session):
+    _assert_same_population(
+        client, captured, session,
+        "graduation_class_min=2015&graduation_class_max=2018",
+        graduation_class_min=2015, graduation_class_max=2018,
+    )
+
+
+def test_graduation_class_range_narrows_on_the_class_column(client, captured, session):
+    sql, params = _list_sql(client, captured, "graduation_class_min=2016")
+    assert "alumni.graduation_class >= " in sql
+    assert "graduation_year >=" not in sql
+    assert 2016 in params.values()
+    unfiltered, _ = _export_sql(session)
+    narrowed, _ = _export_sql(session, graduation_class_max=2020)
+    assert narrowed != unfiltered
+
+
+def test_graduation_class_range_rejects_out_of_range_years(client):
+    assert client.get("/alumni?graduation_class_min=99999").status_code == 422
+    with pytest.raises(ValueError):
+        AlumniExportFilters(graduation_class_max=99999)

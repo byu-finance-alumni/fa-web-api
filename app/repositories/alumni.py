@@ -433,6 +433,13 @@ def build_alumni_query(
     # Exact "Class of" (Marriott) year — used by the cohort-update export to pull a
     # cohort by class year instead of graduation_year.
     graduation_class: int | None = None,
+    # "Class of" RANGE (fa-web-app#959) — the Marriott class year
+    # (``alumni.graduation_class``), inclusive, next to the graduation-year range
+    # in Advanced search. A different column from ``graduation_year``: the two
+    # can disagree by a year (December / summer graduates), which is why the
+    # search offers both.
+    graduation_class_min: int | None = None,
+    graduation_class_max: int | None = None,
     deceased: bool | None = None,
     # Gender (#360): a coarse ``M`` / ``F`` facet, AND-combined with every other
     # filter (e.g. the industry facet). Matches on the first letter of the stored
@@ -655,6 +662,10 @@ def build_alumni_query(
         conditions.append(Alumni.graduation_year <= grad_year_max)
     if graduation_class is not None:
         conditions.append(Alumni.graduation_class == graduation_class)
+    if graduation_class_min is not None:
+        conditions.append(Alumni.graduation_class >= graduation_class_min)
+    if graduation_class_max is not None:
+        conditions.append(Alumni.graduation_class <= graduation_class_max)
     if deceased is not None:
         conditions.append(Alumni.deceased.is_(deceased))
     if gender and gender.strip():

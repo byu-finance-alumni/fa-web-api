@@ -580,6 +580,7 @@ _STAFF_ROUTES = [
     ("put", "/survey/new-people/link", {"json": {"enabled": True}}),
     ("post", "/survey/new-people/link/reissue", {}),
     ("get", "/survey/new-people/submissions", {}),
+    ("get", "/survey/new-people/submissions/count", {}),
     (
         "post",
         "/survey/new-people/submissions/1/approve",
@@ -1674,3 +1675,37 @@ def test_byu_id_is_never_logged(client, db, caplog):
     _as("super_admin")
     _approve(client, sub_id=db._next_sub_id - 1, action="create")
     assert BYU not in caplog.text and "12345" not in caplog.text
+
+
+# ---------------------------------------------- top-bar count (app#958) ------
+
+
+def test_the_pending_count_route_answers_a_bare_number(client, monkeypatch):
+    async def _three(_session):
+        return 3
+
+    monkeypatch.setattr(nps, "pending_count", _three)
+    _as("full_access")
+    resp = client.get("/survey/new-people/submissions/count")
+    assert resp.status_code == 200
+    assert resp.json() == {"pending": 3}
+
+
+def test_the_pending_count_counts_only_pending_rows():
+    seen = []
+
+    class _One:
+        def scalar(self):
+            return 2
+
+    class _CaptureSession:
+        async def execute(self, stmt):
+            seen.append(str(stmt.compile(compile_kwargs={"literal_binds": True})))
+            return _One()
+
+    import asyncio
+
+    assert asyncio.run(nps.pending_count(_CaptureSession())) == 2
+    (sql,) = seen
+    assert "count(*)" in sql.lower()
+    assert "new_people_submissions.status = 'pending'" in sql or "status = 'pending'" in sql

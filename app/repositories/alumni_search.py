@@ -153,6 +153,18 @@ _HISTORY_WEIGHT = 0.7
 #: literal term the user typed.
 _ALIAS_PENALTY = 0.85
 
+#: How many characters SHORTER than a multi-word phrase a cell may be and still
+#: be a fuzzy match for the whole phrase (#692) — one extra typed letter. See
+#: :func:`segment_predicate`.
+_PHRASE_SHORTFALL = 1
+
+#: Ranking tiers for a multi-word segment that IS someone's full name (#692):
+#: "Scott Kim" against first + last name joined. Both sit above _EXACT_SCORE, so
+#: the person whose name was typed always outranks a row that merely matched
+#: each word somewhere ("Scott Kimball", "Kim Scott at Scottrade").
+_FULL_NAME_EXACT_SCORE = 200.0
+_FULL_NAME_PREFIX_SCORE = 150.0
+
 #: Terms scored per segment (the phrase plus its first few tokens). A cap keeps
 #: the ORDER BY expression bounded for a pasted-paragraph query.
 _MAX_SCORED_TERMS = 4
@@ -230,16 +242,23 @@ def norm(column) -> ColumnElement[str]:
     return func.alumni_search_norm(column)
 
 
-def _matches(normalized, term: str):
+def _matches(normalized, term: str, *, fuzzy_min_length: int | None = None):
     """Predicate: ``normalized`` matches ``term`` (or a known synonym of it).
 
     ``term`` is already normalized, so it cannot contain a LIKE metacharacter
     and needs no escaping — normalization deletes ``%`` and ``_`` outright.
+
+    ``fuzzy_min_length`` (the joined-phrase leg only, see
+    :func:`segment_predicate`) stops a fuzzy hit on a cell much SHORTER than the
+    term. Synonym spellings are other terms and take no such bound.
     """
     spellings = expand(term)
     if len(spellings) > 1:
-        return or_(*[_matches_one(normalized, s) for s in spellings])
-    return _matches_one(normalized, term)
+        return or_(
+            _matches_one(normalized, term, fuzzy_min_length=fuzzy_min_length),
+            *[_matches_one(normalized, s) for s in spellings[1:]],
+        )
+    return _matches_one(normalized, term, fuzzy_min_length=fuzzy_min_length)
 
 
 def _word_similarity_floor(term: str) -> float | None:
@@ -259,16 +278,27 @@ def _word_similarity_floor(term: str) -> float | None:
     return max(_WORD_SIMILARITY_FLOOR, _MIN_SHARED_TRIGRAMS / trigrams)
 
 
-def _matches_one(normalized, term: str):
-    """Exact / prefix / contains / trigram-similar, for a single spelling."""
+def _matches_one(normalized, term: str, *, fuzzy_min_length: int | None = None):
+    """Exact / prefix / contains / trigram-similar, for a single spelling.
+
+    ``fuzzy_min_length`` adds ``length(cell) >= n`` to the two fuzzy legs only
+    (never to the precise one). It is a recheck on rows the trigram index
+    already found, so it narrows the result and never the index probe.
+    """
     legs = [normalized.like(f"%{term}%")]
     if len(term) >= MIN_FUZZY_LENGTH:
+        length_guard = (
+            [func.length(normalized) >= fuzzy_min_length]
+            if fuzzy_min_length is not None
+            else []
+        )
         legs.append(
             and_(
                 # GIN-answerable pre-filter (session threshold, default 0.3)...
                 normalized.op("%", is_comparison=True)(term),
                 # ...narrowed to OUR floor, so behaviour never depends on a GUC.
                 func.similarity(normalized, term) >= _SIMILARITY_FLOOR,
+                *length_guard,
             )
         )
         word_floor = _word_similarity_floor(term)
@@ -279,24 +309,32 @@ def _matches_one(normalized, term: str):
                     # on the RIGHT for the index to be usable.
                     literal(term).op("<%", is_comparison=True)(normalized),
                     func.word_similarity(term, normalized) >= word_floor,
+                    *length_guard,
                 )
             )
     return or_(*legs)
 
 
-def _exists_over(model, columns: tuple, alumni_id_column, term: str):
+def _exists_over(
+    model, columns: tuple, alumni_id_column, term: str, *, fuzzy_min_length=None
+):
     """Correlated EXISTS: some row of ``model`` for this alumnus matches ``term``."""
     return (
         select(literal(1))
         .where(
             alumni_id_column == Alumni.alumni_id,
-            or_(*[_matches(norm(c), term) for c in columns]),
+            or_(
+                *[
+                    _matches(norm(c), term, fuzzy_min_length=fuzzy_min_length)
+                    for c in columns
+                ]
+            ),
         )
         .exists()
     )
 
 
-def _alumni_row_in(columns: tuple, term: str):
+def _alumni_row_in(columns: tuple, term: str, *, fuzzy_min_length=None):
     """``alumni_id IN (SELECT ... WHERE <term matches one of these columns>)``.
 
     Written as an id-set subquery rather than as inline column predicates for a
@@ -314,15 +352,30 @@ def _alumni_row_in(columns: tuple, term: str):
     other = aliased(Alumni)
     return Alumni.alumni_id.in_(
         select(other.alumni_id).where(
-            or_(*[_matches(norm(getattr(other, c.key)), term) for c in columns])
+            or_(
+                *[
+                    _matches(
+                        norm(getattr(other, c.key)),
+                        term,
+                        fuzzy_min_length=fuzzy_min_length,
+                    )
+                    for c in columns
+                ]
+            )
         )
     )
 
 
-def _term_predicate(term: str, role: str, *, include_ids: bool, extra=None):
+def _term_predicate(
+    term: str, role: str, *, include_ids: bool, extra=None, fuzzy_min_length=None
+):
     """OR of every place ``term`` is allowed to match, for one routed role."""
     row_columns = _name_columns(role) + (_ID_COLUMNS if include_ids else ())
-    legs = [_alumni_row_in(row_columns, term)] if row_columns else []
+    legs = (
+        [_alumni_row_in(row_columns, term, fuzzy_min_length=fuzzy_min_length)]
+        if row_columns
+        else []
+    )
     # Caller-supplied extra meaning for a bare token (the CFP/CFA/CPA
     # holder-EXISTS, #404). OR-ed INTO this token's group so the token is
     # satisfied by holding the certification alone and never has to also match a
@@ -335,14 +388,22 @@ def _term_predicate(term: str, role: str, *, include_ids: bool, extra=None):
     if employment:
         legs.append(
             _exists_over(
-                CurrentEmployment, employment, CurrentEmployment.alumni_id, term
+                CurrentEmployment,
+                employment,
+                CurrentEmployment.alumni_id,
+                term,
+                fuzzy_min_length=fuzzy_min_length,
             )
         )
     history = _history_columns(role)
     if history:
         legs.append(
             _exists_over(
-                EmploymentHistory, history, EmploymentHistory.alumni_id, term
+                EmploymentHistory,
+                history,
+                EmploymentHistory.alumni_id,
+                term,
+                fuzzy_min_length=fuzzy_min_length,
             )
         )
     return or_(*legs)
@@ -362,6 +423,23 @@ def segment_predicate(segment: QuerySegment, *, include_ids: bool = False, extra
       on ``last_name`` (#281). This is the pre-existing semantic, preserved.
 
     For a one-word segment the two legs are identical, so only one is emitted.
+
+    **The phrase leg's fuzzy match is length-bounded (#692).** Searching
+    "Scott Kim" returned every alumnus named Scott: the joined phrase
+    ``scottkim`` scores ``similarity('scott', 'scottkim') = 5/10 = 0.50`` against
+    a first-name cell holding just "Scott", which clears the 0.45 floor. Those
+    rows then tied Scott Kim on rank (each is an exact hit on the ``scott``
+    token), so he sorted alphabetically among all of them — off the top-bar's
+    eight suggestions and often off page 1. The same arithmetic lets
+    "Dallas Smith" pull in everyone who works in Dallas. In general a cell that
+    holds ONE word ``W`` of a phrase scores ``len(W) / (len(phrase) + 2)``, which
+    clears 0.45 whenever the other words are short.
+
+    A cell holding only part of the phrase is the TOKENS leg's job (which
+    requires every word to match somewhere), so the phrase's fuzzy legs now only
+    consider a cell at least ``len(phrase) - _PHRASE_SHORTFALL`` long. A typo
+    inside a genuinely one-cell value ("goldman schs" -> Goldman Sachs, 11 vs 12)
+    is unaffected; the exact / contains leg on the phrase is unaffected too.
     """
     token_legs = [
         _term_predicate(token, segment.role, include_ids=include_ids, extra=extra)
@@ -371,7 +449,11 @@ def segment_predicate(segment: QuerySegment, *, include_ids: bool = False, extra
     if len(segment.tokens) == 1:
         return tokens_leg
     phrase_leg = _term_predicate(
-        segment.phrase, segment.role, include_ids=include_ids, extra=extra
+        segment.phrase,
+        segment.role,
+        include_ids=include_ids,
+        extra=extra,
+        fuzzy_min_length=len(segment.phrase) - _PHRASE_SHORTFALL,
     )
     return or_(phrase_leg, tokens_leg)
 
@@ -488,6 +570,49 @@ def _max_over(model, columns: tuple, alumni_id_column, terms, weight: float):
     )
 
 
+#: The ways a person's full name is spelled out when typed (#692), each a tuple
+#: of name columns joined in order. Legal and preferred first name, with and
+#: without the middle name, the maiden name, and surname-first ("Kim, Scott" —
+#: the comma is a separator, so it reaches here as the same two words).
+_FULL_NAME_SPELLINGS = (
+    (Alumni.first_name, Alumni.last_name),
+    (Alumni.preferred_first_name, Alumni.last_name),
+    (Alumni.first_name, Alumni.middle_name, Alumni.last_name),
+    (Alumni.middle_name, Alumni.last_name),
+    (Alumni.first_name, Alumni.birth_name),
+    (Alumni.preferred_first_name, Alumni.birth_name),
+    (Alumni.last_name, Alumni.first_name),
+    (Alumni.last_name, Alumni.preferred_first_name),
+)
+
+
+def _full_name_score(segment: QuerySegment):
+    """Rank tier for a segment that spells out this alumnus's full name (#692).
+
+    Each spelling is the normalized columns joined (``concat`` skips a NULL
+    column), compared with the segment's joined phrase: equal scores
+    ``_FULL_NAME_EXACT_SCORE``, a prefix ("Scott Kim" -> Scott Kimball) scores
+    ``_FULL_NAME_PREFIX_SCORE``. ORDER BY only — these joined expressions are not
+    indexed, and they never decide who matches (the per-token leg already finds
+    the exact full name), so they are evaluated just over the surviving rows.
+
+    ``None`` for a one-word or a routed segment: one word is not a full name, and
+    "at <words>" / "in <words>" never searches names at all.
+    """
+    if segment.role != ROLE_ANY or len(segment.tokens) < 2:
+        return None
+    phrase = segment.phrase
+    spellings = [func.concat(*[norm(c) for c in cols]) for cols in _FULL_NAME_SPELLINGS]
+    return case(
+        (literal(phrase).in_(spellings), literal(_FULL_NAME_EXACT_SCORE)),
+        (
+            or_(*[s.like(f"{phrase}%") for s in spellings]),
+            literal(_FULL_NAME_PREFIX_SCORE),
+        ),
+        else_=literal(0.0),
+    )
+
+
 def _segment_score(segment: QuerySegment):
     terms = _scored_terms(segment)
     parts = [
@@ -499,6 +624,9 @@ def _segment_score(segment: QuerySegment):
             ]
         )
     ]
+    full_name = _full_name_score(segment)
+    if full_name is not None:
+        parts.append(full_name)
     employment = _employment_columns(segment.role)
     if employment:
         parts.append(

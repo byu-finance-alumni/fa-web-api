@@ -1818,6 +1818,22 @@ async def _load_side_rows(session: AsyncSession, ids: list[int]):
 async def list_pending(session: AsyncSession, graduation_year: int) -> list[SurveyResponseItem]:
     """Pending responses for a grad year, each with its before/after diff
     (unchanged fields are dropped)."""
+    return await _list_pending_where(
+        session, SurveyResponse.graduation_year == graduation_year
+    )
+
+
+async def list_pending_without_year(session: AsyncSession) -> list[SurveyResponseItem]:
+    """Pending responses that belong to NO class year (api#696).
+
+    A friend of the program usually has no graduation year, so their reply is
+    stored with ``graduation_year`` NULL -- and every class queue above is keyed
+    by year, so it would sit unseen. This is their queue (and that of any alum
+    whose year is blank). Same rows, same diff, same apply/reject as a class's."""
+    return await _list_pending_where(session, SurveyResponse.graduation_year.is_(None))
+
+
+async def _list_pending_where(session: AsyncSession, scope) -> list[SurveyResponseItem]:
     responses = (
         (
             await session.execute(
@@ -1826,7 +1842,7 @@ async def list_pending(session: AsyncSession, graduation_year: int) -> list[Surv
                     # Shared with the year picker's pending count (#856) so the
                     # two can never disagree.
                     *awaiting_review_where(),
-                    SurveyResponse.graduation_year == graduation_year,
+                    scope,
                 )
                 .order_by(SurveyResponse.submitted_at.desc())
             )

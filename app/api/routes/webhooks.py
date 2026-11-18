@@ -8,7 +8,8 @@ has no user -- and the Svix signature is the whole credential:
   Fail closed: an unconfigured deploy never accepts unsigned events.
 * body larger than :data:`MAX_BODY_BYTES` -> 413, before any parsing.
 * signature missing, wrong, or timestamp more than five minutes off -> 401.
-* a verified ``email.bounced`` / ``email.complained`` is stored, idempotent on
+* a verified ``email.bounced`` / ``email.complained`` is stored (and an
+  ``email.delivered`` for one of our logged survey emails, #697), idempotent on
   ``svix-id``; any other verified event type is acknowledged (200) and dropped.
 
 Kept out of the OpenAPI schema: it is not part of the frontend contract.

@@ -15,6 +15,7 @@ STAFF (``surveys.manage``, the same capability as the survey review queue):
 * ``PUT  /survey/new-people/link``           -- switch it on or off
 * ``POST /survey/new-people/link/reissue``   -- new key; the old one dies at once
 * ``GET  /survey/new-people/submissions``    -- pending, oldest first
+* ``GET  /survey/new-people/submissions/count`` -- how many are pending (top bar)
 * ``GET  /survey/new-people/submissions/{id}/preview?alumni_id=`` -- merge diff
 * ``POST /survey/new-people/submissions/reject`` -- bulk reject
 * ``POST /survey/new-people/submissions/{id}/approve``
@@ -45,6 +46,7 @@ from app.schemas.new_people import (
     NewPeopleInviteResult,
     NewPeopleLinkRead,
     NewPeopleLinkUpdate,
+    NewPeoplePendingCount,
     NewPeopleSurveyInfo,
     NewPersonApproveRequest,
     NewPersonApproveResult,
@@ -178,6 +180,20 @@ async def reissue_new_people_link(
 ) -> NewPeopleLinkRead:
     """A new key. The old URL stops working immediately; on/off is unchanged."""
     return await new_people_survey.reissue(session, user.user_id)
+
+
+@router.get("/new-people/submissions/count", response_model=NewPeoplePendingCount)
+async def count_new_people_submissions(
+    _user: RequireSurveysManage, session: SessionDep
+) -> NewPeoplePendingCount:
+    """How many new-people submissions wait for review (fa-web-app #958) -- the
+    small number on the top bar. Same capability as the queue itself
+    (``surveys.manage``), so only people who can review see it.
+
+    A bare count with no PII, so it is neither audit-logged nor charged to the
+    browse read budget: the top bar asks on every page, and spending the
+    per-user browse budget on it would throttle real list reads."""
+    return NewPeoplePendingCount(pending=await new_people_survey.pending_count(session))
 
 
 @router.get("/new-people/submissions", response_model=list[NewPersonSubmissionItem])

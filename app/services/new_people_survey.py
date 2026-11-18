@@ -765,6 +765,21 @@ async def _possible_matches(
     return results
 
 
+async def pending_count(session: AsyncSession) -> int:
+    """How many new-people submissions are waiting for review -- the number on
+    the top bar's survey entry (fa-web-app #958). One COUNT, no PII."""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(NewPersonSubmission)
+                .where(NewPersonSubmission.status == STATUS_PENDING)
+            )
+        ).scalar()
+        or 0
+    )
+
+
 async def list_pending(session: AsyncSession) -> list[NewPersonSubmissionItem]:
     """Pending submissions, oldest first, each with its possible matches."""
     rows = (

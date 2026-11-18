@@ -1,8 +1,9 @@
 """Resend delivery events for survey emails (fa-web-app #858).
 
 One row per Resend webhook delivery we accept on ``POST /webhooks/resend``:
-``email.bounced`` and ``email.complained``. Everything else Resend can send is
-acknowledged and dropped.
+``email.bounced`` and ``email.complained``, plus ``email.delivered`` for an email
+whose message id is on a survey send log (#697). Everything else Resend can send
+is acknowledged and dropped.
 
 * ``svix_id`` is UNIQUE -- Svix redelivers until it sees a 2xx, so a repeat is a
   no-op rather than a second row.
@@ -26,6 +27,10 @@ from app.core.database import Base
 
 EVENT_BOUNCED = "email.bounced"
 EVENT_COMPLAINED = "email.complained"
+# Stored only for an email we can tie to a send-log row by its message id
+# (fa-web-api #697): it is what clears a bounce once a later email to the
+# person's current address got through.
+EVENT_DELIVERED = "email.delivered"
 BOUNCE_PERMANENT = "permanent"
 
 

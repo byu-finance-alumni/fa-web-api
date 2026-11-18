@@ -1,5 +1,7 @@
 """One-off survey sends: the survey emailed to ONE alum from their profile (api#669).
 
+Friends of the program can be sent it too (api#696).
+
 Two tables, kept apart from ``survey_send_log`` ON PURPOSE:
 
 * ``survey_one_off`` -- one row per "Send survey" press: who, which class year
@@ -53,7 +55,9 @@ class SurveyOneOff(Base):
     )
     # The year the survey link is minted for (the alum's graduation year at the
     # time of the send). Recorded, never used to pick a class campaign cycle.
-    graduation_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    # NULL for a friend of the program with no year (api#696; migration
+    # ``2026-11-18_friend_one_off_and_bounce_clear.sql`` dropped the NOT NULL).
+    graduation_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sent_by_user_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("users.user_id", ondelete="SET NULL")
     )

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import logging
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -76,6 +77,8 @@ from app.schemas.profile import (
     TaskRead,
 )
 from app.services import survey_email, survey_one_off
+
+log = logging.getLogger(__name__)
 
 
 def _now() -> datetime.datetime:
@@ -380,6 +383,34 @@ async def _derive_survey_history(
     return rows
 
 
+async def survey_box_dates(
+    session: AsyncSession, alumni_id: int
+) -> tuple[datetime.datetime | None, datetime.datetime | None]:
+    """``(last_submitted_at, last_sent_at)`` for the profile's survey box
+    (fa-web-app #957).
+
+    * last submitted: their newest reply staff have not rejected (pending,
+      applied or confirmed) -- a rejected one changed nothing on the record;
+    * last sent: the last survey email of any kind, class campaign or one-off.
+
+    Never raises and never poisons the profile read's transaction (SAVEPOINT):
+    two dates in a summary box are not worth a profile that fails to load.
+    """
+    try:
+        async with session.begin_nested():
+            submitted = await session.scalar(
+                select(func.max(SurveyResponse.submitted_at)).where(
+                    SurveyResponse.alumni_id == alumni_id,
+                    SurveyResponse.status.in_(survey_email.RESPONDED_STATUSES),
+                )
+            )
+            sent = await survey_one_off.last_sent_at(session, alumni_id)
+    except Exception:  # noqa: BLE001 - see above
+        log.warning("profile: could not read the survey box dates")
+        return None, None
+    return submitted, sent
+
+
 async def get_profile(
     session: AsyncSession,
     alumni_id: int,
@@ -633,6 +664,10 @@ async def get_profile(
                         next_survey_date = reminder
                         break
 
+    survey_last_submitted_at, survey_last_sent_at = await survey_box_dates(
+        session, alumni_id
+    )
+
     profile = ProfileRead(
         alumni=AlumniRead.model_validate(alumnus).model_copy(
             update={"profile_updated_by_name": profile_updated_by_name}
@@ -653,6 +688,8 @@ async def get_profile(
         status_labels=list(status_labels),
         surveys=surveys,
         next_survey_date=next_survey_date,
+        survey_last_submitted_at=survey_last_submitted_at,
+        survey_last_sent_at=survey_last_sent_at,
         interactions=[
             InteractionRead.model_validate(i).model_copy(
                 # full_access/student see the logger's full name; view_only sees

@@ -547,6 +547,7 @@ CREATE TABLE events (
     event_date        date,
     event_location    varchar(255),
     event_notes       text,
+    keynote_speaker   varchar(255), -- plain typed name, api#695
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT fk_events_user_id FOREIGN KEY (logged_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL

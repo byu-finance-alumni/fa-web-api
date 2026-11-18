@@ -88,6 +88,8 @@ class EventCreate(BaseModel):
     event_date: datetime.date
     event_location: str | None = None
     event_notes: str | None = None
+    # Optional plain-text name, not a profile link (api#695).
+    keynote_speaker: str | None = None
 
     @field_validator("event_name")
     @classmethod
@@ -99,7 +101,7 @@ class EventCreate(BaseModel):
             raise ValueError("event_name must be at most 255 characters.")
         return stripped
 
-    @field_validator("event_type", "event_location")
+    @field_validator("event_type", "event_location", "keynote_speaker")
     @classmethod
     def _blank_to_none_capped(cls, value: str | None) -> str | None:
         if value is None:
@@ -137,6 +139,7 @@ class EventUpdate(BaseModel):
     event_date: datetime.date | None = None
     event_location: str | None = None
     event_notes: str | None = None
+    keynote_speaker: str | None = None
 
     @field_validator("event_name")
     @classmethod
@@ -158,7 +161,9 @@ class EventUpdate(BaseModel):
         return value
 
     # Reuse EventCreate's free-text validators so the rules stay in one place.
-    _validate_type_location = field_validator("event_type", "event_location")(
+    _validate_type_location = field_validator(
+        "event_type", "event_location", "keynote_speaker"
+    )(
         EventCreate._blank_to_none_capped.__func__  # type: ignore[attr-defined]
     )
     _validate_notes = field_validator("event_notes")(

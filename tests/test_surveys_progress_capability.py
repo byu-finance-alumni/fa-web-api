@@ -69,6 +69,7 @@ _MANAGE_ROUTES = [
     ("post", "/survey/schedules/2020/resume", {}),
     ("post", "/survey/schedules/2020/cancel", {}),
     ("get", "/survey/campaigns/2020/responses", {}),
+    ("get", "/survey/no-year/responses", {}),
     ("post", "/survey/responses/1/apply", {}),
     ("post", "/survey/responses/1/reject", {}),
     ("put", "/survey/message", {"json": {}}),

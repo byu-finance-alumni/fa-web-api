@@ -483,6 +483,27 @@ async def survey_pending_responses(
     return items
 
 
+@router.get("/no-year/responses", response_model=list[SurveyResponseItem])
+async def survey_pending_responses_without_year(
+    user: SurveysBrowseReadRateLimit,
+    session: SessionDep,
+) -> list[SurveyResponseItem]:
+    """Admin review queue for submissions with NO class year (api#696): friends
+    of the program, who are sent the survey from their profile and usually have
+    no graduation year, so no class queue would ever show their reply. Same
+    gate, rows and audit as the per-year queue; approve/reject are the same
+    ``/responses/{id}`` routes."""
+    items = await survey_responses.list_pending_without_year(session)
+    await _log_survey_read(
+        session,
+        actor_user_id=user.user_id,
+        action="read_survey_responses",
+        entity_type="survey_campaign",
+        scope=f"graduation_year=none; rows={len(items)}",
+    )
+    return items
+
+
 @router.post("/responses/{response_id}/apply", response_model=SurveyApplyResult)
 async def survey_apply_response(
     response_id: int, user: RequireSurveysManage, session: SessionDep

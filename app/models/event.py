@@ -30,6 +30,8 @@ class Event(TimestampMixin, Base):
     event_date: Mapped[datetime.date | None] = mapped_column(Date)
     event_location: Mapped[str | None] = mapped_column(String(255))
     event_notes: Mapped[str | None] = mapped_column(Text)
+    # Plain typed name, not linked to a profile (api#695).
+    keynote_speaker: Mapped[str | None] = mapped_column(String(255))
 
 
 class EventAttendance(TimestampMixin, Base):

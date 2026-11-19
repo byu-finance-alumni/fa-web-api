@@ -44,6 +44,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.survey_email_event import SurveyEmailEvent
+from app.models.survey_one_off import SurveyOneOff, SurveyOneOffSendLog
 from app.models.survey_schedule import SurveySendLog
 from app.models.tags import AlumniStatusLabel, StatusLabel
 from app.schemas.auth import UserContext
@@ -343,8 +344,12 @@ class _EventSession:
     """Enough of a session for ``record_webhook_event``: a send log keyed by
     message id, a set of existing alumni, and a real svix_id unique store."""
 
-    def __init__(self, *, send_log=None, alumni=(), deleted_before_insert=()):
+    def __init__(
+        self, *, send_log=None, one_off_log=None, alumni=(), deleted_before_insert=()
+    ):
         self.send_log = dict(send_log or {})  # email_id -> (alumni_id, year)
+        # email_id -> (alumni_id, year) for one-off sends (#697).
+        self.one_off_log = dict(one_off_log or {})
         self.alumni = set(alumni)
         # Alumni that pass the existence check but are gone by the INSERT.
         self.deleted_before_insert = set(deleted_before_insert)
@@ -367,6 +372,8 @@ class _EventSession:
             froms = {getattr(f, "name", None) for f in stmt.get_final_froms()}
             if "survey_send_log" in froms:
                 return _Result(self.send_log.get(params.get("resend_email_id_1")))
+            if "survey_one_off_send_log" in str(stmt):
+                return _Result(self.one_off_log.get(params.get("resend_email_id_1")))
             if "alumni" in froms:
                 aid = params.get("alumni_id_1")
                 return _Result((aid,) if aid in self.alumni else None)
@@ -499,6 +506,46 @@ def test_other_events_are_acknowledged_and_dropped(payload):
     assert session.events == {}
 
 
+_DELIVERED = {
+    "type": "email.delivered",
+    "created_at": "2026-11-18T18:00:00.000Z",
+    "data": {"email_id": "re_d", "tags": {"alumni_id": "5", "stage": "0"}},
+}
+
+
+def test_a_delivery_of_a_logged_survey_email_is_stored():
+    """#697: a delivery is what clears a bounce, so ours are kept."""
+    session = _EventSession(send_log={"re_d": (5, 2020)}, alumni={5})
+    assert _record(session, _DELIVERED) == "stored"
+    row = session.events["msg_1"]
+    assert (row["alumni_id"], row["event_type"]) == (5, "email.delivered")
+    assert row["bounce_type"] is None
+
+
+def test_a_delivery_of_a_one_off_email_is_matched_through_its_own_log():
+    session = _EventSession(one_off_log={"re_d": (5, None)}, alumni={5})
+    assert _record(session, _DELIVERED) == "stored"
+    row = session.events["msg_1"]
+    assert (row["alumni_id"], row["graduation_year"]) == (5, None)
+
+
+def test_a_delivery_matched_only_by_its_tags_is_not_stored():
+    """Without the send-log row we do not know the address it went to, so it
+    could never clear anything -- and every non-survey email would pile up."""
+    session = _EventSession(alumni={5})
+    assert _record(session, _DELIVERED) == "ignored"
+    assert session.events == {}
+
+
+def test_a_one_off_bounce_is_matched_through_the_one_off_log():
+    payload = json.loads(json.dumps(_BOUNCE))
+    del payload["data"]["tags"]
+    session = _EventSession(one_off_log={"re_123": (42, 2019)})
+    assert _record(session, payload) == "stored"
+    row = session.events["msg_1"]
+    assert (row["alumni_id"], row["graduation_year"]) == (42, 2019)
+
+
 def test_no_address_is_written_to_the_event_row():
     session = _EventSession(alumni={5})
     _record(session, _BOUNCE)
@@ -525,6 +572,8 @@ def db():
                 Alumni.__table__,
                 AlumniContactInfo.__table__,
                 SurveySendLog.__table__,
+                SurveyOneOff.__table__,
+                SurveyOneOffSendLog.__table__,
                 SurveyEmailEvent.__table__,
                 AlumniStatusLabel.__table__,
                 StatusLabel.__table__,
@@ -674,11 +723,25 @@ def test_one_row_per_alum_with_their_latest_bounce(db):
     assert items[0].address_still_on_file is True
 
 
-def test_it_says_when_the_address_has_already_been_changed(db):
+def test_a_bounce_on_an_address_since_changed_no_longer_lists_them(db):
+    """#697: the address was fixed, so the old bounce is nothing to chase."""
     _alum(db, 1, "A", personal="fixed@x.org", work="also@x.org")
     _sent(db, 1, "re_1", "Broken@X.org")
     _event(db, 1, "re_1")
-    assert _list(db)[0].address_still_on_file is False
+    assert _list(db) == []
+    assert _page(db).total == 0
+
+
+def test_an_older_bounce_on_the_current_address_still_lists_them(db):
+    """Only bounces on OLD addresses are dropped -- an earlier bounce on the
+    address still on file is the one that stands."""
+    _alum(db, 1, "A", personal="cur@x.org")
+    _sent(db, 1, "re_cur", "cur@x.org")
+    _sent(db, 1, "re_old", "old@x.org", stage=1)
+    _event(db, 1, "re_cur", when=datetime.datetime(2026, 9, 1, tzinfo=datetime.UTC))
+    _event(db, 1, "re_old", when=datetime.datetime(2026, 10, 1, tzinfo=datetime.UTC))
+    items = _list(db)
+    assert [i.bounced_address for i in items] == ["cur@x.org"]
 
 
 def test_address_match_ignores_case(db):
@@ -694,6 +757,90 @@ def test_a_tag_matched_bounce_lists_without_an_address(db):
     items = _list(db)
     assert items[0].bounced_address is None
     assert items[0].address_still_on_file is None
+
+
+def _one_off_sent(conn, alumni_id, email_id, sent_to, *, year=_YEAR, stage=0):
+    one_off_id = next(_seq)
+    conn.execute(
+        SurveyOneOff.__table__.insert().values(
+            survey_one_off_id=one_off_id, alumni_id=alumni_id, graduation_year=year,
+            started_at=datetime.datetime(2026, 11, 1, tzinfo=datetime.UTC),
+        )
+    )
+    conn.execute(
+        SurveyOneOffSendLog.__table__.insert().values(
+            survey_one_off_send_log_id=next(_seq),
+            survey_one_off_id=one_off_id,
+            stage=stage,
+            resend_email_id=email_id,
+            sent_to=sent_to,
+        )
+    )
+
+
+def _delivered(conn, alumni_id, email_id, when):
+    _event(conn, alumni_id, email_id, event_type="email.delivered",
+           bounce_type=None, subtype=None, when=when)
+
+
+_OCT = datetime.datetime(2026, 10, 1, tzinfo=datetime.UTC)
+_NOV = datetime.datetime(2026, 11, 1, tzinfo=datetime.UTC)
+
+
+def test_a_later_delivery_to_the_current_address_clears_the_bounce(db):
+    """#697: the address was fine after all (or was fixed back) and the re-send
+    got through -- they are not bounced any more."""
+    _alum(db, 1, "A", personal="a@x.org")
+    _sent(db, 1, "re_b", "a@x.org")
+    _event(db, 1, "re_b", when=_OCT)
+    _one_off_sent(db, 1, "re_ok", "a@x.org")
+    _delivered(db, 1, "re_ok", _NOV)
+    assert _list(db) == []
+
+
+def test_a_delivery_before_the_bounce_does_not_clear_it(db):
+    _alum(db, 1, "A", personal="a@x.org")
+    _sent(db, 1, "re_ok", "a@x.org")
+    _sent(db, 1, "re_b", "a@x.org", stage=1)
+    _delivered(db, 1, "re_ok", _OCT)
+    _event(db, 1, "re_b", when=_NOV)
+    assert [i.alumni_id for i in _list(db)] == [1]
+
+
+def test_a_delivery_to_an_address_no_longer_on_file_does_not_clear_it(db):
+    _alum(db, 1, "A", personal="a@x.org")
+    _sent(db, 1, "re_b", "a@x.org")
+    _event(db, 1, "re_b", when=_OCT)
+    _one_off_sent(db, 1, "re_ok", "gone@x.org")
+    _delivered(db, 1, "re_ok", _NOV)
+    assert [i.alumni_id for i in _list(db)] == [1]
+
+
+def test_a_later_delivery_also_clears_a_tag_matched_bounce(db):
+    _alum(db, 1, "A", personal="a@x.org")
+    _event(db, 1, None, when=_OCT)
+    _sent(db, 1, "re_ok", "a@x.org", stage=1)
+    _delivered(db, 1, "re_ok", _NOV)
+    assert _list(db) == []
+
+
+def test_a_one_off_bounce_lists_with_the_address_it_went_to(db):
+    _alum(db, 1, "A", personal="a@x.org")
+    _one_off_sent(db, 1, "re_b", "a@x.org")
+    _event(db, 1, "re_b", when=_OCT)
+    (item,) = _list(db)
+    assert (item.bounced_address, item.address_still_on_file) == ("a@x.org", True)
+
+
+def test_the_fixed_address_and_re_send_case_from_the_meeting(db):
+    """Bounced, the address was fixed, the survey re-sent to them alone and it
+    went through -- they must not read as bounced (2026-11-18)."""
+    _alum(db, 1, "A", personal="fixed@x.org")
+    _sent(db, 1, "re_b", "typo@x.org")
+    _event(db, 1, "re_b", when=_OCT)
+    _one_off_sent(db, 1, "re_ok", "fixed@x.org")
+    _delivered(db, 1, "re_ok", _NOV)
+    assert _page(db).total == 0
 
 
 # ====================================================== endpoint / auth =====

@@ -416,7 +416,6 @@ def test_preview_falls_back_to_the_work_email(world):
         ({"personal": None, "work": None}, None, "unreachable"),
         ({"personal": "someone@example.com"}, None, "unreachable"),
         ({"year": None}, None, "no_graduation_year"),
-        ({"is_alumni": False}, None, "not_alumni"),
         ({"archived": True}, None, "archived"),
     ],
 )
@@ -459,6 +458,93 @@ def test_unknown_alum_is_404(world):
         world.preview(999)
     with pytest.raises(NotFoundError):
         world.send(999)
+
+
+# ============================================================== friends ======
+# api#696: the button was disabled for every friend because _resolve refused
+# anyone who was not an alum (and most friends have no graduation year either).
+
+_FRIEND = 3
+
+
+def test_a_friend_with_no_year_can_be_sent_the_survey(world):
+    world.alum(_FRIEND, first="Fran", is_alumni=False, year=None)
+    p = world.preview(_FRIEND)
+    assert (p.can_send, p.reason_code, p.reason) == (True, None, None)
+    assert p.email == "alum3@byu.edu"
+    world.send(_FRIEND)
+    (email,) = world.emails
+    assert email["to"] == ["alum3@byu.edu"]
+    # The year is recorded as unknown, never invented.
+    (row,) = world.conn.scalars(select(SurveyOneOff)).all()
+    assert row.graduation_year is None
+    # No year tag, so a bounce for it can never be filed under a class.
+    tags = {t["name"]: t["value"] for t in email["tags"]}
+    assert tags == {"alumni_id": "3", "stage": "0", "one_off": "1"}
+    # The link opens THEIR survey.
+    token = email["text"].split("https://finance.alumni.byu.edu/survey/", 1)[1].split()[0]
+    assert survey_email.verify_survey_token(token) == _FRIEND
+
+
+def test_a_friend_send_never_touches_any_class_campaign(world):
+    world.alum(_FRIEND, first="Fran", is_alumni=False, year=None)
+    world.send(_FRIEND)
+    assert world.class_rows() == []
+    assert world.campaigns() == []
+
+
+def test_a_class_campaign_pause_does_not_hold_a_friend_with_that_year(world):
+    """A friend belongs to no class campaign, even with a year on file."""
+    world.alum(_FRIEND, first="Fran", is_alumni=False, year=_YEAR)
+    world.schedule(status="paused")
+    assert world.preview(_FRIEND).can_send is True
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "label", "code"),
+    [
+        ({"deceased": True}, None, "suppressed"),
+        ({}, "Do Not Contact", "suppressed"),
+        ({"personal": None, "work": None}, None, "unreachable"),
+        ({"archived": True}, None, "archived"),
+    ],
+)
+def test_a_friend_gets_the_same_refusals_as_an_alum(world, kwargs, label, code):
+    world.alum(_FRIEND, first="Fran", is_alumni=False, year=None, **kwargs)
+    if label:
+        world.label(_FRIEND, label)
+    assert world.preview(_FRIEND).reason_code == code
+    with pytest.raises(ConflictError):
+        world.send(_FRIEND)
+    assert world.emails == []
+
+
+def test_a_friend_send_counts_toward_the_cap(world):
+    world.cap(daily=1)
+    world.alum(_FRIEND, first="Fran", is_alumni=False, year=None)
+    world.alum(_ANN)
+    world.send(_FRIEND)
+    with pytest.raises(ConflictError):
+        world.send(_ANN)
+    assert world.to() == ["alum3@byu.edu"]
+
+
+def test_a_friend_gets_the_day_seven_and_fourteen_reminders(world):
+    world.alum(_FRIEND, first="Fran", is_alumni=False, year=None)
+    world.send(_FRIEND)
+    world.age_one_offs(7)
+    assert world.run_cron().one_off_reminders_sent == 1
+    tags = {t["name"]: t["value"] for t in world.emails[-1]["tags"]}
+    assert tags["stage"] == "1" and "graduation_year" not in tags
+    world.age_one_offs(7)
+    assert world.run_cron().one_off_reminders_sent == 1
+    assert world.class_rows() == []
+
+
+def test_an_alum_without_a_year_is_still_refused(world):
+    """The friend rule did not loosen the alum one."""
+    world.alum(_ANN, year=None)
+    assert world.preview().reason_code == "no_graduation_year"
 
 
 # ================================================================== send ======
@@ -843,6 +929,21 @@ def test_profile_history_closes_the_ask_once_they_reply(world):
     world.replied(_ANN, status="pending", at=_now() + datetime.timedelta(seconds=5))
     rows = asyncio.run(profile._derive_survey_history(world.session, _ANN, _YEAR))
     assert [r.completed for r in rows] == [True]
+
+
+def test_the_profile_survey_box_reads_last_sent_and_last_submitted(world):
+    """fa-web-app #957: the box shows "Last sent" until they reply, then the
+    date they filled it out. A rejected reply is not a fill-out."""
+    world.alum(_ANN)
+    assert asyncio.run(profile.survey_box_dates(world.session, _ANN)) == (None, None)
+    world.send()
+    submitted, sent = asyncio.run(profile.survey_box_dates(world.session, _ANN))
+    assert submitted is None and sent is not None
+    world.replied(_ANN, status="rejected", days_ago=0)
+    assert asyncio.run(profile.survey_box_dates(world.session, _ANN))[0] is None
+    world.replied(_ANN, status="applied", days_ago=1)
+    submitted, _sent = asyncio.run(profile.survey_box_dates(world.session, _ANN))
+    assert submitted is not None
 
 
 # =================================================================== routes ===

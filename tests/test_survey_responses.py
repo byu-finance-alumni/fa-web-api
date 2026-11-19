@@ -1696,3 +1696,45 @@ def test_log_safe_strips_line_breaks():
 
     assert log_safe("12\r\nWARNING:forged") == "12WARNING:forged"
     assert log_safe(12) == "12"
+
+
+# ------------------------------------------------ friends (api#696) ----------
+
+
+def test_a_friends_reply_with_no_year_is_staged_like_anyone_elses(monkeypatch):
+    """A friend of the program has no graduation year. Their link opens the same
+    form, and the reply is stored with year and campaign cycle left NULL -- it is
+    never pinned on a class."""
+    monkeypatch.setattr(sr, "verify_survey_token", lambda _t: 5)
+    friend = types.SimpleNamespace(
+        alumni_id=5, archived=False, graduation_year=None, is_alumni=False
+    )
+    session = _Session(friend)
+    result = asyncio.run(sr.submit_response(session, "tok", {"contact.city": "Provo"}))
+    assert result.staged is True and result.change_count == 1
+    (staged,) = [o for o in session.added if isinstance(o, SurveyResponse)]
+    assert staged.graduation_year is None
+    assert staged.cycle_seq is None and staged.stage is None
+    assert staged.status == "pending"
+
+
+def test_replies_with_no_year_have_their_own_review_queue(monkeypatch):
+    """Every class queue is keyed by year, so a friend's reply needs this one."""
+    seen = []
+
+    class _Rows:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class _CaptureSession:
+        async def execute(self, stmt):
+            seen.append(str(stmt.compile(compile_kwargs={"literal_binds": True})))
+            return _Rows()
+
+    assert asyncio.run(sr.list_pending_without_year(_CaptureSession())) == []
+    (sql,) = seen
+    assert "survey_responses.graduation_year IS NULL" in sql
+    assert "survey_responses.status = 'pending'" in sql

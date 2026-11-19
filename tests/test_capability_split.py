@@ -149,6 +149,8 @@ _PROBES: list[tuple[str, str, str, dict]] = [
     (Capability.NOTES_MANAGE, "patch", "/notes/1", {"json": {}}),
     (Capability.NOTES_MANAGE, "delete", "/notes/1", {}),
     (Capability.SURVEYS_MANAGE, "get", "/survey/campaigns/2020/responses", {}),
+    (Capability.SURVEYS_MANAGE, "get", "/survey/no-year/responses", {}),
+    (Capability.SURVEYS_MANAGE, "get", "/survey/new-people/submissions/count", {}),
     (Capability.SURVEYS_MANAGE, "post", "/survey/responses/1/apply", {}),
     # `GET /survey/schedules` moved to the read-only `surveys.progress` view
     # (#605), which `surveys.manage` also satisfies, so it can no longer prove

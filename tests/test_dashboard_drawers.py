@@ -366,8 +366,9 @@ def test_activity_q_searches_names_and_type_with_ilike(client):
     assert response.status_code == 200
     # The page-rows statement carries the filter predicates.
     sql = _compiled(session.execute_args[0])
-    # first / last / preferred name + interaction_type -> 4 ILIKE clauses.
-    assert sql.count("ILIKE") == 4
+    # first / last / preferred name, first+last and preferred+last (#692), and
+    # interaction_type -> 6 ILIKE clauses.
+    assert sql.count("ILIKE") == 6
     assert "first_name" in sql
     assert "last_name" in sql
     assert "preferred_first_name" in sql
@@ -375,6 +376,23 @@ def test_activity_q_searches_names_and_type_with_ilike(client):
     # The count query is filtered too, so totals match the page.
     count_sql = _compiled(session.scalar_args[0])
     assert "ILIKE" in count_sql
+
+
+def test_activity_q_matches_a_full_first_and_last_name(client):
+    # #692: "Scott Kim" can never match ONE name column, so the feed returned
+    # nothing for a full name. The joined first/preferred + last legs fix that,
+    # and runs of inner whitespace are collapsed so a double space still hits.
+    session = _activity_session()
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    app.dependency_overrides[get_session] = _with_session(session)
+
+    response = client.get("/dashboard/activity?q=Scott%20%20Kim")
+    assert response.status_code == 200
+    compiled = session.execute_args[0].compile()
+    sql = str(compiled)
+    assert "coalesce(alumni.first_name" in sql
+    assert "coalesce(alumni.preferred_first_name" in sql
+    assert "%Scott Kim%" in compiled.params.values()
 
 
 def test_activity_type_filters_exact_ilike(client):

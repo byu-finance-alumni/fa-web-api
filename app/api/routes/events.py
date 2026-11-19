@@ -37,7 +37,7 @@ from app.api.dependencies.auth import (
 )
 from app.api.params import IdPath
 from app.core.database import get_session
-from app.core.errors import ConflictError, NotFoundError
+from app.core.errors import ConflictError, InvalidRequestError, NotFoundError
 from app.core.friend_id import friend_id_for
 from app.core.rate_limit import BrowseReadRateLimit, ExportReadRateLimit
 from app.models.alumni import Alumni
@@ -53,10 +53,16 @@ from app.schemas.attendee_match import (
     AttendeeFriendResult,
     AttendeeMatchPreview,
 )
+from app.schemas.attendee_sheet import (
+    SheetCommitItem,
+    SheetCommitRequest,
+    SheetCommitResult,
+    SheetPreview,
+)
 from app.schemas.event import AttendeeCreate, AttendeeRead, EventCreate, EventUpdate
 from app.schemas.imports import EventImportPreview, EventImportResult
 from app.services import alumni as alumni_service
-from app.services import attendee_match, friend_identity, import_events
+from app.services import attendee_match, attendee_sheet, friend_identity, import_events
 
 # Reuse the alumni export's formula-injection neutralizer (canonical source:
 # alumni_export._FORMULA_LEAD) so attendee cells starting with = + - @ \t \r are
@@ -79,6 +85,7 @@ def _serialize(e: Event, attendance: int) -> dict:
         "event_date": e.event_date.isoformat() if e.event_date else None,
         "event_location": e.event_location,
         "event_notes": e.event_notes,
+        "keynote_speaker": e.keynote_speaker,
         "attendance_count": attendance,
     }
 
@@ -249,6 +256,22 @@ async def attendee_match_template(_: RequireEventsManage) -> Response:
     )
 
 
+@router.get("/attendees/sheet/template")
+async def attendee_sheet_template(_: RequireEventsManage) -> Response:
+    """Download the attendee SPREADSHEET template (api#693): Fname, Lname,
+    Company, Role, Email, Focus, UG, UG YR, LinkedIn, Grad, GradYR, Net ID, with
+    one Finance alum and one friend as examples. Net ID may be left blank and
+    extra columns are ignored. Declared before ``/{event_id}`` so the literal
+    path wins."""
+    return Response(
+        content=attendee_sheet.build_template_csv(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="event_attendee_sheet_template.csv"'
+        },
+    )
+
+
 # The event's identity is entered in the wizard and posted alongside the file as
 # multipart form fields (the CSV is only the attendee roster — #149).
 EventNameForm = Annotated[str, Form()]
@@ -365,6 +388,7 @@ async def create_event(
         event_date=payload.event_date,
         event_location=payload.event_location,
         event_notes=payload.event_notes,
+        keynote_speaker=payload.keynote_speaker,
         logged_by_user_id=user.user_id,
     )
     session.add(event)
@@ -529,17 +553,19 @@ async def list_event_attendees(
 async def export_event_attendees(
     event_id: IdPath, user: ExportReadRateLimit, session: SessionDep
 ) -> Response:
-    """Download an event's attendee list as CSV — columns **Name, Email, Net ID**
-    (#219). Gated at ``full_access`` (a rung above the view-only attendee list)
+    """Download an event's attendee list as CSV — columns **Name, Alumni/Friend,
+    Email, Net ID** (#219; the Alumni/Friend column and alumni-then-friends
+    order are api#694). Gated at ``full_access`` (a rung above the view-only attendee list)
     because bulk contact details — alumni PII — leave the system here, and audited
     as a disclosure (action ``export_event_attendees``, row count only, never the
     data itself). 404 if the event is unknown.
 
     Email is the alumnus's personal email, falling back to the work email. Rows
-    are ordered by name, matching the on-screen roster.
+    list every alumnus first, then every friend, each group ordered by name.
 
-    A non-editor holding the assignable ``alumni.export`` gets **Name, Email**
-    only: Net ID is nulled on every read they make (VIEW_ONLY_HIDDEN_FIELDS), so
+    A non-editor holding the assignable ``alumni.export`` gets **Name,
+    Alumni/Friend, Email** only: Net ID is nulled on every read they make
+    (VIEW_ONLY_HIDDEN_FIELDS), so
     the column is dropped rather than the export refused.
 
     Archived attendees are left out below full_access, matching the on-screen
@@ -558,7 +584,8 @@ async def export_event_attendees(
             AlumniContactInfo, AlumniContactInfo.alumni_id == Alumni.alumni_id
         )
         .where(EventAttendance.event_id == event_id)
-        .order_by(Alumni.last_name, Alumni.first_name)
+        # Alumni first, then friends (api#694), each by name.
+        .order_by(Alumni.is_alumni.desc(), Alumni.last_name, Alumni.first_name)
     )
     if not user.sees_archived:
         stmt = stmt.where(Alumni.archived.is_(False))
@@ -567,12 +594,17 @@ async def export_event_attendees(
     include_net_id = user.can_edit_alumni
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["Name", "Email", "Net ID"] if include_net_id else ["Name", "Email"])
+    writer.writerow(
+        ["Name", "Alumni/Friend", "Email", "Net ID"]
+        if include_net_id
+        else ["Name", "Alumni/Friend", "Email"]
+    )
     for alumni, personal_email, work_email in rows:
         # Neutralize every free-text cell (#169) — a name/email/net_id starting
         # with a formula lead char would otherwise export as an executable cell.
         cells = [
             _fmt(_attendee_name(alumni), "str"),
+            "Alumni" if alumni.is_alumni else "Friend",
             _fmt(personal_email or work_email or "", "str"),
         ]
         if include_net_id:
@@ -591,7 +623,7 @@ async def export_event_attendees(
             entity_id=event_id,
             new_value=(
                 f"rows={len(rows)}; "
-                f"columns={'name,email,net_id' if include_net_id else 'name,email'}; "
+                f"columns={'name,type,email,net_id' if include_net_id else 'name,type,email'}; "
                 f"event={event.event_name!r}"
             ),
         )
@@ -1270,6 +1302,315 @@ async def create_attendee_friends(
         items=items,
         header_errors=[],
     )
+
+
+# --- Attendee spreadsheet import (api#693) -----------------------------------
+#
+# A sign-up sheet for ONE event (Fname, Lname, Company, Role, Email, Focus, UG,
+# UG YR, LinkedIn, Grad, GradYR, Net ID). /preview reports every row as matched
+# / ambiguous / new alum / new friend and WRITES NOTHING but its disclosure
+# audit row; the confirm screen then posts every row back, edited, to /commit.
+#
+# Guards: /preview reads real alumni (names, years, employer) so it sits on
+# events.manage, the same rung as the conference matcher's preview. /commit
+# both records attendance (events.manage) and may create alumni / friend records
+# (alumni.create, the friends leg's guard) so it requires BOTH.
+
+
+def _empty_sheet_preview(header_errors: list[str], ignored: list[str]) -> dict:
+    return {
+        "columns_ok": False,
+        "header_errors": header_errors,
+        "ignored_columns": ignored,
+        "summary": {
+            "total_rows": 0,
+            "matched": 0,
+            "ambiguous": 0,
+            "new_alumni": 0,
+            "new_friend": 0,
+            "already_attending": 0,
+            "invalid": 0,
+        },
+        "rows": [],
+        "warnings": [],
+    }
+
+
+@router.post("/{event_id}/attendees/sheet/preview", response_model=SheetPreview)
+async def preview_attendee_sheet(
+    event_id: IdPath,
+    user: RequireEventsManage,
+    session: SessionDep,
+    file: Annotated[UploadFile, File()],
+) -> dict | JSONResponse:
+    """Confirm-screen report for an attendee spreadsheet (NO alumni or
+    attendance writes). Same 4 MB / 2,000-row limits as the conference matcher.
+    Audited as a disclosure: row counts plus the ids of every record surfaced
+    as a candidate, never the file's contents. 404 if the event is unknown."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    file_bytes = await _read_capped_attendees(file)
+    if file_bytes is None:
+        return _attendee_too_large_response()
+    rows, header_errors, ignored = attendee_sheet.parse_sheet(file_bytes)
+    if header_errors:
+        return _empty_sheet_preview(header_errors, ignored)
+    report = await attendee_sheet.preview(session, event_id, rows)
+    report["ignored_columns"] = ignored
+    disclosed: list[int] = report.pop("_disclosed_alumni_ids", [])
+    summary = report["summary"]
+    session.add(
+        AuditLog(
+            user_id=user.user_id,
+            action_type="attendee_sheet_preview",
+            entity_type="event",
+            entity_id=event_id,
+            new_value=(
+                f"rows={summary['total_rows']}; matched={summary['matched']}; "
+                f"ambiguous={summary['ambiguous']}; "
+                f"new_alumni={summary['new_alumni']}; "
+                f"new_friend={summary['new_friend']}; "
+                f"already_attending={summary['already_attending']}; "
+                f"disclosed={len(disclosed)}; "
+                f"alumni_ids={','.join(str(i) for i in disclosed)}"
+            ),
+        )
+    )
+    await session.commit()
+    return report
+
+
+def _sheet_person_key(row) -> tuple:
+    return (
+        attendee_match._norm_name(row.first_name),
+        attendee_match._norm_name(row.last_name),
+        row.ug_year,
+        row.grad_year,
+    )
+
+
+def _sheet_create_model(row, is_alumni: bool) -> tuple[AlumniCreateFull, str | None]:
+    """Validate a new record. A LinkedIn link the alumni schema refuses (not a
+    linkedin.com URL) is dropped with a note rather than failing the row."""
+    payload = attendee_sheet.new_record_payload(row, is_alumni=is_alumni)
+    try:
+        return AlumniCreateFull(**payload), None
+    except ValidationError as exc:
+        bad = {str(loc) for err in exc.errors() for loc in err.get("loc", ())}
+        if "linkedin_url" not in bad:
+            raise
+    payload.pop("linkedin_url", None)
+    return AlumniCreateFull(**payload), "LinkedIn was not a linkedin.com link and was left blank."
+
+
+@router.post(
+    "/{event_id}/attendees/sheet/commit", response_model=SheetCommitResult
+)
+async def commit_attendee_sheet(
+    event_id: IdPath,
+    payload: SheetCommitRequest,
+    user: RequireEventsManage,
+    _creator: RequireAlumniCreate,
+    session: SessionDep,
+) -> SheetCommitResult:
+    """Save the confirmed spreadsheet rows (api#693).
+
+    Each row carries the reviewer's choice:
+
+    * ``match`` + ``alumni_id`` — record attendance for that record (re-checked:
+      must exist and not be archived; ``not_found`` otherwise).
+    * ``new_alumni`` / ``new_friend`` — create the record from the row's name,
+      Net ID, LinkedIn, years, email, company and role through the shared
+      ``create_alumni`` path (cleaning, duplicate blocking and audit logging
+      fire exactly as for a manual create), then record attendance.
+    * ``skip`` — nothing.
+
+    Idempotent per (event, record): someone already on the roster is reported
+    ``already_attending``. One transaction, with a savepoint per new record so
+    a refused row never takes the rest down. At most
+    ``MAX_NEW_RECORDS_PER_COMMIT`` new records per call. 404 if the event is
+    unknown."""
+    event = await session.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+
+    rows = payload.rows
+    new_rows = [r for r in rows if r.action in ("new_alumni", "new_friend")]
+    if len(new_rows) > attendee_sheet.MAX_NEW_RECORDS_PER_COMMIT:
+        raise InvalidRequestError(
+            f"At most {attendee_sheet.MAX_NEW_RECORDS_PER_COMMIT} new people can be "
+            "created at once. Split the file."
+        )
+
+    roster: set[int] = set(
+        (
+            await session.execute(
+                select(EventAttendance.alumni_id).where(
+                    EventAttendance.event_id == event_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    match_ids = sorted({r.alumni_id for r in rows if r.action == "match" and r.alumni_id})
+    records: dict[int, Alumni] = {}
+    if match_ids:
+        found = (
+            await session.execute(select(Alumni).where(Alumni.alumni_id.in_(match_ids)))
+        ).scalars().all()
+        records = {a.alumni_id: a for a in found}
+
+    items: list[SheetCommitItem] = []
+    counts = dict.fromkeys(
+        (
+            "added",
+            "created_alumni",
+            "created_friends",
+            "already_attending",
+            "skipped",
+            "not_found",
+            "rejected",
+        ),
+        0,
+    )
+    created_people: dict[tuple, int] = {}
+    wrote = False
+
+    real_commit = session.commit
+    real_refresh = getattr(session, "refresh", None)
+
+    async def _noop_commit() -> None:
+        await session.flush()
+
+    async def _noop_refresh(_obj: object) -> None:
+        return None
+
+    def _attend(alumni_id: int, name: str, how: str) -> None:
+        session.add(EventAttendance(event_id=event_id, alumni_id=alumni_id))
+        session.add(
+            AuditLog(
+                user_id=user.user_id,
+                action_type="add_attendee",
+                entity_type="event",
+                entity_id=event_id,
+                new_value=f"{alumni_id}: {name} ({how})",
+            )
+        )
+        roster.add(alumni_id)
+
+    for row in rows:
+        if row.action == "skip":
+            counts["skipped"] += 1
+            items.append(SheetCommitItem(row=row.row, status="skipped"))
+            continue
+
+        if row.action == "match":
+            alumni = records.get(row.alumni_id)  # type: ignore[arg-type]
+            if alumni is None or alumni.archived:
+                counts["not_found"] += 1
+                items.append(
+                    SheetCommitItem(
+                        row=row.row,
+                        status="not_found",
+                        alumni_id=row.alumni_id,
+                        message="That record no longer exists. Re-run the preview.",
+                    )
+                )
+                continue
+            name = _attendee_name(alumni)
+            visible = friend_id_for(alumni.alumni_id, alumni.is_alumni)
+            if alumni.alumni_id in roster:
+                counts["already_attending"] += 1
+                items.append(
+                    SheetCommitItem(
+                        row=row.row,
+                        status="already_attending",
+                        alumni_id=alumni.alumni_id,
+                        friend_id=visible,
+                        name=name,
+                        message="Already on this event's roster.",
+                    )
+                )
+                continue
+            _attend(alumni.alumni_id, name, "spreadsheet match")
+            wrote = True
+            counts["added"] += 1
+            items.append(
+                SheetCommitItem(
+                    row=row.row,
+                    status="added",
+                    alumni_id=alumni.alumni_id,
+                    friend_id=visible,
+                    name=name,
+                )
+            )
+            continue
+
+        # new_alumni / new_friend
+        is_alumni = row.action == "new_alumni"
+        display = f"{row.first_name} {row.last_name}"
+        key = _sheet_person_key(row)
+        if key in created_people:
+            counts["already_attending"] += 1
+            items.append(
+                SheetCommitItem(
+                    row=row.row,
+                    status="already_attending",
+                    alumni_id=created_people[key],
+                    name=display,
+                    message="Same person as an earlier row; saved once.",
+                )
+            )
+            continue
+        async with session.begin_nested() as savepoint:
+            try:
+                model, note = _sheet_create_model(row, is_alumni)
+                session.commit = _noop_commit  # type: ignore[method-assign]
+                if real_refresh is not None:
+                    session.refresh = _noop_refresh  # type: ignore[method-assign]
+                try:
+                    record = await alumni_service.create_alumni(
+                        session, model, actor_user_id=user.user_id
+                    )
+                finally:
+                    session.commit = real_commit  # type: ignore[method-assign]
+                    if real_refresh is not None:
+                        session.refresh = real_refresh  # type: ignore[method-assign]
+                _attend(
+                    record.alumni_id,
+                    display,
+                    f"{'alum' if is_alumni else 'friend'} created from attendee spreadsheet",
+                )
+                wrote = True
+                created_people[key] = record.alumni_id
+                counts["created_alumni" if is_alumni else "created_friends"] += 1
+                items.append(
+                    SheetCommitItem(
+                        row=row.row,
+                        status="created_alumni" if is_alumni else "created_friend",
+                        alumni_id=record.alumni_id,
+                        friend_id=friend_id_for(record.alumni_id, is_alumni),
+                        name=display,
+                        message=note,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - record + continue per row
+                await savepoint.rollback()
+                counts["rejected"] += 1
+                items.append(
+                    SheetCommitItem(
+                        row=row.row,
+                        status="rejected",
+                        name=display,
+                        message=_friend_reject_reason(exc, row.row),
+                    )
+                )
+
+    if wrote:
+        await session.commit()
+    return SheetCommitResult(event_id=event_id, items=items, **counts)
 
 
 def _friend_reject_reason(exc: Exception, row_num: int) -> str:

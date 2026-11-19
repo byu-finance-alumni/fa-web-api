@@ -85,6 +85,7 @@ def _event():
         event_date=datetime.date(2026, 4, 10),
         event_location="Tanner Building",
         event_notes="Annual mixer.",
+        keynote_speaker=None,
     )
 
 
@@ -172,7 +173,8 @@ class _ExportSession:
     async def get(self, _model, _pk):
         return self._event
 
-    async def execute(self, _stmt):
+    async def execute(self, stmt):
+        self.compiled = str(stmt.compile())
         return _Result(self._rows)
 
     def add(self, obj):
@@ -189,6 +191,7 @@ def _export_alumnus(**over):
         preferred_first_name=None,
         last_name="Doe",
         net_id="jdoe",
+        is_alumni=True,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -252,10 +255,10 @@ def test_attendee_export_returns_csv_and_audits(client):
         in response.headers["content-disposition"]
     )
     lines = response.text.splitlines()
-    assert lines[0] == "Name,Email,Net ID"
-    assert lines[1] == "Jane Doe,jane@personal.com,jdoe"
-    assert lines[2] == "Mark Ash,mark@work.com,mash"  # work-email fallback
-    assert lines[3] == "Amy Bee,,"  # no email, no net_id
+    assert lines[0] == "Name,Alumni/Friend,Email,Net ID"
+    assert lines[1] == "Jane Doe,Alumni,jane@personal.com,jdoe"
+    assert lines[2] == "Mark Ash,Alumni,mark@work.com,mash"  # work-email fallback
+    assert lines[3] == "Amy Bee,Alumni,,"  # no email, no net_id
 
     assert session.committed is True
     audits = [o for o in session.added if hasattr(o, "action_type")]
@@ -266,7 +269,7 @@ def test_attendee_export_returns_csv_and_audits(client):
     assert audits[0].user_id == 1
     # Disclosure record is self-contained: row count + fixed column set + event.
     assert audits[0].new_value == (
-        "rows=3; columns=name,email,net_id; event='Spring Networking Night'"
+        "rows=3; columns=name,type,email,net_id; event='Spring Networking Night'"
     )
 
 
@@ -299,13 +302,47 @@ def test_attendee_export_neutralizes_csv_formula_injection(client):
     response = client.get("/events/7/attendees/export")
     assert response.status_code == 200
     rows = list(_csv.reader(_io.StringIO(response.text)))
-    assert rows[0] == ["Name", "Email", "Net ID"]
-    name_cell, email_cell, net_id_cell = rows[1]
+    assert rows[0] == ["Name", "Alumni/Friend", "Email", "Net ID"]
+    name_cell, type_cell, email_cell, net_id_cell = rows[1]
+    assert type_cell == "Alumni"
     # Every cell that starts with a formula-lead char is tab-prefixed; the
     # underlying value is preserved byte-for-byte after the tab.
     assert name_cell == '\t=HYPERLINK("http://evil.com","Click")'
     assert email_cell == "\t-2+3+cmd|' /C calc'!A1@evil.com"
     assert net_id_cell == "\t+cmd|'/C calc'!A1"
+
+
+def test_attendee_export_lists_alumni_then_friends_with_a_type_column(client):
+    # api#694: alumni first, then friends, each marked; nobody added or dropped.
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _ExportSession(
+        event=_event(),
+        # The DB returns rows in the ORDER BY below; the route keeps that order.
+        rows=[
+            (_export_alumnus(), "jane@personal.com", None),
+            (
+                _export_alumnus(
+                    alumni_id=50, first_name="Sam", last_name="Able",
+                    net_id=None, is_alumni=False,
+                ),
+                "sam@example.org",
+                None,
+            ),
+        ],
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.get("/events/7/attendees/export")
+    assert response.status_code == 200
+    lines = response.text.splitlines()
+    assert lines == [
+        "Name,Alumni/Friend,Email,Net ID",
+        "Jane Doe,Alumni,jane@personal.com,jdoe",
+        "Sam Able,Friend,sam@example.org,",
+    ]
+    # Alumni (is_alumni true) sort before friends, then by name.
+    order_by = session.compiled.split("ORDER BY", 1)[1]
+    assert order_by.strip().startswith("alumni.is_alumni DESC")
+    assert "alumni.last_name" in order_by
 
 
 # --- list filters (compiled SQL) ----------------------------------------------
@@ -794,3 +831,79 @@ def test_remove_attendee_happy_path_deletes_and_audits(client):
     assert audits[0].entity_id == 7
     assert audits[0].user_id == 1
     assert audits[0].old_value == "42"
+
+
+# --- keynote speaker (api#695) ------------------------------------------------
+
+
+def test_create_event_stores_keynote_speaker(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _CreateSession()
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.post(
+        "/events",
+        json={
+            "event_name": "Finance Conference",
+            "event_date": "2026-04-10",
+            "keynote_speaker": "  Jane Q. Speaker  ",
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["keynote_speaker"] == "Jane Q. Speaker"
+    events = [o for o in session.added if hasattr(o, "event_name")]
+    assert events[0].keynote_speaker == "Jane Q. Speaker"
+
+
+def test_keynote_speaker_is_optional_and_blank_is_none(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _CreateSession()
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.post(
+        "/events",
+        json={"event_name": "Mixer", "event_date": "2026-04-10", "keynote_speaker": " "},
+    )
+    assert response.status_code == 201
+    assert response.json()["keynote_speaker"] is None
+
+
+def test_keynote_speaker_is_capped(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    response = client.post(
+        "/events",
+        json={
+            "event_name": "Mixer",
+            "event_date": "2026-04-10",
+            "keynote_speaker": "x" * 256,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_update_event_sets_and_clears_keynote_speaker(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    event = _event()
+    session = _UpdateSession(event)
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.patch("/events/7", json={"keynote_speaker": "Dr. Ada Smith"})
+    assert response.status_code == 200
+    assert response.json()["keynote_speaker"] == "Dr. Ada Smith"
+    audits = [o for o in session.added if hasattr(o, "action_type")]
+    assert [(a.field_name, a.old_value, a.new_value) for a in audits] == [
+        ("keynote_speaker", None, "Dr. Ada Smith")
+    ]
+
+    session2 = _UpdateSession(event)
+    app.dependency_overrides[get_session] = _with_session(session2)
+    response = client.patch("/events/7", json={"keynote_speaker": ""})
+    assert response.status_code == 200
+    assert response.json()["keynote_speaker"] is None
+
+
+def test_get_event_returns_keynote_speaker(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("view_only")
+    event = _event()
+    event.keynote_speaker = "Ada Smith"
+    app.dependency_overrides[get_session] = _with_session(_UpdateSession(event))
+    response = client.get("/events/7")
+    assert response.status_code == 200
+    assert response.json()["keynote_speaker"] == "Ada Smith"

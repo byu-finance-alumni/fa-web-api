@@ -102,6 +102,13 @@ class NewPersonPossibleMatch(BaseModel):
     match_reason: Literal["byu_id", "email", "name"]
 
 
+class NewPeoplePendingCount(BaseModel):
+    """``GET /survey/new-people/submissions/count`` (fa-web-app #958): how many
+    new-people submissions wait for review. A number only -- no names."""
+
+    pending: int
+
+
 class NewPersonSubmissionItem(BaseModel):
     """One pending submission in the New people review queue."""
 

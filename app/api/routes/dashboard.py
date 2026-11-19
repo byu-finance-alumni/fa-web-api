@@ -962,12 +962,24 @@ async def activity_feed(
     # Build the shared filter predicates once so the count and the page agree.
     conditions = []
     if q and q.strip():
-        like = f"%{escape_like(q.strip())}%"
+        # Inner whitespace collapsed to one space so "Scott  Kim" still reads as
+        # a full name; the joined first/preferred + last legs are what let a
+        # FULL name match at all (#692) -- every other leg is one column, which
+        # can never contain "Scott Kim".
+        term = " ".join(q.split())
+        like = f"%{escape_like(term)}%"
+        last = func.coalesce(Alumni.last_name, "")
         conditions.append(
             or_(
                 Alumni.first_name.ilike(like, escape="\\"),
                 Alumni.last_name.ilike(like, escape="\\"),
                 Alumni.preferred_first_name.ilike(like, escape="\\"),
+                (func.coalesce(Alumni.first_name, "") + " " + last).ilike(
+                    like, escape="\\"
+                ),
+                (func.coalesce(Alumni.preferred_first_name, "") + " " + last).ilike(
+                    like, escape="\\"
+                ),
                 Interaction.interaction_type.ilike(like, escape="\\"),
             )
         )

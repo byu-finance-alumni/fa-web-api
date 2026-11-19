@@ -504,6 +504,7 @@ _OTHER_STAFF_LISTS = [
     "/donations/alumni/1",
     "/events/1/attendees",
     "/survey/campaigns/2020/responses",
+    "/survey/no-year/responses",
     "/survey/campaigns/2020/recipients",
     "/survey/campaigns/2020/unreachable",
     "/survey/schedules/2020/non-responders",

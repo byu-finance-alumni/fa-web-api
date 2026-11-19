@@ -435,3 +435,115 @@ def test_external_ids_are_only_searched_for_a_one_word_query():
     assert parse_free_text("123456789").single_token is True
     assert parse_free_text("Kyle Marsh").single_token is False
     assert parse_free_text("at Adobe").single_token is False
+
+
+# --- H. full-name search (#692) ----------------------------------------------
+#
+# Meeting 2026-11-18: searching "Scott Kim" did not show Scott Kim. He WAS in
+# the result set — but so was every alumnus named Scott, because the joined
+# phrase ``scottkim`` fuzzy-matched a first-name cell holding just "Scott". All
+# of those rows ranked 100 (an exact hit on the ``scott`` token), so he sorted
+# alphabetically among them: off the top bar's eight suggestions, and often off
+# page 1 of the list.
+
+
+def _pg_trigrams(word: str) -> set[str]:
+    """pg_trgm's trigram set for one already-normalized word (two leading
+    blanks, one trailing), so the arithmetic below is PostgreSQL's own."""
+    padded = f"  {word} "
+    return {padded[i : i + 3] for i in range(len(padded) - 2)}
+
+
+def _pg_similarity(a: str, b: str) -> float:
+    ta, tb = _pg_trigrams(a), _pg_trigrams(b)
+    return len(ta & tb) / len(ta | tb)
+
+
+def _phrase_fuzzy_min_lengths(stmt) -> set[int]:
+    """The ``length(cell) >= n`` bounds the statement carries (bound params)."""
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    names = re.findall(
+        r"length\(alumni_search_norm\([^)]*\)\) >= %\((\w+)\)s", str(compiled)
+    )
+    return {compiled.params[n] for n in names}
+
+
+def test_the_root_cause_one_word_of_a_full_name_cleared_the_fuzzy_floor():
+    # THE bug in arithmetic: 5 shared trigrams of 10 -> 0.50 >= 0.45. A cell that
+    # holds ONE word W of a phrase scores len(W) / (len(phrase) + 2), so every
+    # name whose other words are short flooded the result. "Dallas Smith" did the
+    # same through the CITY column.
+    assert _pg_similarity("scott", "scottkim") >= _SIMILARITY_FLOOR
+    assert _pg_similarity("scotty", "scottkim") >= _SIMILARITY_FLOOR
+    assert _pg_similarity("dallas", "dallassmith") >= _SIMILARITY_FLOOR
+
+
+def test_the_phrase_fuzzy_legs_skip_a_cell_holding_only_part_of_the_name():
+    from app.repositories.alumni_search import _PHRASE_SHORTFALL
+
+    floor = len("scottkim") - _PHRASE_SHORTFALL
+    assert _phrase_fuzzy_min_lengths(build_alumni_query(q="Scott Kim")) == {floor}
+    # The guard rejects exactly the flood rows above...
+    for cell in ("scott", "scotty", "kim"):
+        assert len(cell) < floor
+    # ...but a whole-value typo inside one cell keeps its fuzzy match.
+    assert len("goldmansachs") >= len("goldmanschs") - _PHRASE_SHORTFALL
+    assert _pg_similarity("goldmansachs", "goldmanschs") >= _SIMILARITY_FLOOR
+    assert len(normalize("Dallas")) < len("dallassmith") - _PHRASE_SHORTFALL
+
+
+def test_a_full_name_still_requires_both_words_and_keeps_its_precise_legs():
+    # The per-token leg (each word somewhere) is what finds Scott Kim, and it is
+    # unbounded: "kim" is too short to be fuzzy at all, so it is a plain contains.
+    values = list(build_alumni_query(q="Scott Kim").compile(
+        dialect=postgresql.dialect()
+    ).params.values())
+    assert "%scott%" in values
+    assert "%kim%" in values
+    assert "%scottkim%" in values  # the phrase's precise leg is untouched
+
+
+def test_single_word_and_routed_queries_get_no_length_guard():
+    assert _phrase_fuzzy_min_lengths(build_alumni_query(q="goldman")) == set()
+    assert _phrase_fuzzy_min_lengths(build_alumni_query(q="Scottsdale")) == set()
+
+
+def test_an_exact_full_name_outranks_every_single_word_hit():
+    from app.repositories.alumni_search import (
+        _FULL_NAME_EXACT_SCORE,
+        _FULL_NAME_PREFIX_SCORE,
+    )
+
+    # Scott Kim above "Scott Kimball" above anyone who only matched each word
+    # somewhere (an exact first name, weight 1.0, scores _EXACT_SCORE).
+    assert _FULL_NAME_EXACT_SCORE > _FULL_NAME_PREFIX_SCORE > _EXACT_SCORE * _NAME_WEIGHT
+    sql = str(relevance_expression(parse_free_text("Scott Kim")).compile(
+        dialect=postgresql.dialect()
+    ))
+    def joined(*cols: str) -> str:
+        return ", ".join(f"alumni_search_norm(alumni.{c})" for c in cols) + ")"
+
+    assert "concat(" + joined("first_name", "last_name") in sql
+    assert "concat(" + joined("preferred_first_name", "last_name") in sql
+    # Surname-first ("Kim, Scott") and the middle name are spellings too.
+    assert "concat(" + joined("last_name", "first_name") in sql
+    assert joined("middle_name", "last_name") in sql
+
+
+def test_the_full_name_tier_is_only_for_multi_word_unrouted_segments():
+    for q in ("Scott", "at goldman sachs", "in new york"):
+        sql = str(relevance_expression(parse_free_text(q)).compile(
+            dialect=postgresql.dialect()
+        ))
+        assert "concat(" not in sql, q
+
+
+def test_the_full_name_tier_never_changes_who_matches():
+    # Ranking only: the population (shared with the CSV export) has no concat.
+    assert "concat(" not in _sql(build_alumni_query(q="Scott Kim"))
+
+
+def test_two_word_names_parse_as_one_unrouted_segment():
+    # Several names that LOOK like places or filler must stay a name search.
+    for q in ("Scott Kim", "Dallas Smith", "Grant Park", "Ann Lee", "Austin Jones"):
+        assert _roles(q) == [(ROLE_ANY, tuple(normalize(w) for w in q.split()))], q

@@ -395,7 +395,8 @@ class _AttendeeSession:
 
     async def execute(self, _stmt):
         alum = SimpleNamespace(
-            first_name="Jane", preferred_first_name=None, last_name="Doe", net_id="jdoe9"
+            first_name="Jane", preferred_first_name=None, last_name="Doe", net_id="jdoe9",
+            is_alumni=True,
         )
         return SimpleNamespace(all=lambda: [(alum, "jane@personal.com", None)])
 
@@ -409,12 +410,17 @@ class _AttendeeSession:
 @pytest.mark.parametrize(
     ("role", "header", "row", "cols"),
     [
-        ("view_only", "Name,Email", "Jane Doe,jane@personal.com", "name,email"),
+        (
+            "view_only",
+            "Name,Alumni/Friend,Email",
+            "Jane Doe,Alumni,jane@personal.com",
+            "name,type,email",
+        ),
         (
             "full_access",
-            "Name,Email,Net ID",
-            "Jane Doe,jane@personal.com,jdoe9",
-            "name,email,net_id",
+            "Name,Alumni/Friend,Email,Net ID",
+            "Jane Doe,Alumni,jane@personal.com,jdoe9",
+            "name,type,email,net_id",
         ),
     ],
 )

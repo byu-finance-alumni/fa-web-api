@@ -161,7 +161,7 @@ def test_event_attendees_unknown_event_is_404(client):
 
 class _ExportSession:
     """Stand-in for the attendee export: ``get`` returns the event, ``execute``
-    returns (alumni, personal_email, work_email) rows, and add/commit record the
+    returns (alumni, personal_email, work_email, suppressed) rows, and add/commit record the
     disclosure audit."""
 
     def __init__(self, *, event, rows):
@@ -175,7 +175,7 @@ class _ExportSession:
 
     async def execute(self, stmt):
         self.compiled = str(stmt.compile())
-        return _Result(self._rows)
+        return _Result([(*r, False) if len(r) == 3 else r for r in self._rows])
 
     def add(self, obj):
         self.added.append(obj)
@@ -343,6 +343,38 @@ def test_attendee_export_lists_alumni_then_friends_with_a_type_column(client):
     order_by = session.compiled.split("ORDER BY", 1)[1]
     assert order_by.strip().startswith("alumni.is_alumni DESC")
     assert "alumni.last_name" in order_by
+
+
+def test_attendee_export_blanks_the_email_of_deceased_and_do_not_contact(client):
+    app.dependency_overrides[get_current_db_user] = lambda: _ctx("full_access")
+    session = _ExportSession(
+        event=_event(),
+        rows=[
+            (_export_alumnus(), "jane@personal.com", "jane@work.com", True),
+            (
+                _export_alumnus(alumni_id=43, first_name="Mark", net_id="mash"),
+                "mark@personal.com",
+                None,
+                False,
+            ),
+        ],
+    )
+    app.dependency_overrides[get_session] = _with_session(session)
+    response = client.get("/events/7/attendees/export")
+    assert response.status_code == 200
+    # Still listed (they attended), with neither address.
+    assert response.text.splitlines()[1:] == [
+        "Jane Doe,Alumni,,jdoe",
+        "Mark Doe,Alumni,mark@personal.com,mash",
+    ]
+    # The flag comes from the deceased column OR a suppressing status label, and
+    # the label lookup is correlated (it must not add alumni to its own FROM).
+    select_list = session.compiled.split("ORDER BY", 1)[0]
+    assert "alumni.deceased IS" in select_list
+    exists = select_list.split("EXISTS (", 1)[1].split("AS suppressed", 1)[0]
+    assert "FROM alumni_status_label" in exists
+    assert "alumni_status_labels.alumni_id = alumni.alumni_id" in exists
+    assert "FROM alumni," not in exists and ", alumni " not in exists
 
 
 # --- list filters (compiled SQL) ----------------------------------------------

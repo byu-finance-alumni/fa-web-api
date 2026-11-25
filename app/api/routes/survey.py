@@ -1525,7 +1525,8 @@ async def survey_one_off_send(
     Re-sending to the same person is allowed, but within 24 hours of their last
     survey email (class or one-off) only with `{"confirm_resend": true}`;
     without it the answer is 409 with `error.code` = `resend_confirm_required`
-    and `error.last_sent_at` (ISO 8601), and nothing is sent. Audited on the
+    and `error.last_sent_at` (ISO 8601), and nothing is sent. A fourth one-off to
+    the same person within 24 hours is refused (409) even with it. Audited on the
     alum's record.
 
     Gated like the profile's Edit button (`alumni.edit`), and braked to 10 sends

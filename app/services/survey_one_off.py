@@ -102,6 +102,11 @@ AUDIT_ACTION = "send_survey_one_off"
 RESEND_COOLDOWN = datetime.timedelta(hours=24)
 REASON_RESEND_CONFIRM = "resend_confirm_required"
 
+#: Hard ceiling on one-off sends to the same person inside :data:`RESEND_COOLDOWN`.
+#: ``confirm_resend`` does NOT lift it. Counted from the database, so it holds
+#: across every server instance (the per-editor limiter is in-process).
+MAX_SENDS_PER_PERSON = 3
+
 # Stable reason codes (the frontend may key on them) and their plain wording.
 # Kept as a stable code although nothing returns it any more: friends are
 # sendable since api#696. An older frontend may still key on it.
@@ -123,6 +128,10 @@ REASON_TEXT = {
     REASON_CAMPAIGN_CANCELLED: "Their class's survey campaign was stopped.",
 }
 
+TOO_MANY_SENDS_MESSAGE = (
+    f"They have already been sent the survey {MAX_SENDS_PER_PERSON} times in the "
+    "last 24 hours. Try again later. Nothing was sent."
+)
 BUSY_MESSAGE = (
     "A survey send is running right now. Try again in a minute. Nothing was sent."
 )
@@ -281,6 +290,29 @@ async def _last_one_off_sent_at(
     except Exception:  # noqa: BLE001 - a missing table must not break the page
         log.warning("survey_one_off: could not read the one-off send log")
         return None
+
+
+async def _recent_one_off_count(session: AsyncSession, alumni_id: int) -> int:
+    """One-off sends (stage 0, not reminders) to this person inside
+    :data:`RESEND_COOLDOWN`, by any editor. A released claim (Resend refused it)
+    has no row, so it does not count. Deliberately NOT swallowed on error: a
+    ceiling that can't be read must not let the send through."""
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(SurveyOneOffSendLog)
+            .join(
+                SurveyOneOff,
+                SurveyOneOff.survey_one_off_id
+                == SurveyOneOffSendLog.survey_one_off_id,
+            )
+            .where(
+                SurveyOneOff.alumni_id == alumni_id,
+                SurveyOneOffSendLog.stage == STAGE_INITIAL,
+                SurveyOneOffSendLog.sent_at > _now() - RESEND_COOLDOWN,
+            )
+        )
+    ).scalar_one()
 
 
 async def sends_for_alum(
@@ -481,6 +513,8 @@ async def send_one_off(
       us to slow down. Nothing was sent in any of these;
     * :class:`ResendNeedsConfirm` (409) -- they were sent a survey (any kind)
       within :data:`RESEND_COOLDOWN` and ``confirm_resend`` is not set;
+    * :class:`ConflictError` (409) -- :data:`MAX_SENDS_PER_PERSON` one-offs already
+      went to them in that window, whatever ``confirm_resend`` says;
     * :class:`ServiceError` -- Resend refused, or the outcome is unknown.
     """
     base_url, from_field = _from_field()
@@ -498,7 +532,11 @@ async def send_one_off(
     async with survey_email.send_lock() as acquired:
         if not acquired:
             raise ConflictError(BUSY_MESSAGE)
-        # Checked UNDER the send lock so two quick clicks can't both pass it.
+        # Both checked UNDER the send lock so two quick clicks can't both pass.
+        # The ceiling goes first: there is no point asking to confirm a re-send
+        # that would be refused anyway.
+        if await _recent_one_off_count(session, alumni_id) >= MAX_SENDS_PER_PERSON:
+            raise ConflictError(TOO_MANY_SENDS_MESSAGE)
         if not confirm_resend:
             previous = await last_sent_at(session, alumni_id)
             if previous is not None and _now() - previous < RESEND_COOLDOWN:

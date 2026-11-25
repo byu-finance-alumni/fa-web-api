@@ -25,7 +25,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import (
@@ -37,6 +37,7 @@ from app.api.dependencies.auth import (
 )
 from app.api.params import IdPath
 from app.core.database import get_session
+from app.core.dropdowns import SUPPRESSED_CONTACT_STATUS_LABELS
 from app.core.errors import ConflictError, InvalidRequestError, NotFoundError
 from app.core.friend_id import friend_id_for
 from app.core.rate_limit import BrowseReadRateLimit, ExportReadRateLimit
@@ -44,6 +45,7 @@ from app.models.alumni import Alumni
 from app.models.audit import AuditLog
 from app.models.contact import AlumniContactInfo
 from app.models.event import Event, EventAttendance
+from app.repositories.alumni import has_status_label_exists
 from app.schemas.alumni import AlumniCreateFull
 from app.schemas.attendee_match import (
     AttendeeApplyItem,
@@ -560,7 +562,9 @@ async def export_event_attendees(
     as a disclosure (action ``export_event_attendees``, row count only, never the
     data itself). 404 if the event is unknown.
 
-    Email is the alumnus's personal email, falling back to the work email. Rows
+    Email is the alumnus's personal email, falling back to the work email. It is
+    left BLANK for anyone deceased or marked Do Not Contact (the Outreach lists'
+    rule); they stay on the list because they did attend. Rows
     list every alumnus first, then every friend, each group ordered by name.
 
     A non-editor holding the assignable ``alumni.export`` gets **Name,
@@ -578,6 +582,11 @@ async def export_event_attendees(
             Alumni,
             AlumniContactInfo.personal_email,
             AlumniContactInfo.work_email,
+            # Deceased / Do Not Contact: listed, but with no email.
+            or_(
+                Alumni.deceased.is_(True),
+                has_status_label_exists(SUPPRESSED_CONTACT_STATUS_LABELS),
+            ).label("suppressed"),
         )
         .join(EventAttendance, EventAttendance.alumni_id == Alumni.alumni_id)
         .outerjoin(
@@ -599,13 +608,13 @@ async def export_event_attendees(
         if include_net_id
         else ["Name", "Alumni/Friend", "Email"]
     )
-    for alumni, personal_email, work_email in rows:
+    for alumni, personal_email, work_email, suppressed in rows:
         # Neutralize every free-text cell (#169) — a name/email/net_id starting
         # with a formula lead char would otherwise export as an executable cell.
         cells = [
             _fmt(_attendee_name(alumni), "str"),
             "Alumni" if alumni.is_alumni else "Friend",
-            _fmt(personal_email or work_email or "", "str"),
+            _fmt("" if suppressed else (personal_email or work_email or ""), "str"),
         ]
         if include_net_id:
             cells.append(_fmt(alumni.net_id or "", "str"))

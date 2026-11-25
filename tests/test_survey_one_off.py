@@ -647,6 +647,36 @@ def test_a_re_send_within_24_hours_needs_the_confirm(world):
     assert world.to() == ["alum1@byu.edu", "alum1@byu.edu"]
 
 
+def test_a_fourth_send_in_24_hours_is_refused_even_with_the_confirm(world):
+    world.alum(_ANN)
+    world.alum(_BEN)
+    for actor in (7, 8, 9):  # the ceiling is per recipient, not per editor
+        world.send(actor_user_id=actor, confirm_resend=True)
+    for confirm in (True, False):
+        with pytest.raises(ConflictError) as refused:
+            world.send(actor_user_id=10, confirm_resend=confirm)
+        assert refused.value.message == survey_one_off.TOO_MANY_SENDS_MESSAGE
+        # Not the "confirm to send again" answer: confirming would not help.
+        assert not isinstance(refused.value, survey_one_off.ResendNeedsConfirm)
+    assert len(world.emails) == len(world.one_off_rows()) == 3
+    # Someone else is unaffected, and the ceiling lifts after a day.
+    world.send(_BEN)
+    world.age_one_offs(1)
+    world.send()
+    assert len(world.emails) == 5
+
+
+def test_a_refused_attempt_does_not_use_up_the_ceiling(world):
+    world.alum(_ANN)
+    world.fail_with = ServiceError("Resend rejected the send (HTTP 403).")
+    for _ in range(4):
+        with pytest.raises(ServiceError):
+            world.send(confirm_resend=True)
+    world.fail_with = None
+    world.send()
+    assert len(world.one_off_rows()) == 1
+
+
 def test_a_class_email_in_the_last_24_hours_also_needs_the_confirm(world):
     world.alum(_ANN)
     world.class_send()

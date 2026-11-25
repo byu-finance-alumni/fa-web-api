@@ -398,7 +398,7 @@ class _AttendeeSession:
             first_name="Jane", preferred_first_name=None, last_name="Doe", net_id="jdoe9",
             is_alumni=True,
         )
-        return SimpleNamespace(all=lambda: [(alum, "jane@personal.com", None)])
+        return SimpleNamespace(all=lambda: [(alum, "jane@personal.com", None, False)])
 
     def add(self, obj):
         self.added.append(obj)
